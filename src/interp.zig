@@ -2471,9 +2471,35 @@ pub const Vm = struct {
                 else
                     "'for' step must be a number"),
                 // The container is a register in all four forms; the field
-                // forms' key is a constant, which the message never reads.
-                .get_index, .get_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value{s}", .{ regs.get(instr.b).typeName(), try self.faultVarInfo(arena, &info_buf, proto, pc, instr.b, regs.get(instr.b)) }),
-                .set_index, .set_field => try std.fmt.allocPrint(arena, "attempt to index a {s} value{s}", .{ regs.get(instr.a).typeName(), try self.faultVarInfo(arena, &info_buf, proto, pc, instr.a, regs.get(instr.a)) }),
+                // forms' key is a constant.
+                .get_index, .get_field => blk: {
+                    const key = if (instr.op == .get_field) proto.constants[instr.c] else regs.get(instr.c);
+                    break :blk try self.indexFaultMessage(arena, &info_buf, proto, pc, instr.b, regs.get(instr.b), key, false);
+                },
+                .set_index, .set_field => blk: {
+                    const key = if (instr.op == .set_field) proto.constants[instr.b] else regs.get(instr.b);
+                    break :blk try self.indexFaultMessage(arena, &info_buf, proto, pc, instr.a, regs.get(instr.a), key, true);
+                },
+                // `R[a] = R[b][R[c]][R[aux]]` and `R[a][R[b]][R[c]] = R[aux]`:
+                // the fault is the first step's, or the second's on the
+                // middle value, which no register holds.
+                .get_index2, .set_index2 => blk: {
+                    const store = instr.op == .set_index2;
+                    const outer_reg: u16 = if (store) instr.a else instr.b;
+                    const outer = regs.get(outer_reg);
+                    const key1 = regs.get(if (store) instr.b else instr.c);
+                    const key2 = regs.get(if (store) instr.c else @as(u16, @intCast(instr.aux)));
+                    const mid: Value = switch (self.probeIndex(outer, key1, false)) {
+                        .found => |v| v,
+                        .grid_row => |in_range| if (in_range) break :blk try arena.dupe(u8, @errorName(err)) else Value.nil(),
+                        .not_indexable, .bad_key => break :blk try self.indexFaultMessage(arena, &info_buf, proto, pc, outer_reg, outer, key1, false),
+                        .unknown => break :blk try arena.dupe(u8, @errorName(err)),
+                    };
+                    break :blk if (store)
+                        try self.indexFaultMessage(arena, &info_buf, proto, pc, null, mid, key2, true)
+                    else
+                        try self.indexFaultMessage(arena, &info_buf, proto, pc, null, mid, key2, false);
+                },
                 // Doc 66 P1: an `itern` faults only in the call it makes.
                 .call, .itern => blk: {
                     // A native runs inline (no child frame), so when one returns a
@@ -2500,6 +2526,81 @@ pub const Vm = struct {
 
         const frames = try self.backtraceFrames(arena);
         return .{ .message = message, .chunk = proto.chunk, .proto_id = proto.id, .line = line, .start = span.start, .end = span.end, .frames = frames };
+    }
+
+    /// What `indexGet` (`store` false) or `indexSet` (true) of
+    /// `container[key]` trips over, found without running anything: the raw
+    /// walk of the `__index`/`__newindex` chain of tables those take.
+    const IndexProbe = union(enum) {
+        /// A read's value (a store would not fault here).
+        found: Value,
+        /// A value with no `__index`/`__newindex` that is not a table;
+        /// `first` when it is `container` itself.
+        not_indexable: struct { v: Value, first: bool },
+        /// A store of a nil or NaN key into a table: Lua's message.
+        bad_key: []const u8,
+        /// A grid `container`, which only the fused ops read: whether `key`
+        /// names one of its rows.
+        grid_row: bool,
+        /// The walk reaches a functional metamethod, a grid past the first
+        /// step, or the chain limit.
+        unknown,
+    };
+
+    fn probeIndex(self: *Vm, container: Value, key: Value, comptime store: bool) IndexProbe {
+        const name = if (store) self.mm.newindex else self.mm.index;
+        var cur = container;
+        var hops: usize = 0;
+        while (hops < max_metatable_chain) : (hops += 1) {
+            if (cur.isRowView()) return .unknown;
+            const is_table = cur.isHeap() and cur.heapType() == .table;
+            if (is_table) {
+                const t = table.Table.fromHeader(cur.asHeap());
+                // `Table.get` on a grid would mint a row view.
+                if (t.array.isGrid()) {
+                    if (hops > 0) return .unknown;
+                    const k = table.normalizeKey(key);
+                    return .{ .grid_row = k.isInt() and k.asInt() >= 1 and k.asInt() <= @as(i64, @intCast(t.array.gridRows())) };
+                }
+                const raw = t.get(key);
+                if (!raw.isNil()) return .{ .found = raw };
+            }
+            const handler = self.metamethod(cur, name);
+            if (handler.isNil()) {
+                if (!is_table) return .{ .not_indexable = .{ .v = cur, .first = hops == 0 } };
+                if (store) {
+                    if (key.isNil()) return .{ .bad_key = "table index is nil" };
+                    if (key.isFloat() and std.math.isNan(key.asFloat())) return .{ .bad_key = "table index is NaN" };
+                }
+                return .{ .found = Value.nil() };
+            }
+            if (isFunction(handler)) return .unknown;
+            cur = handler;
+        }
+        return .unknown;
+    }
+
+    /// The message for a faulted `container[key]` read or store: Lua's
+    /// "table index is nil"/"NaN" for a bad key, else "attempt to index a
+    /// <type> value" naming what the chain reached, with `varinfo` when that
+    /// is `container` in register `reg`. Without a probe answer, the
+    /// container's type. Inline, and the probe skipped for a non-table with
+    /// no metatable (its own first step's answer): out of line and probing,
+    /// an `x.y` on nil cost ~150 instructions more per caught fault.
+    inline fn indexFaultMessage(self: *Vm, arena: std.mem.Allocator, info_buf: []u8, proto: *const bytecode.Proto, pc: usize, reg: ?u16, container: Value, key: Value, comptime store: bool) std.mem.Allocator.Error![]const u8 {
+        var v = container;
+        var first = true;
+        const plain = !(container.isHeap() and container.heapType() == .table) and self.metatableOf(container) == null;
+        if (!plain) switch (self.probeIndex(container, key, store)) {
+            .bad_key => |m| return arena.dupe(u8, m),
+            .not_indexable => |n| {
+                v = n.v;
+                first = n.first;
+            },
+            .found, .grid_row, .unknown => {},
+        };
+        const info = if (!first) "" else if (reg) |r| try self.faultVarInfo(arena, info_buf, proto, pc, r, v) else "";
+        return std.fmt.allocPrint(arena, "attempt to index a {s} value{s}", .{ v.typeName(), info });
     }
 
     /// The suffix naming the faulting value, as Lua 5.4's `varinfo` does
@@ -3147,9 +3248,14 @@ pub const Vm = struct {
         return @min(out.len, 1 + produced);
     }
 
+    /// Is `v` a function (a closure or a native), as Lua's `ttisfunction`.
+    fn isFunction(v: Value) bool {
+        return v.isHeap() and (v.heapType() == .function or v.heapType() == .native);
+    }
+
     /// May `v` be called: a function, or a value with `__call`.
     fn isCallable(self: *Vm, v: Value) bool {
-        if (v.isHeap() and (v.heapType() == .function or v.heapType() == .native)) return true;
+        if (isFunction(v)) return true;
         return !self.metamethod(v, self.mm.call).isNil();
     }
 
@@ -10161,8 +10267,10 @@ pub const Vm = struct {
                 if (cur.isHeap() and cur.heapType() == .table) return Value.nil();
                 return Error.TypeError;
             }
-            if (handler.isHeap() and handler.heapType() == .table) {
-                cur = handler; // chain: look the key up in the `__index` table
+            // Lua's `luaV_finishget`: a function is called; anything else
+            // is indexed in turn (a table's raw slot, or its own `__index`).
+            if (!isFunction(handler)) {
+                cur = handler;
                 continue;
             }
             // Functional `__index`: `handler(cur, key)` → first result.
@@ -10177,9 +10285,11 @@ pub const Vm = struct {
     /// key). Otherwise:
     ///   - no metatable / no `__newindex` → raw set (creates the key); a
     ///     non-indexable value faults (`TypeError`).
-    ///   - `__newindex` is a table → repeat the set on it (chained, bounded).
-    ///   - `__newindex` is any other value (a function) → call it as
+    ///   - `__newindex` is a function → call it as
     ///     `handler(container, key, val)` (no result).
+    ///   - `__newindex` is any other value → repeat the set on it (chained,
+    ///     bounded), as Lua does: a table's raw slot, else its own
+    ///     `__newindex`, else the fault.
     pub fn indexSet(self: *Vm, container: Value, key: Value, val: Value) Error!void {
         var cur = container;
         var hops: usize = 0;
@@ -10230,8 +10340,9 @@ pub const Vm = struct {
                     self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
                     return;
                 }
-                if (handler.isHeap() and handler.heapType() == .table) {
-                    cur = handler; // chain the set into the `__newindex` table
+                // As `luaV_finishset`: only a function is called.
+                if (!isFunction(handler)) {
+                    cur = handler; // chain the set into the `__newindex` value
                     continue;
                 }
                 var out: [1]Value = .{Value.nil()};
@@ -10241,7 +10352,7 @@ pub const Vm = struct {
             // `cur` is not a table: only a `__newindex` can rescue it.
             const handler = self.metamethod(cur, self.mm.newindex);
             if (handler.isNil()) return Error.TypeError;
-            if (handler.isHeap() and handler.heapType() == .table) {
+            if (!isFunction(handler)) {
                 cur = handler;
                 continue;
             }

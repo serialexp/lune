@@ -161,6 +161,41 @@ test "rawset, rawlen and setmetatable check their arguments as Lua does" {
         "bad argument #2 to 'setmetatable' (nil or table expected, got no value)\n");
 }
 
+test "a store with a nil or NaN key says so, through __newindex chains and t[i][j]" {
+    try expectProgram(
+        \\local t = {{}}
+        \\local k
+        \\print(pcall(function() t[k] = 1 end))
+        \\print(pcall(function() t[0/0] = 1 end))
+        \\print(pcall(function() t[1][k] = 1 end))
+    , "false\tmain:3: table index is nil\nfalse\tmain:4: table index is NaN\n" ++
+        "false\tmain:5: table index is nil\n");
+    try expectProgram(
+        \\local t, k = {{}}, nil
+        \\print(pcall(function() t[2][1] = 1 end))
+        \\print(pcall(function() return t[2][1] end))
+        \\print(pcall(function() setmetatable({}, {__newindex = {}})[k] = 1 end))
+        \\print(pcall(function() setmetatable({}, {__newindex = function() end})[k] = 1 end))
+        \\local g = {{1, 2}, {3, 4}}
+        \\g[1][1] = 7
+        \\print(pcall(function() return g[5][1] end))
+    , "false\tmain:2: attempt to index a nil value\nfalse\tmain:3: attempt to index a nil value\n" ++
+        "false\tmain:4: table index is nil\ntrue\nfalse\tmain:8: attempt to index a nil value\n");
+}
+
+test "an __index or __newindex that is not a function is indexed in turn" {
+    try expectProgram(
+        \\print(setmetatable({}, {__index = "abc"}).len == string.len)
+        \\print(pcall(function() return setmetatable({}, {__index = true}).x end))
+        \\print(pcall(function() setmetatable({}, {__newindex = 5}).x = 1 end))
+        \\local seen
+        \\local inner = setmetatable({}, {__newindex = function(_, k, v) seen = k .. v end})
+        \\setmetatable({}, {__newindex = inner}).x = 1
+        \\print(seen, rawget(inner, "x"))
+    , "true\nfalse\tmain:2: attempt to index a boolean value\n" ++
+        "false\tmain:3: attempt to index a number value\nx1\tnil\n");
+}
+
 test "assert raises its message with the caller's position" {
     try expectProgram(
         \\print(pcall(function() assert(false, "boom") end))

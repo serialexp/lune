@@ -131,6 +131,10 @@ Wrong results:
       a method lookup; a bad `self` is "calling 'f' on bad self".
 - [x] `gsub` with `"%x"` in the replacement yields `"x"` (Lua: "invalid
       use of '%' in replacement string"). `%z` is unsupported. Both fixed.
+- [x] `t[nil] = 1` and `t[0/0] = 1` said "attempt to index a table value"
+      (Lua: "table index is nil"/"NaN"); `t[i][j]` faults said "TypeError".
+      An `__index`/`__newindex` that is neither a table nor a function was
+      called; Lua indexes it in turn (`__index = "abc"` reaches `string`).
 - [ ] The undefined-global lint fires for globals created via
       `_G.name = …`.
 
