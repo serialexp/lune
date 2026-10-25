@@ -10259,8 +10259,8 @@ pub inline fn fastResult(vm: *const Vm, fast: function.FastBuiltin, regs: RegWin
             const tv = vm.type_names[@intFromEnum(x.typeNameId())];
             return if (tv.isNil()) null else tv;
         },
-        .floor => return if (x.isNumber()) stdmath.floorOf(x) catch null else null,
-        .ceil => return if (x.isNumber()) stdmath.ceilOf(x) catch null else null,
+        .floor => return if (x.isNumber()) stdmath.floorOf(x) else null,
+        .ceil => return if (x.isNumber()) stdmath.ceilOf(x) else null,
         .sqrt => return if (x.isNumber()) stdmath.sqrtOf(x) else null,
         .abs => return if (x.isNumber()) stdmath.absOf(x) else null,
         inline .max, .min => |which| {
@@ -10803,6 +10803,7 @@ fn nativeRandom(ctx: *anyopaque, args: []const Value) anyerror!Value {
     var low: i64 = 1;
     var up: i64 = undefined;
     var full_width = false; // the `math.random(0)` special case: a full 64-bit int
+    if (args.len > 2) return vm.raiseLocatedError("wrong number of arguments", 1);
     if (args.len >= 1) {
         if (args.len == 1) {
             up = try randIntArg(vm, args, 0);
@@ -10811,8 +10812,8 @@ fn nativeRandom(ctx: *anyopaque, args: []const Value) anyerror!Value {
             low = try randIntArg(vm, args, 0);
             up = try randIntArg(vm, args, 1);
         }
-        if (!full_width and low > up)
-            return vm.badArgReason(if (args.len == 1) 1 else 2, "interval is empty");
+        // Lua blames #1 for both forms.
+        if (!full_width and low > up) return vm.badArgReason(1, "interval is empty");
     }
 
     // Known-valid (or the 0-arg float form): now seed lazily — on the first draw,

@@ -81,10 +81,10 @@ effect log so runs stay replayable (doc 02).
 - [ ] Call sugar `f{...}`, `f"str"` / `require"x"` unsupported (deferred).
 - [ ] `local x <const>` / `<close>`, hex floats (`0x1p4`), the `\z` escape,
       `'\xff'` don't parse.
-- [ ] Multiple-assignment order: `local i,t=1,{} i, t[i] = i+1, 20` sets
+- [x] Multiple-assignment order: `local i,t=1,{} i, t[i] = i+1, 20` sets
       `t[2]`; the 5.4 manual's order sets `t[1]`.
-- [ ] Integral floats rejected by bitwise ops (`3.0 & 1`, `2^31 | 0`) and
-      `math.floor(1e100)`.
+- [ ] Integral floats rejected by bitwise ops (`3.0 & 1`, `2^31 | 0`).
+      (`math.floor(1e100)` now returns the float, as in Lua.)
 - [ ] `table.sort` without a comparator rejects elements that only have
       `__lt`.
 - [ ] `string.format`: `%s` of a table (even with `__tostring`) or function
@@ -120,9 +120,10 @@ effect log so runs stay replayable (doc 02).
       coral-marten's doc 66 P5, which holds interp.zig.
 - [ ] Uncaught errors put the location last (`… at file.lua:33`), caught
       ones first.
-- [ ] Bare native errors: `bad argument to 'insert'/'sort'/'concat'/
-      'format'/'floor'` with no position or type; bad patterns →
-      `HostError`; `t[nil]=1` → `attempt to index a table value`.
+- [ ] Bare native errors: `bad argument to 'concat'/'format'` with no
+      argument number or type; `t[nil]=1` → `attempt to index a table
+      value` (Lua: "table index is nil"). (`insert`, `sort`, the math
+      library and bad patterns now give Lua's messages.)
 - [ ] Excluded functions fail as `attempt to call a nil value`
       (`("x"):byte()`): say "string.byte is not available in mahina; use
       string.codepoint".

@@ -149,8 +149,8 @@ test "fast functions: argument and result counts around the fast path" {
             "7.5\t2\t2\n" ++
             "function\tnil\t2\t6\t5\n" ++
             "true\ttrue\t5\tnil\n" ++
-            "false\tanonymous:10: bad argument to 'floor'\n" ++
-            "false\tanonymous:11: bad argument to 'floor'\n" ++
+            "false\tanonymous:10: bad argument #1 to 'floor' (number expected, got string)\n" ++
+            "true\tinf\n" ++
             "false\tanonymous:12: bad argument to 'rawlen'\n" ++
             "b\t0\n",
     );

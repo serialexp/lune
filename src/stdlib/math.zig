@@ -3,15 +3,14 @@
 //! Pure, deterministic numeric functions (tier `core` in
 //! `docs/lua-stdlib-inventory.csv`). Every native here is a *pure host call*:
 //! it reads its argument `Value`s and returns a `Value`, touching neither the
-//! VM, the heap, nor any host effect — so `ctx` is ignored and this module
-//! imports only `value` and `function`, never `interp`. That keeps the library
-//! code out of the interpreter core: `interp.base_natives` simply concatenates
+//! heap nor any host effect. The VM (`ctx`) is used only to raise Lua's
+//! "bad argument" errors. `interp.base_natives` simply concatenates
 //! `math.natives` (and `math.constants`) at comptime.
 //!
 //! Number semantics follow Lua 5.4's integer/float subtype model (which mahina's
 //! `Value` already mirrors — `int` and `float` are distinct tags, not a float
 //! subtype): `abs`/`max`/`min`/`fmod` preserve the subtype of their result,
-//! `floor`/`ceil` yield integers, and the transcendental functions always yield
+//! `floor`/`ceil` yield integers when the result fits one, and the transcendental functions always yield
 //! floats.
 //!
 //! `math.modf` returns *two* values via the native multi-return ABI
@@ -36,6 +35,7 @@ const std = @import("std");
 const value = @import("../value.zig");
 const function = @import("../function.zig");
 const fmath = @import("../fmath.zig");
+const interp = @import("../interp.zig");
 
 const Value = value.Value;
 
@@ -43,12 +43,32 @@ const Value = value.Value;
 // Argument helpers
 // ---------------------------------------------------------------------------
 
-/// Fetch argument `i` as a number `Value`, or `TypeError` if missing/non-number.
-/// Mirrors Lua's "bad argument" arity/type checks (mahina surfaces them as a single
-/// `TypeError`; `interp.narrowError` maps `error.TypeError` straight across).
-fn numArg(args: []const Value, i: usize) error{TypeError}!Value {
-    if (i >= args.len or !args[i].isNumber()) return error.TypeError;
-    return args[i];
+inline fn vmOf(ctx: *anyopaque) *interp.Vm {
+    return @ptrCast(@alignCast(ctx));
+}
+
+/// Argument `i` as a number `Value`, or Lua's "bad argument #n to 'f'
+/// (number expected, got …)".
+fn numArg(ctx: *anyopaque, args: []const Value, i: usize) interp.Error!Value {
+    if (i < args.len and args[i].isNumber()) return args[i];
+    return vmOf(ctx).badArg(i + 1, "number", if (i < args.len) args[i] else null);
+}
+
+/// Optional argument `i` as a float: absent or nil gives `default`
+/// (`luaL_optnumber`).
+fn optFloatArg(ctx: *anyopaque, args: []const Value, i: usize, default: f64) interp.Error!f64 {
+    if (i >= args.len or args[i].isNil()) return default;
+    return (try numArg(ctx, args, i)).toFloat();
+}
+
+/// Argument `i` as an integer. An integral float converts, as
+/// `luaL_checkinteger` does.
+fn intArg(ctx: *anyopaque, args: []const Value, i: usize) interp.Error!i64 {
+    const x = try numArg(ctx, args, i);
+    if (x.isInt()) return x.asInt();
+    const f = x.asFloat();
+    if (f == @trunc(f)) if (floatToIntValue(f)) |v| return v.asInt() else |_| {};
+    return vmOf(ctx).badArgReason(i + 1, "number has no integer representation");
 }
 
 /// Convert a finite, in-range float to an integer `Value`; `TypeError` if the
@@ -74,14 +94,20 @@ pub inline fn absOf(x: Value) Value {
     return Value.float(@abs(x.asFloat()));
 }
 
-pub inline fn ceilOf(x: Value) error{TypeError}!Value {
+pub fn ceilOf(x: Value) Value {
     if (x.isInt()) return x;
-    return floatToIntValue(@ceil(x.asFloat()));
+    return intOrFloat(@ceil(x.asFloat()));
 }
 
-pub inline fn floorOf(x: Value) error{TypeError}!Value {
+pub fn floorOf(x: Value) Value {
     if (x.isInt()) return x;
-    return floatToIntValue(@floor(x.asFloat()));
+    return intOrFloat(@floor(x.asFloat()));
+}
+
+/// An integral float as an integer when it fits, else the float itself
+/// (2^63, ±inf, NaN), as Lua's `floor`/`ceil` return it.
+fn intOrFloat(f: f64) Value {
+    return floatToIntValue(f) catch Value.float(f);
 }
 
 pub inline fn sqrtOf(x: Value) Value {
@@ -101,36 +127,38 @@ pub inline fn pickExtremum(comptime max: bool, best: Value, v: Value) Value {
 
 /// `math.abs(x)` — absolute value, preserving subtype. Integer `abs(mininteger)`
 /// wraps to `mininteger` (Lua uses wrapping integer negation).
-fn mAbs(_: *anyopaque, args: []const Value) anyerror!Value {
-    return absOf(try numArg(args, 0));
+fn mAbs(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return absOf(try numArg(ctx, args, 0));
 }
 
-/// `math.ceil(x)` — smallest integer >= x, returned as an integer.
-fn mCeil(_: *anyopaque, args: []const Value) anyerror!Value {
-    return ceilOf(try numArg(args, 0));
+/// `math.ceil(x)` — smallest integer >= x, returned as an integer when it
+/// fits one.
+fn mCeil(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return ceilOf(try numArg(ctx, args, 0));
 }
 
-/// `math.floor(x)` — largest integer <= x, returned as an integer.
-fn mFloor(_: *anyopaque, args: []const Value) anyerror!Value {
-    return floorOf(try numArg(args, 0));
+/// `math.floor(x)` — largest integer <= x, returned as an integer when it
+/// fits one.
+fn mFloor(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return floorOf(try numArg(ctx, args, 0));
 }
 
 /// `math.sqrt(x)` — square root (always float).
-fn mSqrt(_: *anyopaque, args: []const Value) anyerror!Value {
-    return sqrtOf(try numArg(args, 0));
+fn mSqrt(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return sqrtOf(try numArg(ctx, args, 0));
 }
 
 /// `math.exp(x)` — e^x (always float).
-fn mExp(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(@exp((try numArg(args, 0)).toFloat()));
+fn mExp(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return Value.float(@exp((try numArg(ctx, args, 0)).toFloat()));
 }
 
 /// `math.log(x [, base])` — logarithm of x in `base` (default natural log).
 /// Bases 2 and 10 use the dedicated builtins for accuracy (matching Lua).
-fn mLog(_: *anyopaque, args: []const Value) anyerror!Value {
-    const x = (try numArg(args, 0)).toFloat();
-    if (args.len >= 2 and args[1].isNumber()) {
-        const base = args[1].toFloat();
+fn mLog(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const x = (try numArg(ctx, args, 0)).toFloat();
+    if (args.len >= 2 and !args[1].isNil()) {
+        const base = (try numArg(ctx, args, 1)).toFloat();
         if (base == 2.0) return Value.float(@log2(x));
         if (base == 10.0) return Value.float(@log10(x));
         return Value.float(@log(x) / @log(base));
@@ -142,58 +170,58 @@ fn mLog(_: *anyopaque, args: []const Value) anyerror!Value {
 /// shared `fmath.sinRuntime` kernel (doc 23 D4) so tier-0, tier-1a, and the
 /// native callout all execute the SAME compiled body — bit-identity across
 /// tiers by construction.
-fn mSin(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(fmath.sinRuntime((try numArg(args, 0)).toFloat()));
+fn mSin(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return Value.float(fmath.sinRuntime((try numArg(ctx, args, 0)).toFloat()));
 }
 
 /// `math.cos(x)` — cosine of x in radians (always float). Shared-kernel
 /// routing, exactly as `mSin`.
-fn mCos(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(fmath.cosRuntime((try numArg(args, 0)).toFloat()));
+fn mCos(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return Value.float(fmath.cosRuntime((try numArg(ctx, args, 0)).toFloat()));
 }
 
 /// `math.tan(x)` — tangent of x in radians (always float).
-fn mTan(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(std.math.tan((try numArg(args, 0)).toFloat()));
+fn mTan(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return Value.float(std.math.tan((try numArg(ctx, args, 0)).toFloat()));
 }
 
 /// `math.asin(x)` — arc sine, in radians (always float).
-fn mAsin(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(std.math.asin((try numArg(args, 0)).toFloat()));
+fn mAsin(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return Value.float(std.math.asin((try numArg(ctx, args, 0)).toFloat()));
 }
 
 /// `math.acos(x)` — arc cosine, in radians (always float).
-fn mAcos(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(std.math.acos((try numArg(args, 0)).toFloat()));
+fn mAcos(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return Value.float(std.math.acos((try numArg(ctx, args, 0)).toFloat()));
 }
 
 /// `math.atan(y [, x])` — atan(y/x) in radians, using both signs to pick the
 /// quadrant. `x` defaults to 1, so `atan(y)` is the ordinary arctangent.
-fn mAtan(_: *anyopaque, args: []const Value) anyerror!Value {
-    const y = (try numArg(args, 0)).toFloat();
-    const x: f64 = if (args.len >= 2 and args[1].isNumber()) args[1].toFloat() else 1.0;
+fn mAtan(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const y = (try numArg(ctx, args, 0)).toFloat();
+    const x = try optFloatArg(ctx, args, 1, 1.0);
     return Value.float(std.math.atan2(y, x));
 }
 
 /// `math.deg(x)` — convert radians to degrees (always float).
-fn mDeg(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float((try numArg(args, 0)).toFloat() * (180.0 / std.math.pi));
+fn mDeg(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return Value.float((try numArg(ctx, args, 0)).toFloat() * (180.0 / std.math.pi));
 }
 
 /// `math.rad(x)` — convert degrees to radians (always float).
-fn mRad(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float((try numArg(args, 0)).toFloat() * (std.math.pi / 180.0));
+fn mRad(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return Value.float((try numArg(ctx, args, 0)).toFloat() * (std.math.pi / 180.0));
 }
 
 /// `math.fmod(x, y)` — remainder of x/y with the quotient truncated toward zero
-/// (C `fmod`). Two integers yield an integer remainder (and error on a zero
-/// divisor, like Lua); otherwise the computation is in floats.
-fn mFmod(_: *anyopaque, args: []const Value) anyerror!Value {
-    const x = try numArg(args, 0);
-    const y = try numArg(args, 1);
+/// (C `fmod`). Two integers yield an integer remainder (and a zero divisor is
+/// "bad argument #2 (zero)", like Lua); otherwise the computation is in floats.
+fn mFmod(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const x = try numArg(ctx, args, 0);
+    const y = try numArg(ctx, args, 1);
     if (x.isInt() and y.isInt()) {
         const yi = y.asInt();
-        if (yi == 0) return error.DivisionByZero;
+        if (yi == 0) return vmOf(ctx).badArgReason(2, "zero");
         if (yi == -1) return Value.int(0); // avoid @rem(minInt, -1) overflow; result is 0
         return Value.int(@rem(x.asInt(), yi));
     }
@@ -202,27 +230,29 @@ fn mFmod(_: *anyopaque, args: []const Value) anyerror!Value {
 
 /// `math.max(x, ...)` — the largest argument, preserving its subtype (the actual
 /// `Value` is returned). Needs at least one argument.
-fn mMax(_: *anyopaque, args: []const Value) anyerror!Value {
-    var best = try numArg(args, 0);
+fn mMax(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    if (args.len == 0) return vmOf(ctx).badArgReason(1, "value expected");
+    var best = try numArg(ctx, args, 0);
     var i: usize = 1;
-    while (i < args.len) : (i += 1) best = pickExtremum(true, best, try numArg(args, i));
+    while (i < args.len) : (i += 1) best = pickExtremum(true, best, try numArg(ctx, args, i));
     return best;
 }
 
 /// `math.min(x, ...)` — the smallest argument, preserving its subtype. Needs at
 /// least one argument.
-fn mMin(_: *anyopaque, args: []const Value) anyerror!Value {
-    var best = try numArg(args, 0);
+fn mMin(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    if (args.len == 0) return vmOf(ctx).badArgReason(1, "value expected");
+    var best = try numArg(ctx, args, 0);
     var i: usize = 1;
-    while (i < args.len) : (i += 1) best = pickExtremum(false, best, try numArg(args, i));
+    while (i < args.len) : (i += 1) best = pickExtremum(false, best, try numArg(ctx, args, i));
     return best;
 }
 
 /// `math.tointeger(x)` — x as an integer if it has an exact integer value, else
 /// `nil`. Unlike most of `math`, a non-number argument is *not* an error: it
-/// simply fails (returns nil), matching Lua.
-fn mToInteger(_: *anyopaque, args: []const Value) anyerror!Value {
-    if (args.len == 0) return Value.nil();
+/// simply fails (returns nil), matching Lua. A missing one is an error.
+fn mToInteger(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    if (args.len == 0) return vmOf(ctx).badArgReason(1, "value expected");
     const x = args[0];
     if (x.isInt()) return x;
     if (x.isFloat()) {
@@ -236,10 +266,9 @@ fn mToInteger(_: *anyopaque, args: []const Value) anyerror!Value {
 
 /// `math.ult(m, n)` — whether m < n when both integers are read as *unsigned*.
 /// Both arguments must be integers (Lua errors otherwise).
-fn mUlt(_: *anyopaque, args: []const Value) anyerror!Value {
-    if (args.len < 2 or !args[0].isInt() or !args[1].isInt()) return error.TypeError;
-    const a: u64 = @bitCast(args[0].asInt());
-    const b: u64 = @bitCast(args[1].asInt());
+fn mUlt(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const a: u64 = @bitCast(try intArg(ctx, args, 0));
+    const b: u64 = @bitCast(try intArg(ctx, args, 1));
     return Value.boolean(a < b);
 }
 
@@ -255,8 +284,8 @@ fn modfParts(x: f64) struct { ip: f64, fp: f64 } {
 /// `math.modf(x)` — primary projection (the **integral** part) for single-result
 /// contexts (`local i = math.modf(x)`). The fractional part is delivered by the
 /// multi-return path `mModfN`.
-fn mModf1(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(modfParts((try numArg(args, 0)).toFloat()).ip);
+fn mModf1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    return Value.float(modfParts((try numArg(ctx, args, 0)).toFloat()).ip);
 }
 
 /// `math.modf(x)` — multi-return: `out[0]` = integral part, `out[1]` = fractional
@@ -264,8 +293,8 @@ fn mModf1(_: *anyopaque, args: []const Value) anyerror!Value {
 /// callee/argument registers — see `function.NativeMultiFn`). Writes only as many
 /// results as the caller wants (`out.len`) and returns that count; the VM
 /// nil-pads any further requested slots.
-fn mModfN(_: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
-    const x = (try numArg(args, 0)).toFloat(); // read all args first (alias contract)
+fn mModfN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const x = (try numArg(ctx, args, 0)).toFloat(); // read all args first (alias contract)
     const parts = modfParts(x);
     if (out.len >= 1) out[0] = Value.float(parts.ip);
     if (out.len >= 2) out[1] = Value.float(parts.fp);
@@ -340,8 +369,8 @@ test "floor/ceil return integers" {
     try testing.expect(callOk(&mFloor, &.{Value.int(9)}).asInt() == 9);
 }
 
-test "floor of a huge float has no integer representation" {
-    try testing.expectError(error.TypeError, mFloor(noctx, &.{Value.float(1e300)}));
+test "floor of a float past the integer range is that float" {
+    try testing.expectEqual(@as(f64, 1e300), callOk(&mFloor, &.{Value.float(1e300)}).asFloat());
 }
 
 test "transcendental functions yield floats" {
@@ -364,12 +393,11 @@ test "deg/rad round-trip" {
     try testing.expectApproxEqAbs(std.math.pi, callOk(&mRad, &.{Value.float(180.0)}).asFloat(), 1e-12);
 }
 
-test "fmod: integer and float paths, zero divisor errors" {
+test "fmod: integer and float paths" {
     try testing.expect(callOk(&mFmod, &.{ Value.int(7), Value.int(3) }).asInt() == 1);
     try testing.expect(callOk(&mFmod, &.{ Value.int(-7), Value.int(3) }).asInt() == -1); // truncated toward zero
     try testing.expectApproxEqAbs(@as(f64, 0.5), callOk(&mFmod, &.{ Value.float(5.5), Value.float(1.0) }).asFloat(), 1e-12);
     try testing.expect(callOk(&mFmod, &.{ Value.int(std.math.minInt(i64)), Value.int(-1) }).asInt() == 0);
-    try testing.expectError(error.DivisionByZero, mFmod(noctx, &.{ Value.int(5), Value.int(0) }));
 }
 
 test "modf primary projection is the integral part (float)" {
@@ -424,12 +452,7 @@ test "ult compares as unsigned" {
     // -1 as unsigned is the largest u64, so ult(-1, 1) is false; ult(1, -1) is true.
     try testing.expect(callOk(&mUlt, &.{ Value.int(1), Value.int(-1) }).asBool());
     try testing.expect(!callOk(&mUlt, &.{ Value.int(-1), Value.int(1) }).asBool());
-    try testing.expectError(error.TypeError, mUlt(noctx, &.{ Value.float(1.0), Value.int(2) }));
-}
-
-test "non-number argument is a TypeError" {
-    try testing.expectError(error.TypeError, mSqrt(noctx, &.{Value.nil()}));
-    try testing.expectError(error.TypeError, mAbs(noctx, &.{})); // missing arg
+    try testing.expect(callOk(&mUlt, &.{ Value.float(1.0), Value.int(2) }).asBool()); // integral float converts
 }
 
 test "constants carry the expected values" {

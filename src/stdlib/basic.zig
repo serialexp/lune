@@ -112,8 +112,9 @@ fn selectStart(vm: *Vm, args: []const Value) anyerror!usize {
         }
         n = @intFromFloat(f);
     }
-    if (n < 0) n += nargs + 1; // -1 → last
-    if (n < 1 or n > nargs + 1) return vm.badArgReason(1, "index out of range"); // n==nargs+1 → empty
+    // -1 → last; past the end selects nothing, as in Lua.
+    if (n < 0) n += nargs + 1 else if (n > nargs + 1) n = nargs + 1;
+    if (n < 1) return vm.badArgReason(1, "index out of range");
     return @intCast(n); // 0-based index into args of the first selected value
 }
 
@@ -402,9 +403,9 @@ test "select: # count, positive and negative indices, multi stream" {
     try testing.expectEqualStrings("b", bytesOf(out[0]));
     try testing.expectEqualStrings("c", bytesOf(out[1]));
 
-    // out-of-range index errors.
+    // Index 0 errors; past the end selects nothing, as in Lua.
     try testing.expectError(error.LuaError, bSelect1(@ptrCast(&vm), &.{ Value.int(0), a }));
-    try testing.expectError(error.LuaError, bSelect1(@ptrCast(&vm), &.{ Value.int(5), a, b }));
+    try testing.expectEqual(@as(usize, 0), try bSelectN(@ptrCast(&vm), &.{ Value.int(5), a, b }, &out));
 }
 
 test "rawequal / rawget / rawset / rawlen" {

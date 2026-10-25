@@ -100,3 +100,38 @@ test "the deprecated %z class matches the NUL byte" {
         \\print(string.gsub("a\0b\0", "[%z]", "-"))
     , "2\t2\n1\t1\na-b-\t2\n");
 }
+
+test "select past the end selects nothing" {
+    try expectProgram(
+        \\print(select('#', select(5, 1, 2)), select(3, 1, 2), select(-2, 1, 2))
+        \\print(pcall(select, -3, 1, 2))
+    , "0\tnil\t1\t2\nfalse\tbad argument #1 to 'select' (index out of range)\n");
+}
+
+test "floor and ceil of a float past the integer range return the float" {
+    try expectProgram(
+        \\print(math.type(math.floor(2^63)), math.ceil(-1e100) == -1e100, math.floor(1/0))
+        \\print(math.type(math.ceil(0/0)), math.floor(-2^63), math.ceil(2^62 + 0.0))
+    , "float\ttrue\tinf\nfloat\t-9223372036854775808\t4611686018427387904\n");
+}
+
+test "math argument errors name the argument as Lua does" {
+    try expectProgram(
+        \\for _, f in ipairs({
+        \\  function() return math.floor("x") end, function() return math.fmod(1, 0) end,
+        \\  function() return math.ult(1.5, 2) end, function() return math.max() end,
+        \\}) do print((select(2, pcall(f)):gsub("^[^:]*:%d+: ", ""))) end
+    , "bad argument #1 to 'floor' (number expected, got string)\n" ++
+        "bad argument #2 to 'fmod' (zero)\n" ++
+        "bad argument #1 to 'ult' (number has no integer representation)\n" ++
+        "bad argument #1 to 'max' (value expected)\n");
+}
+
+test "math.random checks its argument count and blames #1 for an empty interval" {
+    try expectProgram(
+        \\print(select(2, pcall(math.random, 1, 2, 3)))
+        \\print(select(2, pcall(math.random, 2, 1)))
+        \\print(math.ult(1.0, 2), select(2, pcall(math.sqrt)))
+    , "wrong number of arguments\nbad argument #1 to 'random' (interval is empty)\n" ++
+        "true\tbad argument #1 to 'sqrt' (number expected, got no value)\n");
+}

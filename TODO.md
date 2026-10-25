@@ -69,15 +69,16 @@ Wrong results:
 - [ ] Missing-argument checks: `tostring()`, `tonumber()`,
       `getmetatable()`, `rawequal(1)`, `setmetatable({})`,
       `math.tointeger()` return instead of raising "value expected".
-- [ ] `select(5, 1, 2)` raises "index out of range" (Lua returns nothing).
+- [x] `select(5, 1, 2)` raises "index out of range" (Lua returns nothing).
 - [ ] `assert(false, "boom")` adds no position (Lua 5.4.6:
       `chunk:N: boom`).
-- [ ] `math.floor`/`ceil` of a float outside the integer range (`2^63`,
+- [x] `math.floor`/`ceil` of a float outside the integer range (`2^63`,
       `1e100`, `inf`, `nan`) raise; Lua returns the float.
-- [ ] `math.random(1, 2, 3)` is accepted (Lua: "wrong number of
+- [x] `math.random(1, 2, 3)` is accepted (Lua: "wrong number of
       arguments"); `random(2, 1)` blames `#2` (Lua `#1`); `fmod(1, 0)`
       says "integer division or modulo by zero" (Lua: "bad argument #2 to
-      'fmod' (zero)").
+      'fmod' (zero)"). Every math argument error now names the argument
+      (it was "bad argument to 'floor'"), and `ult` takes integral floats.
 - [ ] `table.sort({3, nil, 1})` sorts the border-1 prefix silently (Lua:
       "attempt to compare nil with number").
 - [ ] `package.loaded.x = false` makes `require("x")` return `false`; Lua

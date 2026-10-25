@@ -648,10 +648,10 @@ test "errmsg: select() with float arguments handles conversion and bounds checks
     );
 }
 
-test "errmsg: an unconverted (pure) native still names the function, located" {
+test "errmsg: a math native names the function and the argument, located" {
     try expectProgram(
         "print(pcall(function() return math.floor(\"x\") end))\n",
-        "false\tanonymous:1: bad argument to 'floor'\n",
+        "false\tanonymous:1: bad argument #1 to 'floor' (number expected, got string)\n",
     );
 }
 
