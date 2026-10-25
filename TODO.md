@@ -50,9 +50,9 @@ Wrong results:
       '@gmatch_iter'`): `gmatch` returns `(iter, state)`, so only a generic
       `for` works. `string.codes` likewise. The internal `@…_iter` names
       also show in `pairs(_G)` and in error text.
-- [ ] Malformed patterns (`[a`, a trailing `%`, unbalanced `(`/`)`, `%1`
+- [x] Malformed patterns (`[a`, a trailing `%`, unbalanced `(`/`)`, `%1`
       with no capture, `%b`, `%f` without `[`, >32 captures) raise the
-      literal string `"HostError"`.
+      literal string `"HostError"`. Each now raises Lua's message.
 - [ ] `%q` round trip: `("\0" .. "1")` is written `"\01"`, which reads back
       as `"\1"`. Lua pads to `\0001`.
 - [ ] `string.format("%d", 3.5)` and `%x` of 1.5 truncate silently (Lua:
@@ -88,8 +88,8 @@ Wrong results:
       a table value)"; Lua prints its text.
 - [ ] Method calls don't adjust argument numbers: `("a"):rep(2.5)` says
       `#2` (Lua `#1`).
-- [ ] `gsub` with `"%x"` in the replacement yields `"x"` (Lua: "invalid
-      use of '%' in replacement string"). `%z` is unsupported.
+- [x] `gsub` with `"%x"` in the replacement yields `"x"` (Lua: "invalid
+      use of '%' in replacement string"). `%z` is unsupported. Both fixed.
 - [ ] The undefined-global lint fires for globals created via
       `_G.name = …`.
 

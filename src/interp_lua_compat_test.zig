@@ -71,3 +71,32 @@ test "float modulo is fmod with Lua's sign correction" {
         \\print(s)
     , "5\tinf\t-inf\t-3\n1\t0.5\t-0.5\t-1.5\t-0\n1502\n");
 }
+
+test "malformed patterns raise Lua's messages" {
+    try expectProgram(
+        \\for _, p in ipairs({ "[a", "%", "%b", "%fx", "(a)%2", "%0", string.rep("()", 33) }) do
+        \\  print(select(2, pcall(string.find, "a", p)))
+        \\end
+    , "malformed pattern (missing ']')\nmalformed pattern (ends with '%')\n" ++
+        "malformed pattern (missing arguments to '%b')\nmissing '[' after '%f' in pattern\n" ++
+        "invalid capture index %2\ninvalid capture index %0\ntoo many captures\n");
+}
+
+test "gsub replacements and unclosed captures raise Lua's messages" {
+    try expectProgram(
+        \\print(select(2, pcall(string.match, "a", "(a")))
+        \\for _, r in ipairs({ "%x", "%", "%2" }) do
+        \\  print(select(2, pcall(string.gsub, "a", "(a)", r)))
+        \\end
+        \\print(string.gsub("abc", "(%w)", "%%%1%0"))
+    , "unfinished capture\ninvalid use of '%' in replacement string\n" ++
+        "invalid use of '%' in replacement string\ninvalid capture index %2\n%aa%bb%cc\t3\n");
+}
+
+test "the deprecated %z class matches the NUL byte" {
+    try expectProgram(
+        \\print(string.find("a\0b", "%z"))
+        \\print(string.find("a\0b", "%Z+"))
+        \\print(string.gsub("a\0b\0", "[%z]", "-"))
+    , "2\t2\n1\t1\na-b-\t2\n");
+}

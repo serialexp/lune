@@ -1072,17 +1072,22 @@ pub fn resolveInit(init_raw: i64, s: *const String) ?usize {
 fn captureValue(vm: *Vm, ms: *const pattern.MatchState, subj: *const String, i: usize, whole: ?[2]usize) anyerror!Value {
     std.debug.assert(ms.src.ptr == subj.bytes().ptr and ms.src.len == subj.len);
     if (i >= ms.level) {
-        if (i == 0) {
-            const w = whole orelse return error.InvalidCapture;
-            return vm.heap.internValue(ms.src[w[0]..w[1]]);
-        }
-        return error.InvalidCapture;
+        if (i == 0) if (whole) |w| return vm.heap.internValue(ms.src[w[0]..w[1]]);
+        var buf: [64]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "invalid capture index %{d}", .{i + 1}) catch unreachable;
+        return vm.raiseLocatedError(msg, 1);
     }
     const cap = ms.captures[i];
-    if (cap.len == pattern.cap_unfinished) return error.MalformedPattern;
+    if (cap.len == pattern.cap_unfinished) return vm.raiseLocatedError("unfinished capture", 1);
     if (cap.len == pattern.cap_position) return Value.int(@intCast(byteToCharS(subj, cap.init)));
     const l: usize = @intCast(cap.len);
     return vm.heap.internValue(ms.src[cap.init .. cap.init + l]);
+}
+
+/// Raise a matcher error as the message Lua gives for it.
+fn raisePatternError(vm: *Vm, ms: *const pattern.MatchState, e: pattern.Error) interp.Error {
+    var buf: [64]u8 = undefined;
+    return vm.raiseLocatedError(pattern.message(e, ms, &buf), 1);
 }
 
 /// Number of capture results a match produces (`push_captures`'s `nlevels`).
@@ -1137,7 +1142,7 @@ fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     // Doc 30 P3: the shared locate core — the same loop the recorder's
     // outcome computation and the native `smatch` shim run.
     var ms = pattern.MatchState.init(s, pat);
-    if (try pattern.locateMatch(&ms, st, true)) |span| {
+    if (pattern.locateMatch(&ms, st, true) catch |e| return raisePatternError(vm, &ms, e)) |span| {
         buf[0] = Value.int(@intCast(byteToCharS(sobj, span.start)));
         buf[1] = Value.int(@intCast(cpCountPrefixS(sobj, span.end)));
         const nc = try writeCaptures(vm, &ms, sobj, null, buf[2..]);
@@ -1174,7 +1179,7 @@ fn matchCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
 
     // Doc 30 P3: the shared locate core.
     var ms = pattern.MatchState.init(s, pat);
-    if (try pattern.locateMatch(&ms, st, true)) |span| {
+    if (pattern.locateMatch(&ms, st, true) catch |e| return raisePatternError(vm, &ms, e)) |span| {
         return try writeCaptures(vm, &ms, sobj, .{ span.start, span.end }, buf);
     }
     buf[0] = Value.nil();
@@ -1251,7 +1256,7 @@ fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     // Doc 30 P3: the shared locate core, gmatch flavor (no anchor consumption
     // — a leading '^' stays a literal item, exactly as this always ran).
     var ms = pattern.MatchState.init(s, pat);
-    if (try pattern.locateMatch(&ms, src, false)) |span| {
+    if (pattern.locateMatch(&ms, src, false) catch |e| return raisePatternError(vm, &ms, e)) |span| {
         // Ensure progress on an empty match by stepping a whole code point
         // (S-D); `@max(…, 1)` guarantees termination at end-of-string.
         const newpos = if (span.end == span.start) span.end + @max(ms.seqLen(span.end), 1) else span.end;
@@ -1315,8 +1320,13 @@ pub const MatchStatus = struct {
 
 fn matchStatusOf(e: pattern.Error) i64 {
     return switch (e) {
-        error.MalformedPattern => MatchStatus.malformed,
-        error.InvalidCapture => MatchStatus.invalid_capture,
+        error.PatternEndsWithEscape,
+        error.MissingBracket,
+        error.MissingBalanceArgs,
+        error.MissingFrontierSet,
+        error.InvalidPatternCapture,
+        => MatchStatus.malformed,
+        error.InvalidCaptureIndex => MatchStatus.invalid_capture,
         error.TooManyCaptures => MatchStatus.too_many_captures,
         error.PatternTooComplex => MatchStatus.too_complex,
     };
@@ -1443,7 +1453,8 @@ fn appendValueText(vm: *Vm, out: *std.ArrayList(u8), v: Value) anyerror!void {
 }
 
 /// `add_s`: expand a string/number replacement, resolving `%0` (whole match),
-/// `%1`–`%9` (captures), and `%%`/`%x` (literal).
+/// `%1`–`%9` (captures) and `%%`. A `%` before anything else, or at the end,
+/// is an error, as in Lua 5.4.
 fn addReplString(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, subj: *const String, repl: []const u8, s_off: usize, e_off: usize) anyerror!void {
     var i: usize = 0;
     while (i < repl.len) : (i += 1) {
@@ -1453,10 +1464,11 @@ fn addReplString(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState
             continue;
         }
         i += 1;
-        if (i >= repl.len) return error.MalformedPattern; // trailing '%' in replacement
-        const d = repl[i];
-        if (!std.ascii.isDigit(d)) {
-            try out.append(vm.gpa, d); // %% → %, %x → x
+        const d = if (i < repl.len) repl[i] else 0;
+        if (d == '%') {
+            try out.append(vm.gpa, '%');
+        } else if (!std.ascii.isDigit(d)) {
+            return vm.raiseLocatedError("invalid use of '%' in replacement string", 1);
         } else if (d == '0') {
             try out.appendSlice(vm.gpa, ms.src[s_off..e_off]); // whole match
         } else {
@@ -1551,7 +1563,7 @@ fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     var count: i64 = 0;
     while (count < max_n) {
         ms.reset();
-        const e_opt = try ms.match(src, pp);
+        const e_opt = ms.match(src, pp) catch |err| return raisePatternError(vm, &ms, err);
         if (e_opt) |e| {
             count += 1;
             if (repl_table) |t| {

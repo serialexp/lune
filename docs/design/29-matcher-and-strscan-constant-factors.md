@@ -63,6 +63,11 @@ Replace with Pall's two-table design (`lib_string.c:210-228`, `lj_char.c:24`):
   class letter. mahina has no `%z` (dropped per 5.4) — `'z'` maps to 0 → literal,
   same as today.
 
+  *Correction (2026-10-25):* 5.4 did not drop `%z`; `lstrlib.c` keeps it as a
+  deprecated class (`case 'z': res = (c == 0)`), and so does LuaJIT. It is
+  now an eleventh class: a `bits_zero` bit set only on byte 0. The escaped-literal
+  tests use `%y` instead.
+
 **Pin** (review M4): the full cross-product — every `c: 0..255` × every
 `cl: 0..255` (`matchClass` accepts any `u8`, not just the 20 class letters),
 new table vs an **independent reference copy of the old predicates** kept in

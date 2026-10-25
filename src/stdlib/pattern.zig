@@ -41,17 +41,42 @@ pub const cap_position: isize = -2;
 /// Open capture, not yet closed by its `)`.
 pub const cap_unfinished: isize = -1;
 
+/// One tag per message Lua's `lstrlib.c` raises, so `message` can give the
+/// program Lua's exact text.
 pub const Error = error{
-    /// Malformed pattern: unbalanced `[`, trailing `%`, `%b` missing its two
-    /// chars, `%f` without a class, or an unfinished capture at use.
-    MalformedPattern,
+    /// The pattern ends in a lone `%`.
+    PatternEndsWithEscape,
+    /// A `[` set with no closing `]`.
+    MissingBracket,
+    /// `%b` without its two delimiter characters.
+    MissingBalanceArgs,
+    /// `%f` not followed by a `[` set.
+    MissingFrontierSet,
+    /// A `)` with no open capture to close.
+    InvalidPatternCapture,
+    /// A back-reference (`%0`–`%9`) to a capture that doesn't exist or isn't
+    /// closed yet. The digit is in `MatchState.bad_capture`.
+    InvalidCaptureIndex,
     /// More than `max_captures` open captures.
     TooManyCaptures,
-    /// A back-reference (`%1`–`%9`) to a capture that doesn't exist / isn't closed.
-    InvalidCapture,
     /// Recursion exceeded `max_depth` (pathological pattern).
     PatternTooComplex,
 };
+
+/// Lua's message for `e`, written into `buf` when it needs formatting. `ms` is
+/// the state the error came out of (for `InvalidCaptureIndex`'s digit).
+pub fn message(e: Error, ms: *const MatchState, buf: *[64]u8) []const u8 {
+    return switch (e) {
+        error.PatternEndsWithEscape => "malformed pattern (ends with '%')",
+        error.MissingBracket => "malformed pattern (missing ']')",
+        error.MissingBalanceArgs => "malformed pattern (missing arguments to '%b')",
+        error.MissingFrontierSet => "missing '[' after '%f' in pattern",
+        error.InvalidPatternCapture => "invalid pattern capture",
+        error.InvalidCaptureIndex => std.fmt.bufPrint(buf, "invalid capture index %{c}", .{ms.bad_capture}) catch unreachable,
+        error.TooManyCaptures => "too many captures",
+        error.PatternTooComplex => "pattern too complex",
+    };
+}
 
 /// The matcher state: the subject and pattern bytes plus the in-progress
 /// captures. One `MatchState` is reused across the anchored-scan attempts of a
@@ -62,6 +87,8 @@ pub const MatchState = struct {
     pat: []const u8,
     level: usize = 0,
     depth: u32 = 0,
+    /// The digit of the back-reference that raised `InvalidCaptureIndex`.
+    bad_capture: u8 = '0',
     captures: [max_captures]Capture = undefined,
 
     pub fn init(src: []const u8, pat: []const u8) MatchState {
@@ -92,6 +119,8 @@ pub const MatchState = struct {
     const bits_xdigit: u8 = 0x10;
     const bits_upper: u8 = 0x20;
     const bits_lower: u8 = 0x40;
+    /// The NUL byte alone: Lua 5.4's deprecated but still accepted `%z`.
+    const bits_zero: u8 = 0x80;
     const bits_alpha: u8 = bits_upper | bits_lower;
     const bits_alnum: u8 = bits_alpha | bits_digit;
     const bits_graph: u8 = bits_alnum | bits_punct;
@@ -113,10 +142,11 @@ pub const MatchState = struct {
             if (std.ascii.isLower(c)) b |= bits_lower;
             t[i] = b;
         }
+        t[0] |= bits_zero;
         break :blk t;
     };
 
-    /// `cl & 0x1f` → bit mask for the 10 class letters (case-folded by
+    /// `cl & 0x1f` → bit mask for the 11 class letters (case-folded by
     /// construction: 'a' and 'A' share an index). 0 = not a class letter.
     const class_map: [32]u8 = blk: {
         var m: [32]u8 = @splat(0);
@@ -130,11 +160,12 @@ pub const MatchState = struct {
         m['u' & 0x1f] = bits_upper;
         m['w' & 0x1f] = bits_alnum;
         m['x' & 0x1f] = bits_xdigit;
+        m['z' & 0x1f] = bits_zero;
         break :blk m;
     };
 
     /// `match_class(c, cl)` — does byte `c` belong to class letter `cl`? A
-    /// non-class letter matches itself (so `%z` is a literal `z`, per 5.4). An
+    /// non-class letter matches itself (so `%y` is a literal `y`). An
     /// upper-case class letter is the complement of its lower-case form.
     /// One table load + two masks, no branch on the class letter (doc 29 A1).
     fn matchClass(c: u8, cl: u8) bool {
@@ -156,14 +187,14 @@ pub const MatchState = struct {
         var pp = p + 1;
         switch (c) {
             l_esc => {
-                if (pp >= pat.len) return error.MalformedPattern; // ends with '%'
+                if (pp >= pat.len) return error.PatternEndsWithEscape;
                 return pp + 1;
             },
             '[' => {
                 if (pp < pat.len and pat[pp] == '^') pp += 1;
                 // Scan to the closing ']' (mirrors the C do/while, with escapes).
                 while (true) {
-                    if (pp >= pat.len) return error.MalformedPattern; // missing ']'
+                    if (pp >= pat.len) return error.MissingBracket;
                     const ch = pat[pp];
                     pp += 1;
                     if (ch == l_esc and pp < pat.len) pp += 1; // skip escaped char
@@ -288,16 +319,16 @@ pub const MatchState = struct {
             level -= 1;
             if (self.captures[level].len == cap_unfinished) return level;
         }
-        return error.MalformedPattern; // invalid pattern capture
+        return error.InvalidPatternCapture;
     }
 
-    fn checkCapture(self: *const MatchState, l: u8) Error!usize {
-        // l is the digit char ('1'..'9'); index = l - '1'.
-        if (l < '1') return error.InvalidCapture;
-        const idx: usize = l - '1';
-        if (idx >= self.level or self.captures[idx].len == cap_unfinished)
-            return error.InvalidCapture;
-        return idx;
+    fn checkCapture(self: *MatchState, l: u8) Error!usize {
+        // l is the digit char ('0'..'9'); index = l - '1'.
+        if (l < '1' or l - '1' >= self.level or self.captures[l - '1'].len == cap_unfinished) {
+            self.bad_capture = l;
+            return error.InvalidCaptureIndex;
+        }
+        return l - '1';
     }
 
     fn startCapture(self: *MatchState, s: usize, p: usize, what: isize) Error!?usize {
@@ -329,7 +360,7 @@ pub const MatchState = struct {
 
     fn matchBalance(self: *MatchState, s: usize, p: usize) Error!?usize {
         const pat = self.pat;
-        if (p + 1 >= pat.len) return error.MalformedPattern; // missing args to '%b'
+        if (p + 1 >= pat.len) return error.MissingBalanceArgs;
         if (s >= self.src.len or self.src[s] != pat[p]) return null;
         const b = pat[p];
         const e = pat[p + 1];
@@ -478,7 +509,7 @@ pub const MatchState = struct {
                             },
                             'f' => {
                                 p += 2;
-                                if (p >= pat.len or pat[p] != '[') return error.MalformedPattern; // missing '[' after %f
+                                if (p >= pat.len or pat[p] != '[') return error.MissingFrontierSet;
                                 const ep = try self.classEnd(p);
                                 const prev: u8 = if (s == 0) 0 else src[s - 1];
                                 const cur: u8 = if (s < src.len) src[s] else 0;
@@ -745,15 +776,17 @@ test "%f frontier" {
 test "malformed patterns error" {
     var ms = MatchState.init("abc", "[abc");
     ms.reset();
-    try testing.expectError(error.MalformedPattern, ms.match(0, 0));
+    try testing.expectError(error.MissingBracket, ms.match(0, 0));
 
     var ms2 = MatchState.init("abc", "%");
     ms2.reset();
-    try testing.expectError(error.MalformedPattern, ms2.match(0, 0));
+    try testing.expectError(error.PatternEndsWithEscape, ms2.match(0, 0));
 
     var ms3 = MatchState.init("abc", "(ab)%2");
     ms3.reset();
-    try testing.expectError(error.InvalidCapture, ms3.match(0, 0));
+    try testing.expectError(error.InvalidCaptureIndex, ms3.match(0, 0));
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("invalid capture index %2", message(error.InvalidCaptureIndex, &ms3, &buf));
 }
 
 test "hasSpecials" {
@@ -861,6 +894,7 @@ fn refMatchClass(c: u8, cl: u8) bool {
         'u' => std.ascii.isUpper(c),
         'w' => std.ascii.isAlphanumeric(c),
         'x' => std.ascii.isHex(c),
+        'z' => c == 0,
         else => return cl == c,
     };
     return if (std.ascii.isUpper(cl)) !res else res;
@@ -927,9 +961,11 @@ test "doc 29 A4: countRun equals the old loop for every item kind" {
 }
 
 test "doc 29 A4: escaped-literal quantifiers behave as before" {
-    // %z is a literal 'z' per 5.4 (the class was dropped) — quantified.
-    try testing.expectEqual(@as(?[2]usize, .{ 0, 3 }), try firstMatch("zzzab", "%z+"));
-    try testing.expectEqual(@as(?[2]usize, .{ 0, 0 }), try firstMatch("abc", "%z*"));
+    // %y is a literal 'y' (not a class letter) — quantified.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 3 }), try firstMatch("yyyab", "%y+"));
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 0 }), try firstMatch("abc", "%y*"));
+    // %z is still a class in 5.4 (deprecated, `lstrlib.c` `case 'z'`): NUL.
+    try testing.expectEqual(@as(?[2]usize, .{ 1, 3 }), try firstMatch("z\x00\x00b", "%z+"));
     // %% quantified: a run of literal percent signs.
     try testing.expectEqual(@as(?[2]usize, .{ 1, 3 }), try firstMatch("a%%b", "%%+"));
     // %q (escaped plain letter) quantified.
@@ -1048,8 +1084,8 @@ test "doc 30: census rejects what it cannot statically validate" {
     }
     // And the matcher agrees these are errors (or unreachable-at-close):
     // firstMatch on a few of them must error, never succeed silently.
-    try testing.expectError(error.MalformedPattern, firstMatch("abc", "%"));
-    try testing.expectError(error.MalformedPattern, firstMatch("abc", "[abc"));
+    try testing.expectError(error.PatternEndsWithEscape, firstMatch("abc", "%"));
+    try testing.expectError(error.MissingBracket, firstMatch("abc", "[abc"));
 }
 
 test "doc 30: census capture-count cap" {

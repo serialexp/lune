@@ -140,8 +140,9 @@ What follows from that:
 - `string.upper` and `lower` use Unicode simple case mapping:
   `("é"):upper()` is `"É"`.
 - In patterns, `.` matches one code point, but the classes `%a`, `%w`,
-  `%s`, `%p`, `%d` are ASCII only, and a set such as `[а-я]` or `[é]`
-  does not match characters outside ASCII yet.
+  `%s`, `%p`, `%d` are ASCII only, their complements (`%A`, `%W`, …)
+  don't match characters outside ASCII either, and a set such as
+  `[а-я]` or `[é]` does not match characters outside ASCII yet.
 - A `\xNN` or `\ddd` escape must be below 128, and `\u{...}` must be a
   valid code point; Lua accepts any byte.
 
