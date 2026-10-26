@@ -19,6 +19,10 @@ land; move whole phases to Done once everything inside them is checked.
   first; a continuation form of the C API maybe later.
 - [x] **Q4 — the async surface** (§7): decided 2026-10-26 — async with
   syntactic sugar (`async function` / `await`).
+- [x] **Q2 on wasm32** (§5): decided 2026-10-26 — the browser VM uses the
+  same model and simply holds more memory.
+- [x] **Async start** (§7): decided 2026-10-26 — a task starts at the call;
+  awaiting a finished task continues at once.
 - [x] **Q1 research round 1** (§4.1): Codex and Antigravity surveyed
   single-model designs; reports in `docs/reviews/doc73/`.
 
@@ -27,8 +31,9 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Q1 — direction** (§4, §4.1): Bart leans to a single model (option
   4.4) with Lua's coroutines derived from it; the two reports differ on
   where its delimiters live (§4.1).
-- [ ] **Q2 on wasm32** (§5): the in-browser VM (`zig build wasm`) has no
-  reserve-then-commit; every reserved byte is real linear memory.
+- [ ] **Async error timing** (§7): an error raised before the first
+  `await` — stored in the task (C#, JS) or raised at the call; and what an
+  error in a task nobody awaits does.
 - [ ] **P0 — the thread object and stack switch** (§5), `coroutine.create`,
   `resume`, `yield`, `status`, `running`, `isyieldable`, `wrap`, `close`.
 - [ ] **P1 — GC, keyframes and replay** (§6.1, §6.2): suspended stacks are
@@ -185,10 +190,10 @@ entry argument rather than baking its address (no `tags.ptr` immediates in
    Z-2), address space per live coroutine, and the same extra `Vm.frames`
    load on calls as 5.1.
 
-**Decided (Bart, 2026-10-26): option 3.** Open: wasm32 has no
-reserve-then-commit, so the browser VM needs its own stack backend behind
-the same contract (smaller fixed stacks, growth with relocation there, or a
-cap on live coroutines).
+**Decided (Bart, 2026-10-26): option 3.** wasm32 has no
+reserve-then-commit, so in the browser VM every stack is fully committed
+linear memory. Decided the same day: that's acceptable; the browser build
+uses the same model and holds more memory.
 
 ## 6. What every option must handle
 
@@ -238,8 +243,12 @@ Built on the coroutine primitive, not beside it:
   a divergence from Lua that code would have to opt into.
 
 **Decided (Bart, 2026-10-26):** syntax, compiling to the library calls.
-Still open: whether an async call starts its task at once or when first
-awaited.
+Decided the same day: calling an async function starts its task at once
+and runs it to its first `await` that must wait (as C#, JavaScript and
+Kotlin's `async {}` do; Python coroutines and Rust futures wait to be
+awaited or polled). Awaiting a task that has already finished continues at
+once, with no switch (C#'s completed-task fast path; JavaScript instead
+always defers to a microtask).
 
 ## 8. Open questions for review
 
