@@ -223,6 +223,16 @@ test "VM-driven snapshot captures a complete, non-dangling heap graph" {
                 },
                 .HeapClosure => |c| for (c.upvalue_ids) |id| try refs.append(a, id),
                 .HeapUpvalue => |u| if (refId(u.value)) |id| try refs.append(a, id),
+                .HeapThread => |t| {
+                    if (refId(t.body)) |id| try refs.append(a, id);
+                    for (t.death) |d| if (refId(d)) |id| try refs.append(a, id);
+                    if (t.resumer_id != 0) try refs.append(a, t.resumer_id - 1);
+                    for (t.context) |c| {
+                        for (c.stack) |v| if (v.body == .HeapRef) try refs.append(a, v.body.HeapRef.id);
+                        for (c.frames) |f| try refs.append(a, f.closure_id);
+                        for (c.open_upvalues) |u| try refs.append(a, u.upvalue_id);
+                    }
+                },
             };
             for (kf.stack) |v| if (v.body == .HeapRef) try refs.append(a, v.body.HeapRef.id);
             for (refs.items) |id| try testing.expect(ids.contains(id));
@@ -244,6 +254,7 @@ test "VM-driven snapshot captures a complete, non-dangling heap graph" {
                 .HeapNative => n_native += 1,
                 .HeapString => n_string += 1,
                 .HeapFile => {}, // io.stdout / io.stderr
+                .HeapThread => {},
             };
             try testing.expect(n_table >= 2); // globals + g
             try testing.expect(n_closure >= 1); // g.add

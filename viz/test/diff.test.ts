@@ -70,6 +70,14 @@ const integerCorpus: { name: string; src: string }[] = [
   { name: "table of ints", src: "local t = {a = 1, b = 2, c = 3}\nprint(t.a + t.b + t.c)\n" },
   { name: "nested arithmetic", src: "local x = 7\nlocal y = (x * 3 + 1) % 5\nprint(y)\n" },
   { name: "string interning", src: 'local a = "mahina"\nlocal b = "mahina"\nprint(a)\nprint(b)\n' },
+  // Doc 73: a suspended coroutine (its own stack in the keyframe) and a dead one.
+  {
+    name: "coroutines",
+    src:
+      "local co = coroutine.create(function(a)\n  local s = a\n  for i = 1, 3 do s = s + coroutine.yield(s) end\n  return s\nend)\n" +
+      "for k = 1, 3 do print(coroutine.resume(co, k)) end\nprint(coroutine.status(co))\n" +
+      'local dead = coroutine.create(function() error("x") end)\nprint(coroutine.resume(dead))\n',
+  },
 ];
 
 for (const { name, src } of integerCorpus) {

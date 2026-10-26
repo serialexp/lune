@@ -225,6 +225,12 @@ pub const Heap = struct {
         self.gc_headroom -= 1;
     }
 
+    /// `linkRestored` for a coroutine, which the heap also counts.
+    pub fn linkRestoredThread(self: *Heap, h: *GcHeader, id: u32) void {
+        self.linkRestored(h, id);
+        self.thread_count += 1;
+    }
+
     /// Advance the monotonic id counter to at least `next`, so allocations after a
     /// restore cannot reuse an id that a restored object already holds. Idempotent
     /// and monotonic (never lowers the counter).

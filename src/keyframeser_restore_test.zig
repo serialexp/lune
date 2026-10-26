@@ -1715,3 +1715,139 @@ test "doc 32: a heterogeneous `.value` array survives round-trip and still recor
 
     try testing.expect(vm_r.trace.entries > 0);
 }
+
+/// A thread record of `snap` with `edit` applied, in a copy of its object
+/// list: `pick` chooses which (`.suspended` with frames, `.dead`, or the main
+/// thread object).
+const ThreadPick = enum { suspended, dead, main };
+
+fn editThread(
+    a: std.mem.Allocator,
+    snap: schema.SnapshotFile,
+    pick: ThreadPick,
+    comptime edit: fn (a: std.mem.Allocator, t: *schema.HeapThread) anyerror!void,
+) !schema.SnapshotFile {
+    const objects = try a.dupe(schema.HeapObject, snap.keyframe.objects);
+    var hit = false;
+    for (objects) |*o| {
+        if (o.body != .HeapThread) continue;
+        const t = &o.body.HeapThread;
+        const this: ThreadPick = if (t.kind == 1) .main else if (t.status == 3) .dead else .suspended;
+        if (this != pick or hit) continue;
+        hit = true;
+        try edit(a, t);
+    }
+    try testing.expect(hit);
+    var out = snap;
+    out.keyframe.objects = objects;
+    return out;
+}
+
+test "doc 73: coroutines round-trip through a keyframe, and malformed thread records are rejected" {
+    const gpa = testing.allocator;
+    const source =
+        \\local getter
+        \\co = coroutine.create(function(a)
+        \\  local v = a
+        \\  getter = function() return v end
+        \\  v = v + coroutine.yield(v)
+        \\  return v
+        \\end)
+        \\coroutine.resume(co, 5)
+        \\dead = coroutine.create(function() error("x") end)
+        \\coroutine.resume(dead)
+        \\main = coroutine.running()
+        \\get = getter
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+
+    // The restored VM recaptures the same bytes, and the suspended
+    // coroutine's open cell reads its own stack.
+    {
+        const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+        defer {
+            vm2.deinit();
+            gpa.destroy(vm2);
+        }
+        const b1 = try encodeSnapshot(gpa, vm2);
+        defer gpa.free(b1);
+        try testing.expectEqualSlices(u8, b0, b1);
+        try testing.expect(vm2.main_thread != null);
+        try testing.expectEqual(@as(usize, 3), vm2.heap.thread_count);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const snap = try schema.SnapshotFile.decode(a, b0);
+    const E = struct {
+        fn running(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.status = 1;
+        }
+        fn resumer(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.resumer_id = 1;
+        }
+        fn noStack(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.has_stack = 0;
+        }
+        fn stackOnDead(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.has_stack = 1;
+        }
+        fn kind(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.kind = 2;
+        }
+        fn status(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.status = 9;
+        }
+        fn nilBody(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.body = sNil();
+        }
+        fn mainWithBody(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.body = sInt(1);
+        }
+        fn mainSuspended(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.status = 0;
+        }
+        fn retWiring(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.ret_c = 1;
+        }
+        fn openTwice(al: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            const ctx = try al.dupe(schema.ThreadContext, t.context);
+            const ou = ctx[0].open_upvalues;
+            try testing.expect(ou.len == 1);
+            ctx[0].open_upvalues = try std.mem.concat(al, schema.OpenUpvalueRef, &.{ ou, ou });
+            t.context = ctx;
+        }
+    };
+    const cases = .{
+        .{ ThreadPick.suspended, E.running, error.InvalidThread },
+        .{ ThreadPick.suspended, E.resumer, error.InvalidThread },
+        .{ ThreadPick.suspended, E.noStack, error.InvalidThread },
+        .{ ThreadPick.dead, E.stackOnDead, error.InvalidThread },
+        .{ ThreadPick.suspended, E.kind, error.InvalidThread },
+        .{ ThreadPick.dead, E.status, error.InvalidThread },
+        .{ ThreadPick.suspended, E.nilBody, error.InvalidThread },
+        .{ ThreadPick.main, E.mainWithBody, error.InvalidThread },
+        .{ ThreadPick.main, E.mainSuspended, error.InvalidThread },
+        .{ ThreadPick.suspended, E.retWiring, error.InvalidThread },
+        .{ ThreadPick.suspended, E.openTwice, error.UpvalueOpenTwice },
+    };
+    inline for (cases) |c| {
+        try expectRestoreError(try editThread(a, snap, c[0], c[1]), chunk.proto, c[2]);
+    }
+}

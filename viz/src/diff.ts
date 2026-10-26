@@ -205,6 +205,25 @@ export function keyframeSansArg(bytes: Uint8Array): string {
         body = { file_id: f.file_id, kind: f.kind, mode: f.mode, closed: f.closed, path: Array.from(new Uint8Array(f.path)) };
         break;
       }
+      case 8: { // coroutine (doc 73): its wiring and, when it isn't running, its stack
+        const t = o.body.value;
+        body = {
+          kind: t.kind,
+          status: t.status,
+          body: canonSv(t.body),
+          resumer: Number(t.resumer_id) > 0 ? visit(Number(t.resumer_id) - 1) : -1,
+          death: t.death.map(canonSv),
+          ret: [t.ret_lo, t.ret_c],
+          yield: [t.yield_lo, t.yield_c],
+          has_stack: t.has_stack,
+          context: t.context.map((c: any) => ({
+            stack: c.stack.map(canonSv),
+            frames: c.frames.map((fr: any) => ({ closure: visit(Number(fr.closure_id)), pc: fr.pc, base: fr.base, ret_dest: fr.ret_dest, ret_count: fr.ret_count })),
+            open_upvalues: c.open_upvalues.map((uv: any) => ({ stack_index: uv.stack_index, upvalue: visit(Number(uv.upvalue_id)) })),
+          })),
+        };
+        break;
+      }
       default:
         body = { unknown: o.obj_type };
     }

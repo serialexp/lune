@@ -574,16 +574,34 @@ pub const BitStreamDecoder = struct {
     }
 
     pub fn readVarlengthLeb128(self: *BitStreamDecoder) Error!u64 {
+        return self.readLeb128(false);
+    }
+
+    /// Canonical LEB128: the bytes of minimal LEB128 and nothing else. Rejects
+    /// over-long forms (a multi-byte encoding whose last byte is 0x00) and
+    /// values above 64 bits, so each value has exactly one encoding.
+    pub fn readVarlengthLeb128Canonical(self: *BitStreamDecoder) Error!u64 {
+        return self.readLeb128(true);
+    }
+
+    /// Unsigned LEB128 limited to 64 bits. The tenth byte may only carry bit 63;
+    /// later bytes may only pad (plain form) and are an error in canonical form.
+    fn readLeb128(self: *BitStreamDecoder, canonical: bool) Error!u64 {
         var result: u64 = 0;
-        var shift: u7 = 0;
-        while (true) {
+        var index: usize = 0;
+        while (true) : (index += 1) {
             const byte = try self.readUint8();
-            result |= (@as(u64, byte & 0x7F) << @intCast(shift));
-            shift += 7;
-            if ((byte & 0x80) == 0) break;
-            if (shift > 64) return error.InvalidEncoding;
+            const payload = byte & 0x7F;
+            const allowed: u8 = if (index < 9) 0x7F else if (index == 9) 0x01 else 0x00;
+            if ((payload & ~allowed) != 0 or (canonical and index == 9 and (byte & 0x80) != 0)) {
+                return error.InvalidEncoding;
+            }
+            if (index < 10) result |= @as(u64, payload) << @intCast(7 * index);
+            if ((byte & 0x80) == 0) {
+                if (canonical and byte == 0 and index > 0) return error.InvalidEncoding;
+                return result;
+            }
         }
-        return result;
     }
 
     pub fn readVarlengthEbml(self: *BitStreamDecoder) Error!u64 {
@@ -810,6 +828,47 @@ test "varlength encodings round-trip" {
     try testing.expectEqual(@as(u64, 137), try dec.readVarlengthVlq());
     try testing.expectEqual(@as(i64, -75), try dec.readVarlengthZigzag());
     try testing.expectEqual(@as(i64, -12345), try dec.readVarlengthSleb128());
+}
+
+test "canonical leb128 round-trips minimal forms" {
+    const values = [_]u64{ 0, 127, 128, 16383, 16384, std.math.maxInt(u64) };
+    for (values) |value| {
+        var enc = newEncoder();
+        defer enc.deinit();
+        try enc.writeVarlengthLeb128(value);
+        const out = try enc.finish();
+        defer testing.allocator.free(out);
+        var dec = BitStreamDecoder.init(out, .msb_first);
+        try testing.expectEqual(value, try dec.readVarlengthLeb128Canonical());
+    }
+}
+
+test "canonical leb128 rejects over-long forms; plain accepts them" {
+    const cases = [_][]const u8{ &.{ 0x80, 0x00 }, &.{ 0x81, 0x00 }, &.{ 0xff, 0x00 }, &.{ 0x80, 0x80, 0x00 } };
+    for (cases) |bytes| {
+        var canonical = BitStreamDecoder.init(bytes, .msb_first);
+        try testing.expectError(error.InvalidEncoding, canonical.readVarlengthLeb128Canonical());
+        var plain = BitStreamDecoder.init(bytes, .msb_first);
+        _ = try plain.readVarlengthLeb128();
+    }
+}
+
+test "leb128 rejects values above 64 bits" {
+    const tenth_too_big = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02 };
+    const padded_past_ten = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 };
+    const cases = [_][]const u8{ &tenth_too_big, &padded_past_ten };
+    for (cases) |bytes| {
+        var plain = BitStreamDecoder.init(bytes, .msb_first);
+        try testing.expectError(error.InvalidEncoding, plain.readVarlengthLeb128());
+        var canonical = BitStreamDecoder.init(bytes, .msb_first);
+        try testing.expectError(error.InvalidEncoding, canonical.readVarlengthLeb128Canonical());
+    }
+    // An eleventh byte is never canonical, even one that carries no bits.
+    const eleven_bytes = [_]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x81, 0x00 };
+    var canonical = BitStreamDecoder.init(&eleven_bytes, .msb_first);
+    try testing.expectError(error.InvalidEncoding, canonical.readVarlengthLeb128Canonical());
+    var plain = BitStreamDecoder.init(&eleven_bytes, .msb_first);
+    try testing.expectEqual(std.math.maxInt(u64), try plain.readVarlengthLeb128());
 }
 
 test "crc32 matches known vector" {

@@ -50,13 +50,20 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **P1 (most) — `coroutine.create`, `resume`, `yield`, `status` (incl.
   `"normal"`), `running` (with a main-thread object), `isyieldable`,
   `close`** with Lua's messages; `src/interp_coroutine_test.zig`.
+- [x] **Keyframes carry coroutines** (§6.2), snapshot format 13: a
+  `HeapThread` record per coroutine (kind, status, body, resumer, death,
+  resume/yield wiring) holding a stack that isn't running as a
+  `ThreadContext`, captured and restored with that stack loaded, under the
+  collector's keep set. Capture refuses while a coroutine runs, so every
+  captured one is suspended or dead. Every-cut resume test, malformed-record
+  rejections, a wasm ≡ native viz case.
 
 ### Outstanding
 
-- [ ] **P0 remainder** (§5, §6.1, §6.2): keyframes carry every coroutine
-  (snapshot format 12 → 13; until then the keyframe writer rejects threads
-  and suspension is refused while a coroutine runs); host suspension inside
-  a coroutine; the reserved-stack pool with decommit behind one wrapper;
+- [ ] **P0 remainder** (§5, §6.1, §6.2): a stop inside a coroutine — the
+  suspend there (refused by `canSuspendHere` today), the main stack carried
+  as a saved context with the running coroutine's id (a format bump), and
+  exec resuming in that coroutine; the reserved-stack pool with decommit behind one wrapper;
   GC weight for a thread's stack; liveness masks for suspended frames.
 - [ ] **Native coroutine bodies**: `coroutine.create(print)` is refused
   ("Lua function expected") until a Zig body can run on a coroutine stack.

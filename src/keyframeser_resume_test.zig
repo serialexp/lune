@@ -1230,3 +1230,48 @@ test "keyframe cut while a grid is live: a later deflation allocates the same id
         gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
     }
 }
+
+test "doc 73: every cut with coroutines alive resumes after restore" {
+    // A cut lands only on the main stack (`canSuspendHere`), so every
+    // coroutine is captured suspended or dead: one stopped mid-body, one
+    // not started, one killed by an error, one whose open upvalue a main
+    // closure reads, plus the main thread object. A cut due inside a
+    // coroutine defers to the main stack's next stoppable step.
+    const gpa = testing.allocator;
+    const source =
+        \\local shared = 0
+        \\local gen = coroutine.create(function(a, b)
+        \\  local acc = a + b
+        \\  for i = 1, 3 do
+        \\    shared = shared + i
+        \\    acc = acc + coroutine.yield(acc, shared)
+        \\  end
+        \\  return "done", acc
+        \\end)
+        \\local fresh = coroutine.create(function(x, ...) return x * 2, select("#", ...) end)
+        \\local dead = coroutine.create(function() error("boom") end)
+        \\print(coroutine.resume(dead))
+        \\local main = coroutine.running()
+        \\local getter
+        \\local cell = coroutine.create(function()
+        \\  local v = 1
+        \\  getter = function() return v end
+        \\  while true do v = v + 1 coroutine.yield() end
+        \\end)
+        \\coroutine.resume(cell)
+        \\for k = 1, 5 do
+        \\  print(k, coroutine.resume(gen, k, 10))
+        \\  print(coroutine.status(gen), shared, getter())
+        \\  coroutine.resume(cell)
+        \\end
+        \\print(coroutine.resume(fresh, 21, 1, 2), coroutine.status(fresh))
+        \\print(coroutine.status(dead), coroutine.close(dead), main == coroutine.running())
+        \\print(getter(), coroutine.close(cell), getter(), coroutine.status(cell))
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}

@@ -3071,7 +3071,619 @@ export class HeapFileDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4, file=7). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
+ * A stack that isn't running (doc 73): its live register window (a slot dead at capture is a DeadSlot tombstone, by the same keep set the collector walks it with), its call frames, bottom first, and its open upvalues. Laid out exactly as Keyframe's stack/frames/open_upvalues, which describe the running stack.
+ */
+export interface ThreadContextInput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  stack: StackValueInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  frames: FrameRefInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  open_upvalues: OpenUpvalueRefInput[];
+}
+
+/**
+ * A stack that isn't running (doc 73): its live register window (a slot dead at capture is a DeadSlot tombstone, by the same keep set the collector walks it with), its call frames, bottom first, and its open upvalues. Laid out exactly as Keyframe's stack/frames/open_upvalues, which describe the running stack.
+ */
+export interface ThreadContextOutput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  stack: StackValueOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  frames: FrameRefOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  open_upvalues: OpenUpvalueRefOutput[];
+}
+
+export type ThreadContext = ThreadContextOutput;
+
+export class ThreadContextEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: ThreadContextInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.stack.length, "little_endian");
+    for (let value_stack__iter_index = 0; value_stack__iter_index < value.stack.length; value_stack__iter_index++) {
+      const value_stack__iter = value.stack[value_stack__iter_index];
+      const encoder_value_stack__iter = new StackValueEncoder();
+      const encoded_value_stack__iter = encoder_value_stack__iter.encode(value_stack__iter);
+      for (const byte of encoded_value_stack__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint16(value.frames.length, "little_endian");
+    for (let value_frames__iter_index = 0; value_frames__iter_index < value.frames.length; value_frames__iter_index++) {
+      const value_frames__iter = value.frames[value_frames__iter_index];
+      const encoder_value_frames__iter = new FrameRefEncoder();
+      const encoded_value_frames__iter = encoder_value_frames__iter.encode(value_frames__iter);
+      for (const byte of encoded_value_frames__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint16(value.open_upvalues.length, "little_endian");
+    for (let value_open_upvalues__iter_index = 0; value_open_upvalues__iter_index < value.open_upvalues.length; value_open_upvalues__iter_index++) {
+      const value_open_upvalues__iter = value.open_upvalues[value_open_upvalues__iter_index];
+      const encoder_value_open_upvalues__iter = new OpenUpvalueRefEncoder();
+      const encoded_value_open_upvalues__iter = encoder_value_open_upvalues__iter.encode(value_open_upvalues__iter);
+      for (const byte of encoded_value_open_upvalues__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a ThreadContext value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: ThreadContext): number {
+    let size = 0;
+    // stack: array (kind: length_prefixed)
+    for (const item of value.stack) {
+      const stack_itemEncoder = new StackValueEncoder();
+      size += stack_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    // frames: array (kind: length_prefixed)
+    for (const item of value.frames) {
+      const frames_itemEncoder = new FrameRefEncoder();
+      size += frames_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // open_upvalues: array (kind: length_prefixed)
+    for (const item of value.open_upvalues) {
+      const open_upvalues_itemEncoder = new OpenUpvalueRefEncoder();
+      size += open_upvalues_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    return size;
+  }
+}
+
+export class ThreadContextDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): ThreadContextOutput {
+    const value: any = {};
+
+    value.stack = [];
+    const stack_length = this.readUint32("little_endian");
+    for (let i = 0; i < stack_length; i++) {
+      let stack__iter: any;
+      stack__iter = {};
+      stack__iter.tag = this.readUint8();
+      if (stack__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'ConstNil', value: payload };
+      }
+      else if (stack__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'ConstBool', value: payload };
+      }
+      else if (stack__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'ConstInt', value: payload };
+      }
+      else if (stack__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (stack__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'HeapRef', value: payload };
+      }
+      else if (stack__iter.tag === 255) {
+        const decoder = new DeadSlotDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'DeadSlot', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${stack__iter.tag}`);
+      }
+      value.stack.push(stack__iter);
+    }
+    value.frames = [];
+    const frames_length = this.readUint16("little_endian");
+    for (let i = 0; i < frames_length; i++) {
+      let frames__iter: any;
+      frames__iter = {};
+      frames__iter.closure_id = this.readUint32("little_endian");
+      frames__iter.pc = this.readUint32("little_endian");
+      frames__iter.base = this.readUint32("little_endian");
+      frames__iter.ret_dest = this.readUint16("little_endian");
+      frames__iter.ret_count = this.readUint16("little_endian");
+      frames__iter.varargs_base = this.readUint32("little_endian");
+      frames__iter.varargs_count = this.readUint32("little_endian");
+      frames__iter.ctl = this.readUint8();
+      value.frames.push(frames__iter);
+    }
+    value.open_upvalues = [];
+    const open_upvalues_length = this.readUint16("little_endian");
+    for (let i = 0; i < open_upvalues_length; i++) {
+      let open_upvalues__iter: any;
+      open_upvalues__iter = {};
+      open_upvalues__iter.stack_index = this.readUint32("little_endian");
+      open_upvalues__iter.upvalue_id = this.readUint32("little_endian");
+      value.open_upvalues.push(open_upvalues__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
+ */
+export interface HeapThreadInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  kind: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  status: number;
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  body: SnapValueInput;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  resumer_id: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  death: SnapValueInput[];
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  ret_lo: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  ret_c: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  yield_lo: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  yield_c: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_stack: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  context: ThreadContextInput[];
+}
+
+/**
+ * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
+ */
+export interface HeapThreadOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  kind: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  status: number;
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  body: SnapValueOutput;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  resumer_id: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  death: SnapValueOutput[];
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  ret_lo: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  ret_c: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  yield_lo: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  yield_c: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_stack: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  context: ThreadContextOutput[];
+}
+
+export type HeapThread = HeapThreadOutput;
+
+export class HeapThreadEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapThreadInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.kind);
+    this.writeUint8(value.status);
+    const encoder_body = new SnapValueEncoder();
+    const encoded_body = encoder_body.encode(value.body);
+    for (const byte of encoded_body) {
+      this.writeUint8(byte);
+    }
+    this.writeUint32(value.resumer_id, "little_endian");
+    this.writeUint8(value.death.length);
+    for (let value_death__iter_index = 0; value_death__iter_index < value.death.length; value_death__iter_index++) {
+      const value_death__iter = value.death[value_death__iter_index];
+      const encoder_value_death__iter = new SnapValueEncoder();
+      const encoded_value_death__iter = encoder_value_death__iter.encode(value_death__iter);
+      for (const byte of encoded_value_death__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint32(value.ret_lo, "little_endian");
+    this.writeUint16(value.ret_c, "little_endian");
+    this.writeUint32(value.yield_lo, "little_endian");
+    this.writeUint16(value.yield_c, "little_endian");
+    this.writeUint8(value.has_stack);
+    this.writeUint8(value.context.length);
+    for (let value_context__iter_index = 0; value_context__iter_index < value.context.length; value_context__iter_index++) {
+      const value_context__iter = value.context[value_context__iter_index];
+      const encoder_value_context__iter = new ThreadContextEncoder();
+      const encoded_value_context__iter = encoder_value_context__iter.encode(value_context__iter);
+      for (const byte of encoded_value_context__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapThread value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapThread): number {
+    let size = 0;
+    size += 2; // kind + status
+    // body: custom type (SnapValue)
+    const body_encoder = new SnapValueEncoder();
+    size += body_encoder.calculateSize(value.body);
+    size += 4; // resumer_id
+    // death: array (kind: length_prefixed)
+    for (const item of value.death) {
+      const death_itemEncoder = new SnapValueEncoder();
+      size += death_itemEncoder.calculateSize(item);
+    }
+    size += 14; // length prefix (uint8) + ret_lo + ret_c + yield_lo + yield_c + has_stack
+    // context: array (kind: length_prefixed)
+    for (const item of value.context) {
+      const context_itemEncoder = new ThreadContextEncoder();
+      size += context_itemEncoder.calculateSize(item);
+    }
+    size += 1; // length prefix (uint8)
+    return size;
+  }
+}
+
+export class HeapThreadDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapThreadOutput {
+    const value: any = {};
+
+    value.kind = this.readUint8();
+    value.status = this.readUint8();
+    value.body = {};
+    value.body.tag = this.readUint8();
+    if (value.body.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value.body);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body.body = { type: 'ConstNil', value: payload };
+    }
+    else if (value.body.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value.body);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body.body = { type: 'ConstBool', value: payload };
+    }
+    else if (value.body.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value.body);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body.body = { type: 'ConstInt', value: payload };
+    }
+    else if (value.body.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value.body);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body.body = { type: 'ConstFloat', value: payload };
+    }
+    else if (value.body.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value.body);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body.body = { type: 'HeapRef', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.body.tag}`);
+    }
+    value.resumer_id = this.readUint32("little_endian");
+    value.death = [];
+    const death_length = this.readUint8();
+    for (let i = 0; i < death_length; i++) {
+      let death__iter: any;
+      death__iter = {};
+      death__iter.tag = this.readUint8();
+      if (death__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), death__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        death__iter.body = { type: 'ConstNil', value: payload };
+      }
+      else if (death__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), death__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        death__iter.body = { type: 'ConstBool', value: payload };
+      }
+      else if (death__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), death__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        death__iter.body = { type: 'ConstInt', value: payload };
+      }
+      else if (death__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), death__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        death__iter.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (death__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), death__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        death__iter.body = { type: 'HeapRef', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${death__iter.tag}`);
+      }
+      value.death.push(death__iter);
+    }
+    value.ret_lo = this.readUint32("little_endian");
+    value.ret_c = this.readUint16("little_endian");
+    value.yield_lo = this.readUint32("little_endian");
+    value.yield_c = this.readUint16("little_endian");
+    value.has_stack = this.readUint8();
+    value.context = [];
+    const context_length = this.readUint8();
+    for (let i = 0; i < context_length; i++) {
+      let context__iter: any;
+      context__iter = {};
+      context__iter.stack = [];
+      const context__iter_stack_length = this.readUint32("little_endian");
+      for (let i = 0; i < context__iter_stack_length; i++) {
+        let context__iter_stack__iter: any;
+        context__iter_stack__iter = {};
+        context__iter_stack__iter.tag = this.readUint8();
+        if (context__iter_stack__iter.tag === 0) {
+          const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          context__iter_stack__iter.body = { type: 'ConstNil', value: payload };
+        }
+        else if (context__iter_stack__iter.tag === 1) {
+          const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          context__iter_stack__iter.body = { type: 'ConstBool', value: payload };
+        }
+        else if (context__iter_stack__iter.tag === 2) {
+          const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          context__iter_stack__iter.body = { type: 'ConstInt', value: payload };
+        }
+        else if (context__iter_stack__iter.tag === 3) {
+          const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          context__iter_stack__iter.body = { type: 'ConstFloat', value: payload };
+        }
+        else if (context__iter_stack__iter.tag === 4) {
+          const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          context__iter_stack__iter.body = { type: 'HeapRef', value: payload };
+        }
+        else if (context__iter_stack__iter.tag === 255) {
+          const decoder = new DeadSlotDecoder(this.bytes.slice(this.byteOffset), context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          context__iter_stack__iter.body = { type: 'DeadSlot', value: payload };
+        } else {
+          throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${context__iter_stack__iter.tag}`);
+        }
+        context__iter.stack.push(context__iter_stack__iter);
+      }
+      context__iter.frames = [];
+      const context__iter_frames_length = this.readUint16("little_endian");
+      for (let i = 0; i < context__iter_frames_length; i++) {
+        let context__iter_frames__iter: any;
+        context__iter_frames__iter = {};
+        context__iter_frames__iter.closure_id = this.readUint32("little_endian");
+        context__iter_frames__iter.pc = this.readUint32("little_endian");
+        context__iter_frames__iter.base = this.readUint32("little_endian");
+        context__iter_frames__iter.ret_dest = this.readUint16("little_endian");
+        context__iter_frames__iter.ret_count = this.readUint16("little_endian");
+        context__iter_frames__iter.varargs_base = this.readUint32("little_endian");
+        context__iter_frames__iter.varargs_count = this.readUint32("little_endian");
+        context__iter_frames__iter.ctl = this.readUint8();
+        context__iter.frames.push(context__iter_frames__iter);
+      }
+      context__iter.open_upvalues = [];
+      const context__iter_open_upvalues_length = this.readUint16("little_endian");
+      for (let i = 0; i < context__iter_open_upvalues_length; i++) {
+        let context__iter_open_upvalues__iter: any;
+        context__iter_open_upvalues__iter = {};
+        context__iter_open_upvalues__iter.stack_index = this.readUint32("little_endian");
+        context__iter_open_upvalues__iter.upvalue_id = this.readUint32("little_endian");
+        context__iter.open_upvalues.push(context__iter_open_upvalues__iter);
+      }
+      value.context.push(context__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4, file=7, thread=8). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
  */
 export interface HeapObjectInput {
   /**
@@ -3091,19 +3703,20 @@ export interface HeapObjectInput {
    * @remarks
    *
    * Discriminator: field 'obj_type'
-   * Variants: 6
+   * Variants: 7
    * - HeapString (when value === 0)
    * - HeapTable (when value === 1)
    * - HeapClosure (when value === 2)
    * - HeapNative (when value === 3)
    * - HeapUpvalue (when value === 4)
    * - HeapFile (when value === 7)
+   * - HeapThread (when value === 8)
    */
-  body: { type: 'HeapString'; value: HeapStringInput } | { type: 'HeapTable'; value: HeapTableInput } | { type: 'HeapClosure'; value: HeapClosureInput } | { type: 'HeapNative'; value: HeapNativeInput } | { type: 'HeapUpvalue'; value: HeapUpvalueInput } | { type: 'HeapFile'; value: HeapFileInput };
+  body: { type: 'HeapString'; value: HeapStringInput } | { type: 'HeapTable'; value: HeapTableInput } | { type: 'HeapClosure'; value: HeapClosureInput } | { type: 'HeapNative'; value: HeapNativeInput } | { type: 'HeapUpvalue'; value: HeapUpvalueInput } | { type: 'HeapFile'; value: HeapFileInput } | { type: 'HeapThread'; value: HeapThreadInput };
 }
 
 /**
- * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4, file=7). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
+ * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4, file=7, thread=8). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
  */
 export interface HeapObjectOutput {
   /**
@@ -3123,15 +3736,16 @@ export interface HeapObjectOutput {
    * @remarks
    *
    * Discriminator: field 'obj_type'
-   * Variants: 6
+   * Variants: 7
    * - HeapString (when value === 0)
    * - HeapTable (when value === 1)
    * - HeapClosure (when value === 2)
    * - HeapNative (when value === 3)
    * - HeapUpvalue (when value === 4)
    * - HeapFile (when value === 7)
+   * - HeapThread (when value === 8)
    */
-  body: { type: 'HeapString'; value: HeapStringOutput } | { type: 'HeapTable'; value: HeapTableOutput } | { type: 'HeapClosure'; value: HeapClosureOutput } | { type: 'HeapNative'; value: HeapNativeOutput } | { type: 'HeapUpvalue'; value: HeapUpvalueOutput } | { type: 'HeapFile'; value: HeapFileOutput };
+  body: { type: 'HeapString'; value: HeapStringOutput } | { type: 'HeapTable'; value: HeapTableOutput } | { type: 'HeapClosure'; value: HeapClosureOutput } | { type: 'HeapNative'; value: HeapNativeOutput } | { type: 'HeapUpvalue'; value: HeapUpvalueOutput } | { type: 'HeapFile'; value: HeapFileOutput } | { type: 'HeapThread'; value: HeapThreadOutput };
 }
 
 export type HeapObject = HeapObjectOutput;
@@ -3146,6 +3760,7 @@ export const enum HeapObjectBodyVariant {
   HeapNative = 'HeapNative',
   HeapUpvalue = 'HeapUpvalue',
   HeapFile = 'HeapFile',
+  HeapThread = 'HeapThread',
 }
 
 export class HeapObjectEncoder extends BitStreamEncoder {
@@ -3202,6 +3817,13 @@ export class HeapObjectEncoder extends BitStreamEncoder {
       for (const byte of encoded_value) {
         this.writeUint8(byte);
       }
+    }
+    else if (value.body.type === 'HeapThread') {
+      const encoder_value = new HeapThreadEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.body as any).type}`);
     }
@@ -3237,6 +3859,10 @@ export class HeapObjectEncoder extends BitStreamEncoder {
     }
     else if (value.body.type === 'HeapFile') {
       const _enc = new HeapFileEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HeapThread') {
+      const _enc = new HeapThreadEncoder();
       size += _enc.calculateSize(value.body.value);
     }
     else {
@@ -3292,6 +3918,12 @@ export class HeapObjectDecoder extends SeekableBitStreamDecoder {
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.body = { type: 'HeapFile', value: payload };
+    }
+    else if (value.obj_type === 8) {
+      const decoder = new HeapThreadDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapThread', value: payload };
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.obj_type}`);
     }
@@ -3981,6 +4613,12 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         objects__iter.body = { type: 'HeapFile', value: payload };
+      }
+      else if (objects__iter.obj_type === 8) {
+        const decoder = new HeapThreadDecoder(this.bytes.slice(this.byteOffset), objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        objects__iter.body = { type: 'HeapThread', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${objects__iter.obj_type}`);
       }
@@ -4208,6 +4846,12 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         keyframe_objects__iter.body = { type: 'HeapFile', value: payload };
+      }
+      else if (keyframe_objects__iter.obj_type === 8) {
+        const decoder = new HeapThreadDecoder(this.bytes.slice(this.byteOffset), keyframe_objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_objects__iter.body = { type: 'HeapThread', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${keyframe_objects__iter.obj_type}`);
       }

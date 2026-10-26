@@ -74,6 +74,9 @@ function heapRefDisplay(id: number, obj: HeapObjectOutput | undefined): string {
     case "HeapFile":
       // As `tostring` renders a handle (src/io.zig).
       return obj.body.value.closed !== 0 ? "file (closed)" : `file (0x${id.toString(16)})`;
+    case "HeapThread":
+      // As `tostring` renders a coroutine (src/io.zig).
+      return `thread: 0x${id.toString(16)}`;
     default:
       return `#${id}`;
   }

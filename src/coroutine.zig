@@ -140,6 +140,15 @@ pub fn newMainThread(heap: *gc.Heap) std.mem.Allocator.Error!*Thread {
     return t;
 }
 
+/// A coroutine shell for keyframe restore (`keyframeser`): with a fresh
+/// stack when `has_stack`; the restorer fills in the rest.
+pub fn createRestored(gpa: std.mem.Allocator, has_stack: bool) std.mem.Allocator.Error!*Thread {
+    if (has_stack) return Thread.create(gpa, Value.nil());
+    const t = try gpa.create(Thread);
+    t.* = .{ .header = GcHeader.init(.thread), .stack = null, .saved = undefined, .body = Value.nil() };
+    return t;
+}
+
 pub const thread_ops: gc.ThreadOps = .{ .blacken = blackenThread, .destroy = destroyThread };
 
 fn blackenThread(heap: *gc.Heap, h: *GcHeader) void {

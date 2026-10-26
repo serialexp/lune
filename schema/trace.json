@@ -204,8 +204,34 @@
       ]
     },
 
+    "ThreadContext": {
+      "description": "A stack that isn't running (doc 73): its live register window (a slot dead at capture is a DeadSlot tombstone, by the same keep set the collector walks it with), its call frames, bottom first, and its open upvalues. Laid out exactly as Keyframe's stack/frames/open_upvalues, which describe the running stack.",
+      "sequence": [
+        { "name": "stack",         "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "StackValue" } },
+        { "name": "frames",        "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "FrameRef" } },
+        { "name": "open_upvalues", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "OpenUpvalueRef" } }
+      ]
+    },
+
+    "HeapThread": {
+      "description": "A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.",
+      "sequence": [
+        { "name": "kind",       "type": "uint8" },
+        { "name": "status",     "type": "uint8" },
+        { "name": "body",       "type": "SnapValue" },
+        { "name": "resumer_id", "type": "uint32" },
+        { "name": "death",      "type": "array", "kind": "length_prefixed", "length_type": "uint8", "items": { "type": "SnapValue" } },
+        { "name": "ret_lo",     "type": "uint32" },
+        { "name": "ret_c",      "type": "uint16" },
+        { "name": "yield_lo",   "type": "uint32" },
+        { "name": "yield_c",    "type": "uint16" },
+        { "name": "has_stack",  "type": "uint8" },
+        { "name": "context",    "type": "array", "kind": "length_prefixed", "length_type": "uint8", "items": { "type": "ThreadContext" } }
+      ]
+    },
+
     "HeapObject": {
-      "description": "One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4, file=7). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.",
+      "description": "One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4, file=7, thread=8). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.",
       "sequence": [
         { "name": "id",       "type": "uint32" },
         { "name": "obj_type", "type": "uint8" },
@@ -219,7 +245,8 @@
             { "type": "HeapClosure", "when": "value === 2" },
             { "type": "HeapNative",  "when": "value === 3" },
             { "type": "HeapUpvalue", "when": "value === 4" },
-            { "type": "HeapFile",    "when": "value === 7" }
+            { "type": "HeapFile",    "when": "value === 7" },
+            { "type": "HeapThread",  "when": "value === 8" }
           ]
         }
       ]

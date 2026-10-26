@@ -38,6 +38,8 @@ const trace = @import("trace.zig");
 const system = @import("system.zig");
 const filemod = @import("file.zig");
 const File = filemod.File;
+const coroutine = @import("coroutine.zig");
+const Thread = coroutine.Thread;
 
 const Value = value.Value;
 const GcHeader = object.GcHeader;
@@ -108,7 +110,13 @@ pub const schema = @import("gen/trace_schema.zig");
 /// fingerprint of an open file captured live), and `Keyframe` the file
 /// metatable, the default input and output handles (1-based optional ids)
 /// and `next_file_id`.
-pub const snapshot_format_version: u32 = 12;
+///
+/// v13 (doc 73): coroutines. `HeapObject` gained `HeapThread` (obj_type 8:
+/// kind, status, body, resumer, death, the resume and yield wiring, and the
+/// saved stack of one that isn't running as a `ThreadContext`). Capture still
+/// refuses to run while a coroutine does, so every captured coroutine is
+/// suspended or dead.
+pub const snapshot_format_version: u32 = 13;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -219,8 +227,9 @@ fn sortedHashEntries(a: std.mem.Allocator, t: *const table.Table) ![]HashKV {
 /// `live` is the host system when the capture is live (`off`/`record`): an
 /// open file's fingerprint is then the host's view of it now (doc 65 Q7).
 /// Otherwise a file carries the fingerprint it was restored with, if any.
-pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader, live: ?system.HostSystem) !schema.HeapObject {
-    const Body = schema.BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile;
+/// A coroutine's stack is read through `vm` (`toSchemaThread`).
+pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader, live: ?system.HostSystem) !schema.HeapObject {
+    const Body = schema.BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile_HeapThread;
     const body: Body = switch (h.type) {
         .string => .{ .HeapString = .{ .bytes = string.String.fromHeader(h).bytes() } },
         .table => blk: {
@@ -300,9 +309,92 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader, live: ?system.Host
                 .fingerprint = fps,
             } };
         },
+        .thread => .{ .HeapThread = try toSchemaThread(a, vm, Thread.fromHeader(h)) },
         else => return error.UnsupportedObject, // typed_array / host: no F2a variant
     };
     return .{ .id = h.id, .obj_type = @intFromEnum(h.type), .body = body };
+}
+
+/// `HeapThread.kind`.
+const thread_kind_coroutine: u8 = 0;
+const thread_kind_main: u8 = 1;
+
+/// A coroutine on the wire (doc 73). A stack that isn't running is captured
+/// by loading it into `vm` as a collection walks it (`Vm.walkSavedStacks`),
+/// so its keep set is the collector's; the running state is put back before
+/// this returns. The resume and yield wiring is written only where the
+/// status gives it a meaning, so the bytes don't carry what a past resume
+/// left behind.
+fn toSchemaThread(a: std.mem.Allocator, vm: *Vm, t: *Thread) !schema.HeapThread {
+    var context: []schema.ThreadContext = &.{};
+    if (t.stack != null and t.status != .running) {
+        context = try a.alloc(schema.ThreadContext, 1);
+        var running: coroutine.SavedContext = undefined;
+        coroutine.save(vm, &running);
+        defer coroutine.load(vm, &running);
+        coroutine.load(vm, &t.saved);
+        context[0] = try captureContext(a, vm);
+    }
+    const death: []schema.SnapValue = if (t.death) |d| blk: {
+        const one = try a.alloc(schema.SnapValue, 1);
+        one[0] = toSchemaValue(d);
+        break :blk one;
+    } else &.{};
+    const wired = t.status == .running or t.status == .normal;
+    const at_yield = t.status == .suspended and t.stack != null and t.saved.depth > 0;
+    return .{
+        .kind = if (vm.main_thread == t) thread_kind_main else thread_kind_coroutine,
+        .status = @intFromEnum(t.status),
+        .body = toSchemaValue(t.body),
+        .resumer_id = if (t.resumer) |r| r.header.id + 1 else 0,
+        .death = death,
+        .ret_lo = if (wired) @intCast(t.ret_lo) else 0,
+        .ret_c = if (wired) t.ret_c else 0,
+        .yield_lo = if (at_yield) @intCast(t.yield_lo) else 0,
+        .yield_c = if (at_yield) t.yield_c else 0,
+        .has_stack = @intFromBool(t.stack != null),
+        .context = context,
+    };
+}
+
+/// The loaded stack on the wire: the registers the collector's keep set
+/// names (`Vm.fillKeep`, doc 61 Phase K), every other slot a tombstone; the
+/// frames with their resumable cursors (F2c); the open upvalues.
+fn captureContext(a: std.mem.Allocator, vm: *const Vm) !schema.ThreadContext {
+    // Dead slots are where a JIT run can differ from tier-0 between
+    // collections, so dropping them makes the bytes tier-identical. At a
+    // validated final state (doc 21 Phase A) the keep set is the top-level
+    // result span; otherwise frame masks, varargs spans, open-upvalue slots,
+    // and every gap and unmasked window whole.
+    const keep = try a.alloc(u64, (vm.stack_top + 63) / 64);
+    vm.fillKeep(keep);
+    const stack = try a.alloc(schema.StackValue, vm.stack_top);
+    for (stack, 0..) |*sv, idx| {
+        const kept = (keep[idx / 64] >> @intCast(idx % 64)) & 1 != 0;
+        sv.* = toStackValue(vm.regGet(idx), kept);
+    }
+
+    // Each frame's resumable cursor (pc/base/return-wiring), not just the
+    // closure id — this is what makes a mid-execution snapshot re-executable
+    // (F2c). At final-state capture `vm.depth == 0`, so this is empty.
+    const frames = try a.alloc(schema.FrameRef, vm.depth);
+    for (vm.frames[0..vm.depth], 0..) |f, idx| frames[idx] = .{
+        .closure_id = f.closure.header.id,
+        .pc = @intCast(f.pc),
+        .base = @intCast(f.base),
+        .ret_dest = f.ret_dest,
+        .ret_count = f.ret_count,
+        .varargs_base = @intCast(f.varargs_base),
+        .varargs_count = @intCast(f.varargs_count),
+        .ctl = @bitCast(f.ctl),
+    };
+
+    const open = try a.alloc(schema.OpenUpvalueRef, vm.open_upvalues.items.len);
+    for (vm.open_upvalues.items, 0..) |ou, idx| open[idx] = .{
+        .stack_index = @intCast(ou.index),
+        .upvalue_id = ou.cell.header.id,
+    };
+    return .{ .stack = stack, .frames = frames, .open_upvalues = open };
 }
 
 fn idLessThan(_: void, x: *GcHeader, y: *GcHeader) bool {
@@ -367,12 +459,17 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     for (vm.frames[0..vm.depth]) |*fr| {
         if (fr.in_flight) return error.CaptureInsideNativeActivation;
     }
+    // Doc 73: the format has no running coroutine yet (the main stack would
+    // have to be carried as a saved one), and no suspend lands inside one
+    // (`Vm.canSuspendHere`).
+    if (vm.current != null) return error.CaptureInsideCoroutine;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Capture reads the VM and never mutates it (doc 61 Phase K: grids are
-    // carried as grids, so nothing deflates).
+    // Capture leaves the VM as it found it (doc 61 Phase K: grids are
+    // carried as grids, so nothing deflates). A coroutine's stack is read by
+    // loading it for the moment (`toSchemaThread`).
     //
     // 1. Every unswept object, garbage included (doc 61 Phase K). Allocation
     //    and collection points are tier-identical, and only registers can be
@@ -382,44 +479,11 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     const all = try heapObjectsById(a, vm.heap);
     const objects = try a.alloc(schema.HeapObject, all.len);
     const live: ?system.HostSystem = if (vm.effect_mode == .replay) null else vm.system;
-    for (all, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, h, live);
+    for (all, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, vm, h, live);
 
-    // 2. The registers capture keeps (doc 61 Phase K); every other slot is a
-    //    tombstone. Dead slots are where a JIT run can differ from tier-0
-    //    between collections, so dropping them makes the bytes tier-identical.
-    //    This is the collector's own keep set (`Vm.fillKeep`): at a validated
-    //    final state (doc 21 Phase A) the top-level result span, otherwise
-    //    frame masks, varargs spans, open-upvalue slots, and every gap and
-    //    unmasked window whole.
-    const keep = try a.alloc(u64, (vm.stack_top + 63) / 64);
-    vm.fillKeep(keep);
-    const stack = try a.alloc(schema.StackValue, vm.stack_top);
-    for (stack, 0..) |*sv, idx| {
-        const kept = (keep[idx / 64] >> @intCast(idx % 64)) & 1 != 0;
-        sv.* = toStackValue(vm.regGet(idx), kept);
-    }
-
-    // Capture each frame's resumable cursor (pc/base/return-wiring), not just the
-    // closure id — this is what makes a mid-execution snapshot re-executable (F2c).
-    // At final-state capture `vm.depth == 0`, so this is empty and the bytes match
-    // the v1 layout for those programs save the version word.
-    const frames = try a.alloc(schema.FrameRef, vm.depth);
-    for (vm.frames[0..vm.depth], 0..) |f, idx| frames[idx] = .{
-        .closure_id = f.closure.header.id,
-        .pc = @intCast(f.pc),
-        .base = @intCast(f.base),
-        .ret_dest = f.ret_dest,
-        .ret_count = f.ret_count,
-        .varargs_base = @intCast(f.varargs_base),
-        .varargs_count = @intCast(f.varargs_count),
-        .ctl = @bitCast(f.ctl),
-    };
-
-    const open = try a.alloc(schema.OpenUpvalueRef, vm.open_upvalues.items.len);
-    for (vm.open_upvalues.items, 0..) |ou, idx| open[idx] = .{
-        .stack_index = @intCast(ou.index),
-        .upvalue_id = ou.cell.header.id,
-    };
+    // 2. The running stack: its kept registers (doc 61 Phase K), frames and
+    //    open upvalues.
+    const running = try captureContext(a, vm);
 
     // Runtime-`load`ed chunks, in load order (L-2): source + chunk name. Restore
     // recompiles each — compile is deterministic, so the same sources in the same
@@ -459,9 +523,9 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             // collects at the same allocation as the uninterrupted run.
             .next_gc = vm.heap.next_gc,
             .objects = objects,
-            .stack = stack,
-            .frames = frames,
-            .open_upvalues = open,
+            .stack = running.stack,
+            .frames = running.frames,
+            .open_upvalues = running.open_upvalues,
             .loaded_chunks = loaded,
         },
     };
@@ -512,6 +576,8 @@ pub const RestoreError = error{
     InvalidFile, // a file handle's kind or mode byte is not one the encoder writes, or it has more than one fingerprint
     FileRootNotAFile, // io_input_id / io_output_id resolves to a non-file object
     NextFileIdBelowFiles, // next_file_id is at or below a restored file's id, or below the standard streams' 3
+    InvalidThread, // a coroutine record no capture writes: an unknown kind or status, a stack that doesn't match the status, a running coroutine or a resumer (v13 captures only with none running), a second main thread, a non-function body
+    UpvalueOpenTwice, // an open upvalue cell appears in two open lists
 } || std.mem.Allocator.Error || SchemaDecodeError // + the codec's own decode errors
 || table.Table.Error; // a corrupt snapshot could carry a nil/NaN table key
 
@@ -673,6 +739,123 @@ fn fileRoot(idmap: *const IdMap, id1: u32) RestoreError!?*File {
     return File.fromHeader(h);
 }
 
+/// A `HeapThread` whose fields agree with each other, as capture writes
+/// them. v13 captures only while no coroutine runs, so each one is
+/// suspended (with its stack) or dead (without), and none has a resumer.
+fn checkThreadShape(ht: schema.HeapThread) RestoreError!void {
+    if (ht.has_stack > 1 or ht.death.len > 1 or ht.context.len > 1) return error.InvalidThread;
+    if (ht.resumer_id != 0 or ht.ret_lo != 0 or ht.ret_c != 0) return error.InvalidThread;
+    const status = std.enums.fromInt(Thread.Status, ht.status) orelse return error.InvalidThread;
+    switch (ht.kind) {
+        thread_kind_main => if (status != .running or ht.has_stack != 0 or ht.context.len != 0 or ht.death.len != 0)
+            return error.InvalidThread,
+        thread_kind_coroutine => {
+            const suspended = status == .suspended;
+            if (!suspended and status != .dead) return error.InvalidThread;
+            if (ht.has_stack != @intFromBool(suspended) or ht.context.len != ht.has_stack) return error.InvalidThread;
+            if (ht.context.len == 1 and ht.context[0].frames.len == 0 and (ht.yield_lo != 0 or ht.yield_c != 0))
+                return error.InvalidThread;
+        },
+        else => return error.InvalidThread,
+    }
+}
+
+/// Rebuild the loaded stack from `ctx`: its registers, its frames through the
+/// live call path, its open upvalues (whose `owner` becomes `owner`), then
+/// check its tombstones against the keep set the restored state derives.
+/// `owner` is null for the running (main) stack, which alone may hold a
+/// final cut.
+fn restoreContext(vm: *Vm, ctx: schema.ThreadContext, idmap: *const IdMap, owner: ?*Thread) RestoreError!void {
+    if (ctx.stack.len > vm.regCapacity()) return error.StackTooLarge;
+    for (ctx.stack, 0..) |sv, i| vm.regSet(i, try fromStackValue(sv, idmap));
+    vm.stack_top = ctx.stack.len;
+
+    if (ctx.frames.len > vm.frames.len) return error.TooManyFrames;
+    var expected_base: usize = 0;
+    for (ctx.frames, 0..) |fr, i| {
+        const fh = idmap.get(fr.closure_id) orelse return error.UnresolvedHeapRef;
+        if (fh.type != .function) return error.FrameNotAClosure;
+        const cl = function.Closure.fromHeader(fh);
+        // Doc 68 §5: only a protected call's tag may be set, and the bottom
+        // frame has no caller to protect.
+        // Checked on the raw bits: an out-of-range tag is no `Protect` value.
+        const protect_off = @bitOffsetOf(interp.FrameCtl, "protect");
+        const protect_bits = (fr.ctl >> protect_off) & 0b11;
+        if (fr.ctl & ~(@as(u8, 0b11) << protect_off) != 0 or
+            protect_bits > @intFromEnum(interp.Protect.xpcall) or
+            (i == 0 and protect_bits != 0)) return error.InvalidFrameCtl;
+        const ctl: interp.FrameCtl = .{ .protect = @enumFromInt(protect_bits) };
+        // Frame windows are ordered, non-overlapping and in bounds, starting
+        // at 0. Usually they are contiguous, but a callee whose dynamic
+        // argument span ran past its caller's window sits above that span
+        // (doc 61 P1), leaving a gap that holds the span. Anything else is a
+        // corrupt/incompatible snapshot (and would make resume read the wrong
+        // registers).
+        if (i == 0 and fr.base != 0) return error.FrameWindowMismatch;
+        if (fr.base < expected_base) return error.FrameWindowMismatch;
+        if (@as(usize, fr.base) + cl.proto.num_registers > ctx.stack.len) return error.FrameWindowMismatch;
+        if (fr.varargs_count == 0) {
+            if (fr.varargs_base != 0) return error.InvalidFrameVarargs;
+        } else {
+            if (!cl.proto.is_vararg) return error.InvalidFrameVarargs;
+            const varargs_end = std.math.add(u32, fr.varargs_base, fr.varargs_count) catch
+                return error.InvalidFrameVarargs;
+            if (varargs_end > fr.base or varargs_end > ctx.stack.len)
+                return error.InvalidFrameVarargs;
+        }
+        // Restore through the same physical-frame choke point as live calls, so
+        // the vararg cursor, stack window, call_seq, and region context cannot
+        // drift from normal frame construction. Only the resumable pc is a
+        // restore-specific overwrite.
+        vm.pushFrameVararg(
+            cl,
+            fr.base,
+            fr.ret_dest,
+            fr.ret_count,
+            fr.varargs_base,
+            fr.varargs_count,
+        ) catch return error.TooManyFrames;
+        vm.frames[i].pc = fr.pc;
+        vm.frames[i].ctl = ctl;
+        expected_base = @as(usize, fr.base) + cl.proto.num_registers;
+    }
+    // `pushFrameVararg` raises this to each physical window end. The serialized
+    // live prefix may additionally contain caller-owned argument/vararg slots
+    // (and structural test snapshots can use zero-register frames), so restore
+    // the authoritative captured top after all frame pushes.
+    vm.stack_top = ctx.stack.len;
+    // Doc 61 Phase K: frames re-derive their tombstones at recapture, but at
+    // depth 0 the only capture that tombstones is a validated final cut,
+    // keeping exactly the result span. Re-derive that cut so recapture is
+    // the identity. A coroutine's stack never has one.
+    if (ctx.frames.len == 0 and owner == null) vm.setFinalCut(try finalCutFromStack(ctx.stack));
+
+    for (ctx.open_upvalues) |ou| {
+        const uh = idmap.get(ou.upvalue_id) orelse return error.UnresolvedHeapRef;
+        if (uh.type != .upvalue) return error.UpvalueNotAnUpvalue;
+        if (ou.stack_index >= vm.stack_top) return error.StackIndexOutOfRange;
+        const cell = function.Upvalue.fromHeader(uh);
+        if (cell.isOpen()) return error.UpvalueOpenTwice;
+        // Switch the cell from its closed placeholder to open over the live slot.
+        cell.reopen(ou.stack_index, &vm.tags[ou.stack_index], &vm.payloads[ou.stack_index]);
+        cell.owner = if (owner) |t| &t.header else null;
+        // Doc 54 P1: through the centralized method, so the rebuilt list
+        // republishes `open_upvalue_ceiling` as it grows (round-1 blocker 5:
+        // a restore that bypassed the ceiling would leave it stale-LOW).
+        try vm.appendOpenUpvalue(ou.stack_index, cell);
+    }
+
+    // Doc 61 Phase K: with frames, pcs, open upvalues and the cut in place,
+    // `fillKeep` is the keep set capture used. A tombstone inside it would
+    // turn a live operand, vararg or upvalue slot into nil, so it cannot
+    // come from a capture.
+    vm.fillKeep(vm.gc_keep);
+    for (ctx.stack, 0..) |sv, i| {
+        if (sv.body == .DeadSlot and (vm.gc_keep[i / 64] >> @intCast(i % 64)) & 1 != 0)
+            return error.InvalidTombstones;
+    }
+}
+
 /// Decode `bytes` and restore them into a fresh VM (see `restoreSnapshot`).
 pub fn restore(
     gpa: std.mem.Allocator,
@@ -809,6 +992,14 @@ pub fn restoreSnapshot(
                 vm.heap.linkRestored(&f.header, o.id);
                 break :blk &f.header;
             },
+            .HeapThread => |ht| blk: {
+                try checkThreadShape(ht);
+                if (ht.kind == thread_kind_main and vm.main_thread != null) return error.InvalidThread;
+                const t = try coroutine.createRestored(gpa, ht.has_stack == 1);
+                vm.heap.linkRestoredThread(&t.header, o.id);
+                if (ht.kind == thread_kind_main) vm.main_thread = t;
+                break :blk &t.header;
+            },
             .HeapNative => |hn| blk: {
                 const entry = natives.lookup(hn.name) orelse return error.UnknownNative;
                 // Use the registry's static name (outlives the decode arena).
@@ -933,6 +1124,23 @@ pub fn restoreSnapshot(
                 // value here is a harmless placeholder until then.
                 u.closeWith(try fromSchemaValue(hu.value, &idmap));
             },
+            .HeapThread => |ht| {
+                const t = Thread.fromHeader(h);
+                t.status = @enumFromInt(ht.status); // checked in pass 1a
+                t.body = try fromSchemaValue(ht.body, &idmap);
+                // A coroutine runs a Lua function (`coroutine.create`); the
+                // main thread runs none.
+                const body_ok = if (ht.kind == thread_kind_main)
+                    t.body.isNil()
+                else
+                    t.body.isHeap() and t.body.asHeap().type == .function;
+                if (!body_ok) return error.InvalidThread;
+                if (ht.death.len == 1) t.death = try fromSchemaValue(ht.death[0], &idmap);
+                t.ret_lo = ht.ret_lo;
+                t.ret_c = ht.ret_c;
+                t.yield_lo = ht.yield_lo;
+                t.yield_c = ht.yield_c;
+            },
         }
     }
 
@@ -948,91 +1156,29 @@ pub fn restoreSnapshot(
     // after a restore must compare stores against the live table).
     vm.trace.rec_globals_header = &vm.globals.header;
 
-    if (kf.stack.len > vm.regCapacity()) return error.StackTooLarge;
-    for (kf.stack, 0..) |sv, i| vm.regSet(i, try fromStackValue(sv, &idmap));
-    vm.stack_top = kf.stack.len;
+    try restoreContext(vm, .{ .stack = kf.stack, .frames = kf.frames, .open_upvalues = kf.open_upvalues }, &idmap, null);
 
-    if (kf.frames.len > vm.frames.len) return error.TooManyFrames;
-    var expected_base: usize = 0;
-    for (kf.frames, 0..) |fr, i| {
-        const fh = idmap.get(fr.closure_id) orelse return error.UnresolvedHeapRef;
-        if (fh.type != .function) return error.FrameNotAClosure;
-        const cl = function.Closure.fromHeader(fh);
-        // Doc 68 §5: only a protected call's tag may be set, and the bottom
-        // frame has no caller to protect.
-        // Checked on the raw bits: an out-of-range tag is no `Protect` value.
-        const protect_off = @bitOffsetOf(interp.FrameCtl, "protect");
-        const protect_bits = (fr.ctl >> protect_off) & 0b11;
-        if (fr.ctl & ~(@as(u8, 0b11) << protect_off) != 0 or
-            protect_bits > @intFromEnum(interp.Protect.xpcall) or
-            (i == 0 and protect_bits != 0)) return error.InvalidFrameCtl;
-        const ctl: interp.FrameCtl = .{ .protect = @enumFromInt(protect_bits) };
-        // Frame windows are ordered, non-overlapping and in bounds, starting
-        // at 0. Usually they are contiguous, but a callee whose dynamic
-        // argument span ran past its caller's window sits above that span
-        // (doc 61 P1), leaving a gap that holds the span. Anything else is a
-        // corrupt/incompatible snapshot (and would make resume read the wrong
-        // registers).
-        if (i == 0 and fr.base != 0) return error.FrameWindowMismatch;
-        if (fr.base < expected_base) return error.FrameWindowMismatch;
-        if (@as(usize, fr.base) + cl.proto.num_registers > kf.stack.len) return error.FrameWindowMismatch;
-        if (fr.varargs_count == 0) {
-            if (fr.varargs_base != 0) return error.InvalidFrameVarargs;
-        } else {
-            if (!cl.proto.is_vararg) return error.InvalidFrameVarargs;
-            const varargs_end = std.math.add(u32, fr.varargs_base, fr.varargs_count) catch
-                return error.InvalidFrameVarargs;
-            if (varargs_end > fr.base or varargs_end > kf.stack.len)
-                return error.InvalidFrameVarargs;
+    // Doc 73: each suspended coroutine's stack, rebuilt like the running one
+    // with that stack loaded, as a collection walks it.
+    var main_ctx: coroutine.SavedContext = undefined;
+    coroutine.save(vm, &main_ctx);
+    for (kf.objects) |o| {
+        const ht = switch (o.body) {
+            .HeapThread => |ht| ht,
+            else => continue,
+        };
+        if (ht.context.len == 0) continue;
+        const t = Thread.fromHeader(idmap.get(o.id).?);
+        coroutine.load(vm, &t.saved);
+        // Whatever happens, the stack's state goes back to its thread and
+        // the main stack's into the VM, so each is freed once.
+        defer {
+            coroutine.save(vm, &t.saved);
+            coroutine.load(vm, &main_ctx);
         }
-        // Restore through the same physical-frame choke point as live calls, so
-        // the vararg cursor, stack window, call_seq, and region context cannot
-        // drift from normal frame construction. Only the resumable pc is a
-        // restore-specific overwrite.
-        vm.pushFrameVararg(
-            cl,
-            fr.base,
-            fr.ret_dest,
-            fr.ret_count,
-            fr.varargs_base,
-            fr.varargs_count,
-        ) catch return error.TooManyFrames;
-        vm.frames[i].pc = fr.pc;
-        vm.frames[i].ctl = ctl;
-        expected_base = @as(usize, fr.base) + cl.proto.num_registers;
-    }
-    // `pushFrameVararg` raises this to each physical window end. The serialized
-    // live prefix may additionally contain caller-owned argument/vararg slots
-    // (and structural test snapshots can use zero-register frames), so restore
-    // the authoritative captured top after all frame pushes.
-    vm.stack_top = kf.stack.len;
-    // Doc 61 Phase K: frames re-derive their tombstones at recapture, but at
-    // depth 0 the only capture that tombstones is a validated final cut,
-    // keeping exactly the result span. Re-derive that cut so recapture is
-    // the identity.
-    if (kf.frames.len == 0) vm.setFinalCut(try finalCutFromStack(kf.stack));
-
-    for (kf.open_upvalues) |ou| {
-        const uh = idmap.get(ou.upvalue_id) orelse return error.UnresolvedHeapRef;
-        if (uh.type != .upvalue) return error.UpvalueNotAnUpvalue;
-        if (ou.stack_index >= vm.stack_top) return error.StackIndexOutOfRange;
-        const cell = function.Upvalue.fromHeader(uh);
-        // Switch the cell from its closed placeholder to open over the live slot.
-        cell.reopen(ou.stack_index, &vm.tags[ou.stack_index], &vm.payloads[ou.stack_index]);
-        // Doc 54 P1: through the centralized method, so the rebuilt list
-        // republishes `open_upvalue_ceiling` as it grows (round-1 blocker 5:
-        // a restore that bypassed the ceiling would leave it stale-LOW).
-        try vm.appendOpenUpvalue(ou.stack_index, cell);
-    }
-
-    // Doc 61 Phase K: with frames, pcs, open upvalues and the cut in place,
-    // `fillKeep` is the keep set capture used. A tombstone inside it would
-    // turn a live operand, vararg or upvalue slot into nil, so it cannot
-    // come from a capture.
-    vm.fillKeep(vm.gc_keep);
-    for (kf.stack, 0..) |sv, i| {
-        if (sv.body == .DeadSlot and (vm.gc_keep[i / 64] >> @intCast(i % 64)) & 1 != 0)
-            return error.InvalidTombstones;
+        try restoreContext(vm, ht.context[0], &idmap, t);
+        // A suspended coroutine has its body frame, or hasn't started.
+        if (ht.context[0].frames.len == 0 and ht.context[0].stack.len != 0) return error.InvalidThread;
     }
 
     // VM-level metatable support (chunk 2a). A non-zero `string_metatable_id`

@@ -903,27 +903,49 @@ export class BitStreamDecoder {
    * - Used in Protocol Buffers, WebAssembly, DWARF
    */
   readVarlengthLEB128(): number {
+    return this.readLEB128(false);
+  }
+
+  /**
+   * Read a canonical LEB128 integer: the bytes of minimal LEB128, and nothing
+   * else. Rejects over-long forms (a multi-byte encoding whose last byte is
+   * 0x00) and values above 64 bits, so each value has exactly one encoding.
+   */
+  readVarlengthLEB128Canonical(): number {
+    return this.readLEB128(true);
+  }
+
+  /**
+   * Unsigned LEB128 limited to 64 bits. Bytes past the tenth may only pad
+   * (plain LEB128) and are an error in canonical form. Values above
+   * Number.MAX_SAFE_INTEGER come back as a bigint rather than losing precision.
+   */
+  private readLEB128(canonical: boolean): number {
     let result = 0n;
-    let shift = 0;
+    let index = 0;
 
     while (true) {
       const byte = this.readUint8();
-      const value = BigInt(byte & 0x7F); // Get lower 7 bits
-
-      result |= value << BigInt(shift);
-      shift += 7;
-
-      if ((byte & 0x80) === 0) {
-        // No continuation bit, we're done
-        break;
-      }
-
-      if (shift > 64) {
+      const payload = byte & 0x7F;
+      // The tenth byte carries bit 63 only; later bytes carry nothing.
+      const allowed = index < 9 ? 0x7F : index === 9 ? 0x01 : 0x00;
+      if ((payload & ~allowed) !== 0 || (canonical && index === 9 && (byte & 0x80) !== 0)) {
         throw new BinSchemaError(ErrorCode.INVALID_ENCODING, "LEB128 value too large (exceeds 64 bits)", { position: this.byteOffset });
       }
+      if (index < 10) {
+        result |= BigInt(payload) << BigInt(7 * index);
+      }
+
+      if ((byte & 0x80) === 0) {
+        if (canonical && byte === 0 && index > 0) {
+          throw new BinSchemaError(ErrorCode.INVALID_ENCODING, "LEB128 encoding is not minimal (over-long form)", { position: this.byteOffset });
+        }
+        break;
+      }
+      index++;
     }
 
-    return Number(result);
+    return result <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(result) : (result as unknown as number);
   }
 
   /**
