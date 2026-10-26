@@ -1,7 +1,7 @@
 # 73 — Coroutines, and async on top of them — Design
 
-Status: draft, not yet implemented. Q2–Q4 decided (2026-10-26); Q1 (the
-direction) is open after research round 1 (§4.1).
+Status: designed, not yet implemented. Every open question decided
+2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-26
 
@@ -12,43 +12,50 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Done
 
+- [x] **Q1 — direction** (§4.2): decided 2026-10-26 — one internal
+  mechanism (a delimiter per reserved stack, a tagged suspend to the nearest
+  matching one); public surface only Lua's coroutines plus `async`/`await`.
+- [x] **Q1 research round 1** (§4.1): Codex and Antigravity surveyed
+  single-model designs; reports in `docs/reviews/doc73/`.
 - [x] **Q2 — the stack model** (§5): decided 2026-10-26 — option 5.3, a
   stack per coroutine in reserved address space.
+- [x] **Q2 on wasm32** (§5): decided 2026-10-26 — the browser VM uses the
+  same model and simply holds more memory.
 - [x] **Q3 — yielding across an embedder host function** (§6.3): decided
   2026-10-26 — raise Lua's "attempt to yield across a C-call boundary"
   first; a continuation form of the C API maybe later.
-- [x] **Q4 — the async surface** (§7): decided 2026-10-26 — async with
-  syntactic sugar (`async function` / `await`).
-- [x] **Q2 on wasm32** (§5): decided 2026-10-26 — the browser VM uses the
-  same model and simply holds more memory.
+- [x] **Q4 — the async surface** (§7): decided 2026-10-26 — `async
+  function` / `await` syntax compiling to library calls.
 - [x] **Async start** (§7): decided 2026-10-26 — a task starts at the call;
   awaiting a finished task continues at once.
-- [x] **Q1 research round 1** (§4.1): Codex and Antigravity surveyed
-  single-model designs; reports in `docs/reviews/doc73/`.
-
-### Outstanding
-
-- [ ] **Q1 — direction** (§4, §4.1): Bart leans to a single model (option
-  4.4) with Lua's coroutines derived from it; the two reports differ on
-  where its delimiters live (§4.1).
 - [x] **Async error timing** (§7): decided 2026-10-26 — as in Lua's
   coroutines, an error surfaces from whatever was running the task's code.
 - [x] **Unobserved task errors** (§7): decided 2026-10-26 — fatal unless a
-  handler is registered.
-- [ ] **When a task error counts as unobserved** (§7): it needs a
-  deterministic point, so not when GC finds the task unreachable.
-- [ ] **P0 — the thread object and stack switch** (§5), `coroutine.create`,
-  `resume`, `yield`, `status`, `running`, `isyieldable`, `wrap`, `close`.
-- [ ] **P1 — GC, keyframes and replay** (§6.1, §6.2): suspended stacks are
-  roots with liveness masks; keyframes carry every coroutine; a step can stop
-  inside one.
+  handler is registered, judged when the scheduler goes idle.
+
+### Outstanding
+
+- [ ] **P0 — stacks, the switch, GC and keyframes** (§5, §6.1, §6.2): the
+  reserved-stack pool behind one wrapper; the execution context split out of
+  `Vm`; the tagged suspend; suspended stacks as GC roots with liveness
+  masks; open upvalues into a suspended stack keep it alive; keyframes carry
+  every coroutine. GC and keyframes are in the first slice, not later
+  (Codex, §4.1). Gate: a call-heavy A/B shows no regression.
+- [ ] **P1 — Lua's `coroutine` library** (§4.2): `create`, `resume`,
+  `yield`, `status` (incl. `"normal"`), `running`, `isyieldable`, `wrap`,
+  `close` (closes open upvalues), with Lua's messages; the host-boundary
+  error (§6.3); the doc 68 sites a yield must pass through.
 - [ ] **P2 — the JIT boundary** (§6.4): a switch ends a trace; traces inside a
   coroutine body run as usual.
 - [ ] **P3 — the visualiser** (§6.5): coroutines in the frame view.
-- [ ] **P4 — the async layer** (§7), if chosen.
+- [ ] **P4 — the async layer** (§7): `async function` / `await`, the
+  host-owned scheduler with logged choices, unobserved-error handling.
 - [ ] **P5 — docs and inventory**: the eight `coroutine` rows leave
   `excluded`; `docs/differences-from-lua.md`; doc 00's Non-goal and doc 02's
   "Host-mediated suspension" get a follow-up paragraph.
+- [ ] **Benchmarks** (Rule #20): switch ping-pong at depth 1/20/limit, 10k
+  live shallow coroutines (committed memory tracks touched pages), and
+  create/close churn (pool retention bounded).
 
 ## 1. Why this exists
 
@@ -161,6 +168,17 @@ coroutine whose handle is unreachable, so the stack must stay alive or be
 closed first; and GC and keyframes belong in the first slice, not a later
 phase.
 
+### 4.2 Decision (Bart, 2026-10-26)
+
+One internal mechanism, two public surfaces. Each coroutine and each task
+runs on its own reserved stack (§5) with a delimiter carrying a tag. A
+suspend names a tag and goes to the nearest enclosing delimiter that
+matches: `coroutine.yield` to its coroutine's private tag, `await` to the
+scheduler's. Lua code sees only the `coroutine` library and `async`/`await`;
+general effect handlers (`perform`/`handle`) are not exposed. Because they
+would be a surface over the same mechanism, exposing them later needs no
+change underneath.
+
 ## 5. The stack model (Q2)
 
 Today one VM owns one register file (`Vm.tags`/`Vm.payloads`, 64 Ki slots,
@@ -260,9 +278,9 @@ at the call, as `coroutine.wrap` re-raises it. After that the scheduler is
 running the task, so the error is stored in the task and raised at each
 `await` of it. A failed task that nothing awaits is a fatal error unless a
 handler for unobserved task errors is registered. When "nothing awaits"
-is judged still needs choosing: when the scheduler goes idle, at the end
-of a host tick, or when the VM stops. GC reachability is not an option:
-collection timing must not change program behaviour.
+is judged: decided the same day — when the scheduler goes idle (no task
+can run). GC reachability was never an option: collection timing must not
+change program behaviour.
 
 ## 8. Open questions for review
 
