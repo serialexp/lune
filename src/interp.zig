@@ -53,6 +53,7 @@ const stdload = @import("stdlib/load.zig");
 const stdpackage = @import("stdlib/package.zig");
 const stdio = @import("stdlib/io.zig");
 const stdos = @import("stdlib/os.zig");
+const stdcoroutine = @import("stdlib/coroutine.zig");
 const File = @import("file.zig").File;
 const unicode_case = @import("gen/unicode_case.zig");
 const Value = value.Value;
@@ -251,7 +252,8 @@ pub const mahina_version = "mahina 0.0.0";
 
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
     stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives ++
-    stddebug.natives ++ stdload.natives ++ stdpackage.natives ++ stdio.natives ++ stdos.natives;
+    stddebug.natives ++ stdload.natives ++ stdpackage.natives ++ stdio.natives ++ stdos.natives ++
+    stdcoroutine.natives;
 
 comptime {
     // `pure ⇒ !effect` (doc 17, H-4 / 9-A(i)). `pure` and `effect` are independent
@@ -486,6 +488,24 @@ pub fn protectSignal(e: anyerror) ?Protect {
     return null;
 }
 
+/// What a native that checked its arguments asks the `.call` it was called
+/// by to do in its place (`Vm.opEntry`): a protected call (doc 68 §5), or a
+/// coroutine switch (doc 73).
+const EntryKind = enum(u8) {
+    pcall,
+    xpcall,
+    co_resume,
+    co_yield,
+};
+
+fn entrySignal(e: anyerror) ?EntryKind {
+    if (e == error.ActivatePcall) return .pcall;
+    if (e == error.ActivateXpcall) return .xpcall;
+    if (e == error.ActivateResume) return .co_resume;
+    if (e == error.ActivateYield) return .co_yield;
+    return null;
+}
+
 
 
 comptime {
@@ -586,7 +606,11 @@ const ExecMode = enum { fast, full };
 /// `switch_mode`, the request to re-enter under the other `ExecMode` (recording
 /// just armed → need `.full`; or every hook cleared → drop to `.fast`). The
 /// `exec` wrapper consumes `switch_mode`; it never escapes to a real caller.
-const ExecStep = union(enum) { finished: FrameResult, suspended, switch_mode };
+const ExecStep = union(enum) { finished: FrameResult, suspended, switch_mode, yielded };
+
+/// Where a dispatch loop stopped (`execLoop`). `yielded`: the coroutine a
+/// Zig resume runs (`Vm.resumeSync`) yielded; no other entry sees it.
+const ExecStop = union(enum) { finished: FrameResult, suspended, yielded };
 
 /// Scratch for building one error message on the fault path: a bump allocator
 /// over a stack buffer, falling back to an arena over `gpa` past it (a deep
@@ -774,6 +798,9 @@ pub const Vm = struct {
     current: ?*coroutine.Thread = null,
     /// The main stack's state while a coroutine runs (`current != null`).
     main_saved: coroutine.SavedContext = undefined,
+    /// The main program as a `thread` value, made by the first
+    /// `coroutine.running()` there: it has no stack of its own.
+    main_thread: ?*coroutine.Thread = null,
     /// Shared register/call stack, **struct-of-arrays** (docs/design/09): the
     /// `Value.Tag` discriminant lane and the raw 8-byte `Value.payload.bits` lane,
     /// stored in parallel so the hot tier-0 arms address a 1-byte tag (scale-1)
@@ -1571,17 +1598,18 @@ pub const Vm = struct {
     /// slab write); shared by all three seeding twins so the check is
     /// byte-identical. False → decline the WHOLE candidate to tier-0 (the
     /// `upvalue_cell` grammar — the canonicalized slot read has nothing to
-    /// re-derive from, so no tier-1a downgrade exists). Single-slab
-    /// assumption: coroutines are excluded by design, so `loc.open` indices
-    /// are all coordinates of one slab; if multiple stacks ever appear this
-    /// comparison must gain slab identity.
+    /// re-derive from, so no tier-1a downgrade exists). Doc 73: an open
+    /// cell's index is a slot of its owner's stack, so the cell must belong
+    /// to the running one.
     fn upvalueSlotAliasOk(self: *const Vm, base: usize, seed: trace.InputSeed) bool {
         const cv = self.regGet(base + seed.callee_slot);
         if (!cv.isHeap() or cv.heapType() != .function) return false;
         const cl = function.Closure.fromHeader(cv.asHeap());
         if (seed.source >= cl.upvalues.len) return false;
-        return switch (cl.upvalues[seed.source].loc) {
-            .open => |idx| idx == base + seed.slot,
+        const cell = cl.upvalues[seed.source];
+        const running: ?*object.GcHeader = if (self.current) |t| &t.header else null;
+        return switch (cell.loc) {
+            .open => |idx| idx == base + seed.slot and cell.owner == running,
             .closed => false,
         };
     }
@@ -3184,8 +3212,14 @@ pub const Vm = struct {
     /// instruction can give; under `callValue` there is a Zig frame anyway,
     /// so the call is protected in Zig.
     inline fn nativeUnparkedFailed(self: *Vm, e: anyerror, args: []const Value, results_out: []Value) Error!usize {
-        const kind = protectSignal(e) orelse return narrowError(e);
-        return self.protectedCallSync(kind, args, results_out);
+        return switch (entrySignal(e) orelse return narrowError(e)) {
+            .pcall => self.protectedCallSync(.pcall, args, results_out),
+            .xpcall => self.protectedCallSync(.xpcall, args, results_out),
+            .co_resume => self.resumeSync(args, results_out),
+            // `yield` signals only where it can yield, and nothing called
+            // from Zig can (`native_reentry_depth` is raised).
+            .co_yield => unreachable,
+        };
     }
 
     /// `pcall(f, ...)`/`xpcall(f, h, ...)` (`args` as the natives get them)
@@ -3657,6 +3691,7 @@ pub const Vm = struct {
         // ones waiting on it. Stacks that aren't running are walked by
         // `collect` (`walkSavedStacks`).
         if (self.current) |t| cb(ctx, &t.header);
+        if (self.main_thread) |t| cb(ctx, &t.header);
         // Host-retained chunks (docs/design/03 §"Chunk-constant rooting"): keep a
         // compiled-but-not-yet-run chunk's interned constants alive across the
         // compile→run window.
@@ -3732,7 +3767,10 @@ pub const Vm = struct {
         // Doc 63 §5.6: every guest execution moves the epoch. `run`, `start`
         // and a resume reach the dispatch loop here, not via `execWithEntry`.
         self.heap.bumpHostEpoch();
-        const outcome = try self.execWith(1);
+        // A suspend never stops a coroutine (`canSuspendHere`), so a resume
+        // is on the main stack too.
+        std.debug.assert(self.current == null);
+        const outcome = try self.execWith(1, null);
         if (outcome == .finished and self.depth == 0 and root_base_ok) {
             const fr = outcome.finished;
             // Codex doc-21 B-6: an `all_results` return resolves its count from
@@ -3776,6 +3814,7 @@ pub const Vm = struct {
         self.heap.bumpHostEpoch();
         errdefer self.trace.clearPendingExitAnchor();
         errdefer self.trace.abortRaised(); // guarded no-op when idle (doc 26 D1a)
+        const entry_ctx = self.current;
         if (self.runFastPath()) {
             const frame = &self.frames[self.depth - 1];
             var st: ExecState = .{
@@ -3790,6 +3829,8 @@ pub const Vm = struct {
                 .stop_depth = stop_depth,
                 .step = undefined,
                 .err = null,
+                .entry_ctx = entry_ctx,
+                .entry_stop = stop_depth,
             };
             self.trace.setRegionContext(self.depth, frame.call_seq);
             switch (@call(.never_inline, chainEntry(.fast), .{ &st, 0, undefined, self, st.regs.tags, st.regs.payloads })) {
@@ -3805,17 +3846,32 @@ pub const Vm = struct {
                     return .suspended;
                 },
                 .switch_mode => {}, // mode flip parked `frame.pc`; general loop resumes
+                // Only `resumeSync`'s dispatch stops at a yield.
+                .yielded => unreachable,
                 // Doc 68 §5: a caught error resumes in the protected
                 // call's caller, in the general loop.
-                .err => if (!try self.catchProtected(st.err.?, stop_depth)) return st.err.?,
+                .err => if (!try self.catchExec(st.err.?, entry_ctx, stop_depth)) return st.err.?,
             }
         }
         // The nested errdefers in `execWith` re-run ours on an error edge;
         // both are idempotent (anchor clear, guarded abort).
-        return self.execWith(stop_depth);
+        return self.execWith(stop_depth, entry_ctx);
     }
 
-    fn execWith(self: *Vm, stop_depth: u32) Error!ExecOutcome {
+    /// `execLoop` for every entry but `resumeSync`, which alone sees a yield.
+    fn execWith(self: *Vm, stop_depth: u32, entry_ctx: ?*coroutine.Thread) Error!ExecOutcome {
+        return switch (try self.execLoop(stop_depth, entry_ctx)) {
+            .finished => |fr| .{ .finished = fr },
+            .suspended => .suspended,
+            .yielded => unreachable,
+        };
+    }
+
+    /// Run the dispatch entered in context `entry_ctx` (doc 73; the running
+    /// one when the entry was made) until the frame at `stop_depth` of that
+    /// context returns, a suspend stops it, or (`resumeSync`'s coroutine)
+    /// it yields.
+    fn execLoop(self: *Vm, stop_depth: u32, entry_ctx: ?*coroutine.Thread) Error!ExecStop {
         errdefer self.trace.clearPendingExitAnchor();
         // Doc 26 D1a: an error unwinding through the dispatch loop kills any
         // active recording — the raise is invisible to the recorded IR, so a
@@ -3826,13 +3882,15 @@ pub const Vm = struct {
         errdefer self.trace.abortRaised();
         while (true) {
             const attempt = if (self.runFastPath())
-                self.execImpl(.fast, stop_depth)
+                self.execImpl(.fast, stop_depth, entry_ctx)
             else
-                self.execImpl(.full, stop_depth);
+                self.execImpl(.full, stop_depth, entry_ctx);
             const step = attempt catch |e| {
                 // Doc 68 §5: caught by a protected frame of this
-                // dispatch; its caller resumes after the call.
-                if (try self.catchProtected(e, stop_depth)) continue;
+                // dispatch; its caller resumes after the call. Doc 73: or
+                // the coroutine it happened in dies, and its resumer
+                // resumes after the resume.
+                if (try self.catchExec(e, entry_ctx, stop_depth)) continue;
                 return e;
             };
             switch (step) {
@@ -3844,9 +3902,25 @@ pub const Vm = struct {
                     self.trace.clearPendingExitAnchor();
                     return .suspended;
                 },
+                .yielded => {
+                    self.trace.clearPendingExitAnchor();
+                    return .yielded;
+                },
                 .switch_mode => continue,
             }
         }
+    }
+
+    /// Catch error `e` raised in a dispatch entered in `entry_ctx` with stop
+    /// depth `stop_depth`. In the entry context that is `catchProtected`.
+    /// In a coroutine the dispatch resumed (doc 73), a protected frame of
+    /// the coroutine's catches it as anywhere else; with none, the
+    /// coroutine dies and its resume returns `false, err` in its resumer.
+    /// An error nothing may catch kills every coroutine between the running
+    /// one and the entry context, and propagates from the entry context.
+    fn catchExec(self: *Vm, e: Error, entry_ctx: ?*coroutine.Thread, stop_depth: u32) Error!bool {
+        if (self.current == entry_ctx) return self.catchProtected(e, stop_depth);
+        return self.catchInCoroutine(e, entry_ctx);
     }
 
     /// Doc 68 §5/§7.1: catch error `e`, unwinding out of a dispatch bounded
@@ -3940,6 +4014,257 @@ pub const Vm = struct {
         return true;
     }
 
+    // ------------------------------------------------------------------------
+    // Doc 73: coroutine switches. A coroutine resumed by an instruction runs
+    // in the resumer's dispatch (`enterResume`, `enterYield`,
+    // `opCoroutineReturn`, `catchInCoroutine`); one resumed from Zig runs in
+    // a dispatch of its own (`resumeSync`).
+    // ------------------------------------------------------------------------
+
+    /// `n` values on the running stack from slot `lo`.
+    const LaneSpan = struct {
+        vm: *const Vm,
+        lo: usize,
+        n: usize,
+
+        inline fn get(self: LaneSpan, i: usize) Value {
+            return self.vm.regGet(self.lo + i);
+        }
+    };
+
+    /// The `n` values of a Zig slice.
+    const SliceSpan = struct {
+        s: []const Value,
+        n: usize,
+
+        inline fn get(self: SliceSpan, i: usize) Value {
+            return self.s[i];
+        }
+    };
+
+    /// May the running coroutine yield? Not if a Zig frame was entered since
+    /// it was resumed (Lua's "attempt to yield across a C-call boundary").
+    pub fn canYield(self: *const Vm) bool {
+        const co = self.current orelse return false;
+        return self.native_reentry_depth == co.reentry_base;
+    }
+
+    /// Write a call's results into the stack of context `to`, which isn't
+    /// running: `head` if there is one, then `vals`, at slot `dst`, as a
+    /// call wanting `want` takes them (nil-padded, or all of them for
+    /// `all_results`). Returns how many it wrote, the span an `all_results`
+    /// call's `reg_top` covers. Writes nothing if they don't fit.
+    fn writeAcross(to: *const coroutine.SavedContext, dst: usize, want: u16, head: ?Value, vals: anytype) Error!usize {
+        const h: usize = @intFromBool(head != null);
+        const count: usize = if (want == bytecode.all_results) h + vals.n else want;
+        if (dst + count > to.tags.len) return Error.StackOverflow;
+        var k: usize = 0;
+        while (k < count) : (k += 1) {
+            const v = if (k < h) head.? else if (k - h < vals.n) vals.get(k - h) else Value.nil();
+            to.tags[dst + k] = @intFromEnum(v.tag);
+            to.payloads[dst + k] = v.payload.bits;
+        }
+        return count;
+    }
+
+    /// Hand the next instruction an `all_results` span ending at `top`.
+    inline fn setPendingTop(self: *Vm, top: usize) void {
+        std.debug.assert(!self.reg_top_pending);
+        self.reg_top = top;
+        self.reg_top_pending = true;
+    }
+
+    /// Make suspended coroutine `co` the running context, resumed by the
+    /// running one with `args`: its body's arguments the first time, else
+    /// the results of the yield it stopped at. Fails, with nothing changed,
+    /// when they don't fit its stack.
+    fn resumeInto(self: *Vm, co: *coroutine.Thread, args: anytype) Error!void {
+        std.debug.assert(co.status == .suspended and co.stack != null);
+        if (co.saved.depth == 0) {
+            const cl = Closure.fromHeader(co.body.asHeap());
+            if (args.n + cl.proto.num_registers > stack_slots) return Error.StackOverflow;
+            // Staged in the coroutine's own scratch, idle until it runs; no
+            // safepoint comes before the push roots them.
+            const staged = co.saved.boundary_scratch[0..args.n];
+            for (staged, 0..) |*s, i| s.* = args.get(i);
+            self.switchInto(co);
+            _ = self.bindAndPushClosure(cl, staged) catch unreachable; // fits, checked above
+        } else {
+            const n = try writeAcross(&co.saved, co.yield_lo, co.yield_c, null, args);
+            self.switchInto(co);
+            if (co.yield_c == bytecode.all_results) self.setPendingTop(co.yield_lo + n);
+        }
+    }
+
+    fn switchInto(self: *Vm, co: *coroutine.Thread) void {
+        const r = self.current;
+        if (r) |t| {
+            t.status = .normal;
+            t.reentry_at_resume = self.native_reentry_depth;
+        }
+        co.resumer = r;
+        co.status = .running;
+        co.reentry_base = self.native_reentry_depth;
+        coroutine.switchTo(self, co);
+    }
+
+    /// The running coroutine, resumed by an instruction, stops: at a yield
+    /// (`next` = `.suspended`), or for good (`.dead`: it returned or
+    /// failed). Its resumer, stopped at the resume, runs again, with the
+    /// call's results `head` and `vals` (on the coroutine's stack) written
+    /// as the call takes them. Fails, with nothing changed, when they don't
+    /// fit.
+    fn returnToResumer(self: *Vm, head: Value, vals: anytype, next: coroutine.Thread.Status) Error!void {
+        const co = self.current.?;
+        std.debug.assert(!co.sync);
+        const n = try writeAcross(coroutine.savedOf(self, co.resumer), co.ret_lo, co.ret_c, head, vals);
+        self.leaveRunning(next);
+        if (co.ret_c == bytecode.all_results) self.setPendingTop(co.ret_lo + n);
+    }
+
+    /// Switch from the running coroutine to its resumer, leaving it `next`:
+    /// `.suspended`, or `.dead`, which discards its frames (closing their
+    /// upvalues) and frees its stack.
+    fn leaveRunning(self: *Vm, next: coroutine.Thread.Status) void {
+        const co = self.current.?;
+        const r = co.resumer;
+        if (next == .dead) {
+            self.closeUpvaluesFrom(0);
+            self.dropRegionActivationsFromDepth(0);
+            self.depth = 0;
+            self.stack_top = 0;
+        }
+        co.status = next;
+        co.resumer = null;
+        co.sync = false;
+        coroutine.switchTo(self, r);
+        if (r) |t| t.status = .running;
+        if (next == .dead) co.releaseStack(self.gpa);
+    }
+
+    /// `catchExec` in a coroutine the dispatch resumed: its own protected
+    /// frames, above its body frame, come first; with none it dies, and its
+    /// resume returns `false, err`.
+    noinline fn catchInCoroutine(self: *Vm, e: Error, entry_ctx: ?*coroutine.Thread) Error!bool {
+        @branchHint(.cold);
+        const caught = self.catchProtected(e, 1) catch |e2| {
+            // An `xpcall` handler's own fault that nothing may catch.
+            self.leaveUntil(entry_ctx);
+            return e2;
+        };
+        if (caught) return true;
+        if (!catchable(e)) {
+            self.leaveUntil(entry_ctx);
+            return false;
+        }
+        // The value comes from the faulting frames, still live.
+        const errval = self.pending_error orelse self.synthErrorValue(e) catch |e2| {
+            self.leaveUntil(entry_ctx);
+            return e2;
+        };
+        self.pending_error = null;
+        self.reg_top_pending = false;
+        // What `catchProtected` does: the JIT forgets the raise.
+        self.trace.abortRaised();
+        self.trace.clearPendingExitAnchor();
+        self.current.?.death = errval;
+        const one = [1]Value{errval};
+        self.returnToResumer(Value.boolean(false), SliceSpan{ .s = &one, .n = 1 }, .dead) catch |e2| {
+            self.leaveUntil(entry_ctx);
+            return e2;
+        };
+        return true;
+    }
+
+    /// Kill the running coroutine and each resumer up to context `ctx`, for
+    /// an error that propagates out of the dispatch entered in `ctx`.
+    fn leaveUntil(self: *Vm, ctx: ?*coroutine.Thread) void {
+        self.pending_error = null;
+        self.reg_top_pending = false;
+        while (self.current != ctx) self.leaveRunning(.dead);
+    }
+
+    /// `coroutine.close` of suspended coroutine `co`: discard its frames,
+    /// closing their upvalues, and free its stack.
+    pub fn closeCoroutine(self: *Vm, co: *coroutine.Thread) void {
+        std.debug.assert(co.status == .suspended);
+        // A cell reads its slot through its lane pointers, wherever the
+        // stack is.
+        for (co.saved.open_upvalues.items) |ou| ou.cell.closeWith(ou.cell.get());
+        co.saved.open_upvalues.clearRetainingCapacity();
+        for (co.saved.frames[0..co.saved.depth]) |f| self.trace.dropRegionActivation(f.call_seq);
+        co.status = .dead;
+        co.releaseStack(self.gpa);
+    }
+
+    /// The main program's `thread` value, made the first time it is asked
+    /// for.
+    pub fn mainThread(self: *Vm) Error!*coroutine.Thread {
+        if (self.main_thread) |t| return t;
+        const t = try coroutine.newMainThread(self.heap);
+        self.main_thread = t;
+        return t;
+    }
+
+    /// Doc 73: `coroutine.resume(co, ...)` called from Zig
+    /// (`pcall(coroutine.resume, co)`, a native's callback) rather than by
+    /// an instruction. The coroutine runs in a dispatch of its own, on top
+    /// of this Zig frame, until it stops; then `out` gets `true` and what it
+    /// yielded or returned, or `false` and its error, as many as fit, and
+    /// this returns how many it wrote. `args` are resume's own, and `co`
+    /// (the first) is suspended.
+    pub fn resumeSync(self: *Vm, args: []const Value, out: []Value) Error!usize {
+        const co = coroutine.Thread.fromHeader(args[0].asHeap());
+        // The native being called (resume) names fault sites by depth,
+        // which means nothing on another stack.
+        const saved_native = self.unparked_native;
+        self.unparked_native = null;
+        defer self.unparked_native = saved_native;
+        try self.resumeInto(co, SliceSpan{ .s = args[1..], .n = args.len - 1 });
+        co.sync = true;
+        const stop = self.execLoop(1, co) catch |e| {
+            // No protected frame of the coroutine caught it (`execLoop`).
+            if (!catchable(e)) {
+                self.leaveUntil(co.resumer);
+                return e;
+            }
+            const errval = self.pending_error orelse self.synthErrorValue(e) catch |e2| {
+                self.leaveUntil(co.resumer);
+                return e2;
+            };
+            self.pending_error = null;
+            self.reg_top_pending = false;
+            co.death = errval;
+            self.leaveRunning(.dead);
+            const one = [1]Value{errval};
+            return writeOut(out, false, SliceSpan{ .s = &one, .n = 1 });
+        };
+        switch (stop) {
+            .finished => |fr| {
+                // The body frame is popped, its window still on the stack.
+                const n = writeOut(out, true, LaneSpan{ .vm = self, .lo = self.frames[0].base + fr.reg, .n = fr.count });
+                self.leaveRunning(.dead);
+                return n;
+            },
+            .yielded => {
+                const n = writeOut(out, true, LaneSpan{ .vm = self, .lo = co.xfer_lo, .n = co.xfer_n });
+                self.leaveRunning(.suspended);
+                return n;
+            },
+            // A suspend never stops a coroutine (`canSuspendHere`).
+            .suspended => unreachable,
+        }
+    }
+
+    /// `resumeSync`'s results: `ok`, then `vals`, as many as `out` holds.
+    fn writeOut(out: []Value, ok: bool, vals: anytype) usize {
+        if (out.len == 0) return 0;
+        out[0] = Value.boolean(ok);
+        const n = @min(vals.n, out.len - 1);
+        for (0..n) |i| out[1 + i] = vals.get(i);
+        return 1 + n;
+    }
+
     /// May the dispatch loop run with the off-by-default prologue hooks compiled
     /// out? Only when none is live: no pending suspend cut, no replay line
     /// recording, not mid-trace-recording, and no continuation recording pending
@@ -3995,11 +4320,12 @@ pub const Vm = struct {
     /// Whether a due suspend may stop at the current safepoint. Not while a
     /// native runs code through a Zig re-entry (doc 68 §8, defer: that Zig
     /// frame could not be resumed), nor while a multret result is pending
-    /// (`reg_top_pending`: its producer and consumer are one step). The
+    /// (`reg_top_pending`: its producer and consumer are one step), nor
+    /// while a coroutine runs (doc 73: a keyframe cannot hold one yet). The
     /// replay index records the same predicate per safepoint, so the steps
     /// it offers are exactly the ones a replay stops at.
     pub inline fn canSuspendHere(self: *const Vm) bool {
-        return self.native_reentry_depth == 0 and !self.reg_top_pending;
+        return self.native_reentry_depth == 0 and !self.reg_top_pending and self.current == null;
     }
 
     /// Arm (or, with null, disarm) the mid-execution suspend trigger.
@@ -4060,19 +4386,31 @@ pub const Vm = struct {
         /// `execWith`'s errdefers and every enclosing pcall byte-identical.
         /// Initialized `null` on EVERY entry.
         err: ?Error,
-        /// Doc 68 §5: which protected call `opProtectedEntry` makes, set by
+        /// What `opEntry` does in place of the native call, set by
         /// `nativeFailed` just before it tail-calls it. One entry handler
         /// with the kind here, rather than one per kind, keeps the native
         /// call's error edge to a single tail call (two cost every native
         /// call ~4 instructions in its register allocation).
-        entry_protect: Protect = undefined,
+        entry: EntryKind = undefined,
+        /// Doc 73: the context this dispatch was entered in (`Vm.current`
+        /// then, null for the main stack) and its stop depth. A coroutine it
+        /// resumes runs with `stop_depth` 1, its body frame; `stopFor` gives
+        /// the running context's.
+        entry_ctx: ?*coroutine.Thread,
+        entry_stop: u32,
     };
+
+    /// The stop depth of the context running now, in a dispatch entered in
+    /// `entry_ctx` with stop depth `entry_stop`.
+    inline fn stopFor(vm: *const Vm, entry_ctx: ?*coroutine.Thread, entry_stop: u32) u32 {
+        return if (vm.current == entry_ctx) entry_stop else 1;
+    }
 
     /// Doc 42 §4.1: register-sized handler return. A handler that continues
     /// execution never returns — it tail-jumps to the next dispatch; only exit
     /// events return, and they return through the whole musttail chain in one
     /// `ret` to `execImpl`.
-    const HandlerResult = enum(u8) { finished, suspended, switch_mode, err };
+    const HandlerResult = enum(u8) { finished, suspended, switch_mode, err, yielded };
 
     /// The uniform musttail signature. Every handler, the dispatch helper, and
     /// the back-edge trampoline share it EXACTLY, so every hop in the chain is
@@ -4221,6 +4559,8 @@ pub const Vm = struct {
         t[@intFromEnum(bytecode.OpCode.itern)] = opIternCall(mode);
         t[@intFromEnum(bytecode.OpCode.set_index)] = opSetIndexAppend(mode);
         t[@intFromEnum(bytecode.OpCode.new_table)] = opNewTableSized(mode);
+        t[@intFromEnum(bytecode.OpCode.ret)] = opCoroutineReturn(mode);
+        t[@intFromEnum(bytecode.OpCode.halt)] = opCoroutineReturn(mode);
         return t;
     }
 
@@ -6859,7 +7199,7 @@ pub const Vm = struct {
     /// `@call(.always_tail)` through `dispatchTail`. Mode switches and
     /// suspension keep their old shape — the chain returns, this state dies,
     /// and the next invocation reloads from `CallFrame`.
-    fn execImpl(self: *Vm, comptime mode: ExecMode, stop_depth: u32) Error!ExecStep {
+    fn execImpl(self: *Vm, comptime mode: ExecMode, stop_depth: u32, entry_ctx: ?*coroutine.Thread) Error!ExecStep {
         const frame = &self.frames[self.depth - 1];
         const proto = frame.closure.proto;
         var st: ExecState = .{
@@ -6871,15 +7211,18 @@ pub const Vm = struct {
             .code_gen = self.trace.registry.entry_registry.image_gen,
             .base = frame.base,
             .regs = self.frameWindow(frame.base, proto.num_registers),
-            .stop_depth = stop_depth,
+            .stop_depth = stopFor(self, entry_ctx, stop_depth),
             .step = undefined,
             .err = null,
+            .entry_ctx = entry_ctx,
+            .entry_stop = stop_depth,
         };
         self.trace.setRegionContext(self.depth, frame.call_seq);
         switch (@call(.never_inline, chainEntry(mode), .{ &st, frame.pc, undefined, self, st.regs.tags, st.regs.payloads })) {
             .finished => return st.step,
             .suspended => return .suspended,
             .switch_mode => return .switch_mode,
+            .yielded => return .yielded,
             .err => return st.err.?,
         }
     }
@@ -9034,52 +9377,137 @@ pub const Vm = struct {
         return dispatchTailFrom(mode, st, 0, &code[0], vm, regs.tags, regs.payloads);
     }
 
-    /// A native callee's error edge in `callTail`. `pcall`/`xpcall` of a
-    /// Lua function checked their arguments and signal (`protectSignal`):
-    /// the call becomes a protected entry (`opProtectedEntry`). Any other
-    /// error parks as before.
+    /// A native callee's error edge in `callTail`. A native that checked
+    /// its arguments and signals an entry (`entrySignal`: `pcall`/`xpcall`
+    /// of a Lua function, `coroutine.resume`/`yield`) has `opEntry` do it
+    /// in its place. Any other error parks as before.
     inline fn nativeFailed(comptime mode: ExecMode, comptime of: bytecode.OpCode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64, e: anyerror, entry_top: usize) HandlerResult {
-        const kind = protectSignal(e) orelse return parkErr(st, narrowError(e));
+        const kind = entrySignal(e) orelse return parkErr(st, narrowError(e));
         // The native returned without running anything: undo its call's
         // bookkeeping.
         st.frame.in_flight = false;
         vm.stack_top = entry_top;
-        st.entry_protect = kind;
-        return @call(.always_tail, opProtectedEntry(mode, of), .{ st, pc, instr, vm, tags, payloads });
+        st.entry = kind;
+        return @call(.always_tail, opEntry(mode, of), .{ st, pc, instr, vm, tags, payloads });
     }
 
-    /// Doc 68 §5, LuaJIT's `FRAME_PCALL`: `pcall`/`xpcall` call `instr`
-    /// (a `callTail` opcode) made becomes a call of the Lua function after
-    /// it, in a frame tagged `ctl.protect`, and `pcall` gets no frame. The
-    /// arguments already sit after the function, so nothing moves. The
-    /// call's first result, `true`, goes into `pcall`'s own (dead) slot, and
-    /// the frame's results land just above it through the ordinary return
-    /// wiring. `xpcall`'s handler moves into that first result slot, where
-    /// a catch reads it. Out of line, so the call handlers carry only the
-    /// signal test.
-    fn opProtectedEntry(comptime mode: ExecMode, comptime of: bytecode.OpCode) *const HandlerFn {
+    /// What a native that signalled an entry (`nativeFailed`) asked the
+    /// call `instr` (a `callTail` opcode) to do. Out of line, so the call
+    /// handlers carry only the signal test.
+    ///
+    /// `pcall`/`xpcall` (doc 68 §5, LuaJIT's `FRAME_PCALL`): the call
+    /// becomes a call of the Lua function after it, in a frame tagged
+    /// `ctl.protect`, and `pcall` gets no frame. The arguments already sit
+    /// after the function, so nothing moves. The call's first result,
+    /// `true`, goes into `pcall`'s own (dead) slot, and the frame's results
+    /// land just above it through the ordinary return wiring. `xpcall`'s
+    /// handler moves into that first result slot, where a catch reads it.
+    ///
+    /// `coroutine.resume`/`yield` (doc 73): a switch to another stack
+    /// (`enterResume`, `enterYield`).
+    fn opEntry(comptime mode: ExecMode, comptime of: bytecode.OpCode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 _ = tags;
                 _ = payloads;
-                if (st.entry_protect == .xpcall) return enter(.xpcall, st, pc, instr, vm);
-                return enter(.pcall, st, pc, instr, vm);
+                return switch (st.entry) {
+                    .pcall => enter(.pcall, st, pc, instr, vm),
+                    .xpcall => enter(.xpcall, st, pc, instr, vm),
+                    .co_resume => enterResume(mode, of, st, pc, instr, vm),
+                    .co_yield => enterYield(mode, of, st, pc, instr, vm),
+                };
             }
 
             inline fn enter(comptime kind: Protect, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
                 const a: usize = callA(of, instr);
-                const base = st.base;
-                // `callTail`'s argument count again: only the native's
-                // argument check ran since, which moves no `reg_top`.
-                const nargs: usize = if (callB(of, instr) == bytecode.all_results)
-                    vm.reg_top - (base + a + 1)
-                else
-                    callB(of, instr);
                 const shift = comptime kind.shift();
-                const cl = Closure.fromHeader(vm.regGet(base + a + 1).asHeap());
-                return enterCallee(mode, of, shift, st, pc, instr, vm, base, a, cl, nargs - shift);
+                const cl = Closure.fromHeader(vm.regGet(st.base + a + 1).asHeap());
+                return enterCallee(mode, of, shift, st, pc, instr, vm, st.base, a, cl, entryArgCount(of, st, instr, vm) - shift);
             }
         }.h;
+    }
+
+    /// `callTail`'s argument count for the call `instr` again, for
+    /// `opEntry`: only the native's argument check ran since, which moves
+    /// no `reg_top`.
+    inline fn entryArgCount(comptime of: bytecode.OpCode, st: *const ExecState, instr: *const Instr, vm: *const Vm) usize {
+        const b = callB(of, instr);
+        return if (b == bytecode.all_results) vm.reg_top - (st.base + callA(of, instr) + 1) else b;
+    }
+
+    /// Doc 73: `coroutine.resume(co, ...)`, made by `instr`. The resumer
+    /// stops at the call, out of flight with `pc` one past it, and `co`
+    /// runs on its own stack until it yields, returns or fails; then the
+    /// resumer continues with the call's results (`returnToResumer`).
+    inline fn enterResume(comptime mode: ExecMode, comptime of: bytecode.OpCode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
+        const self = vm;
+        const lo = st.base + callA(of, instr);
+        const co = coroutine.Thread.fromHeader(self.regGet(lo + 1).asHeap());
+        const resumer_frame = st.frame;
+        std.debug.assert(!resumer_frame.in_flight);
+        self.resumeInto(co, LaneSpan{ .vm = self, .lo = lo + 2, .n = entryArgCount(of, st, instr, vm) - 1 }) catch |e| return parkErr(st, e);
+        co.ret_lo = lo;
+        co.ret_c = instr.c;
+        co.sync = false;
+        resumer_frame.pc = pc;
+        // A coroutine is never the context a dispatch was entered in.
+        std.debug.assert(co != st.entry_ctx);
+        return enterContext(mode, st, vm);
+    }
+
+    /// Doc 73: `coroutine.yield(...)`, made by `instr` in the running
+    /// coroutine (`yield` checked it can). The coroutine stops at the
+    /// call, and its resumer continues with `true` and the values.
+    inline fn enterYield(comptime mode: ExecMode, comptime of: bytecode.OpCode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
+        const self = vm;
+        const co = self.current.?;
+        const lo = st.base + callA(of, instr);
+        const n = entryArgCount(of, st, instr, vm);
+        const frame = st.frame;
+        if (co == st.entry_ctx) {
+            // The dispatch was entered to run this coroutine, so a Zig
+            // resume (`resumeSync`) runs it: stop the dispatch, and it
+            // takes the values from here.
+            std.debug.assert(co.sync);
+            co.xfer_lo = lo + 1;
+            co.xfer_n = n;
+        } else {
+            self.returnToResumer(Value.boolean(true), LaneSpan{ .vm = self, .lo = lo + 1, .n = n }, .suspended) catch |e| return parkErr(st, e);
+        }
+        co.yield_lo = lo;
+        co.yield_c = instr.c;
+        frame.pc = pc;
+        if (co == st.entry_ctx) return .yielded;
+        return enterContext(mode, st, vm);
+    }
+
+    /// Doc 73: the running coroutine's body frame returned `n` values at
+    /// `lo` (`opRet`, which closed its upvalues): it is dead, and its
+    /// resumer continues with `true` and the values.
+    fn opCoroutineReturn(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                _ = pc;
+                _ = tags;
+                _ = payloads;
+                // `opRet`'s count again; it consumed a pending `reg_top`,
+                // which still holds the span's end.
+                const lo = st.base + instr.a;
+                const n: usize = if (instr.op == .ret and instr.b == bytecode.all_results) vm.reg_top - lo else if (instr.op == .ret) instr.b else 0;
+                vm.returnToResumer(Value.boolean(true), LaneSpan{ .vm = vm, .lo = lo, .n = n }, .dead) catch |e| return parkErr(st, e);
+                return enterContext(mode, st, vm);
+            }
+        }.h;
+    }
+
+    /// Dispatch the top frame of the context a switch just loaded, with its
+    /// stop depth, from its resume cursor.
+    inline fn enterContext(comptime mode: ExecMode, st: *ExecState, vm: *Vm) HandlerResult {
+        st.stop_depth = stopFor(vm, st.entry_ctx, st.entry_stop);
+        // A pending exit anchor names a pc of the stack left behind.
+        vm.trace.clearPendingExitAnchor();
+        reloadTopFrame(st);
+        return dispatchTail(mode, st, st.frame.pc, vm);
     }
 
     /// The generic native call (`callTail`'s native arm): argument scratch,
@@ -9328,11 +9756,10 @@ pub const Vm = struct {
     fn opRet(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
-                _ = pc;
                 // Frame pop ahead: lanes change under this handler, so it
-                // works through `st` and dispatches on the general path.
-                _ = tags;
-                _ = payloads;
+                // works through `st` and dispatches on the general path
+                // (`tags`/`payloads` only pass through to a coroutine's
+                // return).
                 const self = vm;
                 const a: usize = instr.a;
                 const base = st.base;
@@ -9348,6 +9775,11 @@ pub const Vm = struct {
                 } else if (instr.op == .ret) instr.b else 0;
                 const result: FrameResult = .{ .reg = @intCast(a), .count = ret_count };
                 if (self.depth == st.stop_depth) {
+                    // Doc 73: the body frame of a coroutine this dispatch
+                    // resumed. Through the cold table: inlined here, its
+                    // calls cost every return a spill.
+                    if (self.current != st.entry_ctx)
+                        return coldTail(mode, st, pc, instr, vm, tags, payloads);
                     // Pop the boundary frame. For the top level
                     // (stop_depth == 1) this nets `depth == 0` exactly as
                     // before; for a reentrant `callValue`
@@ -11266,6 +11698,7 @@ test {
     _ = @import("interp_replay_test.zig");
     _ = @import("interp_dispatch_test.zig");
     _ = @import("interp_gc_test.zig");
+    _ = @import("interp_coroutine_test.zig");
     _ = @import("interp_phaseq_test.zig");
     _ = @import("interp_trace_test.zig");
     _ = @import("interp_fastblock_test.zig");

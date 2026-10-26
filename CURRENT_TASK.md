@@ -7,32 +7,26 @@ DOC 73 COROUTINES: P0 IN PROGRESS (2026-10-26, coral-marten).
   stop_depth swapped per context so opRet's existing boundary test catches
   a coroutine's final return; cells need a stack identity; GC walks every
   reachable thread's stack; keyframes get thread records).
-- Landed: 4e37dfd (frames pointer), 9dbdc0b (src/coroutine.zig: Stack +
-  comptime-checked SavedContext save/load; main stack is a Stack).
-- Next, P0c (thread + switch), the plan:
-  1. ObjectType.thread; TypeName `thread`; io rendering "thread: 0x<id>";
-     gc newThread / blacken (body + queue the stack for the VM to walk) /
-     destroy (free Stack + open_upvalues list).
-  2. coroutine.Thread {header, stack: ?Stack, saved: SavedContext, status
-     suspended|running|normal|dead, resumer: ?*Thread (null = main), body,
-     resumer_stop_depth, resume result wiring (a, wanted)}. Vm.current:
-     ?*Thread, Vm.main_saved: SavedContext.
-  3. src/stdlib/coroutine.zig natives create/resume/yield/status/running/
-     isyieldable; resume/yield validate then return signals
-     error.ActivateResume/ActivateYield. Widen ExecState.entry_protect into
-     one entry-kind enum so nativeFailed keeps ONE tail call (its comment:
-     two tail calls cost every native call ~4 instructions).
-  4. The entry handler does the switch: save outgoing (resumer frame pc at
-     the call, ret wiring stored in the thread), load incoming, copy args /
-     yielded values across stacks, swap st.stop_depth (coroutine runs with
-     0, so its base return hits opRet's existing depth==stop_depth test;
-     the cold boundary path tells a coroutine base from a nested-exec stop).
-  5. Errors: the protect-frame search, on reaching a coroutine's base with
-     no protect frame, kills it and delivers (false, err) to the resumer.
-  6. Also: resume via callValue (pcall(coroutine.resume, co), natives that
-     re-enter); tail call of resume/yield (`return coroutine.yield(x)`);
-     recorder must treat the signals as barriers (check how ActivatePcall
-     is handled while recording).
+- Landed: 4e37dfd (frames pointer), 9dbdc0b (Stack + SavedContext),
+  62487c9 (thread object + GC walk), then the P0c switch + library commit
+  (resume/yield/status/running/isyieldable/close; create refuses native
+  bodies). Doc 73's checklist has the details and what remains.
+- How the switch works: natives return error.ActivateResume/ActivateYield;
+  nativeFailed maps them (entrySignal) to ExecState.entry and tail-calls
+  opEntry → enterResume/enterYield, which copy values across lanes
+  (writeAcross) and switchTo the other context. A coroutine's bottom return
+  reaches opCoroutineReturn through the cold table (inlining it into opRet
+  spilled `st`: fib +0.4%). A resume from Zig (callValue path) runs
+  Vm.resumeSync, a nested execLoop that ends at the coroutine's yield.
+  native_reentry_depth is global; Thread.reentry_base gates canYield.
+- A/B note: str_gsub +0.7% / os_date +0.4% are NOT switch cost — identical
+  machine code and allocation counts; table keys hash by GcHeader.id and the
+  library's 15 init objects shift every id (padding a script by a few
+  constants moves the baseline ±0.2–0.5%).
+- Next (P0 remainder): keyframe thread records (format 12 → 13; canSuspendHere
+  refuses while a coroutine runs until then), host suspension inside
+  coroutines, stack pool/decommit, GC weight, native bodies, the benchmarks
+  (ping-pong, 10k coroutines, churn).
 - `coroutine.wrap` needs a callable bound to its coroutine: that is the
   same open decision as gmatch's lone callable (TODO.md:70) — ask Bart
   before building wrap.

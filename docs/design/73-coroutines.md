@@ -1,7 +1,8 @@
 # 73 — Coroutines, and async on top of them — Design
 
-Status: designed, not yet implemented. Every open question decided
-2026-10-26 (Q1: §4.2).
+Status: partial — P0 switch and most of P1 landed (resume/yield on separate
+stacks, the library minus `wrap`); keyframes, JIT, viz and async outstanding.
+Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-26
 
@@ -35,26 +36,40 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **P0a — `Vm.frames` behind a pointer** (§5.1): 4e37dfd. t0 cost
   recursive-fib +1.23%, binary-trees/spectral-norm +0.6% instructions;
   accepted by Bart.
+- [x] **P0b — the main stack as a `coroutine.Stack`, `SavedContext`, the
+  `thread` object and the GC walk of suspended stacks** (§5.1): 9dbdc0b,
+  62487c9.
+- [x] **P0c — the switch** (§5.1, §6.3): `resume`/`yield` switch stacks in
+  the dispatch loop (`opEntry` → `enterResume`/`enterYield`, a coroutine's
+  bottom return through `opCoroutineReturn`); a resume from Zig
+  (`Vm.resumeSync`, e.g. inside a `sort` comparator) runs a nested loop;
+  errors kill the coroutine and return `false, err`; yielding across a Zig
+  frame raises Lua's message. A/B: ±0.9%, the outliers (str_gsub +0.7%)
+  reproduce from object-id shifts alone (identical code, identical
+  allocations).
+- [x] **P1 (most) — `coroutine.create`, `resume`, `yield`, `status` (incl.
+  `"normal"`), `running` (with a main-thread object), `isyieldable`,
+  `close`** with Lua's messages; `src/interp_coroutine_test.zig`.
 
 ### Outstanding
 
-- [ ] **P0 — stacks, the switch, GC and keyframes** (§5, §5.1, §6.1, §6.2): the
-  reserved-stack pool behind one wrapper; the execution context split out of
-  `Vm`; the tagged suspend; suspended stacks as GC roots with liveness
-  masks; open upvalues into a suspended stack keep it alive; keyframes carry
-  every coroutine. GC and keyframes are in the first slice, not later
-  (Codex, §4.1). Gate: a call-heavy A/B shows no regression.
-- [ ] **P1 — Lua's `coroutine` library** (§4.2): `create`, `resume`,
-  `yield`, `status` (incl. `"normal"`), `running`, `isyieldable`, `wrap`,
-  `close` (closes open upvalues), with Lua's messages; the host-boundary
-  error (§6.3); the doc 68 sites a yield must pass through.
+- [ ] **P0 remainder** (§5, §6.1, §6.2): keyframes carry every coroutine
+  (snapshot format 12 → 13; until then the keyframe writer rejects threads
+  and suspension is refused while a coroutine runs); host suspension inside
+  a coroutine; the reserved-stack pool with decommit behind one wrapper;
+  GC weight for a thread's stack; liveness masks for suspended frames.
+- [ ] **Native coroutine bodies**: `coroutine.create(print)` is refused
+  ("Lua function expected") until a Zig body can run on a coroutine stack.
+- [ ] **P1 remainder — `coroutine.wrap`** (§4.2): waits on Bart's decision
+  about a callable non-function value (the same question as gmatch's
+  iterator, TODO.md).
 - [ ] **P2 — the JIT boundary** (§6.4): a switch ends a trace; traces inside a
   coroutine body run as usual.
 - [ ] **P3 — the visualiser** (§6.5): coroutines in the frame view.
 - [ ] **P4 — the async layer** (§7): `async function` / `await`, the
   host-owned scheduler with logged choices, unobserved-error handling.
-- [ ] **P5 — docs and inventory**: the eight `coroutine` rows leave
-  `excluded`; `docs/differences-from-lua.md`; doc 00's Non-goal and doc 02's
+- [ ] **P5 — docs and inventory**: the inventory rows and
+  `docs/differences-from-lua.md` already track the library (P0c); doc 00's Non-goal and doc 02's
   "Host-mediated suspension" get a follow-up paragraph.
 - [ ] **Benchmarks** (Rule #20): switch ping-pong at depth 1/20/limit, 10k
   live shallow coroutines (committed memory tracks touched pages), and

@@ -65,6 +65,25 @@ pub const Thread = struct {
     resumer: ?*Thread = null,
     /// The error that killed it, kept for `coroutine.close`.
     death: ?Value = null,
+    /// While it runs or is `normal`: where its resume's results land in the
+    /// resumer's stack (the call's base slot) and how many the call wants.
+    ret_lo: usize = 0,
+    ret_c: u16 = 0,
+    /// While suspended at a yield: where the next resume's values land (the
+    /// yield call's base slot) and how many the call wants.
+    yield_lo: usize = 0,
+    yield_c: u16 = 0,
+    /// `Vm.native_reentry_depth` when it was last resumed. It can yield only
+    /// while no Zig frame has been entered since (`Vm.canYield`).
+    reentry_base: u16 = 0,
+    /// `Vm.native_reentry_depth` when it last resumed another coroutine, for
+    /// `coroutine.isyieldable` while it is `normal`.
+    reentry_at_resume: u16 = 0,
+    /// Resumed from Zig (`Vm.resumeSync`) rather than by an instruction.
+    /// Its yielded values wait at `xfer_lo` (`xfer_n` of them) for it.
+    sync: bool = false,
+    xfer_lo: usize = 0,
+    xfer_n: usize = 0,
 
     pub const Status = enum(u8) {
         /// Not started, or stopped at a yield.
@@ -112,6 +131,15 @@ pub fn newThread(heap: *gc.Heap, body: Value) std.mem.Allocator.Error!*Thread {
     return t;
 }
 
+/// The main program's `thread` value (`coroutine.running()`): no stack, its
+/// status follows whether a coroutine runs.
+pub fn newMainThread(heap: *gc.Heap) std.mem.Allocator.Error!*Thread {
+    const t = try heap.gpa.create(Thread);
+    t.* = .{ .header = GcHeader.init(.thread), .stack = null, .saved = undefined, .status = .running, .body = Value.nil() };
+    heap.linkThread(&t.header);
+    return t;
+}
+
 pub const thread_ops: gc.ThreadOps = .{ .blacken = blackenThread, .destroy = destroyThread };
 
 fn blackenThread(heap: *gc.Heap, h: *GcHeader) void {
@@ -134,6 +162,8 @@ fn destroyThread(gpa: std.mem.Allocator, h: *GcHeader) void {
 ///
 /// Not saved, because a switch only happens where they are idle (asserted in
 /// `assertSwitchable`): `reg_top_pending`, `pending_error`, `unparked_native`.
+/// `native_reentry_depth` counts Zig frames across every stack, since they
+/// all share the one Zig stack it bounds.
 pub const SavedContext = struct {
     tags: []u8,
     payloads: []u64,
@@ -145,7 +175,6 @@ pub const SavedContext = struct {
     open_upvalues: std.ArrayList(interp.OpenUpvalue) = .empty,
     open_upvalue_ceiling: usize = 0,
     final_cut: ?interp.FinalCut = null,
-    native_reentry_depth: u16 = 0,
 
     /// A fresh, empty context over `stack`.
     pub fn fresh(stack: Stack) SavedContext {
@@ -184,6 +213,22 @@ pub fn assertSwitchable(vm: *const Vm) void {
     std.debug.assert(vm.unparked_native == null);
 }
 
+/// Where context `t`'s state is kept while it isn't running (null = the main
+/// stack).
+pub fn savedOf(vm: *Vm, t: ?*Thread) *SavedContext {
+    return if (t) |x| &x.saved else &vm.main_saved;
+}
+
+/// Make context `to` (null = the main stack) the running one, keeping the
+/// running one's state.
+pub fn switchTo(vm: *Vm, to: ?*Thread) void {
+    assertSwitchable(vm);
+    std.debug.assert(to != vm.current);
+    save(vm, savedOf(vm, vm.current));
+    load(vm, savedOf(vm, to));
+    vm.current = to;
+}
+
 test "save then load restores every per-stack field" {
     const gpa = std.testing.allocator;
     var vm = try Vm.initBare(gpa);
@@ -192,7 +237,6 @@ test "save then load restores every per-stack field" {
     vm.stack_top = 40;
     vm.reg_top = 12;
     vm.open_upvalue_ceiling = 7;
-    vm.native_reentry_depth = 2;
     var main: SavedContext = undefined;
     save(&vm, &main);
 
@@ -209,6 +253,5 @@ test "save then load restores every per-stack field" {
     try std.testing.expectEqual(@as(usize, 40), vm.stack_top);
     try std.testing.expectEqual(@as(usize, 12), vm.reg_top);
     try std.testing.expectEqual(@as(usize, 7), vm.open_upvalue_ceiling);
-    try std.testing.expectEqual(@as(u16, 2), vm.native_reentry_depth);
     try std.testing.expectEqual(main.tags.ptr, vm.tags.ptr);
 }

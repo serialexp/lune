@@ -31,7 +31,7 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 /// `debug.traceback([message [, level]])` — return a string describing the
 /// current call stack, optionally prefixed by `message`.
 ///
-/// Lua-shaped (no leading `thread` argument — mahina exposes no coroutines), and
+/// Lua-shaped (no leading `thread` argument yet — it reports only the running stack), and
 /// mirroring Lua's `db_traceback` (which calls `lua_tostring`, so it **coerces a
 /// number** message):
 ///   * a string or number `message` is rendered (numbers via `coerceConcat`, the
