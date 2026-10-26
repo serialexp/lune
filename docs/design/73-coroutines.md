@@ -31,9 +31,12 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Q1 — direction** (§4, §4.1): Bart leans to a single model (option
   4.4) with Lua's coroutines derived from it; the two reports differ on
   where its delimiters live (§4.1).
-- [ ] **Async error timing** (§7): an error raised before the first
-  `await` — stored in the task (C#, JS) or raised at the call; and what an
-  error in a task nobody awaits does.
+- [x] **Async error timing** (§7): decided 2026-10-26 — as in Lua's
+  coroutines, an error surfaces from whatever was running the task's code.
+- [x] **Unobserved task errors** (§7): decided 2026-10-26 — fatal unless a
+  handler is registered.
+- [ ] **When a task error counts as unobserved** (§7): it needs a
+  deterministic point, so not when GC finds the task unreachable.
 - [ ] **P0 — the thread object and stack switch** (§5), `coroutine.create`,
   `resume`, `yield`, `status`, `running`, `isyieldable`, `wrap`, `close`.
 - [ ] **P1 — GC, keyframes and replay** (§6.1, §6.2): suspended stacks are
@@ -249,6 +252,17 @@ Kotlin's `async {}` do; Python coroutines and Rust futures wait to be
 awaited or polled). Awaiting a task that has already finished continues at
 once, with no switch (C#'s completed-task fast path; JavaScript instead
 always defers to a microtask).
+
+Errors, decided the same day, follow Lua's coroutines (an error comes out
+of the `resume` that ran the failing code). Before its first waiting
+`await` the task runs inside the async call, so an error there is raised
+at the call, as `coroutine.wrap` re-raises it. After that the scheduler is
+running the task, so the error is stored in the task and raised at each
+`await` of it. A failed task that nothing awaits is a fatal error unless a
+handler for unobserved task errors is registered. When "nothing awaits"
+is judged still needs choosing: when the scheduler goes idle, at the end
+of a host tick, or when the VM stops. GC reachability is not an option:
+collection timing must not change program behaviour.
 
 ## 8. Open questions for review
 
