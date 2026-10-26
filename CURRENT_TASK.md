@@ -29,8 +29,12 @@ DOC 73 COROUTINES: P0 IN PROGRESS (2026-10-26, coral-marten).
   Capture/restore load each saved stack into the VM, like walkSavedStacks.
   Gotcha for tests that re-arm a suspend: a stop precedes its instruction
   and resuming re-counts that safepoint, so re-arm at safepoint_seq + 2.
-- Next (P0 remainder): stack pool/decommit, GC weight, native bodies, the
-  benchmarks (ping-pong, 10k coroutines, churn); then wrap (ask Bart).
+- Stack pool landed (src/stack_mem.zig: one page-aligned block per stack,
+  Heap.stack_pool cap 16, trim/madvise after each sweep) with the co_*
+  benchmarks; numbers in doc 73. bench/run.py now reads every @bench line.
+- Next (P0 remainder): GC weight, native bodies; then wrap (ask Bart).
+  P2 lead: co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
+  t0 (yield made deep in recursion) — start with --jit-stats/--dump-aborts.
 - `coroutine.wrap` needs a callable bound to its coroutine: that is the
   same open decision as gmatch's lone callable (TODO.md:70) — ask Bart
   before building wrap.

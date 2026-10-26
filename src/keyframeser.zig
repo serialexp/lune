@@ -1043,7 +1043,7 @@ pub fn restoreSnapshot(
             .HeapThread => |ht| blk: {
                 try checkThreadShape(ht, kf.current_id != 0 and kf.current_id - 1 == o.id);
                 if (ht.kind == thread_kind_main and vm.main_thread != null) return error.InvalidThread;
-                const t = try coroutine.createRestored(gpa, ht.has_stack == 1);
+                const t = try coroutine.createRestored(vm.heap, ht.has_stack == 1);
                 vm.heap.linkRestoredThread(&t.header, o.id);
                 if (ht.kind == thread_kind_main) vm.main_thread = t;
                 break :blk &t.header;

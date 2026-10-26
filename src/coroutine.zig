@@ -14,15 +14,18 @@ const interp = @import("interp.zig");
 const value = @import("value.zig");
 const object = @import("object.zig");
 const gc = @import("gc.zig");
+const stack_mem = @import("stack_mem.zig");
 
 const Vm = interp.Vm;
 const CallFrame = interp.CallFrame;
 const Value = value.Value;
 const GcHeader = object.GcHeader;
 
-/// One stack's memory. Large enough allocations come from mmap on every
-/// real backing allocator, so pages commit only when touched.
+/// One stack's memory: a single block (`stack_mem`) holding the two register
+/// lanes, the scratch lane and the frame array, each region starting on a
+/// block-aligned offset.
 pub const Stack = struct {
+    block: stack_mem.Block,
     tags: []u8,
     payloads: []u64,
     /// `Vm.boundary_scratch` for this stack: absolute-indexed like the
@@ -31,22 +34,48 @@ pub const Stack = struct {
     boundary_scratch: []Value,
     frames: *[interp.max_call_depth]CallFrame,
 
+    const region_align = stack_mem.block_align.toByteUnits();
+    const scratch_at = 0;
+    const payloads_at = std.mem.alignForward(usize, scratch_at + interp.stack_slots * @sizeOf(Value), region_align);
+    const tags_at = std.mem.alignForward(usize, payloads_at + interp.stack_slots * @sizeOf(u64), region_align);
+    const frames_at = std.mem.alignForward(usize, tags_at + interp.stack_slots, region_align);
+    const block_size = std.mem.alignForward(usize, frames_at + @sizeOf([interp.max_call_depth]CallFrame), region_align);
+
+    comptime {
+        std.debug.assert(region_align >= @alignOf(Value) and region_align >= @alignOf(CallFrame));
+    }
+
+    /// A stack in a freshly allocated block.
     pub fn init(gpa: std.mem.Allocator) std.mem.Allocator.Error!Stack {
-        const tags = try gpa.alloc(u8, interp.stack_slots);
-        errdefer gpa.free(tags);
-        const payloads = try gpa.alloc(u64, interp.stack_slots);
-        errdefer gpa.free(payloads);
-        const boundary_scratch = try gpa.alloc(Value, interp.stack_slots);
-        errdefer gpa.free(boundary_scratch);
-        const frames = try gpa.create([interp.max_call_depth]CallFrame);
-        return .{ .tags = tags, .payloads = payloads, .boundary_scratch = boundary_scratch, .frames = frames };
+        return carve(try gpa.alignedAlloc(u8, stack_mem.block_align, block_size));
+    }
+
+    /// A coroutine's stack: a block from the heap's pool when it has one.
+    /// A pooled block holds what its last coroutine left; nothing reads a
+    /// slot or frame the new one hasn't written.
+    pub fn acquire(heap: *gc.Heap) std.mem.Allocator.Error!Stack {
+        if (heap.stack_pool.take()) |b| return carve(b);
+        return init(heap.gpa);
+    }
+
+    /// Give a coroutine's stack back to the heap's pool.
+    pub fn release(self: Stack, heap: *gc.Heap) void {
+        heap.stack_pool.put(heap.gpa, self.block);
     }
 
     pub fn deinit(self: Stack, gpa: std.mem.Allocator) void {
-        gpa.free(self.tags);
-        gpa.free(self.payloads);
-        gpa.free(self.boundary_scratch);
-        gpa.destroy(self.frames);
+        gpa.free(self.block);
+    }
+
+    fn carve(block: stack_mem.Block) Stack {
+        std.debug.assert(block.len == block_size);
+        return .{
+            .block = block,
+            .boundary_scratch = @as([*]Value, @ptrCast(@alignCast(block.ptr + scratch_at)))[0..interp.stack_slots],
+            .payloads = @as([*]u64, @ptrCast(@alignCast(block.ptr + payloads_at)))[0..interp.stack_slots],
+            .tags = block[tags_at..][0..interp.stack_slots],
+            .frames = @ptrCast(@alignCast(block.ptr + frames_at)),
+        };
     }
 };
 
@@ -94,27 +123,27 @@ pub const Thread = struct {
         dead,
     };
 
-    pub fn create(gpa: std.mem.Allocator, body: Value) std.mem.Allocator.Error!*Thread {
-        const stack = try Stack.init(gpa);
-        errdefer stack.deinit(gpa);
-        const self = try gpa.create(Thread);
+    pub fn create(heap: *gc.Heap, body: Value) std.mem.Allocator.Error!*Thread {
+        const self = try heap.gpa.create(Thread);
+        errdefer heap.gpa.destroy(self);
+        const stack = try Stack.acquire(heap);
         self.* = .{ .header = GcHeader.init(.thread), .stack = stack, .saved = SavedContext.fresh(stack), .body = body };
         return self;
     }
 
     /// Release the stack once the coroutine can't run again.
-    pub fn releaseStack(self: *Thread, gpa: std.mem.Allocator) void {
+    pub fn releaseStack(self: *Thread, heap: *gc.Heap) void {
         if (self.stack) |s| {
-            self.saved.open_upvalues.deinit(gpa);
+            self.saved.open_upvalues.deinit(heap.gpa);
             self.saved.open_upvalues = .empty;
-            s.deinit(gpa);
+            s.release(heap);
             self.stack = null;
         }
     }
 
-    pub fn destroy(self: *Thread, gpa: std.mem.Allocator) void {
-        self.releaseStack(gpa);
-        gpa.destroy(self);
+    pub fn destroy(self: *Thread, heap: *gc.Heap) void {
+        self.releaseStack(heap);
+        heap.gpa.destroy(self);
     }
 
     pub fn fromHeader(h: *GcHeader) *Thread {
@@ -126,7 +155,7 @@ pub const Thread = struct {
 
 /// Allocate a coroutine running `body` and register it with the heap.
 pub fn newThread(heap: *gc.Heap, body: Value) std.mem.Allocator.Error!*Thread {
-    const t = try Thread.create(heap.gpa, body);
+    const t = try Thread.create(heap, body);
     heap.linkThread(&t.header);
     return t;
 }
@@ -142,9 +171,9 @@ pub fn newMainThread(heap: *gc.Heap) std.mem.Allocator.Error!*Thread {
 
 /// A coroutine shell for keyframe restore (`keyframeser`): with a fresh
 /// stack when `has_stack`; the restorer fills in the rest.
-pub fn createRestored(gpa: std.mem.Allocator, has_stack: bool) std.mem.Allocator.Error!*Thread {
-    if (has_stack) return Thread.create(gpa, Value.nil());
-    const t = try gpa.create(Thread);
+pub fn createRestored(heap: *gc.Heap, has_stack: bool) std.mem.Allocator.Error!*Thread {
+    if (has_stack) return Thread.create(heap, Value.nil());
+    const t = try heap.gpa.create(Thread);
     t.* = .{ .header = GcHeader.init(.thread), .stack = null, .saved = undefined, .body = Value.nil() };
     return t;
 }
@@ -161,8 +190,8 @@ fn blackenThread(heap: *gc.Heap, h: *GcHeader) void {
     if (t.stack != null and t.status != .running) heap.threads_to_walk.appendAssumeCapacity(h);
 }
 
-fn destroyThread(gpa: std.mem.Allocator, h: *GcHeader) void {
-    Thread.fromHeader(h).destroy(gpa);
+fn destroyThread(heap: *gc.Heap, h: *GcHeader) void {
+    Thread.fromHeader(h).destroy(heap);
 }
 
 /// The `Vm` fields that belong to the running stack. Each field has the name

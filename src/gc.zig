@@ -41,6 +41,7 @@ const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
 const system = @import("system.zig");
 const File = @import("file.zig").File;
+const stack_mem = @import("stack_mem.zig");
 const GcHeader = object.GcHeader;
 const GcColor = object.GcColor;
 const String = string.String;
@@ -143,6 +144,8 @@ pub const Heap = struct {
     threads_to_walk: std.ArrayListUnmanaged(*GcHeader) = .empty,
     /// Live coroutine objects, recounted by every sweep.
     thread_count: usize = 0,
+    /// Stacks of dead coroutines, kept for the next ones (`stack_mem.Pool`).
+    stack_pool: stack_mem.Pool = .{},
     /// How the heap reaches coroutine objects, installed by the VM. The
     /// `Thread` type lives above the heap (it holds VM stack state), and the
     /// heap must not depend on the VM (`tools/check-jit-boundaries.py`).
@@ -189,11 +192,12 @@ pub const Heap = struct {
         var it = self.objects;
         while (it) |h| {
             const next = h.next;
-            destroyObject(self.gpa, self.thread_ops, h);
+            destroyObject(self, h);
             it = next;
         }
         self.objects = null;
         self.object_count = 0;
+        self.stack_pool.deinit(self.gpa); // after the threads put theirs back
         self.gray.deinit(self.gpa);
         self.threads_to_walk.deinit(self.gpa);
         if (self.strtab.len != 0) self.gpa.free(self.strtab);
@@ -816,7 +820,7 @@ pub const Heap = struct {
                 // Unreachable: unlink (leaving `slot` pointing at the successor)
                 // and free. Dead strings simply never re-enter the chains.
                 slot.* = h.next;
-                destroyObject(self.gpa, self.thread_ops, h);
+                destroyObject(self, h);
             } else {
                 // Survivor (reachable, or pinned): reset to white and advance.
                 h.color = .white;
@@ -836,6 +840,9 @@ pub const Heap = struct {
         self.thread_count = live_threads;
         self.setNextGc(@max(initial_gc_threshold, live * heap_growth));
         self.strtabMaybeShrink();
+        // Doc 73: stacks pooled since the last collection hand their pages
+        // back, so an idle pool holds no committed stack memory.
+        self.stack_pool.trim();
     }
 
     /// Optional post-sweep maintenance: halve the bucket array when live entries
@@ -859,11 +866,13 @@ pub const ThreadOps = struct {
     /// Mark the object's children; queue its stack on `threads_to_walk`
     /// when it isn't the running one.
     blacken: *const fn (heap: *Heap, h: *GcHeader) void,
-    destroy: *const fn (gpa: std.mem.Allocator, h: *GcHeader) void,
+    /// Free it; its stack goes back to `Heap.stack_pool`.
+    destroy: *const fn (heap: *Heap, h: *GcHeader) void,
 };
 
 /// Free one object according to its concrete type.
-fn destroyObject(gpa: std.mem.Allocator, thread_ops: ?*const ThreadOps, h: *GcHeader) void {
+fn destroyObject(heap: *Heap, h: *GcHeader) void {
+    const gpa = heap.gpa;
     switch (h.type) {
         .string => String.fromHeader(h).destroy(gpa),
         .table => Table.fromHeader(h).destroy(gpa),
@@ -871,7 +880,7 @@ fn destroyObject(gpa: std.mem.Allocator, thread_ops: ?*const ThreadOps, h: *GcHe
         .native => Native.fromHeader(h).destroy(gpa),
         .upvalue => Upvalue.fromHeader(h).destroy(gpa),
         .file => File.fromHeader(h).destroy(gpa),
-        .thread => thread_ops.?.destroy(gpa, h),
+        .thread => heap.thread_ops.?.destroy(heap, h),
         // typed_array (Phase 9b) and host (embedding) are not heap-allocated
         // here yet.
         else => @panic("gc: unknown object type during sweep"),

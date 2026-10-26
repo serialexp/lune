@@ -96,34 +96,34 @@ def discover(filter_sub, scale):
     for path in sorted(paths):
         with open(path, "r") as fh:
             text = fh.read()
-        m = META_RE.search(text)
-        if not m:
-            continue
-        kv = {}
-        for key, q, bare in KV_RE.findall(m.group(1)):
-            kv[key] = q if q != "" or bare == "" else bare
-        name = kv.get("name") or os.path.splitext(os.path.basename(path))[0]
-        if filter_sub and filter_sub not in name:
-            continue
-        argv = kv.get("args", "").split()
-        if scale != 1.0:
-            argv = scale_argv(argv, scale)
-        lj_src = kv.get("luajit_src")
-        if lj_src:
-            lj_src = os.path.normpath(os.path.join(os.path.dirname(path), lj_src))
-        luajit = kv.get("luajit", "skip")
-        # A `.mah` file is a mahina program by definition, so it cannot be a
-        # LuaJIT parity probe — stock Lua may not even parse it. Catching this
-        # here turns "someone renamed a parity benchmark to .mah" into a loud
-        # discovery-time failure instead of a mysterious cross-engine DIFF.
-        if path.endswith(".mah") and luajit == "compatible":
-            sys.exit(
-                f"{path}: a .mah benchmark cannot declare luajit=compatible.\n"
-                "  .lua = a Lua program (runs under lua/luajit and mahina)\n"
-                "  .mah = a mahina program (mahina only)\n"
-                "  Either rename it to .lua, or drop the parity claim."
-            )
-        benches.append(Bench(path, name, argv, luajit, lj_src))
+        # Every `@bench` line is its own entry, so one program can be measured
+        # at several argument sets (each needs a distinct `name=`).
+        for m in META_RE.finditer(text):
+            kv = {}
+            for key, q, bare in KV_RE.findall(m.group(1)):
+                kv[key] = q if q != "" or bare == "" else bare
+            name = kv.get("name") or os.path.splitext(os.path.basename(path))[0]
+            if filter_sub and filter_sub not in name:
+                continue
+            argv = kv.get("args", "").split()
+            if scale != 1.0:
+                argv = scale_argv(argv, scale)
+            lj_src = kv.get("luajit_src")
+            if lj_src:
+                lj_src = os.path.normpath(os.path.join(os.path.dirname(path), lj_src))
+            luajit = kv.get("luajit", "skip")
+            # A `.mah` file is a mahina program by definition, so it cannot be a
+            # LuaJIT parity probe — stock Lua may not even parse it. Catching this
+            # here turns "someone renamed a parity benchmark to .mah" into a loud
+            # discovery-time failure instead of a mysterious cross-engine DIFF.
+            if path.endswith(".mah") and luajit == "compatible":
+                sys.exit(
+                    f"{path}: a .mah benchmark cannot declare luajit=compatible.\n"
+                    "  .lua = a Lua program (runs under lua/luajit and mahina)\n"
+                    "  .mah = a mahina program (mahina only)\n"
+                    "  Either rename it to .lua, or drop the parity claim."
+                )
+            benches.append(Bench(path, name, argv, luajit, lj_src))
     return benches
 
 

@@ -2,6 +2,18 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Coroutine stacks: Windows decommit and the per-stack page floor (noted 2026-10-26)
+
+- [ ] `stack_mem.decommit` hands pooled blocks back on Linux and Darwin
+      only; Windows keeps a pooled block's touched pages until the pool
+      frees it (`VirtualAlloc(MEM_RESET)` or `DiscardVirtualMemory` would
+      be the equivalent, behind the same wrapper, Rule Z-2).
+- [ ] A live coroutine commits at least one page in each of its four
+      regions (scratch, payloads, tags, frames): ~16 KiB each, so
+      `co_many` (10k live) holds 164 MB where LuaJIT holds 7.6 MB.
+      Interleaving the regions' first pages, or making the regions
+      smaller per stack, would lower the floor (doc 73 §5.1).
+
 ## opCallFast is inlined into opCall (noted 2026-10-26)
 
 - [ ] Doc 70 put the fast bodies in their own handler "so its bodies stay

@@ -167,6 +167,7 @@ test {
     _ = host_system;
     _ = @import("file.zig");
     _ = @import("coroutine.zig");
+    _ = @import("stack_mem.zig");
     _ = datetime;
     _ = tzif;
     _ = relpath;

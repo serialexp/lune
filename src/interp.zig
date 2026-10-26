@@ -4150,7 +4150,7 @@ pub const Vm = struct {
         co.sync = false;
         coroutine.switchTo(self, r);
         if (r) |t| t.status = .running;
-        if (next == .dead) co.releaseStack(self.gpa);
+        if (next == .dead) co.releaseStack(self.heap);
     }
 
     /// `catchExec` in a coroutine the dispatch resumed: its own protected
@@ -4205,7 +4205,7 @@ pub const Vm = struct {
         co.saved.open_upvalues.clearRetainingCapacity();
         for (co.saved.frames[0..co.saved.depth]) |f| self.trace.dropRegionActivation(f.call_seq);
         co.status = .dead;
-        co.releaseStack(self.gpa);
+        co.releaseStack(self.heap);
     }
 
     /// The main program's `thread` value, made the first time it is asked

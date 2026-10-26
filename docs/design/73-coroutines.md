@@ -2,7 +2,7 @@
 
 Status: partial — P0 switch, keyframes and most of P1 landed (resume/yield
 on separate stacks, stops and keyframes inside coroutines, the library minus
-`wrap`); stack pool, JIT, viz and async outstanding.
+`wrap`, and the stack pool); JIT, viz and async outstanding.
 Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-26
@@ -64,27 +64,42 @@ land; move whole phases to Done once everything inside them is checked.
   (`current_id`) and carries the main stack as `main_context`, with the
   running and normal coroutines' resumer chain and wiring, validated on
   restore. Every-cut tests through nested coroutines.
+- [x] **The stack pool** (§5.1): one page-aligned block per stack (scratch,
+  payloads, tags, frames carved from it), a pool of at most 16 released
+  blocks in the heap (`stack_mem.Pool`, the OS call behind one wrapper,
+  Rule Z-2), and `trim` after every sweep handing the blocks pooled since
+  the last one back with `madvise(MADV_DONTNEED)` (Linux, Darwin; Windows
+  and wasm32 keep them, TODO.md). `co_churn` 341 → 7.9 ms (the mmap/munmap
+  and page faults per coroutine were ~47% kernel time), `co_many` 110 →
+  76 ms.
+- [x] **Benchmarks** (Rule #20): `bench/stdlib/co_pingpong.lua` (switch
+  throughput at depth 1/20/150, as `co_pingpong`, `_d20`, `_d150`; the
+  runner now reads every `@bench` line of a file), `co_many.lua` (10k live
+  shallow coroutines), `co_churn.lua` (create/run/drop churn). First board
+  (ReleaseFast, 5 reps, t0 / jit / LuaJIT ms): pingpong 18.0 / 19.4 / 7.2,
+  d20 95.7 / 302.7 / 17.0, d150 610.4 / 2193.7 / 75.4, many 76.4 / 76.2 /
+  3.0 at 164 MB (LuaJIT 7.6 MB: the floor of a page per region per live
+  stack, TODO.md), churn 7.9 / 7.9 / 6.3.
 
 ### Outstanding
 
-- [ ] **P0 remainder** (§5, §6.1): the reserved-stack pool with decommit behind one wrapper;
-  GC weight for a thread's stack; liveness masks for suspended frames.
+- [ ] **P0 remainder** (§5, §6.1): GC weight for a thread's stack; liveness
+  masks for suspended frames.
 - [ ] **Native coroutine bodies**: `coroutine.create(print)` is refused
   ("Lua function expected") until a Zig body can run on a coroutine stack.
 - [ ] **P1 remainder — `coroutine.wrap`** (§4.2): waits on Bart's decision
   about a callable non-function value (the same question as gmatch's
   iterator, TODO.md).
 - [ ] **P2 — the JIT boundary** (§6.4): a switch ends a trace; traces inside a
-  coroutine body run as usual.
+  coroutine body run as usual. Evidence from the first board: with the yield
+  made 20 or 150 calls deep, `--jit-native` is 3.2–3.6× slower than t0
+  (302.7 vs 95.7 ms, 2193.7 vs 610.4 ms) at ~41–46% residency.
 - [ ] **P3 — the visualiser** (§6.5): coroutines in the frame view.
 - [ ] **P4 — the async layer** (§7): `async function` / `await`, the
   host-owned scheduler with logged choices, unobserved-error handling.
 - [ ] **P5 — docs and inventory**: the inventory rows and
   `docs/differences-from-lua.md` already track the library (P0c); doc 00's Non-goal and doc 02's
   "Host-mediated suspension" get a follow-up paragraph.
-- [ ] **Benchmarks** (Rule #20): switch ping-pong at depth 1/20/limit, 10k
-  live shallow coroutines (committed memory tracks touched pages), and
-  create/close churn (pool retention bounded).
 
 ## 1. Why this exists
 
