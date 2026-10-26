@@ -120,7 +120,12 @@ pub const schema = @import("gen/trace_schema.zig");
 /// the running coroutine (1-based optional id), and `main_context`, the main
 /// stack while a coroutine runs; the running and normal coroutines carry
 /// their resumer and resume wiring.
-pub const snapshot_format_version: u32 = 14;
+///
+/// v15 (doc 73): `Keyframe.next_gc` became `gc_target`, the collection
+/// target in pacing units: coroutine stacks are charged against it, and the
+/// live-object threshold is derived from it and the restored stacks'
+/// charge (it can't be the other way round, the threshold saturates).
+pub const snapshot_format_version: u32 = 15;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -478,7 +483,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     //    and collection points are tier-identical, and only registers can be
     //    stale, so this set is too. Carrying the garbage is what lets a
     //    restored VM get the same intern hits and collect at the same points
-    //    (with `next_gc`) as the uninterrupted run.
+    //    (with `gc_target`) as the uninterrupted run.
     const all = try heapObjectsById(a, vm.heap);
     const objects = try a.alloc(schema.HeapObject, all.len);
     const live: ?system.HostSystem = if (vm.effect_mode == .replay) null else vm.system;
@@ -534,7 +539,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             .next_obj_id = vm.heap.next_obj_id,
             // Doc 61 Phase K: the collection threshold, so a restored VM
             // collects at the same allocation as the uninterrupted run.
-            .next_gc = vm.heap.next_gc,
+            .gc_target = vm.heap.gc_target,
             .objects = objects,
             .stack = running.stack,
             .frames = running.frames,
@@ -572,7 +577,9 @@ pub const RestoreError = error{
     UnresolvedHeapRef, // a HeapRef / root id has no matching object
     UnknownProto, // a HeapClosure.proto_id is not in the program's proto tree
     LoadedChunkRecompileFailed, // a recorded `load` source no longer parses/compiles (corrupt snapshot)
-    LoadedChunkRecompileAllocated, // recompiling loaded chunks allocated a heap object — a v8 snapshot must carry every loaded-proto literal (doc 19), so a moved counter means a forked allocation timeline (corrupt snapshot)
+    RootRecompileFailed, // the program source passed to restore doesn't parse/compile
+    ImageHasHeapConstants, // a borrowed `Program.image` holds a heap constant, which would live in another heap
+    RecompileAllocated, // recompiling the program or a loaded chunk allocated a heap object — a snapshot carries every program and loaded-proto literal (doc 19), so a moved counter means a forked allocation timeline (corrupt snapshot, or not this program's)
     UnknownNative, // a HeapNative.name is not in the native registry
     GlobalsNotATable, // globals_id resolves to a non-table object
     MetatableNotATable, // a HeapTable.metatable_id resolves to a non-table object
@@ -689,6 +696,47 @@ fn resolveProto(root: *const Proto, vm: *const Vm, id: u32) ?*const Proto {
     if (findProto(root, id)) |p| return p;
     for (vm.loaded_chunks.items) |lc| if (findProto(lc.chunk.proto, id)) |p| return p;
     return null;
+}
+
+/// The root program's proto tree in `vm`: a source recompiled into it
+/// (`Vm.root_chunk`), or a constant-free image borrowed as is.
+fn recompileRoot(vm: *Vm, program: Program) RestoreError!*const Proto {
+    const src = switch (program) {
+        .image => |p| {
+            if (hasHeapConstants(p)) return error.ImageHasHeapConstants;
+            return p;
+        },
+        .source => |s| s,
+    };
+    const owned = try vm.gpa.dupeSentinel(u8, src.text, 0);
+    var diags = diag.Diagnostics.init(vm.gpa);
+    defer diags.deinit();
+    var tree = parser.parse(vm.gpa, owned, &diags) catch |e| {
+        vm.gpa.free(owned);
+        return if (e == error.OutOfMemory) error.OutOfMemory else error.RootRecompileFailed;
+    };
+    defer tree.deinit();
+    if (diags.hasErrors()) {
+        vm.gpa.free(owned);
+        return error.RootRecompileFailed;
+    }
+    var chunk = compiler.compileWithOptions(vm.gpa, vm.heap, owned, tree.root, &diags, src.options) catch |e| {
+        vm.gpa.free(owned);
+        return if (e == error.OutOfMemory) error.OutOfMemory else error.RootRecompileFailed;
+    };
+    if (diags.hasErrors()) {
+        chunk.deinit();
+        vm.gpa.free(owned);
+        return error.RootRecompileFailed;
+    }
+    vm.adoptRootChunk(.{ .chunk = chunk, .source = owned });
+    return chunk.proto;
+}
+
+fn hasHeapConstants(p: *const Proto) bool {
+    for (p.constants) |c| if (c.isHeap()) return true;
+    for (p.protos) |child| if (hasHeapConstants(child)) return true;
+    return false;
 }
 
 /// Recompile every runtime-`load`ed chunk recorded in the keyframe (L-2), in load
@@ -904,27 +952,49 @@ fn restoreContext(vm: *Vm, ctx: schema.ThreadContext, idmap: *const IdMap, owner
     }
 }
 
+/// The program a keyframe was captured from.
+pub const Program = union(enum) {
+    /// As its host compiled it: the source and the options it passed the
+    /// compiler. Restore recompiles it into the restored heap, so its
+    /// literals are that heap's restored strings and nothing in the restored
+    /// VM points into the compiling VM's heap.
+    source: Source,
+    /// A prebuilt proto tree the restored VM borrows. Only one with no heap
+    /// constants (a hand-built structural test proto) is accepted, since a
+    /// borrowed literal would live in another heap.
+    image: *const Proto,
+
+    pub const Source = struct {
+        text: []const u8,
+        options: compiler.Options = .{},
+    };
+
+    pub fn of(text: []const u8) Program {
+        return .{ .source = .{ .text = text } };
+    }
+};
+
 /// Decode `bytes` and restore them into a fresh VM (see `restoreSnapshot`).
 pub fn restore(
     gpa: std.mem.Allocator,
     bytes: []const u8,
-    root: *const Proto,
+    program: Program,
     natives: NativeRegistry,
 ) RestoreError!*Vm {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit(); // decoded structs are consumed during restore (bytes copied)
     const snapshot = try schema.SnapshotFile.decode(arena.allocator(), bytes);
-    return restoreSnapshot(gpa, snapshot, root, natives);
+    return restoreSnapshot(gpa, snapshot, program, natives);
 }
 
-/// Rebuild a live VM from a decoded keyframe. `root` is the program's root
-/// prototype (resolves `HeapClosure.proto_id`); `natives` rebinds serialized
-/// natives by name. The returned VM is owned by the caller (`vm.deinit()` then
-/// `gpa.destroy(vm)`); on any error nothing is leaked.
+/// Rebuild a live VM from a decoded keyframe. `program` is recompiled into
+/// the VM (`Vm.root_chunk`) and resolves `HeapClosure.proto_id`; `natives`
+/// rebinds serialized natives by name. The returned VM is owned by the caller
+/// (`vm.deinit()` then `gpa.destroy(vm)`); on any error nothing is leaked.
 pub fn restoreSnapshot(
     gpa: std.mem.Allocator,
     snapshot: schema.SnapshotFile,
-    root: *const Proto,
+    program: Program,
     natives: NativeRegistry,
 ) RestoreError!*Vm {
     if (snapshot.version != snapshot_format_version) return error.UnsupportedVersion;
@@ -973,11 +1043,12 @@ pub fn restoreSnapshot(
     // `id >= next_obj_id` is impossible, so reject it as corrupt.
     if (kf.next_obj_id < max_id +| 1) return error.NextObjIdBelowObjects;
     vm.heap.adoptNextId(kf.next_obj_id);
-    // Doc 61 Phase K: the source's collection threshold. With every unswept
-    // object restored, `object_count` matches the source's too, so the next
-    // collection fires at the same allocation. (On a 32-bit host a threshold
-    // past usize can never be reached either way.)
-    vm.heap.setNextGc(std.math.cast(usize, kf.next_gc) orelse std.math.maxInt(usize));
+    // Doc 61 Phase K: the source's collection target. With every unswept
+    // object restored, `object_count` matches the source's too, and so does
+    // the stack charge once the coroutines below take their stacks (doc 73),
+    // so the next collection fires at the same allocation. (On a 32-bit host
+    // a target past usize can never be reached either way.)
+    vm.heap.setGcTarget(std.math.cast(usize, kf.gc_target) orelse std.math.maxInt(usize));
 
     // --- Pass 1a: create every object shell EXCEPT closures, stamped with its
     // original id. Strings are interned first so the recompile below reuses them
@@ -1068,19 +1139,24 @@ pub fn restoreSnapshot(
         idmap.putAssumeCapacityNoClobber(o.id, header);
     }
 
-    // Rebuild the runtime-`load`ed chunk image (L-2): recompile each recorded
-    // source so `resolveProto` can rebind a loaded `HeapClosure.proto_id` in pass
-    // 1b. Deterministic recompile reproduces the same protos/ids the live VM had;
-    // string literals resolve to the already-interned snapshot strings above.
+    // Rebuild the program image: the root program, then the runtime-`load`ed
+    // chunks (L-2), recompiled so `resolveProto` can rebind a `HeapClosure.
+    // proto_id` in pass 1b. Deterministic recompile reproduces the same
+    // protos/ids the live VM had; string literals resolve to the
+    // already-interned snapshot strings above.
+    const root = try recompileRoot(vm, program);
     try recompileLoadedChunks(vm, root, kf.loaded_chunks);
     // v8 integrity check (doc 19): the encoder carries every loaded proto's
-    // (pinned, so unswept) string constants, and Pass 1a interned every restored
-    // string (byte-keyed) before the recompile — so a valid v8 recompile resolves
-    // every literal to a restored object and allocates NOTHING. A moved counter
-    // means the snapshot is missing a loaded-proto literal: its allocation
-    // timeline is already forked from the source VM's, so reject rather than
-    // diverge silently.
-    if (vm.heap.next_obj_id != kf.next_obj_id) return error.LoadedChunkRecompileAllocated;
+    // (pinned, so unswept) string constants and, while the program runs, the
+    // program's (its frame 0 roots them), and Pass 1a interned every restored
+    // string (byte-keyed) before the recompile — so a valid recompile
+    // resolves every literal to a restored object and allocates NOTHING. A
+    // moved counter means the snapshot is missing a literal: a corrupt one,
+    // one whose program isn't `program`, or one captured after the program
+    // returned and a collection swept its own literals (TODO.md). Its
+    // allocation timeline is forked from the source VM's, so reject rather
+    // than diverge silently.
+    if (vm.heap.next_obj_id != kf.next_obj_id) return error.RecompileAllocated;
 
     // --- Pass 1b: create closure shells now that all protos (static + loaded)
     // exist. linkRestored stamps the original id (the counter was already advanced

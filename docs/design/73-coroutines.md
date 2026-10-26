@@ -2,7 +2,7 @@
 
 Status: partial — P0 switch, keyframes and most of P1 landed (resume/yield
 on separate stacks, stops and keyframes inside coroutines, the library minus
-`wrap`, and the stack pool); JIT, viz and async outstanding.
+`wrap`, the stack pool and its GC weight); JIT, viz and async outstanding.
 Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-26
@@ -81,10 +81,28 @@ land; move whole phases to Done once everything inside them is checked.
   3.0 at 164 MB (LuaJIT 7.6 MB: the floor of a page per region per live
   stack, TODO.md), churn 7.9 / 7.9 / 6.3.
 
+- [x] **GC weight for a thread's stack** (§5.1): a coroutine holding a
+  stack charges the heap `Stack.gc_units` pacing units (its committed floor
+  over `gc.nominal_object_bytes` = 256, a typical object's footprint),
+  refunded when the stack is released. The collector paces on
+  `gc_target`, and the threshold the JIT's budget guard reads is derived as
+  `next_gc = gc_target -| stack_debt`. Keyframes carry `gc_target`
+  (format 15). Before: 150k dropped suspended coroutines over 200k live
+  tables peaked at 1.7 GB (LuaJIT 39 MB); after, 105 MB at 1.35 s vs 1.00 s
+  (`bench/stdlib/co_garbage.lua`). Suite instruction counts ±0.01%, except
+  co_many +1.2% and co_churn +2.0% (earlier collections).
+- [x] **Restore recompiles the program** (doc 04 F2b follow-up): found
+  here. Resumed runs that collected diverged because the restored VM
+  borrowed the compile heap's literals.
+
 ### Outstanding
 
-- [ ] **P0 remainder** (§5, §6.1): GC weight for a thread's stack; liveness
-  masks for suspended frames.
+- [ ] **P0 remainder** (§5, §6.1): liveness masks for suspended frames
+  (check first: `walkSavedStack` already loads each stack and runs
+  `fillKeep`, so this may be done).
+- [ ] **Coroutine stacks' committed floor**: ~16 KiB per live coroutine
+  (a page per region) against LuaJIT's ~1 KiB; `co_many` 164 MB vs 7.4 MB,
+  and with it the GC weight below (TODO.md).
 - [ ] **Native coroutine bodies**: `coroutine.create(print)` is refused
   ("Lua function expected") until a Zig body can run on a coroutine stack.
 - [ ] **P1 remainder — `coroutine.wrap`** (§4.2): waits on Bart's decision

@@ -2,6 +2,19 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Restore rejects a keyframe whose program literals were swept (noted 2026-10-26)
+
+- [ ] Restore recompiles the root program (doc 04 F2b follow-up) and
+      rejects with `RecompileAllocated` when a literal isn't in the
+      snapshot. While the program runs its frame 0 roots every literal, but
+      after it returns a collection (a host `callValue`, `mh_collect`) can
+      sweep the literals only its top-level code used, and a keyframe taken
+      then can't be restored. Sound to accept: such a literal is read by no
+      live code (a closure over any proto in the tree marks that proto's
+      subtree), so the compiler could resolve a missing literal to a
+      placeholder in a restore-only mode, with restore checking that no
+      restored closure's proto subtree holds one.
+
 ## Coroutine stacks: Windows decommit and the per-stack page floor (noted 2026-10-26)
 
 - [ ] `stack_mem.decommit` hands pooled blocks back on Linux and Darwin
@@ -12,7 +25,9 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       regions (scratch, payloads, tags, frames): ~16 KiB each, so
       `co_many` (10k live) holds 164 MB where LuaJIT holds 7.6 MB.
       Interleaving the regions' first pages, or making the regions
-      smaller per stack, would lower the floor (doc 73 §5.1).
+      smaller per stack, would lower the floor (doc 73 §5.1). The GC
+      weight (`Stack.gc_units`) is that floor, so a lower floor also means
+      fewer collections in `co_garbage` (1.35 s vs LuaJIT 34 ms).
 
 ## opCallFast is inlined into opCall (noted 2026-10-26)
 

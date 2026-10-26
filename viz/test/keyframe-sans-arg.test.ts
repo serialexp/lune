@@ -50,7 +50,7 @@ class Kf {
         globals_id: globalsId,
         string_metatable_id: 0,
         next_obj_id: this.id,
-        next_gc: 1024n,
+        gc_target: 1024n,
         objects: this.objs,
         stack: [],
         frames: [],

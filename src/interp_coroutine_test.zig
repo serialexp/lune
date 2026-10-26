@@ -215,3 +215,26 @@ test "coroutine: abandoned coroutines are collected, a captured one is kept" {
         \\print(keep())
     , "150\n");
 }
+
+test "coroutine: dropped suspended coroutines bring the collection forward by their stacks" {
+    // 5000 live tables set the collection target near 10k objects. Each
+    // dropped coroutine is three objects, so by count alone all 2000 would
+    // stay uncollected with their stacks; charged its stack's weight
+    // (`Stack.gc_units`) each brings the next collection forward, so only
+    // the ones since the last collection are held at the end.
+    const gpa = std.testing.allocator;
+    var vm = try @import("interp.zig").Vm.init(gpa);
+    defer vm.deinit();
+    try util.compileRun(gpa, &vm,
+        \\live = {}
+        \\for i = 1, 5000 do live[i] = {} end
+        \\for i = 1, 2000 do
+        \\  local co = coroutine.create(function(x) coroutine.yield(x) end)
+        \\  coroutine.resume(co, i)
+        \\end
+    );
+    const units = @import("coroutine.zig").Stack.gc_units;
+    try std.testing.expect(units > 1);
+    try std.testing.expect(vm.heap.thread_count < 2000 / 4);
+    try std.testing.expectEqual(vm.heap.thread_count * units, vm.heap.stack_debt);
+}

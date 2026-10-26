@@ -71,8 +71,7 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
     var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
-    // The suspend VM owns the heap the program image's constants are interned
-    // into; it must outlive the restored VM that borrows `chunk.proto`.
+    // The restored VM recompiles `source` into its own heap (`Vm.root_chunk`).
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     var buf: [512]u8 = undefined;
@@ -102,7 +101,7 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
     errdefer gpa.free(mid);
 
     // (b) F2b property holds mid-execution.
-    const vm_r = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);
@@ -363,7 +362,7 @@ test "§R3: capture→restore→resume with tracing+opt+native — restored narr
     const mid = try encodeSnapshot(gpa, &vm);
     defer gpa.free(mid);
 
-    const vm_r = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);
@@ -445,13 +444,13 @@ test "§R3: failing-allocator restore during the array-part lane and grid rebuil
     defer gpa.free(snap);
 
     const Inner = struct {
-        fn run(fgpa: std.mem.Allocator, snap_: []const u8, proto: *const Proto) !void {
-            const vm_r = try restore(fgpa, snap_, proto, NativeRegistry.base());
+        fn run(fgpa: std.mem.Allocator, snap_: []const u8, program: keyframeser.Program) !void {
+            const vm_r = try restore(fgpa, snap_, program, NativeRegistry.base());
             vm_r.deinit();
             fgpa.destroy(vm_r);
         }
     };
-    try testing.checkAllAllocationFailures(gpa, Inner.run, .{ snap, chunk.proto });
+    try testing.checkAllAllocationFailures(gpa, Inner.run, .{ snap, keyframeser.Program.of(source) });
 }
 
 test "F2c: independent VMs suspended at the same cut produce byte-identical keyframes" {
@@ -550,7 +549,7 @@ test "A-iii: recursive live frames re-key deterministically across keyframe rest
 
     const mid = try encodeSnapshot(gpa, &vm);
     defer gpa.free(mid);
-    const restored = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    const restored = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         restored.deinit();
         gpa.destroy(restored);
@@ -568,7 +567,7 @@ test "A-iii: recursive live frames re-key deterministically across keyframe rest
     const rerecorded = try encodeSnapshot(gpa, restored);
     defer gpa.free(rerecorded);
     try testing.expectEqualSlices(u8, mid, rerecorded);
-    const restored_again = try restore(gpa, rerecorded, chunk.proto, NativeRegistry.base());
+    const restored_again = try restore(gpa, rerecorded, .of(source), NativeRegistry.base());
     defer {
         restored_again.deinit();
         gpa.destroy(restored_again);
@@ -608,7 +607,7 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue)
             .io_output_id = 0,
             .next_file_id = 3,
             .next_obj_id = 10,
-            .next_gc = 1024,
+            .gc_target = 1024,
             .objects = &.{
                 .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 0, .flags = 0, .rehash_threshold = 4, .grid = &.{} } } },
                 .{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
@@ -625,7 +624,7 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue)
             .main_context = &.{},
         },
     };
-    try expectRestoreError(bad, &rootp, error.FrameWindowMismatch);
+    try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);
 }
 
 test "doc 61 P1: an overlapping frame window is rejected (FrameWindowMismatch)" {
@@ -695,7 +694,7 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             .io_output_id = 0,
             .next_file_id = 3,
             .next_obj_id = 10,
-            .next_gc = 1024,
+            .gc_target = 1024,
             .objects = &.{
                 .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 0, .flags = 0, .rehash_threshold = 4, .grid = &.{} } } },
                 .{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
@@ -712,7 +711,7 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             .main_context = &.{},
         },
     };
-    try expectRestoreError(bad, &rootp, error.FrameWindowMismatch);
+    try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -880,7 +879,7 @@ test "doc 21 §T-A.3: result span preserved; dead slots tombstoned, their garbag
 
     // Restore re-derives the cut from the tombstones, so recapture is the
     // identity and the slots come back nil.
-    const vm_r = try restore(gpa, snap, chunk.proto, NativeRegistry.base());
+    const vm_r = try restore(gpa, snap, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);
@@ -934,7 +933,7 @@ test "doc 61 Phase K: a host call after a final cut leaves the source and a rest
 
     const snap = try encodeSnapshot(gpa, &vm);
     defer gpa.free(snap);
-    const vm_r = try restore(gpa, snap, chunk.proto, NativeRegistry.base());
+    const vm_r = try restore(gpa, snap, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);
@@ -1002,7 +1001,7 @@ test "doc 61 Phase K: restore rejects a tombstone in any slot the restored keep 
         stack[i] = keyframeser.dead_slot;
         var f = file;
         f.keyframe.stack = stack;
-        try expectRestoreError(f, chunk.proto, error.InvalidTombstones);
+        try expectRestoreError(f, .of(source), error.InvalidTombstones);
         stack[i] = orig;
         forged += 1;
     }

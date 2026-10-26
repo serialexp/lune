@@ -40,6 +40,11 @@ pub const Stack = struct {
     const tags_at = std.mem.alignForward(usize, payloads_at + interp.stack_slots * @sizeOf(u64), region_align);
     const frames_at = std.mem.alignForward(usize, tags_at + interp.stack_slots, region_align);
     const block_size = std.mem.alignForward(usize, frames_at + @sizeOf([interp.max_call_depth]CallFrame), region_align);
+    /// GC pacing units a coroutine's stack is charged while held (doc 73):
+    /// the memory even a shallow coroutine keeps committed, one page in
+    /// each of the four regions, so dropped suspended coroutines bring the
+    /// next collection forward. A deeper stack holds more than this.
+    pub const gc_units = stack_mem.committedFloor(block_size, 4) / gc.nominal_object_bytes;
 
     comptime {
         std.debug.assert(region_align >= @alignOf(Value) and region_align >= @alignOf(CallFrame));
@@ -54,12 +59,14 @@ pub const Stack = struct {
     /// A pooled block holds what its last coroutine left; nothing reads a
     /// slot or frame the new one hasn't written.
     pub fn acquire(heap: *gc.Heap) std.mem.Allocator.Error!Stack {
-        if (heap.stack_pool.take()) |b| return carve(b);
-        return init(heap.gpa);
+        const s = if (heap.stack_pool.take()) |b| carve(b) else try init(heap.gpa);
+        heap.chargeStack(gc_units);
+        return s;
     }
 
     /// Give a coroutine's stack back to the heap's pool.
     pub fn release(self: Stack, heap: *gc.Heap) void {
+        heap.refundStack(gc_units);
         heap.stack_pool.put(heap.gpa, self.block);
     }
 

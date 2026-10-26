@@ -55,9 +55,9 @@ pub const reg = keyframeser.stackValueOf;
 /// A register tombstone (doc 61 Phase K).
 pub const regDead = keyframeser.dead_slot;
 /// Restore the given file and assert it fails with exactly `want`.
-pub fn expectRestoreError(file: schema.SnapshotFile, root: *const Proto, want: RestoreError) !void {
+pub fn expectRestoreError(file: schema.SnapshotFile, program: keyframeser.Program, want: RestoreError) !void {
     const gpa = testing.allocator;
-    if (restoreSnapshot(gpa, file, root, NativeRegistry.base())) |vm| {
+    if (restoreSnapshot(gpa, file, program, NativeRegistry.base())) |vm| {
         vm.deinit();
         gpa.destroy(vm);
         return error.TestUnexpectedSuccess;

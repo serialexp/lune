@@ -54,11 +54,21 @@ const Proto = bytecode.Proto;
 
 /// The initial collection threshold (and the floor it never drops below): the
 /// collector first runs once the live-object count reaches this, and afterwards
-/// targets `max(this, live * heap_growth)`. Small enough that even short
+/// targets `max(this, (live + stack_debt) * heap_growth)` pacing units (an
+/// object is one, `nominal_object_bytes` of coroutine stack another). Small
+/// enough that even short
 /// programs exercise a cycle; the growth factor keeps long programs from
 /// collecting on every allocation.
 const initial_gc_threshold: usize = 1024;
 const heap_growth: usize = 2;
+
+/// Doc 73: the bytes of coroutine stack one pacing unit stands for, so a
+/// stack's charge (`Heap.chargeStack`) is its committed memory over this.
+/// Pacing counts objects, not bytes, so this is a typical object's real
+/// footprint (an empty table measures ~270 B with its allocations): then
+/// garbage stacks get the headroom garbage objects do, about the live
+/// heap's size, before they bring a collection forward.
+pub const nominal_object_bytes: usize = 256;
 
 /// Doc 30: the JIT pattern-match scratch — plain per-VM memory the match
 /// callouts (`smatch`/`sgmatch` in stralloc.zig) write and the projection ops
@@ -150,14 +160,27 @@ pub const Heap = struct {
     /// `Thread` type lives above the heap (it holds VM stack state), and the
     /// heap must not depend on the VM (`tools/check-jit-boundaries.py`).
     thread_ops: ?*const ThreadOps = null,
-    /// Live-count threshold at which the next collection triggers. Write it
-    /// through `setNextGc`, which keeps `gc_headroom` exact.
+    /// Live-count threshold at which the next collection triggers, derived
+    /// as `gc_target -| stack_debt` by `retarget` (which also keeps
+    /// `gc_headroom` exact); never written directly. The JIT's budget guard
+    /// reads it with `object_count`, so the stack charge lives here rather
+    /// than in the count.
     next_gc: usize = initial_gc_threshold,
+    /// The collection target in pacing units: one per object plus
+    /// `stack_debt`. Set by the sweep and by keyframe restore
+    /// (`setGcTarget`); a keyframe carries it, since `next_gc` alone loses
+    /// the debt once it saturates.
+    gc_target: usize = initial_gc_threshold,
+    /// Doc 73: pacing units charged for the coroutine stacks currently held
+    /// (`chargeStack`/`refundStack`), so garbage coroutines bring the next
+    /// collection forward by the memory their stacks pin, not by one object
+    /// each.
+    stack_debt: usize = 0,
     /// The dispatch prologue's GC gate, a countdown: a collection is due
     /// exactly when it is `<= 0`, which holds iff `gc_stress or object_count
     /// >= next_gc`. It is `next_gc - object_count` (`0` under stress),
-    /// re-derived at every write of `next_gc`/`gc_stress` (`setNextGc`,
-    /// `setGcStress`, the sweep) and decremented in step with `object_count`
+    /// re-derived at every write of `next_gc`/`gc_stress` (`retarget`,
+    /// `setGcStress`) and decremented in step with `object_count`
     /// in `link`, so the per-instruction safepoint test is one compare
     /// instead of the three-field predicate, and an allocation pays one
     /// decrement. Signed so a due-but-deferred heap (a pending multret, a
@@ -664,8 +687,25 @@ pub const Heap = struct {
         self.refreshHeadroom();
     }
 
-    pub fn setNextGc(self: *Heap, threshold: usize) void {
-        self.next_gc = threshold;
+    pub fn setGcTarget(self: *Heap, target: usize) void {
+        self.gc_target = target;
+        self.retarget();
+    }
+
+    /// Doc 73: a coroutine took a stack worth `units` (`coroutine.Stack`).
+    pub fn chargeStack(self: *Heap, units: usize) void {
+        self.stack_debt += units;
+        self.retarget();
+    }
+
+    /// Doc 73: a coroutine gave back a stack charged with `chargeStack`.
+    pub fn refundStack(self: *Heap, units: usize) void {
+        self.stack_debt -= units;
+        self.retarget();
+    }
+
+    fn retarget(self: *Heap) void {
+        self.next_gc = self.gc_target -| self.stack_debt;
         self.refreshHeadroom();
     }
 
@@ -838,7 +878,9 @@ pub const Heap = struct {
         self.strtab_count = live_str;
         self.object_count = live;
         self.thread_count = live_threads;
-        self.setNextGc(@max(initial_gc_threshold, live * heap_growth));
+        // The destroyed coroutines refunded their stacks above, so
+        // `stack_debt` is what the survivors hold.
+        self.setGcTarget(@max(initial_gc_threshold, (live +| self.stack_debt) *| heap_growth));
         self.strtabMaybeShrink();
         // Doc 73: stacks pooled since the last collection hand their pages
         // back, so an idle pool holds no committed stack memory.
@@ -1250,7 +1292,7 @@ test "shouldCollect honours the stress knob and the threshold" {
     heap.setGcStress(true);
     try testing.expect(heap.shouldCollect());
     heap.setGcStress(false);
-    heap.setNextGc(1);
+    heap.setGcTarget(1);
     _ = try heap.intern("x");
     try testing.expect(heap.shouldCollect()); // count (1) >= next_gc (1)
 }
@@ -1259,7 +1301,7 @@ test "the countdown gate tracks the trigger through allocation, deferral, stress
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
 
-    heap.setNextGc(heap.object_count + 2);
+    heap.setGcTarget(heap.object_count + 2);
     _ = try heap.intern("a");
     try testing.expect(!heap.shouldCollect());
     _ = try heap.intern("b");
@@ -1289,7 +1331,7 @@ test "the countdown gate tracks the trigger through allocation, deferral, stress
     heap.setGcStress(false);
     try testing.expect(!heap.shouldCollect());
     // A restored threshold past i64 saturates instead of wrapping.
-    heap.setNextGc(std.math.maxInt(usize));
+    heap.setGcTarget(std.math.maxInt(usize));
     try testing.expectEqual(@as(i64, std.math.maxInt(i64)), heap.gc_headroom);
     try testing.expect(!heap.shouldCollect());
 }

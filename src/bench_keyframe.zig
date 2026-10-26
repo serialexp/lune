@@ -104,7 +104,7 @@ fn scenario(gpa: std.mem.Allocator, s: Scenario) !void {
         const bytes = try keyframeser.encodeSnapshot(gpa, &vm);
         const t1 = now();
         defer gpa.free(bytes);
-        const vm_r = try keyframeser.restore(gpa, bytes, chunk.proto, keyframeser.NativeRegistry.base());
+        const vm_r = try keyframeser.restore(gpa, bytes, .of(s.source), keyframeser.NativeRegistry.base());
         const t2 = now();
         vm_r.deinit();
         gpa.destroy(vm_r);

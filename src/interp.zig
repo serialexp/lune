@@ -1057,6 +1057,10 @@ pub const Vm = struct {
     /// it was compiled from (the keyframe recompiles it on restore, L-2). Freed
     /// in `deinit` in append order.
     loaded_chunks: std.ArrayList(LoadedChunk) = .empty,
+    /// The root program a keyframe restore recompiled into this VM
+    /// (`keyframeser.restore`), owned like `loaded_chunks`; null in a VM the
+    /// host runs its own chunk in.
+    root_chunk: ?LoadedChunk = null,
     /// Next proto id to hand out. Seeded to the static chunk's proto count in
     /// `run`/`start` so every dynamically-`load`ed proto gets a globally-unique id
     /// across the static + dynamic trees — purely so snapshot serialization can
@@ -1213,6 +1217,14 @@ pub const Vm = struct {
     pub fn appendLoadedChunk(self: *Vm, lc: LoadedChunk) !void {
         try self.loaded_chunks.append(self.gpa, lc);
         rootProtoConsts(lc.chunk.proto, {}, pinHeader);
+    }
+
+    /// Take ownership of the root program a keyframe restore recompiled.
+    /// Its literals are not pinned: as in the VM it was captured from, the
+    /// closures over it keep them alive.
+    pub fn adoptRootChunk(self: *Vm, lc: LoadedChunk) void {
+        std.debug.assert(self.root_chunk == null);
+        self.root_chunk = lc;
     }
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
@@ -1439,6 +1451,10 @@ pub const Vm = struct {
             self.gpa.free(lc.source);
         }
         self.loaded_chunks.deinit(self.gpa);
+        if (self.root_chunk) |*rc| {
+            rc.chunk.deinit();
+            self.gpa.free(rc.source);
+        }
         // Borrows only — free the list, never the borrowed chunks (the host owns
         // those and must have released them before its own `Chunk.deinit`).
         self.retained_chunks.deinit(self.gpa);

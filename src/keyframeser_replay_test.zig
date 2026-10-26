@@ -148,7 +148,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
 
     // --- Restore + replay-from-cursor: rebuild the VM from the keyframe, then the
     // driver re-attaches the effect log and cursor (the seam the keyframe omits).
-    const vm_r = try restore(gpa, mid, chunk2.proto, NativeRegistry.base());
+    const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);
@@ -361,7 +361,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     const cut_effects = try effectser.encodeFile(gpa, &cut_vm.effect_log);
     defer gpa.free(cut_effects);
 
-    const resumed = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    const resumed = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         resumed.deinit();
         gpa.destroy(resumed);

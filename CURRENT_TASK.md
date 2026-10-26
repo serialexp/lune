@@ -32,7 +32,14 @@ DOC 73 COROUTINES: P0 IN PROGRESS (2026-10-26, coral-marten).
 - Stack pool landed (src/stack_mem.zig: one page-aligned block per stack,
   Heap.stack_pool cap 16, trim/madvise after each sweep) with the co_*
   benchmarks; numbers in doc 73. bench/run.py now reads every @bench line.
-- Next (P0 remainder): GC weight, native bodies; then wrap (ask Bart).
+- GC weight landed: Heap.stack_debt/gc_target, next_gc derived (the JIT
+  budget guard reads next_gc). It exposed a pre-existing restore bug (the
+  restored VM borrowed the compile heap's program literals; first GC swept
+  the twins) — restore now takes keyframeser.Program (.of(source)) and
+  recompiles the root (Vm.root_chunk). Bart was asked twice (weight design,
+  restore fix) and didn't answer within 15 min; defaults taken: fixed
+  charge per stack, recompile on restore. Both are easy to revisit.
+- Next (P0 remainder): native bodies; then wrap (ask Bart).
   P2 lead: co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
   t0 (yield made deep in recursion) — start with --jit-stats/--dump-aborts.
 - `coroutine.wrap` needs a callable bound to its coroutine: that is the

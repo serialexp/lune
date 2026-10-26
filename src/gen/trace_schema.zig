@@ -1324,7 +1324,7 @@ pub const Keyframe = struct {
     io_output_id: u32,
     next_file_id: u32,
     next_obj_id: u32,
-    next_gc: u64,
+    gc_target: u64,
     objects: []const HeapObject,
     stack: []const StackValue,
     frames: []const FrameRef,
@@ -1350,7 +1350,7 @@ pub const Keyframe = struct {
         try enc.writeUint32(self.io_output_id, .little_endian);
         try enc.writeUint32(self.next_file_id, .little_endian);
         try enc.writeUint32(self.next_obj_id, .little_endian);
-        try enc.writeUint64(self.next_gc, .little_endian);
+        try enc.writeUint64(self.gc_target, .little_endian);
         try enc.writeUint32(@intCast(self.objects.len), .little_endian);
         for (self.objects) |_item_0| {
             try _item_0.encodeInto(enc, ctx);
@@ -1392,7 +1392,7 @@ pub const Keyframe = struct {
         result.io_output_id = try dec.readUint32(.little_endian);
         result.next_file_id = try dec.readUint32(.little_endian);
         result.next_obj_id = try dec.readUint32(.little_endian);
-        result.next_gc = try dec.readUint64(.little_endian);
+        result.gc_target = try dec.readUint64(.little_endian);
         const _len_9 = try dec.readUint32(.little_endian);
         const _buf_10 = try allocator.alloc(HeapObject, @as(usize, _len_9));
         errdefer allocator.free(_buf_10);

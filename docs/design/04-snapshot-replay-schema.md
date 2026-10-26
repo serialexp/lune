@@ -1,8 +1,8 @@
 # mahina — Snapshot & Replay Schema
 
-Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v10** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part; v8 = doc 19 loaded-chunk constants in the `.snapshot` walk + zero-allocation recompile check; v9 = doc 21 canonical final-state capture — dead slots outside the top-level result span nil'd in walk + stack; v10 = doc 61 Phase K — every unswept object instead of the `.snapshot` walk, `next_gc`, `DeadSlot` register tombstones, and each table's physical array part and rehash trigger; `schema/trace.json` is the field-level source of truth); guard-snapshots outstanding
+Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v10** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part; v8 = doc 19 loaded-chunk constants in the `.snapshot` walk + zero-allocation recompile check; v9 = doc 21 canonical final-state capture — dead slots outside the top-level result span nil'd in walk + stack; v10 = doc 61 Phase K — every unswept object instead of the `.snapshot` walk, `next_gc`, `DeadSlot` register tombstones, and each table's physical array part and rehash trigger; v11–v15 since, listed in `keyframeser.zig`'s version notes — v15 = `gc_target`; `schema/trace.json` is the field-level source of truth); restore recompiles the program (F2b follow-up); guard-snapshots outstanding
 Owner: Bart
-Last updated: 2026-10-11
+Last updated: 2026-10-26
 
 Prerequisite for **Phase 5b** (trace serialization format) and **Phase 7** (the
 visualiser). This doc owns the *concrete wire format* — the binschema schema that
@@ -195,6 +195,23 @@ schema follows; this is that schema's home.
       refactor is behaviourally invisible. **Still outstanding for replay:** the
       effect log (F2d) — re-executing *past a nondeterministic input* needs the
       recorded effect fed back.
+
+      **Follow-up (2026-10-26, found through doc 73's GC weight): the borrowed
+      image was unsound, and restore no longer borrows it.** Id equality made
+      lookups hit, but nothing rooted the restored twins of the program's
+      literals: the restored VM's closures point at the compile heap's strings,
+      so its first collection swept the twins and its heap diverged from the
+      uninterrupted run's (a later re-intern would also mint a new id). No
+      resume test collected after the cut until coroutine stacks started
+      bringing collections forward. Restore now takes a `keyframeser.Program`
+      — the source and compiler options — and recompiles it into the restored
+      heap after the strings (`Vm.root_chunk`), exactly as loaded chunks
+      (L-2) already were, so the literals resolve to the restored strings
+      under the same zero-allocation check (`RecompileAllocated`). A
+      prebuilt `Program.image` is still accepted for hand-built structural
+      test protos, only when it holds no heap constant. One case is rejected
+      rather than restored: a keyframe captured after the program returned
+      and a collection swept its own literals (TODO.md).
 
 - [x] **Effect log (Phase 7 v2 / F2d) — the first nondeterministic input.** A
       native can now carry an `effect: ?EffectKind` (null = pure host call like

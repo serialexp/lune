@@ -119,7 +119,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
 
     // --- Restore + replay-from-cursor. `restore` rebuilds the VM fresh, so
     // `unicode_version_pinned` is false again — the derivation is what must hold.
-    const vm_r = try restore(gpa, mid, chunk2.proto, NativeRegistry.base());
+    const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);

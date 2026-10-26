@@ -348,7 +348,7 @@ test "io: a restored handle is detached until reopenFiles, which resumes at the 
     defer host2.deinit();
     try host2.put("log.txt", "one\ntwo\nthree\n");
 
-    const vm_r = try keyframeser.restore(gpa, snap, chunk.proto, keyframeser.NativeRegistry.base());
+    const vm_r = try keyframeser.restore(gpa, snap, .of(source), keyframeser.NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);

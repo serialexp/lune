@@ -32,6 +32,15 @@ pub fn decommit(block: Block) void {
     std.posix.madvise(block.ptr, block.len, std.posix.MADV.DONTNEED) catch {};
 }
 
+/// The least memory a live block of `len` bytes holds committed when each
+/// of its `regions` is touched at its start: a page per region where pages
+/// commit on touch, the whole block on wasm32, whose linear memory is
+/// committed when it grows.
+pub fn committedFloor(len: usize, regions: usize) usize {
+    if (builtin.cpu.arch.isWasm()) return len;
+    return @min(len, regions * std.heap.page_size_min);
+}
+
 /// Released blocks, kept for the next coroutine: a burst of short-lived
 /// coroutines reuses a few blocks instead of mapping and unmapping one each.
 /// At most `cap` are kept. Blocks released since the last `trim` keep the

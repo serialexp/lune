@@ -68,7 +68,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
             .io_output_id = 0,
             .next_file_id = 3,
             .next_obj_id = 8,
-            .next_gc = 1024,
+            .gc_target = 1024,
             .objects = &.{
                 .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a\x00b\xff\xfe" } } },
                 .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "" } } },

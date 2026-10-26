@@ -6713,7 +6713,7 @@ test "executor (tnew OOM, doc 45 D5): a one-shot allocation failure exits precis
     defer gpa.free(entry);
     const values = try gpa.alloc(Value, t.instrs.len);
     defer gpa.free(values);
-    vm.heap.setNextGc(1_000_000); // keep guard_gc out of the way
+    vm.heap.setGcTarget(1_000_000); // keep guard_gc out of the way
 
     // One-shot failing allocator over the heap's real gpa: the FIRST heap
     // allocation attempt (this iteration's `tnew`) fails.

@@ -76,7 +76,7 @@ fn expectRoundTrip(source: [:0]const u8) !void {
     const b0 = try encodeSnapshot(gpa, &vm);
     defer gpa.free(b0);
 
-    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
     defer {
         vm2.deinit();
         gpa.destroy(vm2);
@@ -265,7 +265,7 @@ test "doc 49 P2b: hash-part physical layout diverges across restore; snapshot ar
     const b0 = try encodeSnapshot(gpa, &vm);
     defer gpa.free(b0);
 
-    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
     defer {
         vm2.deinit();
         gpa.destroy(vm2);
@@ -301,7 +301,7 @@ test "doc 49 P2b: hash-part physical layout diverges across restore; snapshot ar
     // Determinism from the restored state: a second restore of the same bytes
     // lands every key at the same (slot, mask) as the first — layout is a
     // pure function of the restored insertion history.
-    const vm3 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    const vm3 = try restore(gpa, b0, .of(source), NativeRegistry.base());
     defer {
         vm3.deinit();
         gpa.destroy(vm3);
@@ -316,11 +316,11 @@ test "doc 49 P2b: hash-part physical layout diverges across restore; snapshot ar
     }
 }
 
-test "doc 62: a restored VM shares its protos' global slot hints with the original, and both read their own globals" {
-    // Restore runs the original chunk's protos, so both VMs' `rd`/`wr` use
-    // the same `Proto.global_slot_hints`. Their globals tables then diverge
-    // (growth, deletion), and calls alternate between the VMs, so each
-    // VM's first access sees a hint the other VM just moved.
+test "doc 62: a restored VM owns its protos, and it and the original read their own globals" {
+    // Restore recompiles the program into the restored VM, so the two VMs'
+    // `rd`/`wr` run different protos with their own
+    // `Proto.global_slot_hints`. Their globals tables then diverge (growth,
+    // deletion) while calls alternate between the VMs.
     const gpa = testing.allocator;
     const source =
         \\x = 1
@@ -342,11 +342,12 @@ test "doc 62: a restored VM shares its protos' global slot hints with the origin
 
     const b0 = try encodeSnapshot(gpa, &vm);
     defer gpa.free(b0);
-    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
     defer {
         vm2.deinit();
         gpa.destroy(vm2);
     }
+    try testing.expect(vm2.root_chunk.?.chunk.proto != chunk.proto);
 
     const Side = struct {
         fn call(v: *Vm, name: []const u8, args: []const Value) !Value {
@@ -411,7 +412,7 @@ test "restore reanimates a live load closure that runs with the same result (L-2
     const b0 = try encodeSnapshot(gpa, &vm);
     defer gpa.free(b0);
 
-    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
     defer {
         vm2.deinit();
         gpa.destroy(vm2);
@@ -465,7 +466,7 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     var max_id: u32 = 0;
     for (decoded.keyframe.objects) |o| max_id = @max(max_id, o.id);
 
-    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
     defer {
         vm2.deinit();
         gpa.destroy(vm2);
@@ -552,7 +553,7 @@ test "H-2: next_obj_id survives pre-cut garbage (restored verbatim, not reconstr
 
     // Restore reproduces the counter VERBATIM (a `max_id + 1` reconstruction would
     // land BELOW this), and the whole snapshot round-trips byte-identical.
-    const vm2 = try restore(gpa, sf, chunk.proto, NativeRegistry.base());
+    const vm2 = try restore(gpa, sf, .of(source), NativeRegistry.base());
     defer {
         vm2.deinit();
         gpa.destroy(vm2);
@@ -612,7 +613,7 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle in any
     // chunks against the restored heap (interning reuses the reconstructed same-id
     // strings) and re-retain them. SAME order → byte-identical re-encode.
     {
-        const vm2 = try restore(gpa, b0, cm.proto, NativeRegistry.base());
+        const vm2 = try restore(gpa, b0, .of(main_src), NativeRegistry.base());
         defer {
             vm2.deinit();
             gpa.destroy(vm2);
@@ -639,7 +640,7 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle in any
     // carries every unswept object in id order (doc 61 Phase K), so the retain
     // order no longer shows (it used to set the walk's discovery order).
     {
-        const vm3 = try restore(gpa, b0, cm.proto, NativeRegistry.base());
+        const vm3 = try restore(gpa, b0, .of(main_src), NativeRegistry.base());
         defer {
             vm3.deinit();
             gpa.destroy(vm3);
@@ -763,7 +764,7 @@ test "restore reanimates the package/require module system (searchers rebind, ca
     const b0 = try encodeSnapshot(gpa, &vm);
     defer gpa.free(b0);
 
-    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
     defer {
         vm2.deinit();
         gpa.destroy(vm2);
@@ -804,7 +805,7 @@ test "doc 19 §R2: v8 schema boundary — version rejection + missing loaded lit
     //       literals, so they must never enter the v8 invariant domain;
     //   (b) a v8 snapshot that IS missing a loaded-proto literal (hand-corrupted
     //       here by deleting the string object) makes `recompileLoadedChunks`
-    //       allocate — restore must reject it (`LoadedChunkRecompileAllocated`)
+    //       allocate — restore must reject it (`RecompileAllocated`)
     //       rather than silently fork the allocation timeline.
     const gpa = testing.allocator;
     // The loaded chunk's closure is DROPPED before the cut: post-doc-19 its literal
@@ -840,7 +841,7 @@ test "doc 19 §R2: v8 schema boundary — version rejection + missing loaded lit
     // present as an object (the `.snapshot` root put it there despite the dropped
     // closure).
     {
-        const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+        const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
         defer {
             vm2.deinit();
             gpa.destroy(vm2);
@@ -854,7 +855,7 @@ test "doc 19 §R2: v8 schema boundary — version rejection + missing loaded lit
         defer arena.deinit();
         var snap = try schema.SnapshotFile.decode(arena.allocator(), b0);
         snap.version = 7;
-        try testing.expectError(error.UnsupportedVersion, restoreSnapshot(gpa, snap, chunk.proto, NativeRegistry.base()));
+        try testing.expectError(error.UnsupportedVersion, restoreSnapshot(gpa, snap, .of(source), NativeRegistry.base()));
     }
 
     // (b) Zero-allocation check: same bytes, the "victim" string object deleted.
@@ -876,7 +877,7 @@ test "doc 19 §R2: v8 schema boundary — version rejection + missing loaded lit
         }
         try testing.expectEqual(@as(usize, 1), dropped); // the literal WAS serialized
         snap.keyframe.objects = kept[0..n];
-        try testing.expectError(error.LoadedChunkRecompileAllocated, restoreSnapshot(gpa, snap, chunk.proto, NativeRegistry.base()));
+        try testing.expectError(error.RecompileAllocated, restoreSnapshot(gpa, snap, .of(source), NativeRegistry.base()));
     }
 }
 
@@ -925,7 +926,7 @@ test "doc 19 §T3: restored load-driven program resumes with the JIT and traces 
     const mid = try encodeSnapshot(gpa, &vm);
     defer gpa.free(mid);
 
-    const vm_r = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);
@@ -1001,7 +1002,7 @@ test "metatable edge to the id-0 object survives round-trip (1-based encoding)" 
     const b0 = try encodeSnapshot(gpa, &vm);
     defer gpa.free(b0);
 
-    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
     defer {
         vm2.deinit();
         gpa.destroy(vm2);
@@ -1045,7 +1046,7 @@ test "restore preserves a multi-result native's projection and multi fn" {
     const b0 = try encodeSnapshot(gpa, &vm);
     defer gpa.free(b0);
 
-    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
     defer {
         vm2.deinit();
         gpa.destroy(vm2);
@@ -1097,7 +1098,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
             .io_output_id = 0,
             .next_file_id = 3,
             .next_obj_id = 8,
-            .next_gc = 1024,
+            .gc_target = 1024,
             .objects = &.{
                 .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a\x00b\xff\xfe" } } },
                 .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "" } } },
@@ -1139,7 +1140,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
         },
     };
 
-    const vm = try restoreSnapshot(gpa, file, &rootp, NativeRegistry.base());
+    const vm = try restoreSnapshot(gpa, file, .{ .image = &rootp }, NativeRegistry.base());
     defer {
         vm.deinit();
         gpa.destroy(vm);
@@ -1196,7 +1197,7 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 1,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{ sInt(10), sInt(11) },
             .entries = &.{.{ .key = sInt(0), .val = sInt(99) }},
@@ -1212,7 +1213,7 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.ArrayResidentKeyInHash);
+    } }, .{ .image = &rootp }, error.ArrayResidentKeyInHash);
 
     // Float-spelled 0.0 normalizes to integer 0 → same rejection.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
@@ -1223,7 +1224,7 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 1,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{sInt(10)},
             .entries = &.{.{ .key = sFloat(0.0), .val = sInt(99) }},
@@ -1239,7 +1240,7 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.ArrayResidentKeyInHash);
+    } }, .{ .image = &rootp }, error.ArrayResidentKeyInHash);
 
     // A key just past the extent (== asize) is a legitimate hash resident.
     {
@@ -1252,7 +1253,7 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
             .io_output_id = 0,
             .next_file_id = 3,
             .next_obj_id = 1,
-            .next_gc = 1024,
+            .gc_target = 1024,
             .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
                 .array = &.{sInt(10)},
                 .entries = &.{.{ .key = sInt(1), .val = sInt(99) }},
@@ -1268,7 +1269,7 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
             .loaded_chunks = &.{},
             .current_id = 0,
             .main_context = &.{},
-        } }, &rootp, NativeRegistry.base());
+        } }, .{ .image = &rootp }, NativeRegistry.base());
         defer {
             vm.deinit();
             gpa.destroy(vm);
@@ -1291,7 +1292,7 @@ fn oneTableFile(obj: *[1]schema.HeapObject, ht: schema.HeapTable) schema.Snapsho
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 1,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = obj,
         .stack = &.{},
         .frames = &.{},
@@ -1321,7 +1322,7 @@ fn tableInGlobalsFile(obj: *[2]schema.HeapObject, ht: schema.HeapTable) schema.S
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 2,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = obj,
         .stack = &.{},
         .frames = &.{},
@@ -1360,7 +1361,7 @@ test "restore: the array part comes back in its captured lane, commitment and re
             .flags = c.flags,
             .rehash_threshold = c.rehash,
             .grid = &.{},
-        }), &rootp, NativeRegistry.base());
+        }), .{ .image = &rootp }, NativeRegistry.base());
         defer {
             vm.deinit();
             gpa.destroy(vm);
@@ -1375,13 +1376,13 @@ test "restore: the array part comes back in its captured lane, commitment and re
     }
 
     // A trigger below 4 is one no capture produces.
-    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 0, .flags = 0, .rehash_threshold = 3, .grid = &.{} }), &rootp, error.InvalidRehashThreshold);
+    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 0, .flags = 0, .rehash_threshold = 3, .grid = &.{} }), .{ .image = &rootp }, error.InvalidRehashThreshold);
 
     // A value that does not fit the serialized lane, an unknown lane, and a
     // grid lane with no grid are all corrupt.
-    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{ sNil(), sInt(300) }, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.i8), .flags = 0, .rehash_threshold = 4, .grid = &.{} }), &rootp, error.InvalidTableLane);
-    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 200, .flags = 0, .rehash_threshold = 4, .grid = &.{} }), &rootp, error.InvalidTableLane);
-    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.grid), .flags = frozen, .rehash_threshold = 4, .grid = &.{} }), &rootp, error.InvalidTableLane);
+    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{ sNil(), sInt(300) }, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.i8), .flags = 0, .rehash_threshold = 4, .grid = &.{} }), .{ .image = &rootp }, error.InvalidTableLane);
+    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 200, .flags = 0, .rehash_threshold = 4, .grid = &.{} }), .{ .image = &rootp }, error.InvalidTableLane);
+    try expectRestoreError(oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.grid), .flags = frozen, .rehash_threshold = 4, .grid = &.{} }), .{ .image = &rootp }, error.InvalidTableLane);
 }
 
 test "restore: a grid array part round-trips cells, holes and row lengths" {
@@ -1408,7 +1409,7 @@ test "restore: a grid array part round-trips cells, holes and row lengths" {
         .grid = &.{good},
     };
     {
-        const vm = try restoreSnapshot(gpa, tableInGlobalsFile(&obj, good_table), &rootp, NativeRegistry.base());
+        const vm = try restoreSnapshot(gpa, tableInGlobalsFile(&obj, good_table), .{ .image = &rootp }, NativeRegistry.base());
         defer {
             vm.deinit();
             gpa.destroy(vm);
@@ -1448,14 +1449,14 @@ test "restore: a grid array part round-trips cells, holes and row lengths" {
         .{ .elem = @intFromEnum(Lane.boolean), .stride = 3, .row_len = good.row_len, .cells = good.cells },
     };
     for (bad_grids) |bg| {
-        try expectRestoreError(tableInGlobalsFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.grid), .flags = 1, .rehash_threshold = 4, .grid = &.{bg} }), &rootp, error.InvalidTableLane);
+        try expectRestoreError(tableInGlobalsFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.grid), .flags = 1, .rehash_threshold = 4, .grid = &.{bg} }), .{ .image = &rootp }, error.InvalidTableLane);
     }
-    try expectRestoreError(tableInGlobalsFile(&obj, .{ .array = &.{sInt(1)}, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.grid), .flags = 1, .rehash_threshold = 4, .grid = &.{good} }), &rootp, error.InvalidTableLane);
+    try expectRestoreError(tableInGlobalsFile(&obj, .{ .array = &.{sInt(1)}, .entries = &.{}, .metatable_id = 0, .lane = @intFromEnum(Lane.grid), .flags = 1, .rehash_threshold = 4, .grid = &.{good} }), .{ .image = &rootp }, error.InvalidTableLane);
 
     // Globals never inflate (global stores write them raw), so a grid there is
     // corrupt.
     var one: [1]schema.HeapObject = undefined;
-    try expectRestoreError(oneTableFile(&one, good_table), &rootp, error.GlobalsNotATable);
+    try expectRestoreError(oneTableFile(&one, good_table), .{ .image = &rootp }, error.GlobalsNotATable);
 }
 
 test "restore surfaces specific errors for malformed snapshots" {
@@ -1470,7 +1471,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 1,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{.{ .key = sInt(1), .val = sRef(77) }},
@@ -1486,7 +1487,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.UnresolvedHeapRef);
+    } }, .{ .image = &rootp }, error.UnresolvedHeapRef);
 
     // A closure naming a proto id the program image does not contain.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
@@ -1497,7 +1498,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 1,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 99, .upvalue_ids = &.{} } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1505,7 +1506,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.UnknownProto);
+    } }, .{ .image = &rootp }, error.UnknownProto);
 
     // A native whose name is not in the registry.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
@@ -1516,7 +1517,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 1,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "nope" } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1524,7 +1525,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.UnknownNative);
+    } }, .{ .image = &rootp }, error.UnknownNative);
 
     // globals_id resolves to a string, not a table.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
@@ -1535,7 +1536,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 1,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{.{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "x" } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1543,7 +1544,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.GlobalsNotATable);
+    } }, .{ .image = &rootp }, error.GlobalsNotATable);
 
     // Two objects sharing an id.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
@@ -1554,7 +1555,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 6,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{
             .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a" } } },
             .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "b" } } },
@@ -1565,7 +1566,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.DuplicateId);
+    } }, .{ .image = &rootp }, error.DuplicateId);
 
     // A wrong-version file is rejected outright.
     try expectRestoreError(.{ .version = snapshot_format_version + 1, .keyframe = .{
@@ -1576,7 +1577,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 1,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{},
         .stack = &.{},
         .frames = &.{},
@@ -1584,7 +1585,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.UnsupportedVersion);
+    } }, .{ .image = &rootp }, error.UnsupportedVersion);
 
     // L-2: two HeapStrings carrying identical bytes under distinct ids. A valid
     // snapshot interns one String per byte-sequence, so this is corrupt — restore
@@ -1597,7 +1598,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 2,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{
             .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "dup" } } },
             .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "dup" } } },
@@ -1608,7 +1609,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.DuplicateInternedString);
+    } }, .{ .image = &rootp }, error.DuplicateInternedString);
 
     // L-2: the restored id space is exhausted (an object names the top id) AND
     // the snapshot carries a loaded chunk to recompile — recompiling would
@@ -1622,7 +1623,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = std.math.maxInt(u32),
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{.{ .id = std.math.maxInt(u32), .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{},
@@ -1638,7 +1639,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{.{ .source = "return 1", .name = "(load)" }},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.IdSpaceExhausted);
+    } }, .{ .image = &rootp }, error.IdSpaceExhausted);
 
     // H-2 (v5): `next_obj_id` at/below a restored id is corrupt — a live object
     // cannot hold an id the counter has not handed out yet. Here object id 5 sits
@@ -1652,7 +1653,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .io_output_id = 0,
         .next_file_id = 3,
         .next_obj_id = 3,
-        .next_gc = 1024,
+        .gc_target = 1024,
         .objects = &.{.{ .id = 5, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{},
@@ -1668,7 +1669,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
         .current_id = 0,
         .main_context = &.{},
-    } }, &rootp, error.NextObjIdBelowObjects);
+    } }, .{ .image = &rootp }, error.NextObjIdBelowObjects);
 }
 
 test "doc 32: a heterogeneous `.value` array survives round-trip and still records post-restore" {
@@ -1719,7 +1720,7 @@ test "doc 32: a heterogeneous `.value` array survives round-trip and still recor
     const mid = try encodeSnapshot(gpa, &vm);
     defer gpa.free(mid);
 
-    const vm_r = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);
@@ -1809,7 +1810,7 @@ test "doc 73: coroutines round-trip through a keyframe, and malformed thread rec
     // The restored VM recaptures the same bytes, and the suspended
     // coroutine's open cell reads its own stack.
     {
-        const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+        const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
         defer {
             vm2.deinit();
             gpa.destroy(vm2);
@@ -1878,7 +1879,7 @@ test "doc 73: coroutines round-trip through a keyframe, and malformed thread rec
         .{ ThreadPick.suspended, E.openTwice, error.UpvalueOpenTwice },
     };
     inline for (cases) |c| {
-        try expectRestoreError(try editThread(a, snap, c[0], c[1]), chunk.proto, c[2]);
+        try expectRestoreError(try editThread(a, snap, c[0], c[1]), .of(source), c[2]);
     }
 }
 
@@ -1920,7 +1921,7 @@ test "doc 73: a keyframe inside nested coroutines rejects a broken resumer chain
     const b0 = try encodeSnapshot(gpa, &vm);
     defer gpa.free(b0);
     {
-        const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+        const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
         defer {
             vm2.deinit();
             gpa.destroy(vm2);
@@ -1938,12 +1939,12 @@ test "doc 73: a keyframe inside nested coroutines rejects a broken resumer chain
     {
         var s = snap;
         s.keyframe.current_id = 0;
-        try expectRestoreError(s, chunk.proto, error.InvalidThread);
+        try expectRestoreError(s, .of(source), error.InvalidThread);
     }
     {
         var s = snap;
         s.keyframe.main_context = &.{};
-        try expectRestoreError(s, chunk.proto, error.InvalidThread);
+        try expectRestoreError(s, .of(source), error.InvalidThread);
     }
     // The normal coroutine resumed by itself: a cycle off the chain.
     {
@@ -1957,7 +1958,7 @@ test "doc 73: a keyframe inside nested coroutines rejects a broken resumer chain
         try testing.expect(hit);
         var s = snap;
         s.keyframe.objects = objects;
-        try expectRestoreError(s, chunk.proto, error.InvalidThread);
+        try expectRestoreError(s, .of(source), error.InvalidThread);
     }
     // The running coroutine named as the main thread's id.
     {
@@ -1965,6 +1966,6 @@ test "doc 73: a keyframe inside nested coroutines rejects a broken resumer chain
         for (snap.keyframe.objects) |o| {
             if (o.body == .HeapThread and o.body.HeapThread.status == 2) s.keyframe.current_id = o.id + 1;
         }
-        try expectRestoreError(s, chunk.proto, error.InvalidThread);
+        try expectRestoreError(s, .of(source), error.InvalidThread);
     }
 }
