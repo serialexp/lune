@@ -587,7 +587,7 @@ test "env: os.getenv reads set/unset/empty (record)" {
     // HOME set; MISSING → nil; EMPTY is set-but-empty (== "" is true, not nil);
     // a non-string name is a bad argument, raised before any effect is logged.
     try testing.expectEqualStrings(
-        "/home/bart\nnil\ntrue\nfalse\tbad argument #1 to 'getenv' (string expected, got number)\n",
+        "/home/bart\nnil\ntrue\nfalse\tbad argument #1 to 'os.getenv' (string expected, got number)\n",
         sink.buffered(),
     );
     // One effect logged per successful call.

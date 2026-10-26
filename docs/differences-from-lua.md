@@ -176,7 +176,7 @@ What follows from that:
 
 | Missing | Why | Instead |
 |---|---|---|
-| `coroutine.wrap` | not built yet (`docs/design/73-coroutines.md`); `coroutine.create` also refuses a native function as the body | `coroutine.create` + `resume` with a Lua function |
+| `coroutine.wrap` | not built yet (`docs/design/73-coroutines.md`) | `coroutine.create` + `resume` |
 | `debug.*` except `traceback` | reflection breaks the language's guarantees; the trace visualiser takes its place | `mahina viz` |
 | `string.byte`, `utf8` | strings are code points | `string.codepoint`, `string.char`, `string.codes` |
 | `string.dump` | bytecode is internal and not portable between versions | — |

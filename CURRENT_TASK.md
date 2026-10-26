@@ -1,4 +1,4 @@
-DOC 73 COROUTINES: P0 IN PROGRESS (2026-10-26, coral-marten).
+DOC 73 COROUTINES: P0 + P1 (minus wrap) DONE (2026-10-27, coral-marten).
 - All questions decided. Bart accepted the frames-pointer cost; P0a landed
   (4e37dfd). The P0 runtime design is doc 73 §5.1 (stack = one allocation
   of tags+payloads+scratch+frames; active fields stay in Vm and are
@@ -39,8 +39,17 @@ DOC 73 COROUTINES: P0 IN PROGRESS (2026-10-26, coral-marten).
   recompiles the root (Vm.root_chunk). Bart was asked twice (weight design,
   restore fix) and didn't answer within 15 min; defaults taken: fixed
   charge per stack, recompile on restore. Both are easy to revisit.
-- Next (P0 remainder): native bodies; then wrap (ask Bart).
-  P2 lead: co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
+- Native bodies landed (2026-10-27): a native body runs under a Lua shim
+  (coroutine.native_body_source, reserved proto id maxInt-1, compiled once
+  per VM by Vm.nativeBodyProto; first resume is Vm.startInto, out of line —
+  inline it cost pingpong 2 instr/round trip). Bad-argument names from a
+  native with no Lua call site now come from a package.loaded search
+  (Vm.loadedNativeName), as Lua's pushglobalfuncname; package.loaded
+  gained `coroutine`. coArg says "thread expected" as Lua 5.4.6.
+- Bart's order (2026-10-27): finish the whole feature (wrap, viz, async,
+  docs) before ANY coroutine performance work, P2 JIT included.
+- Next: wrap (ask Bart about the callable primitive first).
+  P2 lead (deferred): co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
   t0 (yield made deep in recursion) — start with --jit-stats/--dump-aborts.
 - `coroutine.wrap` needs a callable bound to its coroutine: that is the
   same open decision as gmatch's lone callable (TODO.md:70) — ask Bart

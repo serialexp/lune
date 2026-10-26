@@ -258,7 +258,7 @@ test "os: os.exit ends the run with its status, and pcall cannot stop it" {
     try testing.expectEqual(@as(?i32, 4), r.exit);
     const bad = try run(testing.allocator, .{ .host = &host }, "print(pcall(os.exit, 'x'))");
     defer bad.deinit(testing.allocator);
-    try testing.expectEqualStrings("false\tbad argument #1 to 'exit' (number expected, got string)\n", bad.out);
+    try testing.expectEqualStrings("false\tbad argument #1 to 'os.exit' (number expected, got string)\n", bad.out);
 }
 
 fn enableEnv(vm: *Vm) anyerror!void {

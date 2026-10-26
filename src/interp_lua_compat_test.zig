@@ -132,8 +132,8 @@ test "math.random checks its argument count and blames #1 for an empty interval"
         \\print(select(2, pcall(math.random, 1, 2, 3)))
         \\print(select(2, pcall(math.random, 2, 1)))
         \\print(math.ult(1.0, 2), select(2, pcall(math.sqrt)))
-    , "wrong number of arguments\nbad argument #1 to 'random' (interval is empty)\n" ++
-        "true\tbad argument #1 to 'sqrt' (number expected, got no value)\n");
+    , "wrong number of arguments\nbad argument #1 to 'math.random' (interval is empty)\n" ++
+        "true\tbad argument #1 to 'math.sqrt' (number expected, got no value)\n");
 }
 
 test "a missing argument is 'value expected', as in Lua" {
@@ -270,7 +270,7 @@ test "string.format checks its specs as Lua does" {
         \\e("%100d", 1)
         \\e("%#d", 1)
         \\e("%05s", "a")
-    , "bad argument #2 to 'format' (number has no integer representation)\n" ++
+    , "bad argument #2 to 'string.format' (number has no integer representation)\n" ++
         "invalid conversion specification: '%100d'\n" ++
         "invalid conversion specification: '%#d'\n" ++
         "invalid conversion specification: '%05s'\n");
@@ -280,7 +280,7 @@ test "string.format checks its specs as Lua does" {
         \\e("abc%")
         \\e("%5q", "x")
     , "invalid conversion '%F' to 'format'\n" ++
-        "bad argument #2 to 'format' (no value)\n" ++
+        "bad argument #2 to 'string.format' (no value)\n" ++
         "specifier '%q' cannot have modifiers\n");
 }
 
@@ -293,7 +293,7 @@ test "string.format: %a, the # flag, and %s through __tostring" {
         \\print(select(2, pcall(string.format, "%5s", "a\0b")))
     , "0x1.8p+0 0X1.999999999999AP-4 0x2p+0 0x1.000p+0 0x0.0000000000001p-1022\n" ++
         "3. 3.e+00 3. 3\n[TS][  TS][TS  ]\n" ++
-        "bad argument #2 to 'format' (string contains zeros)\n");
+        "bad argument #2 to 'string.format' (string contains zeros)\n");
 }
 
 test "string.format %q writes literals that read back exactly" {
@@ -304,7 +304,7 @@ test "string.format %q writes literals that read back exactly" {
         \\local v = 1/3
         \\print(load(string.format("return %q", v))() == v)
     , "\"\\0001\" \"a\\13\\9\" 0x1.8p+0\n1e9999 -1e9999 (0/0) 0x8000000000000000\n" ++
-        "bad argument #2 to 'format' (value has no literal form)\ntrue\n");
+        "bad argument #2 to 'string.format' (value has no literal form)\ntrue\n");
 }
 
 test "tonumber reads Lua's numerals" {
@@ -343,5 +343,5 @@ test "method calls number arguments from the one after self" {
     , "bad argument #1 to 'rep' (number has no integer representation)\n" ++
         "bad argument #2 to 'rep' (number has no integer representation)\n" ++
         "calling 'upper' on bad self (string expected, got table)\n" ++
-        "bad argument #1 to 'rep' (string expected, got no value)\n");
+        "bad argument #1 to 'string.rep' (string expected, got no value)\n");
 }

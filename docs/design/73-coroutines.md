@@ -2,10 +2,11 @@
 
 Status: partial — P0 switch, keyframes and most of P1 landed (resume/yield
 on separate stacks, stops and keyframes inside coroutines, the library minus
-`wrap`, the stack pool and its GC weight); JIT, viz and async outstanding.
+`wrap`, the stack pool and its GC weight, native bodies); JIT, viz and
+async outstanding.
 Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
-Last updated: 2026-10-26
+Last updated: 2026-10-27
 
 ## Implementation status
 
@@ -98,14 +99,23 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Restore recompiles the program** (doc 04 F2b follow-up): found
   here. Resumed runs that collected diverged because the restored VM
   borrowed the compile heap's literals.
+- [x] **Native coroutine bodies** (extended beyond the original plan):
+  `coroutine.create(print)` runs as in Lua. A native body runs under a
+  one-line Lua shim, `return function(f, ...) return f(...) end`
+  (`coroutine.native_body_source`), compiled once per VM under a reserved
+  proto id, so a native that switches (`yield`, `pcall`, `resume`) does so
+  from a Lua frame and the saved stack keeps only Lua frames. A fresh shim
+  closure per coroutine; keyframe restore rebuilds the shim from its id.
+  Bad-argument messages from a native with no Lua call site now name it
+  as Lua's `pushglobalfuncname` does (`'io.open'`, `'?'` for a file
+  method), by searching `package.loaded`, which also gained its missing
+  `coroutine` entry. Every-cut resume test with native bodies suspended.
 
 ### Outstanding
 
 - [ ] **Coroutine stacks' committed floor**: ~16 KiB per live coroutine
   (a page per region) against LuaJIT's ~1 KiB; `co_many` 164 MB vs 7.4 MB,
   and with it the GC weight below (TODO.md).
-- [ ] **Native coroutine bodies**: `coroutine.create(print)` is refused
-  ("Lua function expected") until a Zig body can run on a coroutine stack.
 - [ ] **P1 remainder — `coroutine.wrap`** (§4.2): waits on Bart's decision
   about a callable non-function value (the same question as gmatch's
   iterator, TODO.md).

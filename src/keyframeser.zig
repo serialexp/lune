@@ -692,7 +692,12 @@ fn findProto(root: *const Proto, id: u32) ?*const Proto {
 /// chunk's tree (L-2). The id space is disjoint by construction (`load` offsets
 /// each loaded tree's ids by the running `next_proto_id`), so a `proto_id` matches
 /// exactly one proto. Static protos are checked first (the common case).
-fn resolveProto(root: *const Proto, vm: *const Vm, id: u32) ?*const Proto {
+fn resolveProto(root: *const Proto, vm: *Vm, id: u32) std.mem.Allocator.Error!?*const Proto {
+    // Doc 73: the frame a native-body coroutine runs its native from.
+    if (id == coroutine.native_body_proto_id) return vm.nativeBodyProto() catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => unreachable, // compiling it raises nothing else
+    };
     if (findProto(root, id)) |p| return p;
     for (vm.loaded_chunks.items) |lc| if (findProto(lc.chunk.proto, id)) |p| return p;
     return null;
@@ -1167,7 +1172,7 @@ pub fn restoreSnapshot(
             else => continue,
         };
         if (idmap.contains(o.id)) return error.DuplicateId;
-        const proto = resolveProto(root, vm, hc.proto_id) orelse return error.UnknownProto;
+        const proto = (try resolveProto(root, vm, hc.proto_id)) orelse return error.UnknownProto;
         const cl = try function.Closure.create(gpa, proto, hc.upvalue_ids.len);
         vm.heap.linkRestored(&cl.header, o.id);
         idmap.putAssumeCapacityNoClobber(o.id, &cl.header);
@@ -1252,12 +1257,12 @@ pub fn restoreSnapshot(
                 const t = Thread.fromHeader(h);
                 t.status = @enumFromInt(ht.status); // checked in pass 1a
                 t.body = try fromSchemaValue(ht.body, &idmap);
-                // A coroutine runs a Lua function (`coroutine.create`); the
-                // main thread runs none.
+                // A coroutine runs a function, Lua or native
+                // (`coroutine.create`); the main thread runs none.
                 const body_ok = if (ht.kind == thread_kind_main)
                     t.body.isNil()
                 else
-                    t.body.isHeap() and t.body.asHeap().type == .function;
+                    t.body.isHeap() and (t.body.asHeap().type == .function or t.body.asHeap().type == .native);
                 if (!body_ok) return error.InvalidThread;
                 if (ht.death.len == 1) t.death = try fromSchemaValue(ht.death[0], &idmap);
                 if (ht.resumer_id != 0) {

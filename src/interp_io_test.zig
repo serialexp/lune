@@ -131,7 +131,7 @@ test "io: a count reads code points, a binary count reads bytes into a byte arra
         \\print(#a, a[1], a[2], a[3])
         \\print(pcall(b.read, b, "l"))
         \\b:close()
-    , "äöü€\tx\n3\t195\t164\t195\nfalse\tbad argument #2 to 'read' (format not allowed on a binary file)\n");
+    , "äöü€\tx\n3\t195\t164\t195\nfalse\tbad argument #2 to '?' (format not allowed on a binary file)\n");
 }
 
 test "io: write, seek, append and io.lines against the host" {
@@ -180,14 +180,14 @@ test "io: failures raise by default and return nil, msg, code in Lua mode" {
         defer r.deinit(testing.allocator);
         try testing.expectEqualStrings("false\tcannot open 'missing.txt': not found\n" ++
             "false\tcannot open 'secret': permission denied\n" ++
-            "false\tbad argument #2 to 'open' (invalid mode)\n", r.out);
+            "false\tbad argument #2 to 'io.open' (invalid mode)\n", r.out);
     }
     {
         const r = try run(testing.allocator, .{ .host = &host, .io_errors = .lua }, source);
         defer r.deinit(testing.allocator);
         try testing.expectEqualStrings("true\tnil\tcannot open 'missing.txt': not found\t1\n" ++
             "true\tnil\tcannot open 'secret': permission denied\t2\n" ++
-            "false\tbad argument #2 to 'open' (invalid mode)\n", r.out);
+            "false\tbad argument #2 to 'io.open' (invalid mode)\n", r.out);
     }
 }
 

@@ -478,7 +478,7 @@ pub fn installPackageRuntime(vm: *Vm) interp.Error!void {
 /// `globals`, so `require` of a built-in returns the live module table. `_G` maps
 /// to the globals table itself (Lua's `package.loaded._G == _G`).
 fn seedLoaded(vm: *Vm, loaded: *Table) interp.Error!void {
-    const builtins = [_][]const u8{ "package", "string", "table", "math", "os", "io" };
+    const builtins = [_][]const u8{ "package", "coroutine", "string", "table", "math", "os", "io" };
     for (builtins) |modname| {
         const key = try vm.heap.internValue(modname);
         const mod = vm.globals.get(key);

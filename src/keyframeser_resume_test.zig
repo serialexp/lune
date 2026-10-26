@@ -1311,3 +1311,39 @@ test "doc 73: every cut through nested coroutines resumes after restore" {
         gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
     }
 }
+
+test "doc 73: every cut with native-body coroutines resumes after restore" {
+    // A native body runs inside the shim proto (`coroutine.native_body_source`),
+    // which restore rebuilds from its reserved id: a `yield` body stopped
+    // mid-switch, a `pcall` body suspended under a Lua function that yields,
+    // a `resume` body driving a Lua coroutine, and one never started.
+    const gpa = testing.allocator;
+    const source =
+        \\local y = coroutine.create(coroutine.yield)
+        \\local p = coroutine.create(pcall)
+        \\local r = coroutine.create(coroutine.resume)
+        \\local inner = coroutine.create(function(x)
+        \\  local a = coroutine.yield(x * 2)
+        \\  return a + 1
+        \\end)
+        \\local later = coroutine.create(string.rep)
+        \\print(coroutine.resume(y, 1, 2))
+        \\print(coroutine.resume(p, function(a)
+        \\  local b = coroutine.yield(a + 1)
+        \\  return b * 2
+        \\end, 10))
+        \\print(coroutine.resume(r, inner, 4))
+        \\print(coroutine.status(y), coroutine.status(p), coroutine.status(r), coroutine.status(inner))
+        \\print(coroutine.resume(y, 3))
+        \\print(coroutine.resume(p, 21))
+        \\print(coroutine.resume(inner, 5))
+        \\print(coroutine.resume(later, "ab", 2))
+        \\print(coroutine.status(y), coroutine.status(p), coroutine.status(r), coroutine.status(inner))
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}

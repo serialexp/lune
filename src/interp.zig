@@ -1061,6 +1061,10 @@ pub const Vm = struct {
     /// (`keyframeser.restore`), owned like `loaded_chunks`; null in a VM the
     /// host runs its own chunk in.
     root_chunk: ?LoadedChunk = null,
+    /// Doc 73: the frame a coroutine whose body is a native runs it from
+    /// (`coroutine.native_body_source`), compiled the first time one starts
+    /// (`nativeBodyProto`). No constants, so compiling it touches no heap.
+    native_body_chunk: ?compiler.Chunk = null,
     /// Next proto id to hand out. Seeded to the static chunk's proto count in
     /// `run`/`start` so every dynamically-`load`ed proto gets a globally-unique id
     /// across the static + dynamic trees — purely so snapshot serialization can
@@ -1225,6 +1229,43 @@ pub const Vm = struct {
     pub fn adoptRootChunk(self: *Vm, lc: LoadedChunk) void {
         std.debug.assert(self.root_chunk == null);
         self.root_chunk = lc;
+    }
+
+    /// Doc 73: the proto a native-body coroutine's frame runs
+    /// (`function(f, ...) return f(...) end`), with the reserved id
+    /// `coroutine.native_body_proto_id`. Compiled once per VM, the same in
+    /// every VM, so a keyframe names it by id.
+    pub fn nativeBodyProto(self: *Vm) Error!*const Proto {
+        if (self.native_body_chunk) |c| return c.proto.protos[0];
+        const parser = @import("parser.zig");
+        const diag = @import("diag.zig");
+        var diags = diag.Diagnostics.init(self.gpa);
+        defer diags.deinit();
+        var tree = parser.parse(self.gpa, coroutine.native_body_source, &diags) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable, // a constant source that parses
+        };
+        defer tree.deinit();
+        std.debug.assert(!diags.hasErrors());
+        const before = self.heap.next_obj_id;
+        const chunk = compiler.compileWithOptions(self.gpa, self.heap, coroutine.native_body_source, tree.root, &diags, .{
+            .id_base = coroutine.native_body_proto_id - 1,
+            .chunk_name = "=[C]",
+        }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable, // a constant source that compiles
+        };
+        std.debug.assert(!diags.hasErrors() and self.heap.next_obj_id == before);
+        self.native_body_chunk = chunk;
+        const proto = chunk.proto.protos[0];
+        std.debug.assert(proto.id == coroutine.native_body_proto_id);
+        return proto;
+    }
+
+    /// Whether frame `idx` is a native-body coroutine's (`nativeBodyProto`):
+    /// to Lua that frame is the native itself, a C level with no location.
+    pub fn isNativeBodyFrame(self: *const Vm, idx: usize) bool {
+        return self.frames[idx].closure.proto.id == coroutine.native_body_proto_id;
     }
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
@@ -1455,6 +1496,7 @@ pub const Vm = struct {
             rc.chunk.deinit();
             self.gpa.free(rc.source);
         }
+        if (self.native_body_chunk) |*c| c.deinit();
         // Borrows only — free the list, never the borrowed chunks (the host owns
         // those and must have released them before its own `Chunk.deinit`).
         self.retained_chunks.deinit(self.gpa);
@@ -2196,9 +2238,10 @@ pub const Vm = struct {
     /// the location prefix in that case), or an empty stack.
     pub fn callSiteAt(self: *Vm, level: usize) ?CallSite {
         if (self.depth == 0 or level == 0) return null;
-        // Lua counts C functions as levels, with no location. Two live here:
-        // the native that called the running native (`callValue`), and the
-        // `pcall`/`xpcall` beneath each protected frame (doc 68 §5).
+        // Lua counts C functions as levels, with no location. Three live here:
+        // the native that called the running native (`callValue`), the
+        // `pcall`/`xpcall` beneath each protected frame (doc 68 §5), and a
+        // native-body coroutine's frame (doc 73).
         var lvl = level;
         if (self.unparkedNative() != null) {
             if (lvl == 1) return null;
@@ -2207,6 +2250,9 @@ pub const Vm = struct {
         var idx = self.depth;
         while (idx > 0) {
             idx -= 1;
+            // Doc 73: a native-body coroutine's frame is that native, the
+            // coroutine's bottom: it and every level below it are unlocated.
+            if (self.isNativeBodyFrame(idx)) return null;
             if (lvl == 1) return self.siteOf(idx);
             lvl -= 1;
             if (self.frames[idx].ctl.protect != .none) {
@@ -2245,6 +2291,51 @@ pub const Vm = struct {
     /// The display name for a native in an error message: the field part of its
     /// registered name (`string.sub` → `sub`), matching how Lua names the called
     /// function. A top-level native (`print`) has no module prefix and passes through.
+    /// The name of a native with no Lua call site to name it, found the way
+    /// Lua's `pushglobalfuncname` finds it: the `module.field` under which
+    /// `package.loaded` holds it (`io.open`), a bare `field` for `_G`
+    /// (`print`), and `?` when no loaded module holds it (a file method).
+    /// Lua takes whichever match its hash order meets first; this searches
+    /// the modules other than `_G` first, each in its table's slot order, so
+    /// the answer is deterministic and a global alias of a library function
+    /// still reads as the library name. Read-only and allocation-free; it
+    /// runs only while an error message is being built.
+    fn loadedNativeName(self: *const Vm, nat: *const function.Native) NativeName {
+        const loaded_v = self.fieldByName(self.fieldByName(Value.heap(&self.globals.header), "package"), "loaded");
+        if (!(loaded_v.isHeap() and loaded_v.heapType() == .table)) return .{ .field = "?" };
+        const loaded = table.Table.fromHeader(loaded_v.asHeap());
+        const g = Value.heap(&self.globals.header);
+        var it = loaded.hash.iterator();
+        while (it.next()) |e| {
+            const mod = e.value_ptr.*;
+            if (mod.isHeap() and mod.asHeap() == g.asHeap()) continue;
+            const module = strBytes(e.key) orelse continue;
+            if (fieldNameOf(mod, nat)) |field| return .{ .module = module, .field = field };
+        }
+        if (fieldNameOf(g, nat)) |field| return .{ .field = field };
+        return .{ .field = "?" };
+    }
+
+    /// The string key under which table `t` holds `nat` in its hash part,
+    /// or null (also when `t` is not a table).
+    fn fieldNameOf(t: Value, nat: *const function.Native) ?[]const u8 {
+        if (!(t.isHeap() and t.heapType() == .table)) return null;
+        var it = table.Table.fromHeader(t.asHeap()).hash.iterator();
+        while (it.next()) |e| {
+            const v = e.value_ptr.*;
+            if (v.isHeap() and v.asHeap() == &nat.header) return strBytes(e.key) orelse continue;
+        }
+        return null;
+    }
+
+    /// Raw `t[name]` for a string key, or nil when `t` is not a table or
+    /// `name` was never interned (then no table can hold it).
+    fn fieldByName(self: *const Vm, t: Value, name: []const u8) Value {
+        if (!(t.isHeap() and t.heapType() == .table)) return Value.nil();
+        const key = self.heap.internedLookup(name) orelse return Value.nil();
+        return table.Table.fromHeader(t.asHeap()).get(Value.heap(&key.header));
+    }
+
     fn nativeDisplayName(nat: *const function.Native) []const u8 {
         if (std.mem.lastIndexOfScalar(u8, nat.name, '.')) |dot| return nat.name[dot + 1 ..];
         return nat.name;
@@ -2293,11 +2384,30 @@ pub const Vm = struct {
     /// passes none of it. `method` is set when the call site is a method call
     /// (`s:rep(…)`), whose arguments Lua numbers from the one after `self`.
     /// `null` only if there is no resolvable native call site.
-    const NativeSite = struct { fname: []const u8, chunk: []const u8, line: u32, located: bool, method: bool = false };
+    const NativeSite = struct { fname: NativeName, chunk: []const u8, line: u32, located: bool, method: bool = false };
+
+    /// A native's name in a message: `field`, qualified as `module.field`
+    /// when `module` is set.
+    const NativeName = struct {
+        module: []const u8 = "",
+        field: []const u8,
+
+        fn dot(self: NativeName) []const u8 {
+            return if (self.module.len != 0) "." else "";
+        }
+    };
     fn nativeSite(self: *Vm) ?NativeSite {
-        // A native called by a native: named, with no location (Lua's
-        // `bad argument #1 to 'rep'` under `pcall(string.rep)`).
-        if (self.unparkedNative()) |nat| return .{ .fname = nativeDisplayName(nat), .chunk = "", .line = 0, .located = false };
+        // A native called by a native, or the body of a native-body
+        // coroutine: named by its qualified name, with no location (Lua's
+        // `bad argument #1 to 'string.rep'` under `pcall(string.rep)`).
+        if (self.unparkedNative()) |nat| return .{ .fname = self.loadedNativeName(nat), .chunk = "", .line = 0, .located = false };
+        if (self.depth > 0 and self.isNativeBodyFrame(self.depth - 1)) {
+            const f = &self.frames[self.depth - 1];
+            const call = bytecode.callOperandsOf(f.closure.proto.code[f.pc]) orelse return null;
+            const callee = self.regGet(f.base + call.a);
+            if (!(callee.isHeap() and callee.heapType() == .native)) return null;
+            return .{ .fname = self.loadedNativeName(function.Native.fromHeader(callee.asHeap())), .chunk = "", .line = 0, .located = false };
+        }
         const cs = self.callSiteAt(1) orelse return null;
         if (cs.pc >= cs.proto.code.len) return null;
         const call = bytecode.callOperandsOf(cs.proto.code[cs.pc]) orelse return null;
@@ -2305,7 +2415,7 @@ pub const Vm = struct {
         if (!(callee.isHeap() and callee.heapType() == .native)) return null;
         const origin = bc_names.originOf(cs.proto, @intCast(cs.pc), call.a);
         return .{
-            .fname = nativeDisplayName(function.Native.fromHeader(callee.asHeap())),
+            .fname = .{ .field = nativeDisplayName(function.Native.fromHeader(callee.asHeap())) },
             .chunk = cs.proto.chunk,
             .line = cs.line,
             .located = true,
@@ -2322,16 +2432,16 @@ pub const Vm = struct {
     /// Deterministic: reads only the call site and interns an id-stable string.
     fn raiseBadArg(self: *Vm, n: usize, reason: []const u8) Error {
         const site = self.nativeSite();
-        const fname = if (site) |s| s.fname else "?";
+        const fname: NativeName = if (site) |s| s.fname else .{ .field = "?" };
         const method = site != null and site.?.method;
         var scratch: MsgScratch = undefined;
         scratch.init(self.gpa);
         defer scratch.deinit();
         const a = scratch.allocator();
         const body = if (method and n == 1)
-            try std.fmt.allocPrint(a, "calling '{s}' on bad self ({s})", .{ fname, reason })
+            try std.fmt.allocPrint(a, "calling '{s}{s}{s}' on bad self ({s})", .{ fname.module, fname.dot(), fname.field, reason })
         else
-            try std.fmt.allocPrint(a, "bad argument #{d} to '{s}' ({s})", .{ if (method) n - 1 else n, fname, reason });
+            try std.fmt.allocPrint(a, "bad argument #{d} to '{s}{s}{s}' ({s})", .{ if (method) n - 1 else n, fname.module, fname.dot(), fname.field, reason });
         const full = if (site != null and site.?.located)
             try std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ site.?.chunk, site.?.line, body })
         else
@@ -4110,20 +4220,30 @@ pub const Vm = struct {
     /// when they don't fit its stack.
     fn resumeInto(self: *Vm, co: *coroutine.Thread, args: anytype) Error!void {
         std.debug.assert(co.status == .suspended and co.stack != null);
-        if (co.saved.depth == 0) {
-            const cl = Closure.fromHeader(co.body.asHeap());
-            if (args.n + cl.proto.num_registers > stack_slots) return Error.StackOverflow;
-            // Staged in the coroutine's own scratch, idle until it runs; no
-            // safepoint comes before the push roots them.
-            const staged = co.saved.boundary_scratch[0..args.n];
-            for (staged, 0..) |*s, i| s.* = args.get(i);
-            self.switchInto(co);
-            _ = self.bindAndPushClosure(cl, staged) catch unreachable; // fits, checked above
-        } else {
-            const n = try writeAcross(&co.saved, co.yield_lo, co.yield_c, null, args);
-            self.switchInto(co);
-            if (co.yield_c == bytecode.all_results) self.setPendingTop(co.yield_lo + n);
-        }
+        if (co.saved.depth == 0) return self.startInto(co, args);
+        const n = try writeAcross(&co.saved, co.yield_lo, co.yield_c, null, args);
+        self.switchInto(co);
+        if (co.yield_c == bytecode.all_results) self.setPendingTop(co.yield_lo + n);
+    }
+
+    /// `resumeInto`'s first resume: push the body's frame on the coroutine's
+    /// stack. Out of line, once per coroutine, so the hot resume of a
+    /// suspended one stays small.
+    noinline fn startInto(self: *Vm, co: *coroutine.Thread, args: anytype) Error!void {
+        // A native body runs from its own frame (`nativeBodyProto`), which
+        // takes the native as its first argument; a fresh closure per
+        // coroutine, held only by that frame.
+        const native = co.body.heapType() == .native;
+        const lead: usize = @intFromBool(native);
+        const cl = if (native) try self.heap.newClosure(try self.nativeBodyProto(), 0) else Closure.fromHeader(co.body.asHeap());
+        if (lead + args.n + cl.proto.num_registers > stack_slots) return Error.StackOverflow;
+        // Staged in the coroutine's own scratch, idle until it runs; no
+        // safepoint comes before the push roots them.
+        const staged = co.saved.boundary_scratch[0 .. lead + args.n];
+        if (native) staged[0] = co.body;
+        for (staged[lead..], 0..) |*s, i| s.* = args.get(i);
+        self.switchInto(co);
+        _ = self.bindAndPushClosure(cl, staged) catch unreachable; // fits, checked above
     }
 
     fn switchInto(self: *Vm, co: *coroutine.Thread) void {

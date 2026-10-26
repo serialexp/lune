@@ -238,3 +238,71 @@ test "coroutine: dropped suspended coroutines bring the collection forward by th
     try std.testing.expect(vm.heap.thread_count < 2000 / 4);
     try std.testing.expectEqual(vm.heap.thread_count * units, vm.heap.stack_debt);
 }
+
+test "coroutine: a native body runs as the coroutine, as in Lua" {
+    // Outputs checked against Lua 5.4: errors raised in the body carry no
+    // location at any level, a bad argument names the native by its
+    // qualified name, and `yield`, `pcall` and `resume` bodies switch.
+    try expectProgram(
+        \\print(coroutine.resume(coroutine.create(print), 1, 2))
+        \\print(coroutine.resume(coroutine.create(string.rep)))
+        \\print(coroutine.resume(coroutine.create(error), "x"))
+        \\print(coroutine.resume(coroutine.create(error), "x", 1))
+        \\print(coroutine.resume(coroutine.create(error), "x", 2))
+        \\local ok, e = coroutine.resume(coroutine.create(error), {k = 1})
+        \\print(ok, e.k)
+        \\local co = coroutine.create(coroutine.yield)
+        \\print(coroutine.resume(co, 1, 2))
+        \\print(coroutine.status(co))
+        \\print(coroutine.resume(co, 3, 4))
+        \\print(coroutine.status(co))
+        \\local p = coroutine.create(pcall)
+        \\print(coroutine.resume(p, function(a) local b = coroutine.yield(a + 1) return b * 2 end, 10))
+        \\print(coroutine.resume(p, 21))
+        \\print(coroutine.status(p))
+    , "1\t2\ntrue\n" ++
+        "false\tbad argument #1 to 'string.rep' (string expected, got no value)\n" ++
+        "false\tx\nfalse\tx\nfalse\tx\nfalse\t1\n" ++
+        "true\t1\t2\nsuspended\ntrue\t3\t4\ndead\n" ++
+        "true\t11\ntrue\ttrue\t42\ndead\n");
+    try expectProgram(
+        \\local q = coroutine.create(pcall)
+        \\print(coroutine.resume(q, error, "boom"))
+        \\print(coroutine.resume(coroutine.create(select), "#", 1, 2, 3))
+        \\local s = coroutine.create(coroutine.running)
+        \\print(select("#", coroutine.resume(s)), coroutine.resume(s))
+        \\print(coroutine.resume(coroutine.create(coroutine.isyieldable)))
+        \\local u = coroutine.create(coroutine.status)
+        \\print(coroutine.resume(u, u))
+        \\print(coroutine.close(coroutine.create(print)))
+        \\local c2 = coroutine.create(coroutine.yield)
+        \\coroutine.resume(c2, 1)
+        \\print(coroutine.close(c2), coroutine.status(c2))
+        \\local function f() return coroutine.resume(coroutine.create(string.rep), "ab", 3) end
+        \\print(f())
+        \\print(coroutine.resume(coroutine.create(table.unpack), {1, 2, 3}))
+        \\local cc = coroutine.create(coroutine.resume)
+        \\local inner = coroutine.create(function(x) coroutine.yield(x * 2) return "fin" end)
+        \\print(coroutine.resume(cc, inner, 4))
+        \\print(coroutine.status(cc), coroutine.status(inner))
+    , "true\tfalse\tboom\ntrue\t3\n" ++
+        "3\tfalse\tcannot resume dead coroutine\n" ++
+        "true\ttrue\ntrue\trunning\ntrue\ntrue\tdead\n" ++
+        "true\tababab\ntrue\t1\t2\t3\n" ++
+        "true\ttrue\t8\ndead\tsuspended\n");
+}
+
+test "coroutine: a non-coroutine argument is a bad argument naming the library function" {
+    // As Lua 5.4.6 prints them.
+    try expectProgram(
+        \\print(pcall(coroutine.resume, 1))
+        \\print(pcall(coroutine.status, {}))
+    , "false\tbad argument #1 to 'coroutine.resume' (thread expected, got number)\n" ++
+        "false\tbad argument #1 to 'coroutine.status' (thread expected, got table)\n");
+    try expectProgram(
+        \\print(pcall(coroutine.close))
+        \\print(pcall(function() return coroutine.status(true) end))
+    , "false\tbad argument #1 to 'coroutine.close' (thread expected, got no value)\n" ++
+        "false\tmain:2: bad argument #1 to 'status' (thread expected, got boolean)\n");
+}
+

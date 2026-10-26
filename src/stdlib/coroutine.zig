@@ -44,7 +44,7 @@ fn isThread(v: Value) bool {
 /// Argument `i` (0-based) as a coroutine, as Lua's `getco` checks it.
 fn coArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Thread {
     if (i < args.len and isThread(args[i])) return Thread.fromHeader(args[i].asHeap());
-    return vm.badArg(i + 1, "coroutine", if (i < args.len) args[i] else null);
+    return vm.badArg(i + 1, "thread", if (i < args.len) args[i] else null);
 }
 
 /// `t`'s status. The main thread's follows whether a coroutine runs.
@@ -59,7 +59,6 @@ fn nCreate(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const f: ?Value = if (args.len >= 1) args[0] else null;
     const is_fn = if (f) |v| v.isHeap() and (v.heapType() == .function or v.heapType() == .native) else false;
     if (!is_fn) return vm.badArg(1, "function", f);
-    if (f.?.heapType() == .native) return vm.badArgReason(1, "Lua function expected");
     const t = try coroutine.newThread(vm.heap, f.?);
     return Value.heap(&t.header);
 }

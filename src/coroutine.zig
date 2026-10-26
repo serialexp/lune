@@ -21,6 +21,18 @@ const CallFrame = interp.CallFrame;
 const Value = value.Value;
 const GcHeader = object.GcHeader;
 
+/// Doc 73: a coroutine whose body is a native runs it from a frame of this
+/// function (`Vm.nativeBodyProto`), called with the native and the first
+/// resume's values, so the native is called from Lua: a `coroutine.yield`
+/// or `pcall` body switches and protects exactly as it would from Lua code.
+/// To Lua the frame is the native itself (`Vm.isNativeBodyFrame`).
+pub const native_body_source: [:0]const u8 = "return function(f, ...) return f(...) end";
+
+/// The reserved proto id of that function, which keyframes name it by: at
+/// the top of the id space (the compiler's counter ends one past it), far
+/// above any program's or loaded chunk's.
+pub const native_body_proto_id: u32 = std.math.maxInt(u32) - 1;
+
 /// One stack's memory: a single block (`stack_mem`) holding the two register
 /// lanes, the scratch lane and the frame array, each region starting on a
 /// block-aligned offset.
