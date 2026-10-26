@@ -1,3 +1,22 @@
+DOC 73 COROUTINES: P0 BLOCKED ON THE FRAME-ARRAY CHOICE (2026-10-26, coral-marten).
+- Q1–Q4 all decided (doc 73 §4.2, §5, §6.3, §7). Next is P0: per-coroutine
+  stacks, the switch, GC and keyframes.
+- Single-stack map (Explore agent, this session): register lanes are
+  slices (swap is free); `Vm.frames` is an inline [200]CallFrame read at
+  fixed offsets by tier-0, `hostcall_x64.S:256` and 3 emitted native sites
+  (`nativegen_emit.zig:998,1197,1258`); open upvalues hold raw lane
+  pointers (fine with reserved stacks) but `upvalueSlotAliasOk`
+  (interp.zig:1565) compares indices without stack identity; fillKeep/GC
+  and keyframes assume one stack axis; nested `execImpl` stop_depth checks
+  compare `self.depth` and must become context-aware; no mmap reserve
+  wrapper exists (only nativegen_mcode.zig).
+- Experiment (/tmp/shadow-f, not committed): `frames` behind a pointer
+  costs tier-0 instructions recursive-fib +1.23%, binary-trees +0.61%,
+  spectral-norm +0.60%, others flat. Cycles unmeasurable (load 11–24).
+  JIT sites not adapted in the experiment.
+- Waiting on Bart: frames behind a pointer, or frames stay inline and are
+  copied out/in per switch (O(depth) x 80 B).
+
 OS.CLOCK COUNTS FROM VM START (2026-10-25, coral-marten).
 - Bart chose VM start (over process start) as the zero. `Vm.clock` is now
   `?Clock` {source, epoch_ns}, set only via `Vm.setClockSource`, which
