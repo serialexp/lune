@@ -1,7 +1,8 @@
 # 73 — Coroutines, and async on top of them — Design
 
-Status: partial — P0 switch and most of P1 landed (resume/yield on separate
-stacks, the library minus `wrap`); keyframes, JIT, viz and async outstanding.
+Status: partial — P0 switch, keyframes and most of P1 landed (resume/yield
+on separate stacks, stops and keyframes inside coroutines, the library minus
+`wrap`); stack pool, JIT, viz and async outstanding.
 Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-26
@@ -57,13 +58,16 @@ land; move whole phases to Done once everything inside them is checked.
   collector's keep set. Capture refuses while a coroutine runs, so every
   captured one is suspended or dead. Every-cut resume test, malformed-record
   rejections, a wasm ≡ native viz case.
+- [x] **A stop inside a coroutine** (§6.2), snapshot format 14: a suspend may
+  land in a coroutine (not in one resumed from Zig, whose Zig frame can't be
+  resumed); `exec` continues it; the keyframe names the running coroutine
+  (`current_id`) and carries the main stack as `main_context`, with the
+  running and normal coroutines' resumer chain and wiring, validated on
+  restore. Every-cut tests through nested coroutines.
 
 ### Outstanding
 
-- [ ] **P0 remainder** (§5, §6.1, §6.2): a stop inside a coroutine — the
-  suspend there (refused by `canSuspendHere` today), the main stack carried
-  as a saved context with the running coroutine's id (a format bump), and
-  exec resuming in that coroutine; the reserved-stack pool with decommit behind one wrapper;
+- [ ] **P0 remainder** (§5, §6.1): the reserved-stack pool with decommit behind one wrapper;
   GC weight for a thread's stack; liveness masks for suspended frames.
 - [ ] **Native coroutine bodies**: `coroutine.create(print)` is refused
   ("Lua function expected") until a Zig body can run on a coroutine stack.

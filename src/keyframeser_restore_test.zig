@@ -1134,6 +1134,8 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
             },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
             .loaded_chunks = &.{},
+            .current_id = 0,
+            .main_context = &.{},
         },
     };
 
@@ -1208,6 +1210,8 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.ArrayResidentKeyInHash);
 
     // Float-spelled 0.0 normalizes to integer 0 → same rejection.
@@ -1233,6 +1237,8 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.ArrayResidentKeyInHash);
 
     // A key just past the extent (== asize) is a legitimate hash resident.
@@ -1260,6 +1266,8 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
             .frames = &.{},
             .open_upvalues = &.{},
             .loaded_chunks = &.{},
+            .current_id = 0,
+            .main_context = &.{},
         } }, &rootp, NativeRegistry.base());
         defer {
             vm.deinit();
@@ -1289,6 +1297,8 @@ fn oneTableFile(obj: *[1]schema.HeapObject, ht: schema.HeapTable) schema.Snapsho
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } };
 }
 
@@ -1317,6 +1327,8 @@ fn tableInGlobalsFile(obj: *[2]schema.HeapObject, ht: schema.HeapTable) schema.S
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } };
 }
 
@@ -1472,6 +1484,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.UnresolvedHeapRef);
 
     // A closure naming a proto id the program image does not contain.
@@ -1489,6 +1503,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.UnknownProto);
 
     // A native whose name is not in the registry.
@@ -1506,6 +1522,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.UnknownNative);
 
     // globals_id resolves to a string, not a table.
@@ -1523,6 +1541,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.GlobalsNotATable);
 
     // Two objects sharing an id.
@@ -1543,6 +1563,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.DuplicateId);
 
     // A wrong-version file is rejected outright.
@@ -1560,6 +1582,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.UnsupportedVersion);
 
     // L-2: two HeapStrings carrying identical bytes under distinct ids. A valid
@@ -1582,6 +1606,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.DuplicateInternedString);
 
     // L-2: the restored id space is exhausted (an object names the top id) AND
@@ -1610,6 +1636,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{.{ .source = "return 1", .name = "(load)" }},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.IdSpaceExhausted);
 
     // H-2 (v5): `next_obj_id` at/below a restored id is corrupt — a live object
@@ -1638,6 +1666,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
+        .current_id = 0,
+        .main_context = &.{},
     } }, &rootp, error.NextObjIdBelowObjects);
 }
 
@@ -1849,5 +1879,92 @@ test "doc 73: coroutines round-trip through a keyframe, and malformed thread rec
     };
     inline for (cases) |c| {
         try expectRestoreError(try editThread(a, snap, c[0], c[1]), chunk.proto, c[2]);
+    }
+}
+
+test "doc 73: a keyframe inside nested coroutines rejects a broken resumer chain" {
+    const gpa = testing.allocator;
+    const source =
+        \\local inner = coroutine.create(function()
+        \\  local s = 0
+        \\  for i = 1, 50 do s = s + i end
+        \\  return s
+        \\end)
+        \\local outer = coroutine.create(function() return coroutine.resume(inner) end)
+        \\print(coroutine.resume(outer))
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    // Stop inside `inner`'s loop, with `outer` normal and the main stack
+    // at its resume.
+    vm.setSuspendCtl(.{ .after_safepoints = 1, .min_depth = 1 });
+    var out = try vm.start(chunk.proto);
+    while (out == .suspended and (vm.current == null or vm.current.?.resumer == null)) {
+        // A stop comes before its instruction runs, and resuming counts its
+        // safepoint again: + 1 would stop there forever.
+        vm.setSuspendCtl(.{ .after_safepoints = vm.safepoint_seq + 2 });
+        out = try vm.exec();
+    }
+    try testing.expect(out == .suspended);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+    {
+        const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+        defer {
+            vm2.deinit();
+            gpa.destroy(vm2);
+        }
+        const b1 = try encodeSnapshot(gpa, vm2);
+        defer gpa.free(b1);
+        try testing.expectEqualSlices(u8, b0, b1);
+        try testing.expect(vm2.current != null and vm2.current.?.resumer != null);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const snap = try schema.SnapshotFile.decode(a, b0);
+    {
+        var s = snap;
+        s.keyframe.current_id = 0;
+        try expectRestoreError(s, chunk.proto, error.InvalidThread);
+    }
+    {
+        var s = snap;
+        s.keyframe.main_context = &.{};
+        try expectRestoreError(s, chunk.proto, error.InvalidThread);
+    }
+    // The normal coroutine resumed by itself: a cycle off the chain.
+    {
+        const objects = try a.dupe(schema.HeapObject, snap.keyframe.objects);
+        var hit = false;
+        for (objects) |*o| {
+            if (o.body != .HeapThread or o.body.HeapThread.status != 2) continue;
+            o.body.HeapThread.resumer_id = o.id + 1;
+            hit = true;
+        }
+        try testing.expect(hit);
+        var s = snap;
+        s.keyframe.objects = objects;
+        try expectRestoreError(s, chunk.proto, error.InvalidThread);
+    }
+    // The running coroutine named as the main thread's id.
+    {
+        var s = snap;
+        for (snap.keyframe.objects) |o| {
+            if (o.body == .HeapThread and o.body.HeapThread.status == 2) s.keyframe.current_id = o.id + 1;
+        }
+        try expectRestoreError(s, chunk.proto, error.InvalidThread);
     }
 }

@@ -693,7 +693,7 @@ pub const CallSite = struct {
 /// Mid-execution suspend trigger (test / debugger hook; null = never suspend, the
 /// normal `run` path). At each dispatch-loop safepoint, `exec` suspends the first
 /// time both conditions hold: at least `after_safepoints` safepoints have elapsed
-/// **and** the live call depth is `>= min_depth`. The depth gate lets a test
+/// **and** the running stack's call depth is `>= min_depth`. The depth gate lets a test
 /// capture *inside a nested call* (`min_depth = 2`) rather than at an arbitrary
 /// point; the safepoint count lets it capture mid-loop in a single frame.
 pub const SuspendCtl = struct {
@@ -1421,6 +1421,14 @@ pub const Vm = struct {
     /// register stack. Any `Value` returned by `run` that is a heap reference
     /// dangles after this — inspect results first.
     pub fn deinit(self: *Vm) void {
+        // Dropped while a coroutine runs (stopped inside one, doc 73): the
+        // coroutine gets its stack's state back and the VM the main stack's,
+        // so the heap frees the one and this the other.
+        if (self.current) |t| {
+            coroutine.save(self, &t.saved);
+            coroutine.load(self, &self.main_saved);
+            self.current = null;
+        }
         self.trace.deinit();
         self.open_upvalues.deinit(self.gpa);
         self.effect_log.deinit(self.gpa);
@@ -3763,13 +3771,16 @@ pub const Vm = struct {
         // `frames[0].base == 0` via FrameWindowMismatch) — cache-and-validate
         // it here rather than trusting it, and never read the popped frame's
         // stale storage afterwards.
-        const root_base_ok = self.depth >= 1 and self.frames[0].base == 0;
+        // The root frame is the main stack's, which a stop inside a
+        // coroutine (doc 73) left saved.
+        const main_depth = if (self.current == null) self.depth else self.main_saved.depth;
+        const main_frames = if (self.current == null) self.frames else self.main_saved.frames;
+        const root_base_ok = main_depth >= 1 and main_frames[0].base == 0;
         // Doc 63 §5.6: every guest execution moves the epoch. `run`, `start`
         // and a resume reach the dispatch loop here, not via `execWithEntry`.
         self.heap.bumpHostEpoch();
-        // A suspend never stops a coroutine (`canSuspendHere`), so a resume
-        // is on the main stack too.
-        std.debug.assert(self.current == null);
+        // After a stop inside a coroutine, the dispatch resumes it; the main
+        // stack is the context this dispatch belongs to either way.
         const outcome = try self.execWith(1, null);
         if (outcome == .finished and self.depth == 0 and root_base_ok) {
             const fr = outcome.finished;
@@ -4320,12 +4331,13 @@ pub const Vm = struct {
     /// Whether a due suspend may stop at the current safepoint. Not while a
     /// native runs code through a Zig re-entry (doc 68 §8, defer: that Zig
     /// frame could not be resumed), nor while a multret result is pending
-    /// (`reg_top_pending`: its producer and consumer are one step), nor
-    /// while a coroutine runs (doc 73: a keyframe cannot hold one yet). The
-    /// replay index records the same predicate per safepoint, so the steps
-    /// it offers are exactly the ones a replay stops at.
+    /// (`reg_top_pending`: its producer and consumer are one step). A
+    /// coroutine may stop (doc 73): its resumers are stopped at their
+    /// resumes, out of flight, and a keyframe carries them all. The replay
+    /// index records the same predicate per safepoint, so the steps it
+    /// offers are exactly the ones a replay stops at.
     pub inline fn canSuspendHere(self: *const Vm) bool {
-        return self.native_reentry_depth == 0 and !self.reg_top_pending and self.current == null;
+        return self.native_reentry_depth == 0 and !self.reg_top_pending;
     }
 
     /// Arm (or, with null, disarm) the mid-execution suspend trigger.

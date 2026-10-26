@@ -104,6 +104,8 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
             },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
             .loaded_chunks = &.{},
+            .current_id = 0,
+            .main_context = &.{},
         },
     };
 

@@ -621,6 +621,8 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue)
             },
             .open_upvalues = &.{},
             .loaded_chunks = &.{},
+            .current_id = 0,
+            .main_context = &.{},
         },
     };
     try expectRestoreError(bad, &rootp, error.FrameWindowMismatch);
@@ -706,6 +708,8 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             },
             .open_upvalues = &.{},
             .loaded_chunks = &.{},
+            .current_id = 0,
+            .main_context = &.{},
         },
     };
     try expectRestoreError(bad, &rootp, error.FrameWindowMismatch);
@@ -1267,6 +1271,39 @@ test "doc 73: every cut with coroutines alive resumes after restore" {
         \\print(coroutine.resume(fresh, 21, 1, 2), coroutine.status(fresh))
         \\print(coroutine.status(dead), coroutine.close(dead), main == coroutine.running())
         \\print(getter(), coroutine.close(cell), getter(), coroutine.status(cell))
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}
+
+test "doc 73: every cut through nested coroutines resumes after restore" {
+    // Cuts land inside coroutines too: a running coroutine, the normal one
+    // that resumed it, the main stack stopped at its resume, `pcall` frames
+    // inside a coroutine, an error that kills one mid-chain.
+    const gpa = testing.allocator;
+    const source =
+        \\local inner = coroutine.create(function(a)
+        \\  local ok, e = pcall(function() error("in" .. a) end)
+        \\  local b = coroutine.yield(a * 2, e)
+        \\  return a + b
+        \\end)
+        \\local outer = coroutine.create(function(...)
+        \\  local n = select("#", ...)
+        \\  local _, x, e = coroutine.resume(inner, n)
+        \\  local y = coroutine.yield(x, e, coroutine.status(inner))
+        \\  local _, z = coroutine.resume(inner, y)
+        \\  local bad = coroutine.create(function() local t = nil return t.x end)
+        \\  local okb = coroutine.resume(bad)
+        \\  return z, okb, coroutine.status(bad)
+        \\end)
+        \\print(coroutine.resume(outer, 1, 2, 3))
+        \\print(coroutine.status(outer), coroutine.status(inner))
+        \\print(coroutine.resume(outer, 10))
+        \\print(coroutine.status(outer), coroutine.status(inner))
     ;
     const ref = try referenceRun(gpa, source);
     defer ref.deinit(gpa);

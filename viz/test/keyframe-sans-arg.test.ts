@@ -56,6 +56,8 @@ class Kf {
         frames: [],
         open_upvalues: [],
         loaded_chunks: loaded.map((l) => ({ source: enc(l.source), name: enc(l.name) })),
+        current_id: 0,
+        main_context: [],
       },
     });
   }

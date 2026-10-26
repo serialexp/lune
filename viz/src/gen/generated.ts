@@ -3297,7 +3297,7 @@ export class ThreadContextDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
+ * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. Only the running coroutine (Keyframe.current_id) and the normal ones on its resumer chain are captured with a resumer and resume wiring. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
  */
 export interface HeapThreadInput {
   /**
@@ -3367,7 +3367,7 @@ export interface HeapThreadInput {
 }
 
 /**
- * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
+ * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. Only the running coroutine (Keyframe.current_id) and the normal ones on its resumer chain are captured with a resumer and resume wiring. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
  */
 export interface HeapThreadOutput {
   /**
@@ -4253,7 +4253,7 @@ export class LoadedChunkDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain.
  */
 export interface KeyframeInput {
   /**
@@ -4346,10 +4346,25 @@ export interface KeyframeInput {
    * Length prefix type: uint32
    */
   loaded_chunks: LoadedChunkInput[];
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  current_id: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  main_context: ThreadContextInput[];
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain.
  */
 export interface KeyframeOutput {
   /**
@@ -4442,6 +4457,21 @@ export interface KeyframeOutput {
    * Length prefix type: uint32
    */
   loaded_chunks: LoadedChunkOutput[];
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  current_id: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  main_context: ThreadContextOutput[];
 }
 
 export type Keyframe = KeyframeOutput;
@@ -4510,6 +4540,16 @@ export class KeyframeEncoder extends BitStreamEncoder {
         this.writeUint8(byte);
       }
     }
+    this.writeUint32(value.current_id, "little_endian");
+    this.writeUint8(value.main_context.length);
+    for (let value_main_context__iter_index = 0; value_main_context__iter_index < value.main_context.length; value_main_context__iter_index++) {
+      const value_main_context__iter = value.main_context[value_main_context__iter_index];
+      const encoder_value_main_context__iter = new ThreadContextEncoder();
+      const encoded_value_main_context__iter = encoder_value_main_context__iter.encode(value_main_context__iter);
+      for (const byte of encoded_value_main_context__iter) {
+        this.writeUint8(byte);
+      }
+    }
     return this.finish();
   }
 
@@ -4549,7 +4589,13 @@ export class KeyframeEncoder extends BitStreamEncoder {
       const loaded_chunks_itemEncoder = new LoadedChunkEncoder();
       size += loaded_chunks_itemEncoder.calculateSize(item);
     }
-    size += 4; // length prefix (uint32)
+    size += 8; // length prefix (uint32) + current_id
+    // main_context: array (kind: length_prefixed)
+    for (const item of value.main_context) {
+      const main_context_itemEncoder = new ThreadContextEncoder();
+      size += main_context_itemEncoder.calculateSize(item);
+    }
+    size += 1; // length prefix (uint8)
     return size;
   }
 }
@@ -4715,6 +4761,84 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
       }
       value.loaded_chunks.push(loaded_chunks__iter);
     }
+    value.current_id = this.readUint32("little_endian");
+    value.main_context = [];
+    const main_context_length = this.readUint8();
+    for (let i = 0; i < main_context_length; i++) {
+      let main_context__iter: any;
+      main_context__iter = {};
+      main_context__iter.stack = [];
+      const main_context__iter_stack_length = this.readUint32("little_endian");
+      for (let i = 0; i < main_context__iter_stack_length; i++) {
+        let main_context__iter_stack__iter: any;
+        main_context__iter_stack__iter = {};
+        main_context__iter_stack__iter.tag = this.readUint8();
+        if (main_context__iter_stack__iter.tag === 0) {
+          const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          main_context__iter_stack__iter.body = { type: 'ConstNil', value: payload };
+        }
+        else if (main_context__iter_stack__iter.tag === 1) {
+          const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          main_context__iter_stack__iter.body = { type: 'ConstBool', value: payload };
+        }
+        else if (main_context__iter_stack__iter.tag === 2) {
+          const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          main_context__iter_stack__iter.body = { type: 'ConstInt', value: payload };
+        }
+        else if (main_context__iter_stack__iter.tag === 3) {
+          const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          main_context__iter_stack__iter.body = { type: 'ConstFloat', value: payload };
+        }
+        else if (main_context__iter_stack__iter.tag === 4) {
+          const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          main_context__iter_stack__iter.body = { type: 'HeapRef', value: payload };
+        }
+        else if (main_context__iter_stack__iter.tag === 255) {
+          const decoder = new DeadSlotDecoder(this.bytes.slice(this.byteOffset), main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          main_context__iter_stack__iter.body = { type: 'DeadSlot', value: payload };
+        } else {
+          throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${main_context__iter_stack__iter.tag}`);
+        }
+        main_context__iter.stack.push(main_context__iter_stack__iter);
+      }
+      main_context__iter.frames = [];
+      const main_context__iter_frames_length = this.readUint16("little_endian");
+      for (let i = 0; i < main_context__iter_frames_length; i++) {
+        let main_context__iter_frames__iter: any;
+        main_context__iter_frames__iter = {};
+        main_context__iter_frames__iter.closure_id = this.readUint32("little_endian");
+        main_context__iter_frames__iter.pc = this.readUint32("little_endian");
+        main_context__iter_frames__iter.base = this.readUint32("little_endian");
+        main_context__iter_frames__iter.ret_dest = this.readUint16("little_endian");
+        main_context__iter_frames__iter.ret_count = this.readUint16("little_endian");
+        main_context__iter_frames__iter.varargs_base = this.readUint32("little_endian");
+        main_context__iter_frames__iter.varargs_count = this.readUint32("little_endian");
+        main_context__iter_frames__iter.ctl = this.readUint8();
+        main_context__iter.frames.push(main_context__iter_frames__iter);
+      }
+      main_context__iter.open_upvalues = [];
+      const main_context__iter_open_upvalues_length = this.readUint16("little_endian");
+      for (let i = 0; i < main_context__iter_open_upvalues_length; i++) {
+        let main_context__iter_open_upvalues__iter: any;
+        main_context__iter_open_upvalues__iter = {};
+        main_context__iter_open_upvalues__iter.stack_index = this.readUint32("little_endian");
+        main_context__iter_open_upvalues__iter.upvalue_id = this.readUint32("little_endian");
+        main_context__iter.open_upvalues.push(main_context__iter_open_upvalues__iter);
+      }
+      value.main_context.push(main_context__iter);
+    }
     return value;
   }
 }
@@ -4729,7 +4853,7 @@ export interface SnapshotFileInput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain.
    */
   keyframe: KeyframeInput;
 }
@@ -4744,7 +4868,7 @@ export interface SnapshotFileOutput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `next_gc` is the heap's collection threshold (live-object count that triggers the next collection). F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain.
    */
   keyframe: KeyframeOutput;
 }
@@ -4947,6 +5071,84 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
         keyframe_loaded_chunks__iter.name.push(keyframe_loaded_chunks__iter_name__iter);
       }
       value.keyframe.loaded_chunks.push(keyframe_loaded_chunks__iter);
+    }
+    value.keyframe.current_id = this.readUint32("little_endian");
+    value.keyframe.main_context = [];
+    const keyframe_main_context_length = this.readUint8();
+    for (let i = 0; i < keyframe_main_context_length; i++) {
+      let keyframe_main_context__iter: any;
+      keyframe_main_context__iter = {};
+      keyframe_main_context__iter.stack = [];
+      const keyframe_main_context__iter_stack_length = this.readUint32("little_endian");
+      for (let i = 0; i < keyframe_main_context__iter_stack_length; i++) {
+        let keyframe_main_context__iter_stack__iter: any;
+        keyframe_main_context__iter_stack__iter = {};
+        keyframe_main_context__iter_stack__iter.tag = this.readUint8();
+        if (keyframe_main_context__iter_stack__iter.tag === 0) {
+          const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), keyframe_main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          keyframe_main_context__iter_stack__iter.body = { type: 'ConstNil', value: payload };
+        }
+        else if (keyframe_main_context__iter_stack__iter.tag === 1) {
+          const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), keyframe_main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          keyframe_main_context__iter_stack__iter.body = { type: 'ConstBool', value: payload };
+        }
+        else if (keyframe_main_context__iter_stack__iter.tag === 2) {
+          const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), keyframe_main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          keyframe_main_context__iter_stack__iter.body = { type: 'ConstInt', value: payload };
+        }
+        else if (keyframe_main_context__iter_stack__iter.tag === 3) {
+          const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), keyframe_main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          keyframe_main_context__iter_stack__iter.body = { type: 'ConstFloat', value: payload };
+        }
+        else if (keyframe_main_context__iter_stack__iter.tag === 4) {
+          const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), keyframe_main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          keyframe_main_context__iter_stack__iter.body = { type: 'HeapRef', value: payload };
+        }
+        else if (keyframe_main_context__iter_stack__iter.tag === 255) {
+          const decoder = new DeadSlotDecoder(this.bytes.slice(this.byteOffset), keyframe_main_context__iter_stack__iter);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          keyframe_main_context__iter_stack__iter.body = { type: 'DeadSlot', value: payload };
+        } else {
+          throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${keyframe_main_context__iter_stack__iter.tag}`);
+        }
+        keyframe_main_context__iter.stack.push(keyframe_main_context__iter_stack__iter);
+      }
+      keyframe_main_context__iter.frames = [];
+      const keyframe_main_context__iter_frames_length = this.readUint16("little_endian");
+      for (let i = 0; i < keyframe_main_context__iter_frames_length; i++) {
+        let keyframe_main_context__iter_frames__iter: any;
+        keyframe_main_context__iter_frames__iter = {};
+        keyframe_main_context__iter_frames__iter.closure_id = this.readUint32("little_endian");
+        keyframe_main_context__iter_frames__iter.pc = this.readUint32("little_endian");
+        keyframe_main_context__iter_frames__iter.base = this.readUint32("little_endian");
+        keyframe_main_context__iter_frames__iter.ret_dest = this.readUint16("little_endian");
+        keyframe_main_context__iter_frames__iter.ret_count = this.readUint16("little_endian");
+        keyframe_main_context__iter_frames__iter.varargs_base = this.readUint32("little_endian");
+        keyframe_main_context__iter_frames__iter.varargs_count = this.readUint32("little_endian");
+        keyframe_main_context__iter_frames__iter.ctl = this.readUint8();
+        keyframe_main_context__iter.frames.push(keyframe_main_context__iter_frames__iter);
+      }
+      keyframe_main_context__iter.open_upvalues = [];
+      const keyframe_main_context__iter_open_upvalues_length = this.readUint16("little_endian");
+      for (let i = 0; i < keyframe_main_context__iter_open_upvalues_length; i++) {
+        let keyframe_main_context__iter_open_upvalues__iter: any;
+        keyframe_main_context__iter_open_upvalues__iter = {};
+        keyframe_main_context__iter_open_upvalues__iter.stack_index = this.readUint32("little_endian");
+        keyframe_main_context__iter_open_upvalues__iter.upvalue_id = this.readUint32("little_endian");
+        keyframe_main_context__iter.open_upvalues.push(keyframe_main_context__iter_open_upvalues__iter);
+      }
+      value.keyframe.main_context.push(keyframe_main_context__iter);
     }
     return value;
   }

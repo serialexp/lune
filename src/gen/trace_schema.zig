@@ -1330,6 +1330,8 @@ pub const Keyframe = struct {
     frames: []const FrameRef,
     open_upvalues: []const OpenUpvalueRef,
     loaded_chunks: []const LoadedChunk,
+    current_id: u32,
+    main_context: []const ThreadContext,
 
     pub fn encode(self: Keyframe, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -1369,6 +1371,11 @@ pub const Keyframe = struct {
         for (self.loaded_chunks) |_item_4| {
             try _item_4.encodeInto(enc, ctx);
         }
+        try enc.writeUint32(self.current_id, .little_endian);
+        try enc.writeUint8(@intCast(self.main_context.len));
+        for (self.main_context) |_item_5| {
+            try _item_5.encodeInto(enc, ctx);
+        }
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!Keyframe {
@@ -1386,41 +1393,49 @@ pub const Keyframe = struct {
         result.next_file_id = try dec.readUint32(.little_endian);
         result.next_obj_id = try dec.readUint32(.little_endian);
         result.next_gc = try dec.readUint64(.little_endian);
-        const _len_8 = try dec.readUint32(.little_endian);
-        const _buf_9 = try allocator.alloc(HeapObject, @as(usize, _len_8));
-        errdefer allocator.free(_buf_9);
-        for (0.._buf_9.len) |_i_6| {
-            _buf_9[_i_6] = try HeapObject.decodeWith(allocator, dec, root);
+        const _len_9 = try dec.readUint32(.little_endian);
+        const _buf_10 = try allocator.alloc(HeapObject, @as(usize, _len_9));
+        errdefer allocator.free(_buf_10);
+        for (0.._buf_10.len) |_i_7| {
+            _buf_10[_i_7] = try HeapObject.decodeWith(allocator, dec, root);
         }
-        result.objects = _buf_9;
-        const _len_13 = try dec.readUint32(.little_endian);
-        const _buf_14 = try allocator.alloc(StackValue, @as(usize, _len_13));
-        errdefer allocator.free(_buf_14);
-        for (0.._buf_14.len) |_i_11| {
-            _buf_14[_i_11] = try StackValue.decodeWith(allocator, dec, root);
+        result.objects = _buf_10;
+        const _len_14 = try dec.readUint32(.little_endian);
+        const _buf_15 = try allocator.alloc(StackValue, @as(usize, _len_14));
+        errdefer allocator.free(_buf_15);
+        for (0.._buf_15.len) |_i_12| {
+            _buf_15[_i_12] = try StackValue.decodeWith(allocator, dec, root);
         }
-        result.stack = _buf_14;
-        const _len_18 = try dec.readUint16(.little_endian);
-        const _buf_19 = try allocator.alloc(FrameRef, @as(usize, _len_18));
-        errdefer allocator.free(_buf_19);
-        for (0.._buf_19.len) |_i_16| {
-            _buf_19[_i_16] = try FrameRef.decodeWith(allocator, dec, root);
+        result.stack = _buf_15;
+        const _len_19 = try dec.readUint16(.little_endian);
+        const _buf_20 = try allocator.alloc(FrameRef, @as(usize, _len_19));
+        errdefer allocator.free(_buf_20);
+        for (0.._buf_20.len) |_i_17| {
+            _buf_20[_i_17] = try FrameRef.decodeWith(allocator, dec, root);
         }
-        result.frames = _buf_19;
-        const _len_23 = try dec.readUint16(.little_endian);
-        const _buf_24 = try allocator.alloc(OpenUpvalueRef, @as(usize, _len_23));
-        errdefer allocator.free(_buf_24);
-        for (0.._buf_24.len) |_i_21| {
-            _buf_24[_i_21] = try OpenUpvalueRef.decodeWith(allocator, dec, root);
+        result.frames = _buf_20;
+        const _len_24 = try dec.readUint16(.little_endian);
+        const _buf_25 = try allocator.alloc(OpenUpvalueRef, @as(usize, _len_24));
+        errdefer allocator.free(_buf_25);
+        for (0.._buf_25.len) |_i_22| {
+            _buf_25[_i_22] = try OpenUpvalueRef.decodeWith(allocator, dec, root);
         }
-        result.open_upvalues = _buf_24;
-        const _len_28 = try dec.readUint32(.little_endian);
-        const _buf_29 = try allocator.alloc(LoadedChunk, @as(usize, _len_28));
-        errdefer allocator.free(_buf_29);
-        for (0.._buf_29.len) |_i_26| {
-            _buf_29[_i_26] = try LoadedChunk.decodeWith(allocator, dec, root);
+        result.open_upvalues = _buf_25;
+        const _len_29 = try dec.readUint32(.little_endian);
+        const _buf_30 = try allocator.alloc(LoadedChunk, @as(usize, _len_29));
+        errdefer allocator.free(_buf_30);
+        for (0.._buf_30.len) |_i_27| {
+            _buf_30[_i_27] = try LoadedChunk.decodeWith(allocator, dec, root);
         }
-        result.loaded_chunks = _buf_29;
+        result.loaded_chunks = _buf_30;
+        result.current_id = try dec.readUint32(.little_endian);
+        const _len_34 = try dec.readUint8();
+        const _buf_35 = try allocator.alloc(ThreadContext, @as(usize, _len_34));
+        errdefer allocator.free(_buf_35);
+        for (0.._buf_35.len) |_i_32| {
+            _buf_35[_i_32] = try ThreadContext.decodeWith(allocator, dec, root);
+        }
+        result.main_context = _buf_35;
         return result;
     }
 };

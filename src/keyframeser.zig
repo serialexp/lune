@@ -113,10 +113,14 @@ pub const schema = @import("gen/trace_schema.zig");
 ///
 /// v13 (doc 73): coroutines. `HeapObject` gained `HeapThread` (obj_type 8:
 /// kind, status, body, resumer, death, the resume and yield wiring, and the
-/// saved stack of one that isn't running as a `ThreadContext`). Capture still
-/// refuses to run while a coroutine does, so every captured coroutine is
-/// suspended or dead.
-pub const snapshot_format_version: u32 = 13;
+/// saved stack of one that isn't running as a `ThreadContext`). v13 captured
+/// only while no coroutine ran.
+///
+/// v14 (doc 73): a stop inside a coroutine. `Keyframe` gained `current_id`,
+/// the running coroutine (1-based optional id), and `main_context`, the main
+/// stack while a coroutine runs; the running and normal coroutines carry
+/// their resumer and resume wiring.
+pub const snapshot_format_version: u32 = 14;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -341,6 +345,9 @@ fn toSchemaThread(a: std.mem.Allocator, vm: *Vm, t: *Thread) !schema.HeapThread 
         break :blk one;
     } else &.{};
     const wired = t.status == .running or t.status == .normal;
+    // Resumed from Zig: that frame is above the capture, which refuses to
+    // run inside one (`encodeSnapshot`), so no chain member can be.
+    if (wired and t.sync) return error.CaptureInsideNativeActivation;
     const at_yield = t.status == .suspended and t.stack != null and t.saved.depth > 0;
     return .{
         .kind = if (vm.main_thread == t) thread_kind_main else thread_kind_coroutine,
@@ -459,10 +466,6 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     for (vm.frames[0..vm.depth]) |*fr| {
         if (fr.in_flight) return error.CaptureInsideNativeActivation;
     }
-    // Doc 73: the format has no running coroutine yet (the main stack would
-    // have to be carried as a saved one), and no suspend lands inside one
-    // (`Vm.canSuspendHere`).
-    if (vm.current != null) return error.CaptureInsideCoroutine;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -482,8 +485,18 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     for (all, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, vm, h, live);
 
     // 2. The running stack: its kept registers (doc 61 Phase K), frames and
-    //    open upvalues.
+    //    open upvalues. With a coroutine running (doc 73), the main stack is
+    //    a saved one, captured with it loaded, as a coroutine's is.
     const running = try captureContext(a, vm);
+    var main_context: []schema.ThreadContext = &.{};
+    if (vm.current != null) {
+        main_context = try a.alloc(schema.ThreadContext, 1);
+        var saved_running: coroutine.SavedContext = undefined;
+        coroutine.save(vm, &saved_running);
+        defer coroutine.load(vm, &saved_running);
+        coroutine.load(vm, &vm.main_saved);
+        main_context[0] = try captureContext(a, vm);
+    }
 
     // Runtime-`load`ed chunks, in load order (L-2): source + chunk name. Restore
     // recompiles each — compile is deterministic, so the same sources in the same
@@ -527,6 +540,8 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             .frames = running.frames,
             .open_upvalues = running.open_upvalues,
             .loaded_chunks = loaded,
+            .current_id = if (vm.current) |t| t.header.id + 1 else 0,
+            .main_context = main_context,
         },
     };
     return file.encode(gpa);
@@ -740,24 +755,53 @@ fn fileRoot(idmap: *const IdMap, id1: u32) RestoreError!?*File {
 }
 
 /// A `HeapThread` whose fields agree with each other, as capture writes
-/// them. v13 captures only while no coroutine runs, so each one is
-/// suspended (with its stack) or dead (without), and none has a resumer.
-fn checkThreadShape(ht: schema.HeapThread) RestoreError!void {
+/// them: the running coroutine (`is_current`) owns a stack but carries none,
+/// being the keyframe's own; a normal or suspended one carries its stack; a
+/// dead one has none. Only running and normal ones have a resumer and
+/// resume wiring (`checkResumerChain` checks they form one chain). The main
+/// thread object has no stack and a fixed status.
+fn checkThreadShape(ht: schema.HeapThread, is_current: bool) RestoreError!void {
     if (ht.has_stack > 1 or ht.death.len > 1 or ht.context.len > 1) return error.InvalidThread;
-    if (ht.resumer_id != 0 or ht.ret_lo != 0 or ht.ret_c != 0) return error.InvalidThread;
     const status = std.enums.fromInt(Thread.Status, ht.status) orelse return error.InvalidThread;
+    const wired = ht.kind == thread_kind_coroutine and (status == .running or status == .normal);
+    if (!wired and (ht.resumer_id != 0 or ht.ret_lo != 0 or ht.ret_c != 0)) return error.InvalidThread;
     switch (ht.kind) {
-        thread_kind_main => if (status != .running or ht.has_stack != 0 or ht.context.len != 0 or ht.death.len != 0)
+        thread_kind_main => if (is_current or status != .running or ht.has_stack != 0 or ht.context.len != 0 or ht.death.len != 0)
             return error.InvalidThread,
         thread_kind_coroutine => {
-            const suspended = status == .suspended;
-            if (!suspended and status != .dead) return error.InvalidThread;
-            if (ht.has_stack != @intFromBool(suspended) or ht.context.len != ht.has_stack) return error.InvalidThread;
-            if (ht.context.len == 1 and ht.context[0].frames.len == 0 and (ht.yield_lo != 0 or ht.yield_c != 0))
-                return error.InvalidThread;
+            if ((status == .running) != is_current) return error.InvalidThread;
+            const want_context: u8 = switch (status) {
+                .running, .dead => 0,
+                .normal, .suspended => 1,
+            };
+            if (ht.has_stack != @intFromBool(status != .dead) or ht.context.len != want_context) return error.InvalidThread;
+            if (status != .dead and ht.death.len != 0) return error.InvalidThread;
+            // Only a coroutine stopped at a yield takes values there.
+            const at_yield = status == .suspended and ht.context[0].frames.len != 0;
+            if (!at_yield and (ht.yield_lo != 0 or ht.yield_c != 0)) return error.InvalidThread;
         },
         else => return error.InvalidThread,
     }
+}
+
+/// With a coroutine running (`current`), the running one and every normal
+/// one form one chain through `resumer` that ends at the main stack; with
+/// none, no coroutine is normal. Run after pass 2 wired the edges.
+fn checkResumerChain(kf: schema.Keyframe, current: ?*Thread) RestoreError!void {
+    var normal: usize = 0;
+    for (kf.objects) |o| {
+        if (o.body == .HeapThread and o.body.HeapThread.status == @intFromEnum(Thread.Status.normal)) normal += 1;
+    }
+    var t = current orelse return if (normal == 0) {} else error.InvalidThread;
+    var waiting: usize = 0;
+    while (t.resumer) |r| : (t = r) {
+        // Each step reaches a distinct normal coroutine, so a cycle runs
+        // past the count.
+        if (r.status != .normal) return error.InvalidThread;
+        waiting += 1;
+        if (waiting > normal) return error.InvalidThread;
+    }
+    if (waiting != normal) return error.InvalidThread;
 }
 
 /// Rebuild the loaded stack from `ctx`: its registers, its frames through the
@@ -791,7 +835,11 @@ fn restoreContext(vm: *Vm, ctx: schema.ThreadContext, idmap: *const IdMap, owner
         // (doc 61 P1), leaving a gap that holds the span. Anything else is a
         // corrupt/incompatible snapshot (and would make resume read the wrong
         // registers).
-        if (i == 0 and fr.base != 0) return error.FrameWindowMismatch;
+        // A coroutine's body frame, started with surplus arguments for its
+        // varargs, sits right above them (`Vm.bindAndPushClosure`).
+        const above_args = owner != null and fr.varargs_count != 0 and
+            @as(u64, fr.varargs_base) + fr.varargs_count == fr.base;
+        if (i == 0 and fr.base != 0 and !above_args) return error.FrameWindowMismatch;
         if (fr.base < expected_base) return error.FrameWindowMismatch;
         if (@as(usize, fr.base) + cl.proto.num_registers > ctx.stack.len) return error.FrameWindowMismatch;
         if (fr.varargs_count == 0) {
@@ -993,7 +1041,7 @@ pub fn restoreSnapshot(
                 break :blk &f.header;
             },
             .HeapThread => |ht| blk: {
-                try checkThreadShape(ht);
+                try checkThreadShape(ht, kf.current_id != 0 and kf.current_id - 1 == o.id);
                 if (ht.kind == thread_kind_main and vm.main_thread != null) return error.InvalidThread;
                 const t = try coroutine.createRestored(gpa, ht.has_stack == 1);
                 vm.heap.linkRestoredThread(&t.header, o.id);
@@ -1136,6 +1184,11 @@ pub fn restoreSnapshot(
                     t.body.isHeap() and t.body.asHeap().type == .function;
                 if (!body_ok) return error.InvalidThread;
                 if (ht.death.len == 1) t.death = try fromSchemaValue(ht.death[0], &idmap);
+                if (ht.resumer_id != 0) {
+                    const rh = idmap.get(ht.resumer_id - 1) orelse return error.UnresolvedHeapRef;
+                    if (rh.type != .thread) return error.InvalidThread;
+                    t.resumer = Thread.fromHeader(rh);
+                }
                 t.ret_lo = ht.ret_lo;
                 t.ret_c = ht.ret_c;
                 t.yield_lo = ht.yield_lo;
@@ -1156,12 +1209,33 @@ pub fn restoreSnapshot(
     // after a restore must compare stores against the live table).
     vm.trace.rec_globals_header = &vm.globals.header;
 
-    try restoreContext(vm, .{ .stack = kf.stack, .frames = kf.frames, .open_upvalues = kf.open_upvalues }, &idmap, null);
+    // Doc 73: the running stack is the keyframe's own. With a coroutine
+    // running, the main stack is rebuilt first and put aside as a switch
+    // would, and the coroutine's is rebuilt loaded.
+    const current: ?*Thread = if (kf.current_id == 0) null else blk: {
+        const h = idmap.get(kf.current_id - 1) orelse return error.UnresolvedHeapRef;
+        if (h.type != .thread) return error.InvalidThread;
+        break :blk Thread.fromHeader(h);
+    };
+    try checkResumerChain(kf, current);
+    const running_ctx: schema.ThreadContext = .{ .stack = kf.stack, .frames = kf.frames, .open_upvalues = kf.open_upvalues };
+    if (current) |t| {
+        // The main stack is stopped at the resume that began the chain.
+        if (kf.main_context.len != 1 or kf.main_context[0].frames.len == 0) return error.InvalidThread;
+        try restoreContext(vm, kf.main_context[0], &idmap, null);
+        coroutine.save(vm, &vm.main_saved);
+        coroutine.load(vm, &t.saved);
+        vm.current = t;
+        try restoreContext(vm, running_ctx, &idmap, t);
+    } else {
+        if (kf.main_context.len != 0) return error.InvalidThread;
+        try restoreContext(vm, running_ctx, &idmap, null);
+    }
 
-    // Doc 73: each suspended coroutine's stack, rebuilt like the running one
+    // Doc 73: each other coroutine's stack, rebuilt like the running one
     // with that stack loaded, as a collection walks it.
-    var main_ctx: coroutine.SavedContext = undefined;
-    coroutine.save(vm, &main_ctx);
+    var running_saved: coroutine.SavedContext = undefined;
+    coroutine.save(vm, &running_saved);
     for (kf.objects) |o| {
         const ht = switch (o.body) {
             .HeapThread => |ht| ht,
@@ -1171,10 +1245,10 @@ pub fn restoreSnapshot(
         const t = Thread.fromHeader(idmap.get(o.id).?);
         coroutine.load(vm, &t.saved);
         // Whatever happens, the stack's state goes back to its thread and
-        // the main stack's into the VM, so each is freed once.
+        // the running stack's into the VM, so each is freed once.
         defer {
             coroutine.save(vm, &t.saved);
-            coroutine.load(vm, &main_ctx);
+            coroutine.load(vm, &running_saved);
         }
         try restoreContext(vm, ht.context[0], &idmap, t);
         // A suspended coroutine has its body frame, or hasn't started.

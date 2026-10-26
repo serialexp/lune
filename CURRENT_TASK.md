@@ -23,10 +23,14 @@ DOC 73 COROUTINES: P0 IN PROGRESS (2026-10-26, coral-marten).
   machine code and allocation counts; table keys hash by GcHeader.id and the
   library's 15 init objects shift every id (padding a script by a few
   constants moves the baseline ±0.2–0.5%).
-- Next (P0 remainder): keyframe thread records (format 12 → 13; canSuspendHere
-  refuses while a coroutine runs until then), host suspension inside
-  coroutines, stack pool/decommit, GC weight, native bodies, the benchmarks
-  (ping-pong, 10k coroutines, churn).
+- Keyframes: 6ab02cf (format 13, HeapThread records) and the stop-inside-a-
+  coroutine commit (format 14: current_id + main_context; canSuspendHere no
+  longer refuses coroutines; Vm.deinit swaps the main stack back first).
+  Capture/restore load each saved stack into the VM, like walkSavedStacks.
+  Gotcha for tests that re-arm a suspend: a stop precedes its instruction
+  and resuming re-counts that safepoint, so re-arm at safepoint_seq + 2.
+- Next (P0 remainder): stack pool/decommit, GC weight, native bodies, the
+  benchmarks (ping-pong, 10k coroutines, churn); then wrap (ask Bart).
 - `coroutine.wrap` needs a callable bound to its coroutine: that is the
   same open decision as gmatch's lone callable (TODO.md:70) — ask Bart
   before building wrap.

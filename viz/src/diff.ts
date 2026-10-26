@@ -147,6 +147,11 @@ export function keyframeSansArg(bytes: Uint8Array): string {
     }
   };
 
+  const canonFrame = (fr: any) => ({ closure: visit(Number(fr.closure_id)), pc: fr.pc, base: fr.base, ret_dest: fr.ret_dest, ret_count: fr.ret_count });
+  const canonOpen = (uv: any) => ({ stack_index: uv.stack_index, upvalue: visit(Number(uv.upvalue_id)) });
+  // A stack that isn't running (doc 73): laid out as the running one is.
+  const canonContext = (c: any) => ({ stack: c.stack.map(canonSv), frames: c.frames.map(canonFrame), open_upvalues: c.open_upvalues.map(canonOpen) });
+
   const roots = {
     globals: visit(Number(kf.globals_id)),
     string_metatable: Number(kf.string_metatable_id) > 0 ? visit(Number(kf.string_metatable_id) - 1) : -1,
@@ -157,8 +162,12 @@ export function keyframeSansArg(bytes: Uint8Array): string {
     io_output: Number(kf.io_output_id) > 0 ? visit(Number(kf.io_output_id) - 1) : -1,
     next_file_id: kf.next_file_id,
     stack: kf.stack.map(canonSv),
-    frames: kf.frames.map((fr: any) => ({ closure: visit(Number(fr.closure_id)), pc: fr.pc, base: fr.base, ret_dest: fr.ret_dest, ret_count: fr.ret_count })),
-    open_upvalues: kf.open_upvalues.map((uv: any) => ({ stack_index: uv.stack_index, upvalue: visit(Number(uv.upvalue_id)) })),
+    frames: kf.frames.map(canonFrame),
+    open_upvalues: kf.open_upvalues.map(canonOpen),
+    // Doc 73: the coroutine running the stack above, and the main stack
+    // while it does.
+    current: Number(kf.current_id) > 0 ? visit(Number(kf.current_id) - 1) : -1,
+    main_context: kf.main_context.map(canonContext),
   };
 
   const objects: any[] = [];
@@ -216,11 +225,7 @@ export function keyframeSansArg(bytes: Uint8Array): string {
           ret: [t.ret_lo, t.ret_c],
           yield: [t.yield_lo, t.yield_c],
           has_stack: t.has_stack,
-          context: t.context.map((c: any) => ({
-            stack: c.stack.map(canonSv),
-            frames: c.frames.map((fr: any) => ({ closure: visit(Number(fr.closure_id)), pc: fr.pc, base: fr.base, ret_dest: fr.ret_dest, ret_count: fr.ret_count })),
-            open_upvalues: c.open_upvalues.map((uv: any) => ({ stack_index: uv.stack_index, upvalue: visit(Number(uv.upvalue_id)) })),
-          })),
+          context: t.context.map(canonContext),
         };
         break;
       }
