@@ -1,21 +1,17 @@
-DOC 73 COROUTINES: P0 BLOCKED ON THE FRAME-ARRAY CHOICE (2026-10-26, coral-marten).
-- Q1–Q4 all decided (doc 73 §4.2, §5, §6.3, §7). Next is P0: per-coroutine
-  stacks, the switch, GC and keyframes.
-- Single-stack map (Explore agent, this session): register lanes are
-  slices (swap is free); `Vm.frames` is an inline [200]CallFrame read at
-  fixed offsets by tier-0, `hostcall_x64.S:256` and 3 emitted native sites
-  (`nativegen_emit.zig:998,1197,1258`); open upvalues hold raw lane
-  pointers (fine with reserved stacks) but `upvalueSlotAliasOk`
-  (interp.zig:1565) compares indices without stack identity; fillKeep/GC
-  and keyframes assume one stack axis; nested `execImpl` stop_depth checks
-  compare `self.depth` and must become context-aware; no mmap reserve
-  wrapper exists (only nativegen_mcode.zig).
-- Experiment (/tmp/shadow-f, not committed): `frames` behind a pointer
-  costs tier-0 instructions recursive-fib +1.23%, binary-trees +0.61%,
-  spectral-norm +0.60%, others flat. Cycles unmeasurable (load 11–24).
-  JIT sites not adapted in the experiment.
-- Waiting on Bart: frames behind a pointer, or frames stay inline and are
-  copied out/in per switch (O(depth) x 80 B).
+DOC 73 COROUTINES: P0 IN PROGRESS (2026-10-26, coral-marten).
+- All questions decided. Bart accepted the frames-pointer cost; P0a landed
+  (4e37dfd). The P0 runtime design is doc 73 §5.1 (stack = one allocation
+  of tags+payloads+scratch+frames; active fields stay in Vm and are
+  saved/loaded via a comptime-checked `SavedContext`; switches happen in the
+  dispatch loop via the cold native-failure path like opProtectedEntry;
+  stop_depth swapped per context so opRet's existing boundary test catches
+  a coroutine's final return; cells need a stack identity; GC walks every
+  reachable thread's stack; keyframes get thread records).
+- Next: SavedContext + save/load (no behaviour change), then the thread
+  object + stack pool, then resume/yield natives with tests, GC, keyframes.
+- Map of single-stack assumptions: see the Explore notes summarised in
+  doc 73 §5.1 (offsets_x64.inc, FrameMotionAbi, upvalueSlotAliasOk at
+  interp.zig ~1565, fillKeep, keyframeser encode/restore).
 
 OS.CLOCK COUNTS FROM VM START (2026-10-25, coral-marten).
 - Bart chose VM start (over process start) as the zero. `Vm.clock` is now

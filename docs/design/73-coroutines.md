@@ -32,10 +32,13 @@ land; move whole phases to Done once everything inside them is checked.
   coroutines, an error surfaces from whatever was running the task's code.
 - [x] **Unobserved task errors** (§7): decided 2026-10-26 — fatal unless a
   handler is registered, judged when the scheduler goes idle.
+- [x] **P0a — `Vm.frames` behind a pointer** (§5.1): 4e37dfd. t0 cost
+  recursive-fib +1.23%, binary-trees/spectral-norm +0.6% instructions;
+  accepted by Bart.
 
 ### Outstanding
 
-- [ ] **P0 — stacks, the switch, GC and keyframes** (§5, §6.1, §6.2): the
+- [ ] **P0 — stacks, the switch, GC and keyframes** (§5, §5.1, §6.1, §6.2): the
   reserved-stack pool behind one wrapper; the execution context split out of
   `Vm`; the tagged suspend; suspended stacks as GC roots with liveness
   masks; open upvalues into a suspended stack keep it alive; keyframes carry
@@ -215,6 +218,76 @@ entry argument rather than baking its address (no `tags.ptr` immediates in
 reserve-then-commit, so in the browser VM every stack is fully committed
 linear memory. Decided the same day: that's acceptable; the browser build
 uses the same model and holds more memory.
+
+### 5.1 The runtime under option 3 (P0 design, 2026-10-26)
+
+Mapped from the tree (`interp.zig` field and line refs as of 4e37dfd).
+
+**What a stack is.** One allocation per coroutine, through the injected
+allocator (Rule Z-4): the tag lane (`stack_slots` u8), the payload lane
+(`stack_slots` u64), its own `boundary_scratch` (`stack_slots` Value) and a
+`[max_call_depth]CallFrame` array, ~1.6 MiB of address space. A large
+allocation is an mmap on every real backing allocator, so pages commit when
+touched and nothing moves. The scratch lane must be per stack: it is
+absolute-indexed like the registers, and a native that re-enters Lua (a
+`table.sort` comparator, a metamethod) can resume a coroutine whose natives
+would otherwise write over the resumer's live scratch at the same indices.
+Freed stacks go to a bounded pool; a pooled stack's pages are returned to
+the OS behind one wrapper (`madvise(MADV_DONTNEED)` on POSIX, nothing on
+wasm32), so a burst of coroutines doesn't stay committed.
+
+**Active fields stay in `Vm`.** The hot path keeps reading `self.depth`,
+`self.tags`, `self.frames` and so on; a switch saves them into the outgoing
+thread object and loads the incoming one's. The saved set is one struct,
+`SavedContext`, whose field names and types are checked at comptime against
+`Vm`, and save/load copy it field by field (`inline for`), so a field
+can't be forgotten: `tags`, `payloads`, `boundary_scratch`, `frames`,
+`depth`, `stack_top`, `reg_top`, `open_upvalues`, `open_upvalue_ceiling`,
+`final_cut`, `native_reentry_depth`. At a switch these must be idle and are
+asserted, not saved: `reg_top_pending`, `pending_error`, `unparked_native`.
+Per-VM and unchanged: `host_out`/`host_out_top` (a LIFO stack, and resumes
+nest LIFO), `gc_keep` (scratch for one walk), `next_call_seq`, heap,
+globals, trace state.
+
+**A switch happens in the dispatch loop, never in a Zig frame.**
+`coroutine.resume` and `coroutine.yield` are natives that return a switch
+request through the cold native-failure path, as `pcall` of a Lua function
+already does (`opProtectedEntry`). The dispatcher saves the outgoing
+context, loads the incoming one and continues at its top frame. A native
+that re-enters Lua runs a nested `execImpl`; a resume inside it switches
+inside that nested loop, and the coroutine yields back to it before the
+native returns (a yield that would cross the native raises "attempt to
+yield across a C-call boundary").
+
+**Bottom of a coroutine.** `ExecState.stop_depth` is swapped with the
+context: a coroutine runs with stop depth 0 at its base frame, and the
+resumer's stop depth is saved in the thread object. The existing
+`depth == stop_depth` boundary test in `opRet` therefore catches a
+coroutine's final return with no new check on the return path; the
+boundary's (cold) handler tells a coroutine base from a nested-exec stop
+and switches back. The same swap stops a coroutine's depth from matching a
+nested exec's stop depth by coincidence.
+
+**Errors.** An error unwinds the coroutine's frames to its protect tags as
+today; reaching the coroutine's base kills it (status `dead`, error kept for
+`close`) and switches to the resumer, where `resume` returns `false, err`
+and `wrap` re-raises.
+
+**Open upvalues.** A cell keeps raw lane pointers; with stacks that never
+move these stay valid while a coroutine is suspended. Each context keeps its
+own `open_upvalues` list. A cell must also name its stack: `loc.open` is an
+index, and `upvalueSlotAliasOk` (interp.zig ~1565) compares indices as if
+there were one slab; it gains a stack identity. `coroutine.close` and
+collecting a dead coroutine close its cells first.
+
+**GC.** Every reachable thread's saved stack is walked like the active one:
+`fillKeep` over that stack's frames with doc 61's masks, reusing `gc_keep`
+one stack at a time. Threads are ordinary GC objects; the active chain
+(running thread and its resumers) is rooted from `Vm`.
+
+**Keyframes.** The schema gains a thread record per live coroutine (status,
+resumer, saved frames, stack values, open upvalues) and the active thread
+id; `snapshot_format_version` bumps.
 
 ## 6. What every option must handle
 
