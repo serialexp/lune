@@ -999,8 +999,7 @@ pub fn emitInlineSelfPush(
     try a.subRegImm32(.rax, 1);
     try a.movRegImm64(.r10, abi.frame_size);
     try a.imulRegReg(.rax, .r10);
-    try a.addRegReg(.rax, .r8);
-    try a.addRegImm32(.rax, abi.vm_frames_off);
+    try a.addRegMem(.rax, .r8, abi.vm_frames_off);
     try a.movMemImm32(.rax, abi.frame_pc_off, p.term_aux + 1);
     // -- step 5: callee window init (fully unrolled) ---------------------
     // Destination slot j lives at lane offset nreg+j of the CURRENT window
@@ -1198,8 +1197,7 @@ pub fn emitInlineSelfRetPop(
     try a.subRegImm32(.rax, 1);
     try a.movRegImm64(.r10, abi.frame_size);
     try a.imulRegReg(.rax, .r10);
-    try a.addRegReg(.rax, .r8);
-    try a.addRegImm32(.rax, abi.vm_frames_off);
+    try a.addRegMem(.rax, .r8, abi.vm_frames_off);
     // -- step 4: open-upvalue ceiling wall (the watermark replaces the
     // helper's full open-list scan; stale-HIGH only declines) ------------
     try a.movRegMem(.rcx, .r8, abi.vm_open_upvalue_ceiling_off);
@@ -1259,8 +1257,7 @@ pub fn emitInlineSelfRetPop(
     try a.subRegImm32(.rax, 1);
     try a.movRegImm64(.r10, abi.frame_size);
     try a.imulRegReg(.rax, .r10);
-    try a.addRegReg(.rax, .r8);
-    try a.addRegImm32(.rax, abi.vm_frames_off);
+    try a.addRegMem(.rax, .r8, abi.vm_frames_off);
     // -- step 8: dropRegionActivation residue. Under the descent gate the
     // profit map is empty, so `nextActivation(call_seq)` closes nothing —
     // but it DOES clear the region-context validity byte when the context

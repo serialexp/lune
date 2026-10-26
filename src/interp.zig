@@ -826,7 +826,10 @@ pub const Vm = struct {
     /// state that the collector roots (via `forEachRootHeader`, keeping every
     /// frame's prototype constants alive) and the keyframe serializer captures for
     /// mid-execution resume. Sized to the call-depth bound, so it never allocates.
-    frames: [max_call_depth]CallFrame = undefined,
+    /// Behind a pointer (doc 73 P0): each coroutine owns its own array and a
+    /// switch repoints this, so the array's address is stable but not fixed
+    /// relative to `Vm` (native code and `hostcall_x64.S` load it).
+    frames: *[max_call_depth]CallFrame,
     /// Next transient activation identity. Monotonic for this VM run; exhaustion
     /// is checked at frame push so a wrapped/duplicate identity is never exposed.
     next_call_seq: u64 = 0,
@@ -1346,6 +1349,8 @@ pub const Vm = struct {
         errdefer gpa.free(boundary_scratch);
         const gc_keep = try gpa.alloc(u64, stack_slots / 64);
         errdefer gpa.free(gc_keep);
+        const frames = try gpa.create([max_call_depth]CallFrame);
+        errdefer gpa.destroy(frames);
         // Stable-address heap (see the `heap` field doc): native pages bake
         // pointers to its collection counters, so it cannot live inside the
         // movable `Vm` by value.
@@ -1360,6 +1365,7 @@ pub const Vm = struct {
             .payloads = payloads,
             .boundary_scratch = boundary_scratch,
             .gc_keep = gc_keep,
+            .frames = frames,
             .trace = trace.TraceState.init(gpa),
         };
         // Registry allocates a stable context; no pointer into movable Vm storage.
@@ -1405,6 +1411,7 @@ pub const Vm = struct {
         self.gpa.free(self.payloads);
         self.gpa.free(self.boundary_scratch);
         self.gpa.free(self.gc_keep);
+        self.gpa.destroy(self.frames);
         self.gpa.free(self.host_out);
     }
 

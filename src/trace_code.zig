@@ -370,7 +370,8 @@ pub const FrameMotionAbi = struct {
     vm_depth_off: i32,
     /// `Vm.stack_top` (usize).
     vm_stack_top_off: i32,
-    /// `Vm.frames` (the inline `[max_call_depth]CallFrame` array base).
+    /// `Vm.frames`: the word holding the `[max_call_depth]CallFrame` array's
+    /// address (doc 73 P0; loaded, not added).
     vm_frames_off: i32,
     /// `Vm.next_call_seq` (u64; maxInt = exhausted, the emitted wall).
     vm_next_call_seq_off: i32,

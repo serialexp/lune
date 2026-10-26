@@ -253,7 +253,7 @@ FUNC_BEGIN(mahina_hostcall_entry)
     mov VM(VM_STACK_TOP)(%rbx), %r13
     mov VM(VM_DEPTH)(%rbx), %eax
     imul $CF_SIZE, %rax, %r9
-    lea VM(VM_FRAMES)(%rbx,%r9), %r9
+    add VM(VM_FRAMES)(%rbx), %r9
     mov %rdx, CF_CLOSURE(%r9)
     mov VM(VM_NEXT_CALL_SEQ)(%rbx), %rax
     mov %rax, CF_CALL_SEQ(%r9)
