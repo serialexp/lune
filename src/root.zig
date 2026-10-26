@@ -29,6 +29,8 @@ pub const mem = @import("mem.zig");
 
 /// Byte-slice equality without std's slow long-slice codegen.
 pub const bytes = @import("bytes.zig");
+/// Coroutine stacks and execution contexts (doc 73).
+pub const coroutine = @import("coroutine.zig");
 
 /// Diagnostic / CLI I/O — the single wrapper around the churny `std.Io` writer
 /// API and `Value` text rendering.
@@ -164,6 +166,7 @@ test {
     _ = system;
     _ = host_system;
     _ = @import("file.zig");
+    _ = @import("coroutine.zig");
     _ = datetime;
     _ = tzif;
     _ = relpath;

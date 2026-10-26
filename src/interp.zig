@@ -29,6 +29,7 @@ const string = @import("string.zig");
 const table = @import("table.zig");
 const array = @import("array.zig");
 const function = @import("function.zig");
+const coroutine = @import("coroutine.zig");
 const trace = @import("trace.zig");
 const trace_exec = @import("trace_exec.zig");
 const table_runtime = @import("table_runtime.zig");
@@ -133,7 +134,7 @@ pub const Error = error{
 /// this one buffer. It is allocated once and **never reallocated**, so a slice
 /// handed to one frame stays valid while a nested call runs above it. 64Ki
 /// `Value` slots = 1 MiB.
-const stack_slots: usize = 1 << 16;
+pub const stack_slots: usize = 1 << 16;
 
 /// Maximum call depth for the tier-0 interpreter. `exec` runs on an explicit
 /// `Vm.frames` call-stack array of this fixed size (no host-stack recursion per
@@ -767,13 +768,17 @@ pub const Vm = struct {
     /// The global environment: a table keyed by interned name strings. Free
     /// (non-local) names read and write here; the base library installs here.
     globals: *table.Table,
+    /// The main program's stack (doc 73 §5.1).
+    main_stack: coroutine.Stack,
     /// Shared register/call stack, **struct-of-arrays** (docs/design/09): the
     /// `Value.Tag` discriminant lane and the raw 8-byte `Value.payload.bits` lane,
     /// stored in parallel so the hot tier-0 arms address a 1-byte tag (scale-1)
     /// and an 8-byte payload (scale-8) with no 16-byte index scaling and no
     /// 16-byte arithmetic-temporary spill. Both fixed-size and never reallocated
     /// (see `stack_slots`), so frame windows stay valid across nested calls.
-    /// `tags.len == payloads.len == stack_slots` always.
+    /// `tags.len == payloads.len == stack_slots` always. Doc 73 §5.1: these
+    /// and the other `coroutine.SavedContext` fields describe whichever stack
+    /// is running (`main_stack` or a coroutine's).
     tags: []u8,
     payloads: []u64,
     /// A reusable `[]Value` scratch buffer, absolute-indexed exactly like the
@@ -1341,16 +1346,10 @@ pub const Vm = struct {
     };
 
     pub fn initBare(gpa: std.mem.Allocator) std.mem.Allocator.Error!Vm {
-        const tags = try gpa.alloc(u8, stack_slots);
-        errdefer gpa.free(tags);
-        const payloads = try gpa.alloc(u64, stack_slots);
-        errdefer gpa.free(payloads);
-        const boundary_scratch = try gpa.alloc(Value, stack_slots);
-        errdefer gpa.free(boundary_scratch);
+        const main_stack = try coroutine.Stack.init(gpa);
+        errdefer main_stack.deinit(gpa);
         const gc_keep = try gpa.alloc(u64, stack_slots / 64);
         errdefer gpa.free(gc_keep);
-        const frames = try gpa.create([max_call_depth]CallFrame);
-        errdefer gpa.destroy(frames);
         // Stable-address heap (see the `heap` field doc): native pages bake
         // pointers to its collection counters, so it cannot live inside the
         // movable `Vm` by value.
@@ -1361,11 +1360,12 @@ pub const Vm = struct {
             .gpa = gpa,
             .heap = heap,
             .globals = undefined,
-            .tags = tags,
-            .payloads = payloads,
-            .boundary_scratch = boundary_scratch,
+            .main_stack = main_stack,
+            .tags = main_stack.tags,
+            .payloads = main_stack.payloads,
+            .boundary_scratch = main_stack.boundary_scratch,
             .gc_keep = gc_keep,
-            .frames = frames,
+            .frames = main_stack.frames,
             .trace = trace.TraceState.init(gpa),
         };
         // Registry allocates a stable context; no pointer into movable Vm storage.
@@ -1407,11 +1407,8 @@ pub const Vm = struct {
         self.parked_results.deinit(self.gpa);
         self.heap.deinit();
         self.gpa.destroy(self.heap);
-        self.gpa.free(self.tags);
-        self.gpa.free(self.payloads);
-        self.gpa.free(self.boundary_scratch);
+        self.main_stack.deinit(self.gpa);
         self.gpa.free(self.gc_keep);
-        self.gpa.destroy(self.frames);
         self.gpa.free(self.host_out);
     }
 
