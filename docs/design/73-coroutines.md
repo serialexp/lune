@@ -91,15 +91,16 @@ land; move whole phases to Done once everything inside them is checked.
   tables peaked at 1.7 GB (LuaJIT 39 MB); after, 105 MB at 1.35 s vs 1.00 s
   (`bench/stdlib/co_garbage.lua`). Suite instruction counts ±0.01%, except
   co_many +1.2% and co_churn +2.0% (earlier collections).
+- [x] **Liveness masks for suspended frames** (§6.1): `walkSavedStack`
+  loads each stack that isn't running and runs doc 61's `fillKeep` over
+  it. Safety builds also assert every saved frame's shape
+  (`assertFrameShapesKnown`), which the GC-stress test legs exercise.
 - [x] **Restore recompiles the program** (doc 04 F2b follow-up): found
   here. Resumed runs that collected diverged because the restored VM
   borrowed the compile heap's literals.
 
 ### Outstanding
 
-- [ ] **P0 remainder** (§5, §6.1): liveness masks for suspended frames
-  (check first: `walkSavedStack` already loads each stack and runs
-  `fillKeep`, so this may be done).
 - [ ] **Coroutine stacks' committed floor**: ~16 KiB per live coroutine
   (a page per region) against LuaJIT's ~1 KiB; `co_many` 164 MB vs 7.4 MB,
   and with it the GC weight below (TODO.md).

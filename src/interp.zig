@@ -3672,6 +3672,9 @@ pub const Vm = struct {
 
     fn walkSavedStack(self: *Vm, saved: *const coroutine.SavedContext) void {
         coroutine.load(self, saved);
+        // Doc 61 §4.5 holds for a stack that isn't running too: its top
+        // frame is in flight in the resume or yield that switched away.
+        if (std.debug.runtime_safety) self.assertFrameShapesKnown();
         self.forEachStackRoot(self.heap, gc.Heap.markHeader);
         self.scrubDeadRegisters();
         self.heap.traceAll();
