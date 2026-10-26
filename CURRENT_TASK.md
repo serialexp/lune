@@ -7,8 +7,35 @@ DOC 73 COROUTINES: P0 IN PROGRESS (2026-10-26, coral-marten).
   stop_depth swapped per context so opRet's existing boundary test catches
   a coroutine's final return; cells need a stack identity; GC walks every
   reachable thread's stack; keyframes get thread records).
-- Next: SavedContext + save/load (no behaviour change), then the thread
-  object + stack pool, then resume/yield natives with tests, GC, keyframes.
+- Landed: 4e37dfd (frames pointer), 9dbdc0b (src/coroutine.zig: Stack +
+  comptime-checked SavedContext save/load; main stack is a Stack).
+- Next, P0c (thread + switch), the plan:
+  1. ObjectType.thread; TypeName `thread`; io rendering "thread: 0x<id>";
+     gc newThread / blacken (body + queue the stack for the VM to walk) /
+     destroy (free Stack + open_upvalues list).
+  2. coroutine.Thread {header, stack: ?Stack, saved: SavedContext, status
+     suspended|running|normal|dead, resumer: ?*Thread (null = main), body,
+     resumer_stop_depth, resume result wiring (a, wanted)}. Vm.current:
+     ?*Thread, Vm.main_saved: SavedContext.
+  3. src/stdlib/coroutine.zig natives create/resume/yield/status/running/
+     isyieldable; resume/yield validate then return signals
+     error.ActivateResume/ActivateYield. Widen ExecState.entry_protect into
+     one entry-kind enum so nativeFailed keeps ONE tail call (its comment:
+     two tail calls cost every native call ~4 instructions).
+  4. The entry handler does the switch: save outgoing (resumer frame pc at
+     the call, ret wiring stored in the thread), load incoming, copy args /
+     yielded values across stacks, swap st.stop_depth (coroutine runs with
+     0, so its base return hits opRet's existing depth==stop_depth test;
+     the cold boundary path tells a coroutine base from a nested-exec stop).
+  5. Errors: the protect-frame search, on reaching a coroutine's base with
+     no protect frame, kills it and delivers (false, err) to the resumer.
+  6. Also: resume via callValue (pcall(coroutine.resume, co), natives that
+     re-enter); tail call of resume/yield (`return coroutine.yield(x)`);
+     recorder must treat the signals as barriers (check how ActivatePcall
+     is handled while recording).
+- `coroutine.wrap` needs a callable bound to its coroutine: that is the
+  same open decision as gmatch's lone callable (TODO.md:70) — ask Bart
+  before building wrap.
 - Map of single-stack assumptions: see the Explore notes summarised in
   doc 73 §5.1 (offsets_x64.inc, FrameMotionAbi, upvalueSlotAliasOk at
   interp.zig ~1565, fillKeep, keyframeser encode/restore).
