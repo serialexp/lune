@@ -136,6 +136,17 @@ pub const Heap = struct {
     /// not yet scanned). Pre-sized before each cycle so marking cannot allocate.
     /// Capacity is retained across cycles.
     gray: std.ArrayListUnmanaged(*GcHeader) = .empty,
+    /// Doc 73 §5.1: suspended coroutines marked this cycle, whose stacks the
+    /// VM walks (`Vm.collect`): their registers need the VM's liveness
+    /// masks, which the heap doesn't have. Pre-sized like `gray`, from
+    /// `thread_count`.
+    threads_to_walk: std.ArrayListUnmanaged(*GcHeader) = .empty,
+    /// Live coroutine objects, recounted by every sweep.
+    thread_count: usize = 0,
+    /// How the heap reaches coroutine objects, installed by the VM. The
+    /// `Thread` type lives above the heap (it holds VM stack state), and the
+    /// heap must not depend on the VM (`tools/check-jit-boundaries.py`).
+    thread_ops: ?*const ThreadOps = null,
     /// Live-count threshold at which the next collection triggers. Write it
     /// through `setNextGc`, which keeps `gc_headroom` exact.
     next_gc: usize = initial_gc_threshold,
@@ -178,12 +189,13 @@ pub const Heap = struct {
         var it = self.objects;
         while (it) |h| {
             const next = h.next;
-            destroyObject(self.gpa, h);
+            destroyObject(self.gpa, self.thread_ops, h);
             it = next;
         }
         self.objects = null;
         self.object_count = 0;
         self.gray.deinit(self.gpa);
+        self.threads_to_walk.deinit(self.gpa);
         if (self.strtab.len != 0) self.gpa.free(self.strtab);
         self.strtab = &.{};
         self.strtab_count = 0;
@@ -584,6 +596,12 @@ pub const Heap = struct {
         return f;
     }
 
+    /// Register a new coroutine object (doc 73; `coroutine.newThread`).
+    pub fn linkThread(self: *Heap, h: *GcHeader) void {
+        self.link(h);
+        self.thread_count += 1;
+    }
+
     /// Allocate an *open* upvalue over live stack slot `index`, whose lanes
     /// are `tag` and `payload`, and register it with the heap. Closing is the
     /// interpreter's job.
@@ -659,6 +677,7 @@ pub const Heap = struct {
     /// the cycle; nothing has been coloured, so the heap is untouched and safe.
     pub fn beginCollect(self: *Heap) std.mem.Allocator.Error!void {
         try self.gray.ensureTotalCapacity(self.gpa, self.object_count);
+        try self.threads_to_walk.ensureTotalCapacity(self.gpa, self.thread_count);
     }
 
     /// Mark one object reachable: if white, colour it gray and enqueue it. Each
@@ -737,10 +756,12 @@ pub const Heap = struct {
                 // to resolve the index anyway. So mark only the closed case.
                 const u = Upvalue.fromHeader(h);
                 switch (u.loc) {
-                    .open => {},
+                    // Doc 73 §5.1: the slot's coroutine stays alive with it.
+                    .open => if (u.owner) |o| self.markHeader(o),
                     .closed => |v| self.markValue(v),
                 }
             },
+            .thread => self.thread_ops.?.blacken(self, h),
             .function => {
                 const cl = Closure.fromHeader(h);
                 for (cl.upvalues) |uv| self.markHeader(&uv.header);
@@ -783,16 +804,18 @@ pub const Heap = struct {
         var live_str: usize = 0;
         var slot: *?*GcHeader = &self.objects;
         var live: usize = 0;
+        var live_threads: usize = 0;
         while (slot.*) |h| {
             if (willFree(h)) {
                 // Unreachable: unlink (leaving `slot` pointing at the successor)
                 // and free. Dead strings simply never re-enter the chains.
                 slot.* = h.next;
-                destroyObject(self.gpa, h);
+                destroyObject(self.gpa, self.thread_ops, h);
             } else {
                 // Survivor (reachable, or pinned): reset to white and advance.
                 h.color = .white;
                 live += 1;
+                if (h.type == .thread) live_threads += 1;
                 if (h.type == .string) {
                     self.strtabInsert(String.fromHeader(h));
                     live_str += 1;
@@ -804,6 +827,7 @@ pub const Heap = struct {
         // the pre-sweep figure.
         self.strtab_count = live_str;
         self.object_count = live;
+        self.thread_count = live_threads;
         self.setNextGc(@max(initial_gc_threshold, live * heap_growth));
         self.strtabMaybeShrink();
     }
@@ -824,8 +848,16 @@ pub const Heap = struct {
     }
 };
 
+/// The heap's view of a coroutine object (`Heap.thread_ops`).
+pub const ThreadOps = struct {
+    /// Mark the object's children; queue its stack on `threads_to_walk`
+    /// when it isn't the running one.
+    blacken: *const fn (heap: *Heap, h: *GcHeader) void,
+    destroy: *const fn (gpa: std.mem.Allocator, h: *GcHeader) void,
+};
+
 /// Free one object according to its concrete type.
-fn destroyObject(gpa: std.mem.Allocator, h: *GcHeader) void {
+fn destroyObject(gpa: std.mem.Allocator, thread_ops: ?*const ThreadOps, h: *GcHeader) void {
     switch (h.type) {
         .string => String.fromHeader(h).destroy(gpa),
         .table => Table.fromHeader(h).destroy(gpa),
@@ -833,6 +865,7 @@ fn destroyObject(gpa: std.mem.Allocator, h: *GcHeader) void {
         .native => Native.fromHeader(h).destroy(gpa),
         .upvalue => Upvalue.fromHeader(h).destroy(gpa),
         .file => File.fromHeader(h).destroy(gpa),
+        .thread => thread_ops.?.destroy(gpa, h),
         // typed_array (Phase 9b) and host (embedding) are not heap-allocated
         // here yet.
         else => @panic("gc: unknown object type during sweep"),

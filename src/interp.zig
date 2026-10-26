@@ -770,6 +770,10 @@ pub const Vm = struct {
     globals: *table.Table,
     /// The main program's stack (doc 73 §5.1).
     main_stack: coroutine.Stack,
+    /// The running coroutine, or null when the main program runs.
+    current: ?*coroutine.Thread = null,
+    /// The main stack's state while a coroutine runs (`current != null`).
+    main_saved: coroutine.SavedContext = undefined,
     /// Shared register/call stack, **struct-of-arrays** (docs/design/09): the
     /// `Value.Tag` discriminant lane and the raw 8-byte `Value.payload.bits` lane,
     /// stored in parallel so the hot tier-0 arms address a 1-byte tag (scale-1)
@@ -1356,6 +1360,7 @@ pub const Vm = struct {
         const heap = try gpa.create(gc.Heap);
         errdefer gpa.destroy(heap);
         heap.* = gc.Heap.init(gpa);
+        heap.thread_ops = &coroutine.thread_ops;
         var vm = Vm{
             .gpa = gpa,
             .heap = heap,
@@ -3305,9 +3310,12 @@ pub const Vm = struct {
         // The root set is defined once in `forEachRootHeader`; marking is just
         // "call `markHeader` on each root".
         self.forEachRootHeader(self.heap, gc.Heap.markHeader);
-        self.heap.traceAll();
-        self.invalidateDeadTraceConsts();
+        // The keep-set is the running stack's until `walkSavedStacks`
+        // reuses it, so scrub now (it depends on the keep-set only).
         self.scrubDeadRegisters();
+        self.heap.traceAll();
+        self.walkSavedStacks();
+        self.invalidateDeadTraceConsts();
         self.heap.sweep();
     }
 
@@ -3581,6 +3589,36 @@ pub const Vm = struct {
         }
     }
 
+    /// Roots 2–4 below, for the stack whose state is loaded: the kept
+    /// registers, each active frame's closure, the open upvalue cells.
+    fn forEachStackRoot(self: *Vm, ctx: anytype, comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void) void {
+        self.fillKeep(self.gc_keep);
+        self.forEachKeptRegister(ctx, cb);
+        for (self.frames[0..self.depth]) |f| cb(ctx, @constCast(&f.closure.header));
+        for (self.open_upvalues.items) |ou| cb(ctx, &ou.cell.header);
+    }
+
+    /// Doc 73 §5.1: mark and scrub every stack that isn't running — the
+    /// main one while a coroutine runs, and each suspended or waiting
+    /// coroutine the mark reached (`Heap.threads_to_walk`) — by loading its
+    /// state and walking it like the running one, so doc 61's masks apply
+    /// unchanged. Each walk can reach more coroutines; the loop ends when
+    /// none is left. Allocates nothing: `gc_keep` is reused stack by stack.
+    fn walkSavedStacks(self: *Vm) void {
+        var running: coroutine.SavedContext = undefined;
+        coroutine.save(self, &running);
+        if (self.current != null) self.walkSavedStack(&self.main_saved);
+        while (self.heap.threads_to_walk.pop()) |h| self.walkSavedStack(&coroutine.Thread.fromHeader(h).saved);
+        coroutine.load(self, &running);
+    }
+
+    fn walkSavedStack(self: *Vm, saved: *const coroutine.SavedContext) void {
+        coroutine.load(self, saved);
+        self.forEachStackRoot(self.heap, gc.Heap.markHeader);
+        self.scrubDeadRegisters();
+        self.heap.traceAll();
+    }
+
     /// Visit every GC root that is a heap object, invoking `cb(ctx, header)` once
     /// per root edge. This is the **single source of truth** for "what is live
     /// from outside the heap", driven by the collector (`collect`, with
@@ -3614,10 +3652,11 @@ pub const Vm = struct {
         comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void,
     ) void {
         cb(ctx, &self.globals.header);
-        self.fillKeep(self.gc_keep);
-        self.forEachKeptRegister(ctx, cb);
-        for (self.frames[0..self.depth]) |f| cb(ctx, @constCast(&f.closure.header));
-        for (self.open_upvalues.items) |ou| cb(ctx, &ou.cell.header);
+        self.forEachStackRoot(ctx, cb);
+        // Doc 73: the running coroutine, and through its `resumer` links the
+        // ones waiting on it. Stacks that aren't running are walked by
+        // `collect` (`walkSavedStacks`).
+        if (self.current) |t| cb(ctx, &t.header);
         // Host-retained chunks (docs/design/03 §"Chunk-constant rooting"): keep a
         // compiled-but-not-yet-run chunk's interned constants alive across the
         // compile→run window.
@@ -10394,6 +10433,7 @@ pub const Vm = struct {
             if (items[k - 1].index == index) return items[k - 1].cell;
         }
         const cell = try self.heap.newUpvalue(index, &self.tags[index], &self.payloads[index]);
+        if (self.current) |t| cell.owner = &t.header;
         try self.appendOpenUpvalue(index, cell);
         return cell;
     }

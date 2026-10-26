@@ -48,6 +48,10 @@ pub const Upvalue = struct {
     payload: *u64,
     /// Where the captured value lives — see `Loc`.
     loc: Loc,
+    /// While open: the coroutine whose stack holds the slot (doc 73 §5.1),
+    /// null for the main stack. Marking an open cell marks it, so a closure
+    /// over a suspended coroutine's local keeps that stack alive.
+    owner: ?*GcHeader = null,
 
     /// Open ⇒ the value is in the VM register stack at slot `open`. Closed ⇒
     /// the value was copied out of the departed slot and is owned here.
@@ -112,6 +116,7 @@ pub const Upvalue = struct {
     /// caller, which owns the stack) and drop the open index.
     pub fn closeWith(self: *Upvalue, v: Value) void {
         self.loc = .{ .closed = v };
+        self.owner = null;
         self.tag = @ptrCast(&self.loc.closed.tag);
         self.payload = &self.loc.closed.payload.bits;
     }

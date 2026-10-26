@@ -27,6 +27,8 @@ pub const ObjectType = enum(u8) {
     host,
     /// A Lua file handle (`file.zig`, doc 65 §4.1).
     file,
+    /// A coroutine (`coroutine.zig`, doc 73).
+    thread,
     _,
 };
 

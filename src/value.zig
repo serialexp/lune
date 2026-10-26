@@ -226,7 +226,7 @@ pub const Value = extern struct {
 
     /// The `type(v)` names, one tag per distinct string; `typeName` is the
     /// tag's name. `Vm.type_names` caches each as an interned string.
-    pub const TypeName = enum(u8) { nil, boolean, number, string, table, function, upvalue, userdata, value };
+    pub const TypeName = enum(u8) { nil, boolean, number, string, table, function, upvalue, userdata, thread, value };
 
     pub fn typeNameId(self: Value) TypeName {
         return switch (self.tag) {
@@ -239,6 +239,7 @@ pub const Value = extern struct {
                 .function, .native => .function,
                 .upvalue => .upvalue,
                 .host, .file => .userdata,
+                .thread => .thread,
                 _ => .value,
             },
             // A grid row is observationally a table.
