@@ -303,7 +303,9 @@ that for a time-travel debugger it *is* the architecture.
       `snapshot_format_version` bump — proven by the keyframeser resume test.
 - [~] **Host-mediated suspension hook.** Reserve "a host effect may suspend its
       caller" so generators / await / tasks can be added later without new
-      machinery. **The substrate now exists** (F2c): the interpreter runs on an
+      machinery. *2026-10-27:* coroutines (doc 73) are the suspension
+      mechanism now; a host effect that suspends its caller is doc 73
+      §7.1's open question A1. **The substrate now exists** (F2c): the interpreter runs on an
       explicit `Vm.frames` call-stack with an iterative `exec` loop, so suspension
       is no longer blocked on host-stack recursion — a safepoint can already park
       the cursor and return `.suspended` (`Vm.suspend_ctl`). What's reserved-but-not-
@@ -383,6 +385,8 @@ accounting that makes "deterministic" true rather than aspirational.
 - General script-level C FFI (an unrecordable effect hole — out per
   `00-architecture.md`).
 - General coroutines (replaced by host-mediated suspension; see below).
+  *Reversed 2026-10-26:* mahina has Lua's coroutines (doc 73); see the
+  follow-up under "Host-mediated suspension".
 
 ## Effect taxonomy
 
@@ -413,6 +417,15 @@ deterministically for free. The three surface forms — stackless generators,
 host-mediated `await`, host-owned tasks (structured concurrency) — are a later
 language-surface design; v1 only has to **not preclude** a suspending host
 effect.
+
+*Follow-up (2026-10-27, doc 73):* stackful coroutines came in after all,
+and they need nothing from this section to stay deterministic. A program's
+own `resume` calls pick which coroutine runs, so a run with coroutines
+logs exactly the effects it would log without them. Keyframes capture
+every coroutine's stack, so a stop or a cut can land inside one and replay
+from there. What this section anticipated survives in the async layer
+(doc 73 §7): a task's wait on something outside the VM completes in an
+order the host decides, and that order is the effect a replay feeds back.
 
 ## Open questions
 

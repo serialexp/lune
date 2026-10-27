@@ -430,6 +430,8 @@ _(nothing yet — design only)_
       + `02-determinism.md`.
 - [x] **Coroutines.** ✅ Decided — general coroutines are a Non-goal (plausibly
       forever); suspension is host-mediated. See Non-goals + `02-determinism.md`.
+      **Reversed 2026-10-26 (Bart, doc 73):** mahina has Lua's coroutines,
+      and async/await is built on them. See the Non-goals follow-up.
 - [x] **FFI vs embedding.** ✅ Decided — first-class embedding API in; general
       script-level C FFI out. See §Embedding API.
 - [x] **Numeric semantics.** ✅ Decided + implemented (`src/arith.zig`):
@@ -510,6 +512,19 @@ retrofitting it later means redoing the hardest part of the system.
   yield across host frames badly in an embedded VM. Instead, **suspension is
   host-mediated**: stackless generators, host-mediated `await`, and host-owned
   tasks cover the real uses without the footguns (see `02-determinism.md`).
+
+  *Follow-up (2026-10-27): no longer a Non-goal.* Doc 73 §2 re-examined
+  the three reasons. LuaJIT ends a trace at `resume`/`yield` too, so a
+  switch being a trace barrier is what it ships with. A program's own
+  `resume` calls decide which coroutine runs, so a run with coroutines is
+  as deterministic as one without and logs no new effects; only
+  host-scheduled tasks need logged choices. Yielding across a host frame
+  is Lua's "attempt to yield across a C-call boundary" error, as in Lua.
+  Bart decided (2026-10-26) on one stack per coroutine, Lua's
+  `coroutine` library in full, and `async function`/`await` over the same
+  switch (doc 73 §4.2, §7). The library, keyframes inside coroutines and
+  the step debugger have landed; the JIT boundary and the async layer are
+  doc 73's outstanding phases.
 
 ## Guiding principles
 
@@ -696,6 +711,9 @@ architectural commitments:
   already a recorded effect and a trace barrier, host-mediated suspension
   (generators / await / tasks — our coroutine replacement) gets deterministic
   scheduling *for free*. v1 need only **not preclude** it.
+  *Follow-up (2026-10-27):* coroutines replaced this plan (doc 73). A
+  host effect is still where a task's wait on the outside world will be
+  logged (doc 73 §7.1), but suspension itself is the coroutine switch.
 
 ## Embedding API
 
@@ -769,6 +787,8 @@ replay fidelity:
   generators, host-mediated `await`, and host-owned tasks (structured
   concurrency) cover lazy sequences, "do/wait/do" sequencing, and cooperative
   tasks — without stackful-coroutine footguns. See Non-goals + `02-determinism.md`.
+  *Reversed 2026-10-26:* Lua's coroutines, with async/await over them
+  (doc 73).
 
 ### Two source extensions, because the divergence is real
 

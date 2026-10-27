@@ -138,6 +138,10 @@ land; move whole phases to Done once everything inside them is checked.
   `describeFault` and `debug.traceback` stay on the running stack, as
   Lua's tracebacks do. Tests: a Zig replay test over every stop of a
   nested program, a wasm test, `chainSegments`.
+- [x] **P5 (coroutines) — docs and inventory**: the inventory rows and
+  `docs/differences-from-lua.md` track the library; doc 00's Non-goal,
+  its decision row and guiding principles, and doc 02's Non-goal and
+  "Host-mediated suspension" got follow-up paragraphs (2026-10-27).
 
 ### Outstanding
 
@@ -150,9 +154,12 @@ land; move whole phases to Done once everything inside them is checked.
   (302.7 vs 95.7 ms, 2193.7 vs 610.4 ms) at ~41–46% residency.
 - [ ] **P4 — the async layer** (§7): `async function` / `await`, the
   host-owned scheduler with logged choices, unobserved-error handling.
-- [ ] **P5 — docs and inventory**: the inventory rows and
-  `docs/differences-from-lua.md` already track the library (P0c); doc 00's Non-goal and doc 02's
-  "Host-mediated suspension" get a follow-up paragraph.
+- [ ] **P4 decisions — §7.1 A1–A4** (what can be awaited, `await` in the
+  main chunk, reserved or contextual words, the task library's extras):
+  asked 2026-10-27, unanswered so far. P4 waits on them.
+- [ ] **P5 — docs for the async layer**: its inventory rows, its
+  `docs/differences-from-lua.md` entry (new syntax), and doc 59's C API
+  section if A1 adds host pendings.
 
 ## 1. Why this exists
 
@@ -460,6 +467,66 @@ handler for unobserved task errors is registered. When "nothing awaits"
 is judged: decided the same day — when the scheduler goes idle (no task
 can run). GC reachability was never an option: collection timing must not
 change program behaviour.
+
+### 7.1 P4 design draft (2026-10-27): what is still open
+
+The tree has no way for anything to wait today: a host function is
+synchronous (`capi.zig` `cHostCall`), a yield across one is an error, and
+the CLI has no sleep and no event loop. So a task can only ever wait on
+another task, and the first await of one that must wait needs something at
+the bottom that completes later. The pieces below are settled by §7; the
+questions after them are not.
+
+Settled shape:
+
+- `async function f(...) ... end` (and `local async function`, and the
+  expression form) compiles to a function that makes a task, a coroutine
+  running the body, and resumes it at once (§7). The call returns the
+  task.
+- `await e` is a prefix operator at unary precedence (`parser.zig`
+  `parseUnary`) that compiles to the library's await call. Awaiting a
+  finished task returns its results (or raises its error) with no switch;
+  awaiting a pending one inside a task yields to the scheduler with what
+  it waits on.
+- The scheduler runs ready tasks first in, first out; which waiting task
+  becomes ready, and when, follows from completions. Only a completion
+  that comes from outside the VM is nondeterministic, so only that is a
+  logged effect (a new `EffectKind`, effect format 8). Tasks that wait
+  only on tasks log nothing, which is §7's "coroutines the program resumes
+  itself log nothing" carried over.
+- An error before the first waiting await is raised at the async call;
+  after it, stored and raised at each await; a failed task never awaited
+  when the scheduler goes idle is fatal unless a handler is registered.
+
+Open:
+
+- **A1 — what can be awaited, so what can be pending.** (a) Tasks only,
+  plus a `task.yield()` that lets the other ready tasks run: no host
+  waits, nothing to log in v1, and a CLI program can't wait on time or
+  I/O. (b) Tasks and *host pendings*: a host function returns a pending
+  value it completes later (`mh_pending_new` / `mh_pending_resolve` in
+  the C API, doc 59), the completion order logged; the CLI gets one
+  primitive to wait on, a timer (`task.sleep(seconds)`). (c) (b) plus
+  async CLI I/O (`io` reads that don't block). Each step is a superset of
+  the one before.
+- **A2 — `await` outside an async function.** (a) In the main chunk it
+  runs the scheduler until what it waits on settles (JavaScript's
+  top-level await; the CLI is then the event loop). (b) Only inside an
+  async function; the main chunk starts the loop with `task.run(f)`
+  (Python's `asyncio.run`). In both, `await` in a plain function inside a
+  task is an error, as `yield` across a C boundary is.
+- **A3 — the words.** (a) `async` and `await` become reserved words:
+  simplest to parse, and a program using either as a name breaks. (b)
+  Contextual: `async` only before `function`, `await` only where an
+  operand may start and the next token can begin an expression; a name
+  `await` keeps working, but `await (x)` is ambiguous with a call and
+  needs a rule.
+- **A4 — the task library's surface.** At least what the syntax compiles
+  to (`task.spawn(f, ...)`, `task.await(t)`) and `task.status(t)`. Open:
+  cancellation (`task.cancel(t)`, raising in the task at its await), the
+  unobserved-error handler (`task.onerror(h)` in the language, or only a C
+  API hook), and combinators (`task.all`, `task.any`), which a program
+  can also write itself.
 
 ## 8. Open questions for review
 
