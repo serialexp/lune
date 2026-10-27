@@ -868,6 +868,7 @@ pub const HeapUpvalue = struct {
 
 pub const HeapNative = struct {
     name: []const u8,
+    bound: []const SnapValue,
 
     pub fn encode(self: HeapNative, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -879,9 +880,12 @@ pub const HeapNative = struct {
     }
 
     pub fn encodeInto(self: HeapNative, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
-        _ = ctx;
         try enc.writeUint32(@intCast(self.name.len), .little_endian);
         try enc.writeBytes(self.name);
+        try enc.writeUint8(@intCast(self.bound.len));
+        for (self.bound) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapNative {
@@ -890,11 +894,16 @@ pub const HeapNative = struct {
     }
 
     pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapNative {
-        _ = allocator;
-        _ = root;
         var result: HeapNative = undefined;
-        const _len_0 = try dec.readUint32(.little_endian);
-        result.name = try dec.readBytesSlice(_len_0);
+        const _len_1 = try dec.readUint32(.little_endian);
+        result.name = try dec.readBytesSlice(_len_1);
+        const _len_5 = try dec.readUint8();
+        const _buf_6 = try allocator.alloc(SnapValue, @as(usize, _len_5));
+        errdefer allocator.free(_buf_6);
+        for (0.._buf_6.len) |_i_3| {
+            _buf_6[_i_3] = try SnapValue.decodeWith(allocator, dec, root);
+        }
+        result.bound = _buf_6;
         return result;
     }
 };
@@ -1059,6 +1068,7 @@ pub const HeapThread = struct {
     death: []const SnapValue,
     ret_lo: u32,
     ret_c: u16,
+    wrapped: u8,
     yield_lo: u32,
     yield_c: u16,
     has_stack: u8,
@@ -1084,6 +1094,7 @@ pub const HeapThread = struct {
         }
         try enc.writeUint32(self.ret_lo, .little_endian);
         try enc.writeUint16(self.ret_c, .little_endian);
+        try enc.writeUint8(self.wrapped);
         try enc.writeUint32(self.yield_lo, .little_endian);
         try enc.writeUint16(self.yield_c, .little_endian);
         try enc.writeUint8(self.has_stack);
@@ -1113,6 +1124,7 @@ pub const HeapThread = struct {
         result.death = _buf_6;
         result.ret_lo = try dec.readUint32(.little_endian);
         result.ret_c = try dec.readUint16(.little_endian);
+        result.wrapped = try dec.readUint8();
         result.yield_lo = try dec.readUint32(.little_endian);
         result.yield_c = try dec.readUint16(.little_endian);
         result.has_stack = try dec.readUint8();

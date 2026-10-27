@@ -117,6 +117,10 @@ pub const Thread = struct {
     /// resumer's stack (the call's base slot) and how many the call wants.
     ret_lo: usize = 0,
     ret_c: u16 = 0,
+    /// While it runs or is `normal`: resumed by its `coroutine.wrap`
+    /// function, so its results land without resume's leading `true`, and
+    /// an error that kills it is raised again in the resumer.
+    wrapped: bool = false,
     /// While suspended at a yield: where the next resume's values land (the
     /// yield call's base slot) and how many the call wants.
     yield_lo: usize = 0,

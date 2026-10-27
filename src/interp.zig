@@ -291,6 +291,16 @@ const base_templates = blk: {
     break :blk t;
 };
 
+/// Registry row `name`'s template, for a library that makes its own natives
+/// (a `manual` row, such as `coroutine.wrap`'s function, `Heap.newBoundNative`).
+pub fn templateOf(comptime name: []const u8) *const function.Native {
+    const i = comptime blk: {
+        for (base_natives, 0..) |bn, i| if (std.mem.eql(u8, bn.name, name)) break :blk i;
+        @compileError("no registry native '" ++ name ++ "'");
+    };
+    return &base_templates[i];
+}
+
 /// The interpreter's own natives. `print` is pure output; `clock` is the first
 /// nondeterministic input.
 const core_natives = [_]BaseNative{
@@ -490,12 +500,14 @@ pub fn protectSignal(e: anyerror) ?Protect {
 
 /// What a native that checked its arguments asks the `.call` it was called
 /// by to do in its place (`Vm.opEntry`): a protected call (doc 68 §5), or a
-/// coroutine switch (doc 73).
+/// coroutine switch (doc 73): `resume`, `yield`, or the call of a
+/// `coroutine.wrap` function, a resume of its bound coroutine.
 const EntryKind = enum(u8) {
     pcall,
     xpcall,
     co_resume,
     co_yield,
+    co_wrap,
 };
 
 fn entrySignal(e: anyerror) ?EntryKind {
@@ -503,6 +515,7 @@ fn entrySignal(e: anyerror) ?EntryKind {
     if (e == error.ActivateXpcall) return .xpcall;
     if (e == error.ActivateResume) return .co_resume;
     if (e == error.ActivateYield) return .co_yield;
+    if (e == error.ActivateWrap) return .co_wrap;
     return null;
 }
 
@@ -2265,6 +2278,19 @@ pub const Vm = struct {
 
     /// The running native, when `callValue` called it and no frame has been
     /// pushed since (`unparked_native`).
+    /// The native the running native was called as, Lua's `ci->func`: for
+    /// one that reads its bound values. A native a native called
+    /// (`callValue`) is the unparked one; one an instruction called is the
+    /// callee of the top frame's call, which stays in its slot, in flight,
+    /// while it runs.
+    pub fn calledNative(self: *const Vm) *function.Native {
+        if (self.unparkedNative()) |nat| return @constCast(nat);
+        const f = &self.frames[self.depth - 1];
+        std.debug.assert(f.in_flight);
+        const call = bytecode.callOperandsOf(f.closure.proto.code[f.pc]).?;
+        return function.Native.fromHeader(self.regGet(f.base + call.a).asHeap());
+    }
+
     fn unparkedNative(self: *const Vm) ?*const function.Native {
         return if (self.unparked_depth == self.depth) self.unparked_native else null;
     }
@@ -3350,6 +3376,7 @@ pub const Vm = struct {
             .pcall => self.protectedCallSync(.pcall, args, results_out),
             .xpcall => self.protectedCallSync(.xpcall, args, results_out),
             .co_resume => self.resumeSync(args, results_out),
+            .co_wrap => self.wrapSync(args, results_out),
             // `yield` signals only where it can yield, and nothing called
             // from Zig can (`native_reentry_depth` is raised).
             .co_yield => unreachable,
@@ -4060,7 +4087,7 @@ pub const Vm = struct {
     /// one and the entry context, and propagates from the entry context.
     fn catchExec(self: *Vm, e: Error, entry_ctx: ?*coroutine.Thread, stop_depth: u32) Error!bool {
         if (self.current == entry_ctx) return self.catchProtected(e, stop_depth);
-        return self.catchInCoroutine(e, entry_ctx);
+        return self.catchInCoroutine(e, entry_ctx, stop_depth);
     }
 
     /// Doc 68 §5/§7.1: catch error `e`, unwinding out of a dispatch bounded
@@ -4262,12 +4289,12 @@ pub const Vm = struct {
     /// (`next` = `.suspended`), or for good (`.dead`: it returned or
     /// failed). Its resumer, stopped at the resume, runs again, with the
     /// call's results `head` and `vals` (on the coroutine's stack) written
-    /// as the call takes them. Fails, with nothing changed, when they don't
-    /// fit.
+    /// as the call takes them; a `wrap` function's call takes no `head`.
+    /// Fails, with nothing changed, when they don't fit.
     fn returnToResumer(self: *Vm, head: Value, vals: anytype, next: coroutine.Thread.Status) Error!void {
         const co = self.current.?;
         std.debug.assert(!co.sync);
-        const n = try writeAcross(coroutine.savedOf(self, co.resumer), co.ret_lo, co.ret_c, head, vals);
+        const n = try writeAcross(coroutine.savedOf(self, co.resumer), co.ret_lo, co.ret_c, if (co.wrapped) null else head, vals);
         self.leaveRunning(next);
         if (co.ret_c == bytecode.all_results) self.setPendingTop(co.ret_lo + n);
     }
@@ -4287,6 +4314,7 @@ pub const Vm = struct {
         co.status = next;
         co.resumer = null;
         co.sync = false;
+        co.wrapped = false;
         coroutine.switchTo(self, r);
         if (r) |t| t.status = .running;
         if (next == .dead) co.releaseStack(self.heap);
@@ -4294,8 +4322,9 @@ pub const Vm = struct {
 
     /// `catchExec` in a coroutine the dispatch resumed: its own protected
     /// frames, above its body frame, come first; with none it dies, and its
-    /// resume returns `false, err`.
-    noinline fn catchInCoroutine(self: *Vm, e: Error, entry_ctx: ?*coroutine.Thread) Error!bool {
+    /// resume returns `false, err`, or its `wrap` function's call raises
+    /// `err` again in the resumer.
+    noinline fn catchInCoroutine(self: *Vm, e: Error, entry_ctx: ?*coroutine.Thread, stop_depth: u32) Error!bool {
         @branchHint(.cold);
         const caught = self.catchProtected(e, 1) catch |e2| {
             // An `xpcall` handler's own fault that nothing may catch.
@@ -4317,13 +4346,38 @@ pub const Vm = struct {
         // What `catchProtected` does: the JIT forgets the raise.
         self.trace.abortRaised();
         self.trace.clearPendingExitAnchor();
-        self.current.?.death = errval;
+        const co = self.current.?;
+        co.death = errval;
+        if (co.wrapped) {
+            self.leaveRunning(.dead);
+            // The resumer stopped one past its call of the wrap function;
+            // put it back at the call, in flight, as a native that raised
+            // leaves it, and raise there.
+            const f = &self.frames[self.depth - 1];
+            f.pc -= 1;
+            f.in_flight = true;
+            const raised = self.raiseWrapped(errval);
+            if (raised != Error.LuaError) {
+                self.leaveUntil(entry_ctx);
+                return raised;
+            }
+            return self.catchExec(raised, entry_ctx, stop_depth);
+        }
         const one = [1]Value{errval};
         self.returnToResumer(Value.boolean(false), SliceSpan{ .s = &one, .n = 1 }, .dead) catch |e2| {
             self.leaveUntil(entry_ctx);
             return e2;
         };
         return true;
+    }
+
+    /// Raise again, from the call of a `coroutine.wrap` function, the error
+    /// `errval` that killed its coroutine: as Lua's `auxwrap`, a string
+    /// gains the location of that call (when its caller is a Lua function).
+    fn raiseWrapped(self: *Vm, errval: Value) Error {
+        if (strBytes(errval)) |s| return self.raiseLocatedError(s, 1);
+        self.pending_error = errval;
+        return Error.LuaError;
     }
 
     /// Kill the running coroutine and each resumer up to context `ctx`, for
@@ -4365,12 +4419,33 @@ pub const Vm = struct {
     /// (the first) is suspended.
     pub fn resumeSync(self: *Vm, args: []const Value, out: []Value) Error!usize {
         const co = coroutine.Thread.fromHeader(args[0].asHeap());
+        if (try self.runSync(co, args[1..], out, true)) |n| return n;
+        const one = [1]Value{co.death.?};
+        return writeOut(out, false, SliceSpan{ .s = &one, .n = 1 });
+    }
+
+    /// Doc 73: the call of a `coroutine.wrap` function from Zig (`pcall(f)`,
+    /// a comparator), with its suspended coroutine: as `resumeSync`, but
+    /// `out` gets only what it yielded or returned, and an error that kills
+    /// it is raised again here.
+    pub fn wrapSync(self: *Vm, args: []const Value, out: []Value) Error!usize {
+        const co = coroutine.Thread.fromHeader(self.calledNative().bound[0].asHeap());
+        if (try self.runSync(co, args, out, false)) |n| return n;
+        return self.raiseWrapped(co.death.?);
+    }
+
+    /// Run suspended coroutine `co` with `args` in a dispatch of its own, on
+    /// top of this Zig frame, until it stops. When it yields or returns,
+    /// `out` gets `true` (if `head`) and its values, as many as fit, and
+    /// this returns how many it wrote; when an error kills it, null, the
+    /// error in `co.death`.
+    fn runSync(self: *Vm, co: *coroutine.Thread, args: []const Value, out: []Value, head: bool) Error!?usize {
         // The native being called (resume) names fault sites by depth,
         // which means nothing on another stack.
         const saved_native = self.unparked_native;
         self.unparked_native = null;
         defer self.unparked_native = saved_native;
-        try self.resumeInto(co, SliceSpan{ .s = args[1..], .n = args.len - 1 });
+        try self.resumeInto(co, SliceSpan{ .s = args, .n = args.len });
         co.sync = true;
         const stop = self.execLoop(1, co) catch |e| {
             // No protected frame of the coroutine caught it (`execLoop`).
@@ -4386,18 +4461,17 @@ pub const Vm = struct {
             self.reg_top_pending = false;
             co.death = errval;
             self.leaveRunning(.dead);
-            const one = [1]Value{errval};
-            return writeOut(out, false, SliceSpan{ .s = &one, .n = 1 });
+            return null;
         };
         switch (stop) {
             .finished => |fr| {
                 // The body frame is popped, its window still on the stack.
-                const n = writeOut(out, true, LaneSpan{ .vm = self, .lo = self.frames[0].base + fr.reg, .n = fr.count });
+                const n = writeOut(out, if (head) true else null, LaneSpan{ .vm = self, .lo = self.frames[0].base + fr.reg, .n = fr.count });
                 self.leaveRunning(.dead);
                 return n;
             },
             .yielded => {
-                const n = writeOut(out, true, LaneSpan{ .vm = self, .lo = co.xfer_lo, .n = co.xfer_n });
+                const n = writeOut(out, if (head) true else null, LaneSpan{ .vm = self, .lo = co.xfer_lo, .n = co.xfer_n });
                 self.leaveRunning(.suspended);
                 return n;
             },
@@ -4406,13 +4480,15 @@ pub const Vm = struct {
         }
     }
 
-    /// `resumeSync`'s results: `ok`, then `vals`, as many as `out` holds.
-    fn writeOut(out: []Value, ok: bool, vals: anytype) usize {
-        if (out.len == 0) return 0;
-        out[0] = Value.boolean(ok);
-        const n = @min(vals.n, out.len - 1);
-        for (0..n) |i| out[1 + i] = vals.get(i);
-        return 1 + n;
+    /// `runSync`'s results: `ok` if there is one, then `vals`, as many as
+    /// `out` holds.
+    fn writeOut(out: []Value, ok: ?bool, vals: anytype) usize {
+        const h: usize = @intFromBool(ok != null);
+        if (out.len < h) return 0;
+        if (ok) |b| out[0] = Value.boolean(b);
+        const n = @min(vals.n, out.len - h);
+        for (0..n) |i| out[h + i] = vals.get(i);
+        return h + n;
     }
 
     /// May the dispatch loop run with the off-by-default prologue hooks compiled
@@ -9566,6 +9642,7 @@ pub const Vm = struct {
                     .xpcall => enter(.xpcall, st, pc, instr, vm),
                     .co_resume => enterResume(mode, of, st, pc, instr, vm),
                     .co_yield => enterYield(mode, of, st, pc, instr, vm),
+                    .co_wrap => enterWrap(mode, of, st, pc, instr, vm),
                 };
             }
 
@@ -9591,15 +9668,34 @@ pub const Vm = struct {
     /// runs on its own stack until it yields, returns or fails; then the
     /// resumer continues with the call's results (`returnToResumer`).
     inline fn enterResume(comptime mode: ExecMode, comptime of: bytecode.OpCode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
+        const lo = st.base + callA(of, instr);
+        const co = coroutine.Thread.fromHeader(vm.regGet(lo + 1).asHeap());
+        return enterCoroutine(mode, of, st, pc, instr, vm, co, false, LaneSpan{ .vm = vm, .lo = lo + 2, .n = entryArgCount(of, st, instr, vm) - 1 });
+    }
+
+    /// Doc 73: the call `instr` of a `coroutine.wrap` function, a resume of
+    /// its bound coroutine with the call's arguments, whose results the
+    /// call takes without resume's `true`.
+    inline fn enterWrap(comptime mode: ExecMode, comptime of: bytecode.OpCode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
+        const lo = st.base + callA(of, instr);
+        const wrap = function.Native.fromHeader(vm.regGet(lo).asHeap());
+        const co = coroutine.Thread.fromHeader(wrap.bound[0].asHeap());
+        return enterCoroutine(mode, of, st, pc, instr, vm, co, true, LaneSpan{ .vm = vm, .lo = lo + 1, .n = entryArgCount(of, st, instr, vm) });
+    }
+
+    /// `enterResume`/`enterWrap`: the resumer stops at the call, and `co`
+    /// runs with `args`; the call's results land at its base slot
+    /// (`returnToResumer`).
+    inline fn enterCoroutine(comptime mode: ExecMode, comptime of: bytecode.OpCode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, co: *coroutine.Thread, wrapped: bool, args: LaneSpan) HandlerResult {
         const self = vm;
         const lo = st.base + callA(of, instr);
-        const co = coroutine.Thread.fromHeader(self.regGet(lo + 1).asHeap());
         const resumer_frame = st.frame;
         std.debug.assert(!resumer_frame.in_flight);
-        self.resumeInto(co, LaneSpan{ .vm = self, .lo = lo + 2, .n = entryArgCount(of, st, instr, vm) - 1 }) catch |e| return parkErr(st, e);
+        self.resumeInto(co, args) catch |e| return parkErr(st, e);
         co.ret_lo = lo;
         co.ret_c = instr.c;
         co.sync = false;
+        co.wrapped = wrapped;
         resumer_frame.pc = pc;
         // A coroutine is never the context a dispatch was entered in.
         std.debug.assert(co != st.entry_ctx);

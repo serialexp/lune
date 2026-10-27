@@ -125,7 +125,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// target in pacing units: coroutine stacks are charged against it, and the
 /// live-object threshold is derived from it and the restored stacks'
 /// charge (it can't be the other way round, the threshold saturates).
-pub const snapshot_format_version: u32 = 15;
+///
+/// v16 (doc 73): `coroutine.wrap`. `HeapNative` gained `bound`, the values
+/// bound to the native (a wrap function's coroutine), and `HeapThread`
+/// `wrapped`, set while its resume is a wrap function's call.
+pub const snapshot_format_version: u32 = 16;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -295,7 +299,12 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader, live: ?sy
             const is_closed = !u.isOpen();
             break :blk .{ .HeapUpvalue = .{ .closed = @intFromBool(is_closed), .value = toSchemaValue(u.get()) } };
         },
-        .native => .{ .HeapNative = .{ .name = function.Native.fromHeader(h).name } },
+        .native => blk: {
+            const n = function.Native.fromHeader(h);
+            const bound = try a.alloc(schema.SnapValue, n.bound.len);
+            for (n.bound, bound) |v, *s| s.* = toSchemaValue(v);
+            break :blk .{ .HeapNative = .{ .name = n.name, .bound = bound } };
+        },
         .file => blk: {
             const f = File.fromHeader(h);
             var fp = f.fingerprint;
@@ -362,6 +371,7 @@ fn toSchemaThread(a: std.mem.Allocator, vm: *Vm, t: *Thread) !schema.HeapThread 
         .death = death,
         .ret_lo = if (wired) @intCast(t.ret_lo) else 0,
         .ret_c = if (wired) t.ret_c else 0,
+        .wrapped = @intFromBool(wired and t.wrapped),
         .yield_lo = if (at_yield) @intCast(t.yield_lo) else 0,
         .yield_c = if (at_yield) t.yield_c else 0,
         .has_stack = @intFromBool(t.stack != null),
@@ -581,6 +591,7 @@ pub const RestoreError = error{
     ImageHasHeapConstants, // a borrowed `Program.image` holds a heap constant, which would live in another heap
     RecompileAllocated, // recompiling the program or a loaded chunk allocated a heap object — a snapshot carries every program and loaded-proto literal (doc 19), so a moved counter means a forked allocation timeline (corrupt snapshot, or not this program's)
     UnknownNative, // a HeapNative.name is not in the native registry
+    InvalidNative, // a HeapNative's bound values are not the ones its registry row binds
     GlobalsNotATable, // globals_id resolves to a non-table object
     MetatableNotATable, // a HeapTable.metatable_id resolves to a non-table object
     ArrayResidentKeyInHash, // a hash entry's normalized integer key is array-covered (`inArray(k, asize)`, incl. float-spelled) — it would be shadowed by the array slot (corrupt/hand-forged snapshot)
@@ -817,7 +828,8 @@ fn checkThreadShape(ht: schema.HeapThread, is_current: bool) RestoreError!void {
     if (ht.has_stack > 1 or ht.death.len > 1 or ht.context.len > 1) return error.InvalidThread;
     const status = std.enums.fromInt(Thread.Status, ht.status) orelse return error.InvalidThread;
     const wired = ht.kind == thread_kind_coroutine and (status == .running or status == .normal);
-    if (!wired and (ht.resumer_id != 0 or ht.ret_lo != 0 or ht.ret_c != 0)) return error.InvalidThread;
+    if (!wired and (ht.resumer_id != 0 or ht.ret_lo != 0 or ht.ret_c != 0 or ht.wrapped != 0)) return error.InvalidThread;
+    if (ht.wrapped > 1) return error.InvalidThread;
     switch (ht.kind) {
         thread_kind_main => if (is_current or status != .running or ht.has_stack != 0 or ht.context.len != 0 or ht.death.len != 0)
             return error.InvalidThread,
@@ -1126,13 +1138,20 @@ pub fn restoreSnapshot(
             },
             .HeapNative => |hn| blk: {
                 const entry = natives.lookup(hn.name) orelse return error.UnknownNative;
-                // Use the registry's static name (outlives the decode arena).
-                const n = try function.Native.create(gpa, entry.func, entry.name);
-                n.effect = entry.effect; // an effect native stays an effect on replay
-                n.multi = entry.multi; // …and keeps its multi-result projection
-                n.recorded = entry.recorded; // …and its JIT-inlinable pure-builtin tag
-                n.protocol = function.Native.protocolOf(false, entry.effect != null, entry.fast, entry.multi != null); // …and its call protocol (doc 70)
-                n.itern = entry.itern; // …and its `itern` lane (doc 66)
+                // As many bound values as the row binds (doc 73), filled in
+                // pass 2.
+                if (hn.bound.len != entry.bound) return error.InvalidNative;
+                const template: function.Native = .{
+                    .header = GcHeader.init(.native),
+                    .func = entry.func,
+                    .name = entry.name, // the registry's static name (outlives the decode arena)
+                    .effect = entry.effect, // an effect native stays an effect on replay
+                    .multi = entry.multi, // …and keeps its multi-result projection
+                    .recorded = entry.recorded, // …and its JIT-inlinable pure-builtin tag
+                    .protocol = function.Native.protocolOf(false, entry.effect != null, entry.fast, entry.multi != null), // …and its call protocol (doc 70)
+                    .itern = entry.itern, // …and its `itern` lane (doc 66)
+                };
+                const n = try function.Native.createBound(gpa, &template, hn.bound.len);
                 // `pure ⇒ !effect` (doc 17, H-4 / 9-A(i)). The static `base_natives`
                 // registry is comptime-proven in `interp.zig`; this guards a
                 // caller-supplied `NativeRegistry` on the restore path.
@@ -1182,7 +1201,11 @@ pub fn restoreSnapshot(
     for (kf.objects) |o| {
         const h = idmap.get(o.id).?;
         switch (o.body) {
-            .HeapString, .HeapNative, .HeapFile => {},
+            .HeapString, .HeapFile => {},
+            .HeapNative => |hn| {
+                const n = function.Native.fromHeader(h);
+                for (hn.bound, n.bound) |sv, *v| v.* = try fromSchemaValue(sv, &idmap);
+            },
             .HeapTable => |ht| {
                 const t = table.Table.fromHeader(h);
                 // Array part: append in order — v7 is positional 0-based (doc 18
@@ -1272,9 +1295,23 @@ pub fn restoreSnapshot(
                 }
                 t.ret_lo = ht.ret_lo;
                 t.ret_c = ht.ret_c;
+                t.wrapped = ht.wrapped == 1;
                 t.yield_lo = ht.yield_lo;
                 t.yield_c = ht.yield_c;
             },
+        }
+    }
+
+    // Bound values are checked once every edge is wired: a `wrap`
+    // function's coroutine is told from the main thread by its body.
+    for (kf.objects) |o| {
+        const hn = switch (o.body) {
+            .HeapNative => |hn| hn,
+            else => continue,
+        };
+        const entry = natives.lookup(hn.name).?; // resolved in pass 1a
+        if (entry.bound_ok) |ok| {
+            if (!ok(function.Native.fromHeader(idmap.get(o.id).?).bound)) return error.InvalidNative;
         }
     }
 

@@ -95,7 +95,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
                 .{ .id = 6, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 1, .upvalue_ids = &.{} } } },
                 .{ .id = 4, .obj_type = 4, .body = .{ .HeapUpvalue = .{ .closed = 1, .value = sInt(99) } } },
                 .{ .id = 5, .obj_type = 4, .body = .{ .HeapUpvalue = .{ .closed = 0, .value = sRef(2) } } },
-                .{ .id = 7, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "print" } } },
+                .{ .id = 7, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "print", .bound = &.{} } } },
             },
             .stack = &.{ util.reg(sRef(2)), util.reg(sInt(-1)), util.regDead },
             .frames = &.{

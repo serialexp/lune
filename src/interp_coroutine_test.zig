@@ -306,3 +306,100 @@ test "coroutine: a non-coroutine argument is a bad argument naming the library f
         "false\tmain:2: bad argument #1 to 'status' (thread expected, got boolean)\n");
 }
 
+
+test "coroutine.wrap: a generator yields and returns its values, as in Lua" {
+    // Outputs checked against Lua 5.4.6.
+    try expectProgram(
+        \\local gen = coroutine.wrap(function(a, b)
+        \\  local c = coroutine.yield(a + b)
+        \\  local d, e = coroutine.yield(c * 2)
+        \\  return d .. e, "end"
+        \\end)
+        \\print(type(gen), gen(1, 2), gen(10))
+        \\print(gen("x", "y"))
+        \\print(pcall(gen))
+        \\for v in coroutine.wrap(function() for i = 1, 3 do coroutine.yield(i) end end) do io.write(v, " ") end
+        \\print(select("#", coroutine.wrap(function() return nil, nil end)()))
+        \\print(pcall(coroutine.wrap, 1))
+    , "function\t3\t20\nxy\tend\nfalse\tcannot resume dead coroutine\n1 2 3 2\n" ++
+        "false\tbad argument #1 to 'coroutine.wrap' (function expected, got number)\n");
+}
+
+test "coroutine.wrap: an error is raised again at the call, located as Lua locates it" {
+    try expectProgram(
+        \\local bad = coroutine.wrap(function() error("boom") end)
+        \\print(pcall(bad))
+        \\local function call() return bad() end
+        \\print(pcall(call))
+        \\local b2 = coroutine.wrap(function() error("b2") end)
+        \\print(pcall(function() return b2() end))
+        \\local b3 = coroutine.wrap(function() error({code = 7}) end)
+        \\local ok, e = pcall(b3)
+        \\print(ok, e.code)
+    , "false\tmain:1: boom\nfalse\tmain:3: cannot resume dead coroutine\n" ++
+        "false\tmain:6: main:5: b2\nfalse\t7\n");
+    try expectProgram(
+        \\local b4 = coroutine.wrap(function() error("lvl0", 0) end)
+        \\print(pcall(function() local r = b4() return r end))
+        \\local e1 = coroutine.wrap(function()
+        \\  coroutine.wrap(function() error("deep") end)()
+        \\end)
+        \\print(pcall(e1))
+        \\local self
+        \\self = coroutine.wrap(function() return self() end)
+        \\print(pcall(self))
+    , "false\tmain:2: lvl0\nfalse\tmain:4: main:4: deep\n" ++
+        "false\tmain:8: cannot resume non-suspended coroutine\n");
+}
+
+test "coroutine.wrap: called from Zig, as a body, and nested" {
+    try expectProgram(
+        \\local g = coroutine.wrap(function() for i = 1, 100 do coroutine.yield(i) end end)
+        \\local t = {5, 3, 8, 1}
+        \\table.sort(t, function(a, b) g() return a < b end)
+        \\print(t[1], t[4], g() > 2)
+        \\local mt = {__index = coroutine.wrap(function(t, k)
+        \\  while true do t, k = coroutine.yield(k .. "!") end
+        \\end)}
+        \\local o = setmetatable({}, mt)
+        \\print(o.x, o.y)
+    , "1\t8\ttrue\nx!\ty!\n");
+    try expectProgram(
+        \\local co = coroutine.create(coroutine.wrap(function(a)
+        \\  local b = coroutine.yield(a * 2)
+        \\  return b + 1
+        \\end))
+        \\print(coroutine.resume(co, 5))
+        \\print(coroutine.resume(co, 7))
+        \\print(coroutine.status(co))
+        \\local outer = coroutine.wrap(function()
+        \\  local inner = coroutine.wrap(function() coroutine.yield("in1") coroutine.yield("in2") end)
+        \\  coroutine.yield(inner())
+        \\  coroutine.yield(inner())
+        \\end)
+        \\print(outer(), outer())
+        \\local w = coroutine.wrap(function() coroutine.yield(coroutine.isyieldable(), coroutine.status(coroutine.running())) end)
+        \\print(w())
+    , "true\t10\nfalse\tcannot resume dead coroutine\ndead\nin1\tin2\ntrue\trunning\n");
+}
+
+test "coroutine.wrap: the collector keeps a wrap function's coroutine" {
+    try expectProgram(
+        \\local gens = {}
+        \\for i = 1, 50 do
+        \\  gens[i] = coroutine.wrap(function() for j = 1, 3 do coroutine.yield(i * 10 + j) end end)
+        \\end
+        \\local s = 0
+        \\for r = 1, 3 do
+        \\  for i = 1, 50 do s = s + gens[i]() end
+        \\  local junk = {}
+        \\  for k = 1, 20000 do junk[k] = {k} end
+        \\end
+        \\local n = 0
+        \\for i = 1, 2000 do
+        \\  local w = coroutine.wrap(function(x) local y = coroutine.yield(x + 1) return y * 2 end)
+        \\  n = n + w(i) + w(3)
+        \\end
+        \\print(s, n)
+    , "38550\t2015000\n");
+}

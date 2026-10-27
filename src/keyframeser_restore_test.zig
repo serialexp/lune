@@ -1124,7 +1124,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
                 .{ .id = 6, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 1, .upvalue_ids = &.{} } } },
                 .{ .id = 4, .obj_type = 4, .body = .{ .HeapUpvalue = .{ .closed = 1, .value = sInt(99) } } },
                 .{ .id = 5, .obj_type = 4, .body = .{ .HeapUpvalue = .{ .closed = 0, .value = sRef(2) } } },
-                .{ .id = 7, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "print" } } },
+                .{ .id = 7, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "print", .bound = &.{} } } },
             },
             .stack = &.{ util.reg(sRef(2)), util.reg(sInt(-1)) },
             // Both stub protos have num_registers == 0, so contiguity wants base 0
@@ -1518,7 +1518,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .next_file_id = 3,
         .next_obj_id = 1,
         .gc_target = 1024,
-        .objects = &.{.{ .id = 0, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "nope" } } }},
+        .objects = &.{.{ .id = 0, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "nope", .bound = &.{} } } }},
         .stack = &.{},
         .frames = &.{},
         .open_upvalues = &.{},
@@ -1857,6 +1857,9 @@ test "doc 73: coroutines round-trip through a keyframe, and malformed thread rec
         fn retWiring(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
             t.ret_c = 1;
         }
+        fn wrappedIdle(_: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
+            t.wrapped = 1;
+        }
         fn openTwice(al: std.mem.Allocator, t: *schema.HeapThread) anyerror!void {
             const ctx = try al.dupe(schema.ThreadContext, t.context);
             const ou = ctx[0].open_upvalues;
@@ -1876,10 +1879,101 @@ test "doc 73: coroutines round-trip through a keyframe, and malformed thread rec
         .{ ThreadPick.main, E.mainWithBody, error.InvalidThread },
         .{ ThreadPick.main, E.mainSuspended, error.InvalidThread },
         .{ ThreadPick.suspended, E.retWiring, error.InvalidThread },
+        .{ ThreadPick.suspended, E.wrappedIdle, error.InvalidThread },
         .{ ThreadPick.suspended, E.openTwice, error.UpvalueOpenTwice },
     };
     inline for (cases) |c| {
         try expectRestoreError(try editThread(a, snap, c[0], c[1]), .of(source), c[2]);
+    }
+}
+
+/// `snap` with `edit` applied to the bound values of its one bound native.
+fn editBound(
+    a: std.mem.Allocator,
+    snap: schema.SnapshotFile,
+    comptime edit: fn (a: std.mem.Allocator, bound: *[]const schema.SnapValue, main_id: u32) anyerror!void,
+) !schema.SnapshotFile {
+    const objects = try a.dupe(schema.HeapObject, snap.keyframe.objects);
+    var main_id: ?u32 = null;
+    for (objects) |o| {
+        if (o.body == .HeapThread and o.body.HeapThread.kind == 1) main_id = o.id;
+    }
+    var hit = false;
+    for (objects) |*o| {
+        if (o.body != .HeapNative or o.body.HeapNative.bound.len == 0) continue;
+        try testing.expect(!hit);
+        hit = true;
+        try edit(a, &o.body.HeapNative.bound, main_id.?);
+    }
+    try testing.expect(hit);
+    var out = snap;
+    out.keyframe.objects = objects;
+    return out;
+}
+
+test "doc 73: wrap functions round-trip through a keyframe, and malformed bound values are rejected" {
+    const gpa = testing.allocator;
+    const source =
+        \\gen = coroutine.wrap(function(a)
+        \\  local b = coroutine.yield(a + 1)
+        \\  return a + b
+        \\end)
+        \\first = gen(10)
+        \\main = coroutine.running()
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+    {
+        const vm2 = try restore(gpa, b0, .of(source), NativeRegistry.base());
+        defer {
+            vm2.deinit();
+            gpa.destroy(vm2);
+        }
+        const b1 = try encodeSnapshot(gpa, vm2);
+        defer gpa.free(b1);
+        try testing.expectEqualSlices(u8, b0, b1);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const snap = try schema.SnapshotFile.decode(a, b0);
+    const E = struct {
+        fn none(_: std.mem.Allocator, b: *[]const schema.SnapValue, _: u32) anyerror!void {
+            b.* = &.{};
+        }
+        fn twice(al: std.mem.Allocator, b: *[]const schema.SnapValue, _: u32) anyerror!void {
+            b.* = try std.mem.concat(al, schema.SnapValue, &.{ b.*, b.* });
+        }
+        fn number(al: std.mem.Allocator, b: *[]const schema.SnapValue, _: u32) anyerror!void {
+            b.* = try al.dupe(schema.SnapValue, &.{sInt(1)});
+        }
+        fn mainThread(al: std.mem.Allocator, b: *[]const schema.SnapValue, main_id: u32) anyerror!void {
+            b.* = try al.dupe(schema.SnapValue, &.{sRef(main_id)});
+        }
+    };
+    const cases = .{
+        .{ E.none, error.InvalidNative },
+        .{ E.twice, error.InvalidNative },
+        .{ E.number, error.InvalidNative },
+        .{ E.mainThread, error.InvalidNative },
+    };
+    inline for (cases) |c| {
+        try expectRestoreError(try editBound(a, snap, c[0]), .of(source), c[1]);
     }
 }
 

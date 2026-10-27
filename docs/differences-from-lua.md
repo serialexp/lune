@@ -11,8 +11,7 @@ The differences most likely to stop an existing Lua program:
 
 - Strings never turn into numbers in arithmetic: `"10" + 1` is an error
   (§Numbers).
-- No `coroutine.wrap` yet, no `goto`, `<const>`/`<close>`, or `f"str"`/`f{...}` call
-  syntax (§Syntax, §Missing libraries and functions).
+- No `goto`, `<const>`/`<close>`, or `f"str"`/`f{...}` call syntax (§Syntax).
 - Calls nest at most 200 deep, and tail calls are not eliminated
   (§Calls).
 
@@ -176,7 +175,6 @@ What follows from that:
 
 | Missing | Why | Instead |
 |---|---|---|
-| `coroutine.wrap` | not built yet (`docs/design/73-coroutines.md`) | `coroutine.create` + `resume` |
 | `debug.*` except `traceback` | reflection breaks the language's guarantees; the trace visualiser takes its place | `mahina viz` |
 | `string.byte`, `utf8` | strings are code points | `string.codepoint`, `string.char`, `string.codes` |
 | `string.dump` | bytecode is internal and not portable between versions | — |

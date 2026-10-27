@@ -1,4 +1,4 @@
-DOC 73 COROUTINES: P0 + P1 (minus wrap) DONE (2026-10-27, coral-marten).
+DOC 73 COROUTINES: P0 + P1 DONE (2026-10-27, coral-marten); next P3 viz.
 - All questions decided. Bart accepted the frames-pointer cost; P0a landed
   (4e37dfd). The P0 runtime design is doc 73 §5.1 (stack = one allocation
   of tags+payloads+scratch+frames; active fields stay in Vm and are
@@ -48,12 +48,19 @@ DOC 73 COROUTINES: P0 + P1 (minus wrap) DONE (2026-10-27, coral-marten).
   gained `coroutine`. coArg says "thread expected" as Lua 5.4.6.
 - Bart's order (2026-10-27): finish the whole feature (wrap, viz, async,
   docs) before ANY coroutine performance work, P2 JIT included.
-- Next: wrap (ask Bart about the callable primitive first).
+- wrap landed (2026-10-27): Bart chose natives with bound values (Lua's
+  C closures). Native.bound + Heap.newBoundNative + Vm.calledNative;
+  error.ActivateWrap → enterWrap (shares enterCoroutine with resume),
+  Thread.wrapped drops the `true`, raiseWrapped re-raises a death at the
+  call; keyframe format 16. Adding the coroutine.wrap native shifted every
+  startup heap id by 2 (interp_gc_test / interp_phaseq_test print ids).
+  A/B: pingpong −0.79%, everything else within ±0.21%.
+- Next: P3 viz — the call chain across coroutines (backtraceFrames lists
+  only the current stack; extend it through the resumer chain with
+  boundary markers; ReplayPanel shows `backtrace`). Then P4 async, P5 docs.
   P2 lead (deferred): co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
   t0 (yield made deep in recursion) — start with --jit-stats/--dump-aborts.
-- `coroutine.wrap` needs a callable bound to its coroutine: that is the
-  same open decision as gmatch's lone callable (TODO.md:70) — ask Bart
-  before building wrap.
+- gmatch/codes lone iterators can now use bound natives (TODO.md).
 - Map of single-stack assumptions: see the Explore notes summarised in
   doc 73 §5.1 (offsets_x64.inc, FrameMotionAbi, upvalueSlotAliasOk at
   interp.zig ~1565, fillKeep, keyframeser encode/restore).

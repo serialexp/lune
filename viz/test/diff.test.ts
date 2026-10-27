@@ -78,6 +78,15 @@ const integerCorpus: { name: string; src: string }[] = [
       "for k = 1, 3 do print(coroutine.resume(co, k)) end\nprint(coroutine.status(co))\n" +
       'local dead = coroutine.create(function() error("x") end)\nprint(coroutine.resume(dead))\n',
   },
+  // Doc 73: coroutine.wrap functions, natives with their coroutine bound,
+  // one suspended and one finished.
+  {
+    name: "coroutine.wrap",
+    src:
+      "local gen = coroutine.wrap(function(n)\n  for i = 1, n do coroutine.yield(i * i) end\nend)\n" +
+      "print(gen(5), gen(), gen())\n" +
+      'local once = coroutine.wrap(function() return "done" end)\nprint(once(), pcall(once))\n',
+  },
 ];
 
 for (const { name, src } of integerCorpus) {

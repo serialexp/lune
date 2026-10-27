@@ -1347,3 +1347,38 @@ test "doc 73: every cut with native-body coroutines resumes after restore" {
         gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
     }
 }
+
+test "doc 73: every cut through coroutine.wrap functions resumes after restore" {
+    // Cuts land inside wrapped coroutines resumed by an instruction (a
+    // generator in a `for`, nested wraps, one that dies with an error the
+    // caller catches), so the keyframe carries running and normal ones
+    // flagged `wrapped`, and suspended ones held only by their functions.
+    const gpa = testing.allocator;
+    const source =
+        \\local function range(n)
+        \\  return coroutine.wrap(function() for i = 1, n do coroutine.yield(i) end end)
+        \\end
+        \\local acc = 0
+        \\for v in range(4) do acc = acc + v end
+        \\local outer = coroutine.wrap(function(a)
+        \\  local inner = coroutine.wrap(function(x)
+        \\    local y = coroutine.yield(x * 2)
+        \\    return y + 1
+        \\  end)
+        \\  local r = inner(a)
+        \\  local b = coroutine.yield(r)
+        \\  return inner(b)
+        \\end)
+        \\print(acc, outer(3), outer(5))
+        \\local bad = coroutine.wrap(function(z) coroutine.yield(z) error("late " .. z) end)
+        \\print(bad(1), pcall(bad))
+        \\local keep = range(2)
+        \\print(keep(), keep(), keep())
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}

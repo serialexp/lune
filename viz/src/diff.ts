@@ -203,8 +203,8 @@ export function keyframeSansArg(bytes: Uint8Array): string {
       case 2: // closure
         body = { proto_id: o.body.value.proto_id, upvalues: o.body.value.upvalue_ids.map((u: any) => visit(Number(u))) };
         break;
-      case 3: // native
-        body = { name: Array.from(new Uint8Array(o.body.value.name)) };
+      case 3: // native, and the values bound to it (a coroutine.wrap function's coroutine)
+        body = { name: Array.from(new Uint8Array(o.body.value.name)), bound: o.body.value.bound.map(canonSv) };
         break;
       case 4: // upvalue
         body = { closed: o.body.value.closed, value: canonSv(o.body.value.value) };
@@ -222,7 +222,7 @@ export function keyframeSansArg(bytes: Uint8Array): string {
           body: canonSv(t.body),
           resumer: Number(t.resumer_id) > 0 ? visit(Number(t.resumer_id) - 1) : -1,
           death: t.death.map(canonSv),
-          ret: [t.ret_lo, t.ret_c],
+          ret: [t.ret_lo, t.ret_c, t.wrapped],
           yield: [t.yield_lo, t.yield_c],
           has_stack: t.has_stack,
           context: t.context.map(canonContext),

@@ -9,14 +9,16 @@
 //!     co)`, a native's callback) runs the coroutine in a dispatch of its own
 //!     on top of that Zig frame (`Vm.resumeSync`).
 //!   * A coroutine may yield only while no Zig frame was entered since it was
-//!     resumed (`Vm.canYield`): from inside a `table.sort` comparator, a
-//!     metamethod run through a Zig re-entry, or a native body, yielding is
-//!     Lua's "attempt to yield across a C-call boundary" error.
+//!     resumed (`Vm.canYield`): from inside a `table.sort` comparator or a
+//!     metamethod run through a Zig re-entry, yielding is Lua's "attempt to
+//!     yield across a C-call boundary" error. A native body runs under a Lua
+//!     shim frame (`coroutine.native_body_source`), so it yields as Lua's do.
+//!   * `coroutine.wrap(f)` returns a native with the coroutine bound to it
+//!     (`function.Native.bound`); calling it signals `error.ActivateWrap`, a
+//!     resume of that coroutine whose results come without `true` and whose
+//!     error is raised again at the call.
 //!   * The main program is a `thread` value too (`coroutine.running()`), with
 //!     no stack of its own.
-//!
-//! Not yet (doc 73 Outstanding): `coroutine.wrap`, and a native function as
-//! a coroutine's body.
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -61,6 +63,51 @@ fn nCreate(ctx: *anyopaque, args: []const Value) anyerror!Value {
     if (!is_fn) return vm.badArg(1, "function", f);
     const t = try coroutine.newThread(vm.heap, f.?);
     return Value.heap(&t.header);
+}
+
+/// `coroutine.wrap(f)`: a coroutine running `f`, as `create` makes it,
+/// bound to a native that resumes it when called (Lua's `auxwrap`).
+fn nWrap(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const co = try nCreate(ctx, args);
+    const w = try vm.heap.newBoundNative(interp.templateOf(wrap_fn_name), 1);
+    w.bound[0] = co;
+    return Value.heap(&w.header);
+}
+
+/// The registry name of `coroutine.wrap`'s functions; `manual`, so it
+/// installs nowhere, and keyframes rebind it by name.
+const wrap_fn_name = "@coroutine_wrap_fn";
+
+/// A `wrap` function's one bound value is a coroutine (not the main
+/// thread, whose object has no stack to run).
+fn wrapBoundOk(bound: []const Value) bool {
+    return isThread(bound[0]) and Thread.fromHeader(bound[0].asHeap()).body.isHeap();
+}
+
+/// A call of a `wrap` function: a suspended coroutine runs (the switch is
+/// the caller's, `error.ActivateWrap`); any other is an error at the call,
+/// as `auxwrap` raises resume's message.
+fn wrapEnter(vm: *Vm) anyerror!usize {
+    const co = Thread.fromHeader(vm.calledNative().bound[0].asHeap());
+    const why = switch (statusOf(vm, co)) {
+        .suspended => return error.ActivateWrap,
+        .dead => "cannot resume dead coroutine",
+        .running, .normal => "cannot resume non-suspended coroutine",
+    };
+    return vm.raiseLocatedError(why, 1);
+}
+
+fn nWrapFnN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    _ = args;
+    _ = out;
+    return wrapEnter(vmOf(ctx));
+}
+
+fn nWrapFn1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = args;
+    _ = try wrapEnter(vmOf(ctx));
+    unreachable; // `wrapEnter` always signals or raises
 }
 
 /// `coroutine.resume(co, ...)`: a suspended coroutine runs (the switch is
@@ -190,4 +237,6 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "coroutine.running", .func = &nRunning1, .multi = &nRunningN, .module = "coroutine", .field = "running" },
     .{ .name = "coroutine.isyieldable", .func = &nIsYieldable, .module = "coroutine", .field = "isyieldable" },
     .{ .name = "coroutine.close", .func = &nClose1, .multi = &nCloseN, .module = "coroutine", .field = "close" },
+    .{ .name = "coroutine.wrap", .func = &nWrap, .module = "coroutine", .field = "wrap" },
+    .{ .name = wrap_fn_name, .func = &nWrapFn1, .multi = &nWrapFnN, .manual = true, .bound = 1, .bound_ok = &wrapBoundOk },
 };

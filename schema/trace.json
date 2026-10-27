@@ -179,8 +179,11 @@
     },
 
     "HeapNative": {
-      "description": "A native (host/builtin) function, identified by name. Rebound to the installed base library by name at restore (the function pointer is meaningless on disk), so only the name is serialized.",
-      "sequence": [ { "name": "name", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" } ]
+      "description": "A native (host/builtin) function, identified by name. Rebound to the installed base library by name at restore (the function pointer is meaningless on disk), so the name is serialized, with the values bound to it (doc 73: Lua's C-closure upvalues, e.g. a coroutine.wrap function's coroutine), as many as its registry row binds.",
+      "sequence": [
+        { "name": "name",  "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" },
+        { "name": "bound", "type": "array", "kind": "length_prefixed", "length_type": "uint8", "items": { "type": "SnapValue" } }
+      ]
     },
 
     "FileFingerprint": {
@@ -214,7 +217,7 @@
     },
 
     "HeapThread": {
-      "description": "A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. Only the running coroutine (Keyframe.current_id) and the normal ones on its resumer chain are captured with a resumer and resume wiring. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.",
+      "description": "A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants, and `wrapped` is 1 when that call is of its coroutine.wrap function (results without resume's `true`, an error raised again at the call); `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. Only the running coroutine (Keyframe.current_id) and the normal ones on its resumer chain are captured with a resumer and resume wiring. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.",
       "sequence": [
         { "name": "kind",       "type": "uint8" },
         { "name": "status",     "type": "uint8" },
@@ -223,6 +226,7 @@
         { "name": "death",      "type": "array", "kind": "length_prefixed", "length_type": "uint8", "items": { "type": "SnapValue" } },
         { "name": "ret_lo",     "type": "uint32" },
         { "name": "ret_c",      "type": "uint16" },
+        { "name": "wrapped",    "type": "uint8" },
         { "name": "yield_lo",   "type": "uint32" },
         { "name": "yield_c",    "type": "uint16" },
         { "name": "has_stack",  "type": "uint8" },

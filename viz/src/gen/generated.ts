@@ -2739,7 +2739,7 @@ export class HeapUpvalueDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A native (host/builtin) function, identified by name. Rebound to the installed base library by name at restore (the function pointer is meaningless on disk), so only the name is serialized.
+ * A native (host/builtin) function, identified by name. Rebound to the installed base library by name at restore (the function pointer is meaningless on disk), so the name is serialized, with the values bound to it (doc 73: Lua's C-closure upvalues, e.g. a coroutine.wrap function's coroutine), as many as its registry row binds.
  */
 export interface HeapNativeInput {
   /**
@@ -2747,10 +2747,20 @@ export interface HeapNativeInput {
    * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
    */
   name: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  bound: SnapValueInput[];
 }
 
 /**
- * A native (host/builtin) function, identified by name. Rebound to the installed base library by name at restore (the function pointer is meaningless on disk), so only the name is serialized.
+ * A native (host/builtin) function, identified by name. Rebound to the installed base library by name at restore (the function pointer is meaningless on disk), so the name is serialized, with the values bound to it (doc 73: Lua's C-closure upvalues, e.g. a coroutine.wrap function's coroutine), as many as its registry row binds.
  */
 export interface HeapNativeOutput {
   /**
@@ -2758,6 +2768,16 @@ export interface HeapNativeOutput {
    * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
    */
   name: number[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  bound: SnapValueOutput[];
 }
 
 export type HeapNative = HeapNativeOutput;
@@ -2778,6 +2798,15 @@ export class HeapNativeEncoder extends BitStreamEncoder {
       const value_name__iter = value.name[value_name__iter_index];
       this.writeUint8(value_name__iter);
     }
+    this.writeUint8(value.bound.length);
+    for (let value_bound__iter_index = 0; value_bound__iter_index < value.bound.length; value_bound__iter_index++) {
+      const value_bound__iter = value.bound[value_bound__iter_index];
+      const encoder_value_bound__iter = new SnapValueEncoder();
+      const encoded_value_bound__iter = encoder_value_bound__iter.encode(value_bound__iter);
+      for (const byte of encoded_value_bound__iter) {
+        this.writeUint8(byte);
+      }
+    }
     return this.finish();
   }
 
@@ -2790,6 +2819,12 @@ export class HeapNativeEncoder extends BitStreamEncoder {
     // name: bytes (kind: length_prefixed)
     size += value.name.length;
     size += 4; // length prefix (uint32)
+    // bound: array (kind: length_prefixed)
+    for (const item of value.bound) {
+      const bound_itemEncoder = new SnapValueEncoder();
+      size += bound_itemEncoder.calculateSize(item);
+    }
+    size += 1; // length prefix (uint8)
     return size;
   }
 }
@@ -2809,6 +2844,46 @@ export class HeapNativeDecoder extends SeekableBitStreamDecoder {
       let name__iter: any;
       name__iter = this.readUint8();
       value.name.push(name__iter);
+    }
+    value.bound = [];
+    const bound_length = this.readUint8();
+    for (let i = 0; i < bound_length; i++) {
+      let bound__iter: any;
+      bound__iter = {};
+      bound__iter.tag = this.readUint8();
+      if (bound__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), bound__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        bound__iter.body = { type: 'ConstNil', value: payload };
+      }
+      else if (bound__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), bound__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        bound__iter.body = { type: 'ConstBool', value: payload };
+      }
+      else if (bound__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), bound__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        bound__iter.body = { type: 'ConstInt', value: payload };
+      }
+      else if (bound__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), bound__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        bound__iter.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (bound__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), bound__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        bound__iter.body = { type: 'HeapRef', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${bound__iter.tag}`);
+      }
+      value.bound.push(bound__iter);
     }
     return value;
   }
@@ -3297,7 +3372,7 @@ export class ThreadContextDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. Only the running coroutine (Keyframe.current_id) and the normal ones on its resumer chain are captured with a resumer and resume wiring. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
+ * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants, and `wrapped` is 1 when that call is of its coroutine.wrap function (results without resume's `true`, an error raised again at the call); `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. Only the running coroutine (Keyframe.current_id) and the normal ones on its resumer chain are captured with a resumer and resume wiring. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
  */
 export interface HeapThreadInput {
   /**
@@ -3340,6 +3415,11 @@ export interface HeapThreadInput {
    */
   ret_c: number;
   /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  wrapped: number;
+  /**
    * 32-bit Unsigned Integer
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
@@ -3367,7 +3447,7 @@ export interface HeapThreadInput {
 }
 
 /**
- * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants; `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. Only the running coroutine (Keyframe.current_id) and the normal ones on its resumer chain are captured with a resumer and resume wiring. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
+ * A coroutine, Lua's `thread` value (doc 73). `kind` 0 is a coroutine, 1 the main program's thread object (made by the first coroutine.running on it; no stack, its status derived). `status` is coroutine.Thread.Status (suspended=0, running=1, normal=2, dead=3). `body` is the function it runs. `resumer_id` is the coroutine that resumed it as a 1-based optional id (0 = the main stack or none). `death` holds the error that killed it, if any (0 or 1 entries). `ret_lo`/`ret_c` are where a running or normal coroutine's resume results land in its resumer's stack and how many the call wants, and `wrapped` is 1 when that call is of its coroutine.wrap function (results without resume's `true`, an error raised again at the call); `yield_lo`/`yield_c` where a coroutine suspended at a yield takes the next resume's values; each pair is 0 when it means nothing in the status. Only the running coroutine (Keyframe.current_id) and the normal ones on its resumer chain are captured with a resumer and resume wiring. `has_stack` is 1 while the coroutine owns a stack (until it dies); `context` holds that stack (1 entry) when it isn't the running one.
  */
 export interface HeapThreadOutput {
   /**
@@ -3409,6 +3489,11 @@ export interface HeapThreadOutput {
    * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
    */
   ret_c: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  wrapped: number;
   /**
    * 32-bit Unsigned Integer
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
@@ -3468,6 +3553,7 @@ export class HeapThreadEncoder extends BitStreamEncoder {
     }
     this.writeUint32(value.ret_lo, "little_endian");
     this.writeUint16(value.ret_c, "little_endian");
+    this.writeUint8(value.wrapped);
     this.writeUint32(value.yield_lo, "little_endian");
     this.writeUint16(value.yield_c, "little_endian");
     this.writeUint8(value.has_stack);
@@ -3499,7 +3585,7 @@ export class HeapThreadEncoder extends BitStreamEncoder {
       const death_itemEncoder = new SnapValueEncoder();
       size += death_itemEncoder.calculateSize(item);
     }
-    size += 14; // length prefix (uint8) + ret_lo + ret_c + yield_lo + yield_c + has_stack
+    size += 15; // length prefix (uint8) + ret_lo + ret_c + wrapped + yield_lo + yield_c + has_stack
     // context: array (kind: length_prefixed)
     for (const item of value.context) {
       const context_itemEncoder = new ThreadContextEncoder();
@@ -3598,6 +3684,7 @@ export class HeapThreadDecoder extends SeekableBitStreamDecoder {
     }
     value.ret_lo = this.readUint32("little_endian");
     value.ret_c = this.readUint16("little_endian");
+    value.wrapped = this.readUint8();
     value.yield_lo = this.readUint32("little_endian");
     value.yield_c = this.readUint16("little_endian");
     value.has_stack = this.readUint8();

@@ -1,9 +1,9 @@
 # 73 — Coroutines, and async on top of them — Design
 
-Status: partial — P0 switch, keyframes and most of P1 landed (resume/yield
-on separate stacks, stops and keyframes inside coroutines, the library minus
-`wrap`, the stack pool and its GC weight, native bodies); JIT, viz and
-async outstanding.
+Status: partial — P0 and P1 landed (resume/yield on separate stacks, stops
+and keyframes inside coroutines, the whole library including `wrap` and
+native bodies, the stack pool and its GC weight); JIT, viz and async
+outstanding.
 Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-27
@@ -110,15 +110,28 @@ land; move whole phases to Done once everything inside them is checked.
   as Lua's `pushglobalfuncname` does (`'io.open'`, `'?'` for a file
   method), by searching `package.loaded`, which also gained its missing
   `coroutine` entry. Every-cut resume test with native bodies suspended.
+- [x] **P1 remainder — `coroutine.wrap`** (§4.2): Bart chose (2026-10-27)
+  natives with bound values, Lua's C closures, over a Lua shim closure or a
+  callable table. `function.Native.bound` holds them (a trailing
+  allocation, as `Closure.upvalues`), the collector marks them, and a
+  running native reads its own through `Vm.calledNative` (Lua's
+  `ci->func`: the unparked native, or the callee of the top frame's call),
+  so no call path changed. A wrap function signals `error.ActivateWrap`:
+  `enterWrap` resumes its bound coroutine through the same switch as
+  `resume`, flagging it `wrapped` so its results come without `true`, and
+  an error that kills it is raised again at the call (`raiseWrapped`, with
+  `auxwrap`'s location for a string); from Zig, `wrapSync`. Keyframes
+  format 16: `HeapNative.bound`, checked on restore against the registry
+  row's `bound` count and `bound_ok`, and `HeapThread.wrapped`. Tests
+  against Lua 5.4.6 output on every tier, every-cut resume, malformed
+  records, a wasm ≡ native case. The same primitive can carry gmatch's and
+  codes' iterator state (TODO.md).
 
 ### Outstanding
 
 - [ ] **Coroutine stacks' committed floor**: ~16 KiB per live coroutine
   (a page per region) against LuaJIT's ~1 KiB; `co_many` 164 MB vs 7.4 MB,
   and with it the GC weight below (TODO.md).
-- [ ] **P1 remainder — `coroutine.wrap`** (§4.2): waits on Bart's decision
-  about a callable non-function value (the same question as gmatch's
-  iterator, TODO.md).
 - [ ] **P2 — the JIT boundary** (§6.4): a switch ends a trace; traces inside a
   coroutine body run as usual. Evidence from the first board: with the yield
   made 20 or 150 calls deep, `--jit-native` is 3.2–3.6× slower than t0

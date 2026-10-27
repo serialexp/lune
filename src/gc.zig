@@ -622,6 +622,15 @@ pub const Heap = struct {
         return n;
     }
 
+    /// Allocate a copy of `template` with `n_bound` bound values, nil for
+    /// the caller to fill before the next safepoint, and register it with
+    /// the heap.
+    pub fn newBoundNative(self: *Heap, template: *const Native, n_bound: usize) std.mem.Allocator.Error!*Native {
+        const n = try Native.createBound(self.gpa, template, n_bound);
+        self.link(&n.header);
+        return n;
+    }
+
     /// Allocate a file handle (doc 65 §4.1) and register it with the heap.
     pub fn newFile(self: *Heap, id: system.FileId, kind: File.Kind, mode: system.OpenMode, path: []const u8) std.mem.Allocator.Error!*File {
         const f = try File.create(self.gpa, id, kind, mode, path);
@@ -774,9 +783,12 @@ pub const Heap = struct {
     /// the header so the collector knows where the child pointers live.
     fn blacken(self: *Heap, h: *GcHeader) void {
         switch (h.type) {
-            // Leaves: no heap children. A `Native`'s name is a borrowed/static
-            // slice, not a heap String; a `File`'s path is owned bytes.
-            .string, .native, .file => {},
+            // Leaves: no heap children. A `File`'s path is owned bytes.
+            .string, .file => {},
+            // A `Native`'s name is a borrowed/static slice, not a heap
+            // String; its bound values (`coroutine.wrap`'s coroutine) are
+            // its only children.
+            .native => for (Native.fromHeader(h).bound) |v| self.markValue(v),
             .table => {
                 const t = Table.fromHeader(h);
                 // Narrow lanes (bool/int/float) hold no heap pointers — the array

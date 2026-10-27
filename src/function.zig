@@ -498,6 +498,13 @@ pub const Native = struct {
     /// How `itern` steps a generic `for` with this native as its iterator
     /// (doc 66). Set from the registry like `protocol`.
     itern: IternLane = .call,
+    /// Values bound to this native, as Lua's C-closure upvalues
+    /// (`lua_pushcclosure`): the state a library function returned to the
+    /// program carries, such as `coroutine.wrap`'s coroutine. The running
+    /// native reaches them through `Vm.calledNative`. Empty for a registry
+    /// native; otherwise held right after the native in its own allocation
+    /// (`createBound`), like `Closure.upvalues`, and traced by the collector.
+    bound: []Value = &.{},
 
     pub const CallProtocol = union(enum(u8)) {
         /// `func`, one result.
@@ -545,6 +552,27 @@ pub const Native = struct {
         return self;
     }
 
+    /// A copy of `template` (an unlinked registry native) with `n_bound`
+    /// nil bound values for the caller to fill. Raw allocation only; the
+    /// heap GC-links it.
+    pub fn createBound(gpa: std.mem.Allocator, template: *const Native, n_bound: usize) std.mem.Allocator.Error!*Native {
+        std.debug.assert(template.bound.len == 0 and template.host == null);
+        const bytes = try gpa.alignedAlloc(u8, .of(Native), boundAllocSize(n_bound));
+        const self: *Native = @ptrCast(bytes.ptr);
+        self.* = template.*;
+        self.header = GcHeader.init(.native);
+        const start: [*]align(@alignOf(Native)) u8 = @ptrCast(self);
+        const cells: [*]Value = @ptrCast(@alignCast(start + @sizeOf(Native)));
+        self.bound = cells[0..n_bound];
+        @memset(self.bound, Value.nil());
+        return self;
+    }
+
+    fn boundAllocSize(n_bound: usize) usize {
+        comptime std.debug.assert(@sizeOf(Native) % @alignOf(Value) == 0);
+        return @sizeOf(Native) + n_bound * @sizeOf(Value);
+    }
+
     pub fn fromHeader(h: *GcHeader) *Native {
         // `@alignCast`: no-op on native, required wasm32 alignment assertion (see
         // `String.fromHeader`). The object is allocated at `@alignOf(Native)`.
@@ -561,7 +589,9 @@ pub const Native = struct {
             gpa.free(hb.name);
             gpa.destroy(hb);
         }
-        gpa.destroy(self);
+        if (self.bound.len == 0) return gpa.destroy(self);
+        const start: [*]align(@alignOf(Native)) u8 = @ptrCast(self);
+        gpa.free(start[0..boundAllocSize(self.bound.len)]);
     }
 };
 
@@ -618,6 +648,12 @@ pub const BaseNative = struct {
     /// default `package.searchers` array. Without this seam such a native would be
     /// unrestorable (`UnknownNative`) since the restorer resolves only by registry name.
     manual: bool = false,
+    /// How many values a native made from this row carries
+    /// (`Native.bound`, `Heap.newBoundNative`), and, for keyframe restore,
+    /// whether a snapshot's are ones it can run with: a restored native
+    /// whose bound values fail it is a malformed snapshot.
+    bound: u8 = 0,
+    bound_ok: ?*const fn (bound: []const Value) bool = null,
     /// The host-system groups this native belongs to (doc 65 §5.2); empty for
     /// one every VM has. A grouped native is installed by `Vm.enableSystem`,
     /// not `installBaseLib`, once any one of its groups is on — `io.read`

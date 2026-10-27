@@ -117,11 +117,15 @@ Wrong results:
 - [ ] `local it = s:gmatch(p); it()` fails (`bad argument #1 to
       '@gmatch_iter'`): `gmatch` returns `(iter, state)`, so only a generic
       `for` works. `string.codes` likewise. The internal `@…_iter` names
-      also show in `pairs(_G)` and in error text. **Needs a decision
-      (2026-10-26):** a `Native` carries no state, so a lone callable needs
-      a stateful native closure (serializable, GC-traced; the same
-      primitive `coroutine.wrap` needs, doc 73), a Lua closure wrapping the
-      iterator, or a callable state table (`__call`).
+      also show in `pairs(_G)` and in error text. **Decided (Bart,
+      2026-10-27): natives with bound values**, built for `coroutine.wrap`
+      (`function.Native.bound`, `Heap.newBoundNative`, `Vm.calledNative`,
+      keyframe format 16). What's left here: `gmatch`/`codes` return a
+      bound native holding the string, pattern and cursor, and the JIT's
+      `recBSGmatchIter` (`trace_recorder.zig`), which reads the state from
+      the generic-`for` state slot today, reads it from the callee's bound
+      values instead (a new IR load plus its nativegen lowering).
+      `str_gmatch` is the benchmark to hold.
 - [x] Malformed patterns (`[a`, a trailing `%`, unbalanced `(`/`)`, `%1`
       with no capture, `%b`, `%f` without `[`, >32 captures) raise the
       literal string `"HostError"`. Each now raises Lua's message.

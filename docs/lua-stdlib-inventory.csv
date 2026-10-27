@@ -28,7 +28,7 @@ coroutine,coroutine.create,core,implemented,"Lua or native bodies; a native body
 coroutine,coroutine.resume,core,implemented,"Switches to the coroutine's own stack (doc 73 P0c); errors return false plus the message."
 coroutine,coroutine.yield,core,implemented,"Raises Lua's messages outside a coroutine and across a Zig frame (doc 73 §6.3)."
 coroutine,coroutine.status,core,implemented,"suspended/running/normal/dead, including the main thread."
-coroutine,coroutine.wrap,core,not-started,"Waits on the callable-value decision (doc 73 P1)."
+coroutine,coroutine.wrap,core,implemented,"A native with its coroutine bound (Native.bound, Lua's C-closure upvalue); results without true, errors raised again at the call with Lua's location (doc 73)."
 coroutine,coroutine.running,core,implemented,"Returns the thread and whether it is the main one."
 coroutine,coroutine.isyieldable,core,implemented,"False on the main thread and below a Zig frame."
 coroutine,coroutine.close,core,implemented,"Closes a suspended or dead coroutine; refuses a running or normal one."
