@@ -3,8 +3,7 @@
 Status: draft, not yet implemented. Direction decided 2026-10-27 (server in
 Zig as a CLI subcommand; design before code). Review round 1 (Codex,
 Antigravity) folded in 2026-10-27; Bart delegated the picks where the
-reviewers disagreed (§12). Open: Q5's file format, Q10's publisher, and
-confirming the §9 budget.
+reviewers disagreed (§12). Every open question decided 2026-10-27.
 Owner: claude (coral-raven)
 Last updated: 2026-10-27
 
@@ -43,17 +42,19 @@ land; move whole phases to Done once everything inside them is checked.
   a sandbox.
 - [x] **Q9 — DAP** (§7.7): its own doc (75).
 - [x] **Q11 — comments** (§6.5): an optional trivia-span sink in the lexer.
-- [x] **Q10 (part) — file extension and extension home** (§8): `.mah` by
+- [x] **Q10 — file extension, extension home, publishing** (§8): `.mah` by
   default (doc 00 §"Two source extensions"), `.lua` opt-in; the VS Code
-  extension lives in-repo under `editors/vscode/`.
+  extension lives in-repo under `editors/vscode/` and is not published to
+  any marketplace (Bart, 2026-10-27: no publisher account, doesn't use VS
+  Code); it installs from a locally built `.vsix`.
+- [x] **Q5 — workspace configuration file** (§7.4): `mahina.toml` at the
+  project root (Bart, 2026-10-27). The Zig stdlib has no TOML reader, so
+  P6 includes a small one for the subset the config uses.
+- [x] **Q12 — the §9 budget**: confirmed by Bart 2026-10-27 (≤ 10 ms at
+  10k lines, ≤ 100 ms at 100k lines).
 
 ### Outstanding
 
-- [ ] **Q5 — workspace configuration file** (§7.4): name and format of the
-  project file (`mahina.toml` vs `.mahinarc`); the content is decided.
-- [ ] **Q10 (rest) — marketplace publisher** for the VS Code extension
-  (Bart's account decision).
-- [ ] **Q12 — confirm the §9 budget** numbers.
 - [ ] **Prerequisite — constant dedup is quadratic** (§9, `TODO.md`):
   `Compiler.addConstant` (`src/compiler.zig:454`) scans the pool per
   constant. Fix with an identity-keyed map before the P2 benchmark can
@@ -93,7 +94,8 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **P5 — stdlib knowledge** (§7.3): hover, `lib.` member completion,
   signature help from the generated table.
 - [ ] **P6 — cross-file** (§7.4): `require` resolution mirroring
-  `package.searchpath`, the project config (Q5), open-document overlays,
+  `package.searchpath`, `mahina.toml` (with a TOML-subset reader in
+  `src/lsp/config.zig`), open-document overlays,
   module exports for `local M = {} … return M`, workspace symbols.
 - [ ] **P7 — JIT lenses** (§7.6): extend the `--emit-coverage` artifact
   with source spans and structured abort records; the editor command,
@@ -161,6 +163,7 @@ src/lsp/
   position.zig      byte offset <-> (line, character) in the negotiated encoding
   analysis.zig      parse + resolve + compile for one document version
   stdlib_db.zig     generated builtin table (P5)
+  config.zig        mahina.toml reader, a TOML subset (P6)
 src/main.zig        `lsp` subcommand, next to `viz`
 ```
 
@@ -411,7 +414,11 @@ assigned to a local table that the chunk's top-level `return` returns
 (`local M = {} … M.f = … return M`, and a returned constructor). Anything
 more is tier 5.
 
-**Project config (Q5 open on name/format).** Versioned, never executed,
+**Project config: `mahina.toml`** at the project root (Q5, decided
+2026-10-27). The Zig stdlib has no TOML reader, so `src/lsp/config.zig`
+parses the subset the config needs (tables, strings, integers, booleans,
+string arrays) and rejects anything else with a located error, published
+as a diagnostic on `mahina.toml` itself. Versioned (`version = 1`), never executed,
 with LSP `initializationOptions` overriding it, documented precedence and
 per-root behaviour in multi-root workspaces. Content: runtime cwd,
 `package.path`, enabled system groups, extra host globals with optional
@@ -463,7 +470,8 @@ its own design questions; doc 75 owns them.
   `vscode-languageclient` starting `mahina lsp` from `PATH` or a setting,
   a TextMate grammar for first paint, `.mah` associated by default and
   `.lua` by opt-in setting. TypeScript, pnpm. The minimal version lands
-  with P2; publisher is Q10.
+  with P2. Not published to any marketplace (Q10): a `just` recipe builds
+  a `.vsix` to install with `code --install-extension`.
 - **Neovim / Helix / Zed / Emacs**: configuration snippets in the README,
   the Neovim one alongside P2.
 - **Smoke**: P0 brings a headless client (a Zig test driving the server
@@ -475,7 +483,7 @@ its own design questions; doc 75 owns them.
 Full re-analysis on every change is only acceptable if it's fast; the
 budget is explicit and benchmarked.
 
-- **Budget (proposal, Q12):** didChange → publishDiagnostics, measured end
+- **Budget (confirmed by Bart 2026-10-27, Q12):** didChange → publishDiagnostics, measured end
   to end (queueing, analysis, serialisation; excluding the debounce), ≤ 10
   ms for a 10k-line file and ≤ 100 ms for 100k lines, ReleaseFast, this
   machine. Peak memory ≤ 2 analysed versions per document.
@@ -514,10 +522,8 @@ budget is explicit and benchmarked.
 
 ## 11. Open questions
 
-- **Q5 — config file name and format.** `mahina.toml` or `.mahinarc`
-  (and so TOML vs something else). The content is settled (§7.4).
-- **Q10 — marketplace publisher** for the VS Code extension.
-- **Q12 — the §9 budget numbers.** Proposed, not yet confirmed.
+None. Q5, Q10 and Q12 were decided by Bart on 2026-10-27; the rest in
+review round 1 (§12).
 
 ## 12. Review round 1 (2026-10-27)
 
