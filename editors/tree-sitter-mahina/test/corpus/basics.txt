@@ -1,0 +1,54 @@
+================
+long strings and comments
+================
+local a = [==[ x ]] y ]==] -- trailing
+--[[ block
+comment ]]
+local b = 'it\'s'
+---
+
+(chunk
+  (local_declaration
+    (typed_name
+      (identifier))
+    (long_string))
+  (comment)
+  (comment)
+  (local_declaration
+    (typed_name
+      (identifier))
+    (string)))
+
+================
+operators and suffixes
+================
+x ..= y ?? z ~>> 2
+a.b:c(d)[e].f = await g(h)
+---
+
+(chunk
+  (compound_assignment_statement
+    (identifier)
+    (binary_expression
+      (identifier)
+      (binary_expression
+        (identifier)
+        (number))))
+  (assignment_statement
+    (field
+      (index
+        (method_call
+          (field
+            (identifier)
+            (identifier))
+          (identifier)
+          (arguments
+            (identifier)))
+        (identifier))
+      (identifier))
+    (await_expression
+      (call
+        (identifier)
+        (arguments
+          (identifier))))))
+

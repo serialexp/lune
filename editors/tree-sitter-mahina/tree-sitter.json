@@ -1,0 +1,18 @@
+{
+  "grammars": [
+    {
+      "name": "mahina",
+      "camelcase": "Mahina",
+      "scope": "source.mahina",
+      "path": ".",
+      "file-types": ["mah", "lua"]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "mahina grammar for editors",
+    "authors": [{ "name": "Bart Riepe" }]
+  },
+  "bindings": {}
+}
