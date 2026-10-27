@@ -89,41 +89,51 @@ pub const LineIndex = struct {
         errdefer cps.deinit(gpa);
         try starts.append(gpa, 0);
 
-        var i: usize = 0;
+        // Line breaks are found by a bulk search; a line is decoded code point
+        // by code point only when it is long enough to need checkpoints, so
+        // building the index of ordinary source is a scan for `\n`/`\r`.
         var line_start: usize = 0;
-        // Checkpoint scan state for the line in progress.
-        var col: u32 = 0;
-        var next_cp: usize = checkpoint_gap;
-        while (i < text.len) {
-            const ch = text[i];
-            if (ch == '\n' or ch == '\r') {
-                if (ch == '\r' and i + 1 < text.len and text[i + 1] == '\n') i += 1;
-                i += 1;
-                try starts.append(gpa, @intCast(i));
-                line_start = i;
-                col = 0;
-                next_cp = i + checkpoint_gap;
-                continue;
+        while (true) {
+            const brk = std.mem.findAnyPos(u8, text, line_start, "\r\n");
+            const line_end = brk orelse text.len;
+            if (line_end - line_start > long_line) {
+                try addCheckpoints(gpa, &cps, text, line_start, line_end, @intCast(starts.items.len - 1));
             }
-            const cp = codePoint(text, i);
-            // A long line gets a checkpoint once it has run `checkpoint_gap`
-            // bytes past the previous one (or its start).
-            if (i >= next_cp and i - line_start >= long_line) {
-                try cps.append(gpa, .{
-                    .line = @intCast(starts.items.len - 1),
-                    .offset = @intCast(i),
-                    .utf16_col = col,
-                });
-                next_cp = i + checkpoint_gap;
-            }
-            col += cp.units;
-            i += cp.bytes;
+            const b = brk orelse break;
+            var next = b + 1;
+            if (text[b] == '\r' and next < text.len and text[next] == '\n') next += 1;
+            try starts.append(gpa, @intCast(next));
+            line_start = next;
         }
 
         const s = try starts.toOwnedSlice(gpa);
         errdefer gpa.free(s);
         const c = try cps.toOwnedSlice(gpa);
         return .{ .starts = s, .checkpoints = c, .len = @intCast(text.len) };
+    }
+
+    /// Checkpoints for one long line `[line_start, line_end)`: one every
+    /// `checkpoint_gap` bytes, at a code point boundary, with its UTF-16 column.
+    fn addCheckpoints(
+        gpa: std.mem.Allocator,
+        cps: *std.ArrayList(Checkpoint),
+        text: []const u8,
+        line_start: usize,
+        line_end: usize,
+        line: u32,
+    ) std.mem.Allocator.Error!void {
+        var i = line_start;
+        var col: u32 = 0;
+        var next = line_start + checkpoint_gap;
+        while (i < line_end) {
+            if (i >= next) {
+                try cps.append(gpa, .{ .line = line, .offset = @intCast(i), .utf16_col = col });
+                next = i + checkpoint_gap;
+            }
+            const cp = codePoint(text, i);
+            col += cp.units;
+            i += cp.bytes;
+        }
     }
 
     pub fn deinit(self: LineIndex, gpa: std.mem.Allocator) void {

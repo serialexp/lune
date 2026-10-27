@@ -3,8 +3,14 @@
 
 pub const position = @import("lsp/position.zig");
 pub const jsonrpc = @import("lsp/jsonrpc.zig");
+pub const protocol = @import("lsp/protocol.zig");
+pub const documents = @import("lsp/documents.zig");
+pub const server = @import("lsp/server.zig");
 
 test {
     _ = position;
     _ = jsonrpc;
+    _ = protocol;
+    _ = documents;
+    _ = server;
 }

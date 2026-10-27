@@ -237,6 +237,17 @@ pub fn decode(comptime T: type, arena: std.mem.Allocator, value: json.Value) err
     };
 }
 
+/// An opaque JSON value (a message's `params`), so callers never name
+/// `std.json`.
+pub const Value = json.Value;
+
+/// Decode a request's `params` into `T`. Absent params decode as `{}`, so a
+/// `T` whose fields all have defaults accepts a request with no params.
+pub fn decodeParams(comptime T: type, arena: std.mem.Allocator, params: ?Value) error{ InvalidParams, OutOfMemory }!T {
+    const v = params orelse json.Value{ .object = json.ObjectMap.empty };
+    return decode(T, arena, v);
+}
+
 /// A JSON value rendered back to text — for tests and for the places a
 /// handler passes an opaque `params` through.
 pub fn valueToString(arena: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]u8 {
