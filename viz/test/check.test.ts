@@ -83,3 +83,10 @@ test("a forward reference to a later global function does not warn", () => {
   const src = "local function main() return helper() end\nfunction helper() return 1 end\n";
   expect(mod.check(src)).toEqual([]);
 });
+
+test("recovery: errors in separate statements are all reported (the LSP path)", () => {
+  const src = "local a = = 1\nprint(1)\nlocal b = = 2\n";
+  const errors = mod.check(src).filter((d) => d.severity === "error");
+  expect(errors.length).toBeGreaterThanOrEqual(2);
+  expect(new Set(errors.map((d) => d.line)).size).toBeGreaterThanOrEqual(2);
+});

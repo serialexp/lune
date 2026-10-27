@@ -138,6 +138,9 @@ land; move whole phases to Done once everything inside them is checked.
     document stays dirty); the server publishes versioned diagnostics with
     code, source, severity, `relatedInformation`, ranges in the negotiated
     encoding, and empty sets on clear.
+  - [x] `mahina_check` (wasm) runs `lsp.analysis.analyse`, the same
+    recovering frontend path as the server; it reports every error, not
+    just the first.
   - [x] P2 bench (§9): `zig build bench-lsp` (`src/bench_lsp.zig`). First
     numbers (ReleaseFast, end to end): 10k lines 8.5 ms, 100k lines 108 ms
     (budget 100 ms, about 8% over: check is 63 ms of it), 1 MB astral line
@@ -149,8 +152,6 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Bench follow-ups:** the 100k-line budget miss (check dominates); the
   recursive-descent parser has no nesting limit, so the wasm stack (much
   smaller than native) needs a depth test or a limit.
-- [ ] **P2 — `mahina_check`** (§6): the wasm check takes the same
-  `checkChunk` path as the LSP.
 - [ ] **P2 viz client** (§13.1): `@codemirror/lsp-client` in the viz with
   a postMessage transport to the worker; its diagnostics replace
   `mahinaLinter.ts`'s direct `mahina_check` path, so the browser has one

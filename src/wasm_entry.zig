@@ -998,48 +998,31 @@ fn collectProtos(out: *std.ArrayList(*const mahina.bytecode.Proto), proto: *cons
 /// (returned error from the frontend) is not itself a diagnostic source here —
 /// the frontend records the reason into `diags` first, which we then surface.
 fn check(res: *CheckResult, source: []const u8) !void {
-    const src0 = try gpa.allocSentinel(u8, source.len, 0);
-    defer gpa.free(src0);
-    @memcpy(src0, source);
+    // The same frontend path as the language server (doc 74 §6): parse with
+    // recovery, resolve, check every statement. Nothing is run or assembled.
+    var an = mahina.lsp.analysis.analyse(gpa, source, &mahina.interp.builtin_global_names, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // `.{}` never abandons; an unparseable document has no usable tree
+        // and its diagnostics are lost with it.
+        error.Abandoned, error.Unparseable => {
+            res.status = 1;
+            return;
+        },
+    };
+    defer an.deinit();
 
-    var diags = Diagnostics.init(gpa);
-    defer diags.deinit();
-
-    // Parse. On a hard parse error the tree is unusable, but the diagnostics are
-    // already recorded — fall through to emit them.
-    var tree_opt: ?mahina.ast.Ast = mahina.parser.parse(gpa, src0, &diags) catch null;
-    defer if (tree_opt) |*t| t.deinit();
-
-    // Only attempt compilation if parsing produced a usable tree with no errors;
-    // the compiler needs a heap to intern string constants into.
-    //
-    // The chunk is kept alive until after `collectDiags` (deferred deinit): the
-    // unknown-global lint allocates its messages in the chunk arena, and
-    // `collectDiags` dupes them out — freeing the chunk first would be a
-    // use-after-free.
-    var vm_opt: ?mahina.interp.Vm = null;
-    defer if (vm_opt) |*vm| vm.deinit();
-    var chunk_opt: ?mahina.compiler.Chunk = null;
-    defer if (chunk_opt) |*c| c.deinit();
-
-    if (tree_opt) |tree| {
-        if (!diags.hasErrors()) {
-            vm_opt = try mahina.interp.Vm.init(gpa);
-            chunk_opt = mahina.compiler.compileWithOptions(gpa, vm_opt.?.heap, src0, tree.root, &diags, .{
-                .known_globals = &mahina.interp.builtin_global_names,
-            }) catch null;
-        }
+    res.diags = try collectDiags(an.diagnostics);
+    var has_errors = false;
+    for (an.diagnostics) |d| {
+        if (d.severity == .@"error") has_errors = true;
     }
-
-    res.diags = try collectDiags(&diags);
-    res.status = if (diags.hasErrors()) 1 else 0;
+    res.status = if (has_errors or an.incomplete) 1 else 0;
 }
 
 /// Flatten a `Diagnostics` list into an owned `[]Diag` (each `msg` duped). The
 /// returned `Buf.len` is the record *count*. On any allocation failure, frees
 /// what was built so far and propagates the error.
-fn collectDiags(diags: *const Diagnostics) !Buf {
-    const items = diags.list.items;
+fn collectDiags(items: []const mahina.diag.Diagnostic) !Buf {
     if (items.len == 0) return .{};
 
     const out = try gpa.alloc(Diag, items.len);
