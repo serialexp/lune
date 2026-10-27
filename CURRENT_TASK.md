@@ -1,3 +1,24 @@
+DOC 74 LANGUAGE SERVER: P0 DONE (2026-10-27, coral-raven); P0 wasm host and P1a–P1d (frontend) are next.
+- What exists: `mahina lsp` serves LSP over stdio (src/lsp/: position, jsonrpc,
+  protocol, documents, server = the sans-IO core, host_stdio = threads + I/O).
+  Lifecycle, utf-8/utf-16 negotiation, incremental sync, 50/250 ms debounce,
+  cancellation, byte-bounded queue. It publishes EMPTY diagnostics per analysed
+  version until P2 wires the frontend in. Plan, decisions and the review round
+  are in docs/design/74-language-server.md (its checklist is the status).
+- Landed: 855c309 (compiler constant-pool dedup via hash map — the §9
+  prerequisite), 29a305f, 2e7293a, 2b309a8, 99b7d43. Clients (decided 2026-10-27):
+  the viz web UI via @codemirror/lsp-client over a wasm host, and Zed (+ a
+  Tree-sitter grammar). No VS Code / Neovim.
+- Next, in order: P0 wasm host (`mahina_lsp_*` in wasm_entry.zig), then P1a name
+  spans in ast.zig/parser.zig, P1b recovery regions, P1c shared resolver
+  (src/resolve.zig; the compiler consumes it — touches compiler.zig scoping),
+  P1d diagnostics model, then P2 end to end + bench_lsp.zig.
+- Full-gate note (2026-10-27): the last `just test` had ONE failure,
+  interp_trace_test "recorder (head, doc 44 D4): a window with no results ...":
+  `registry.cache.items.len` expected 1, found 0. It sits in files another agent
+  has uncommitted (src/trace_recorder.zig, src/interp_trace_test.zig); the LSP
+  commits do not touch the recorder. Everything else passed (2040 pass, 2 skip).
+
 DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT) diagnosed, fix awaits Bart.
 - P2 DIAGNOSIS (2026-10-27): the co_pingpong_d20/_d150 jit slowdown is NOT a
   coroutine cost. /tmp/nb/rec_plain.lua (the same `deep` recursion, no
