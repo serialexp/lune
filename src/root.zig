@@ -57,6 +57,8 @@ pub const token = @import("token.zig");
 pub const lexer = @import("lexer.zig");
 pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
+/// Doc 74: the language server (positions, JSON-RPC framing, the sans-IO core).
+pub const lsp = @import("lsp.zig");
 
 /// Phase 3 — runtime heap objects + bytecode ISA + tier-0 interpreter.
 pub const string = @import("string.zig");
@@ -182,6 +184,7 @@ test {
     _ = lexer;
     _ = ast;
     _ = parser;
+    _ = lsp;
     _ = string;
     _ = array;
     _ = table;
