@@ -407,7 +407,7 @@ pub fn main(init: std.process.Init) u8 {
         defer prog_argv.deinit(gpa);
         prog_argv.append(gpa, "-e") catch return 1;
         while (it.next()) |a| prog_argv.append(gpa, a) catch return 1;
-        return runSource(gpa, init.io, "=(command line)", chunk, topts, init.environ_map, prog_argv.items);
+        return runSource(gpa, init.gpa, init.io, "=(command line)", chunk, topts, init.environ_map, prog_argv.items);
     }
 
     // Otherwise the first non-option argument is a script path.
@@ -421,7 +421,7 @@ pub fn main(init: std.process.Init) u8 {
     defer prog_argv.deinit(gpa);
     prog_argv.append(gpa, first) catch return 1;
     while (it.next()) |a| prog_argv.append(gpa, a) catch return 1;
-    return runSource(gpa, init.io, first, source, topts, init.environ_map, prog_argv.items);
+    return runSource(gpa, init.gpa, init.io, first, source, topts, init.environ_map, prog_argv.items);
 }
 
 /// `mahina --version`: what this binary is and what it can do here.
@@ -511,7 +511,10 @@ fn vizMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
 /// Parse, compile, and run one source chunk. Returns the process exit code.
 /// `name` labels the chunk in diagnostics (a file path or a synthetic name).
 /// `topts` controls the tracing-JIT recorder (off by default).
-fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source: [:0]const u8, topts: TraceOpts, env_map: *std.process.Environ.Map, argv: []const []const u8) u8 {
+/// `thread_gpa` is the process allocator, which is thread-safe: `aio`'s
+/// workers allocate from it (`gpa` may be the `--mem-stats` tracker, which
+/// is not).
+fn runSource(gpa: std.mem.Allocator, thread_gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source: [:0]const u8, topts: TraceOpts, env_map: *std.process.Environ.Map, argv: []const []const u8) u8 {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
     // --- parse ---
@@ -562,6 +565,15 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
     defer real_sys.deinit();
     vm.system = real_sys.system();
     vm.enableSystem(topts.system) catch |err| {
+        mahina.io.eprint("mahina: error: vm init failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    // Doc 73 §7.6: `aio`'s operations, on worker threads started by the
+    // first file operation. Deinit (before the VM's) drops what is still in
+    // flight when the program ends.
+    var aio_host = mahina.aio_host.AioHost.init(thread_gpa, io);
+    defer aio_host.deinit();
+    vm.enableAio(aio_host.host()) catch |err| {
         mahina.io.eprint("mahina: error: vm init failed: {s}\n", .{@errorName(err)});
         return 1;
     };

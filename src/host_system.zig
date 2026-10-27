@@ -154,7 +154,7 @@ pub const RealSystem = struct {
 
     /// The class of an OS error (doc 65 §4.2): what the program sees,
     /// instead of the OS's own text.
-    fn classOf(err: anyerror) seam.ErrorClass {
+    pub fn classOf(err: anyerror) seam.ErrorClass {
         return switch (err) {
             error.FileNotFound, error.NotDir => .not_found,
             error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => .permission_denied,

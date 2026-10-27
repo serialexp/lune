@@ -55,6 +55,7 @@ const stdpackage = @import("stdlib/package.zig");
 const stdio = @import("stdlib/io.zig");
 const stdos = @import("stdlib/os.zig");
 const stdcoroutine = @import("stdlib/coroutine.zig");
+const stdaio = @import("stdlib/aio.zig");
 const File = @import("file.zig").File;
 const unicode_case = @import("gen/unicode_case.zig");
 const Value = value.Value;
@@ -263,7 +264,7 @@ pub const mahina_version = "mahina 0.0.0";
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
     stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives ++
     stddebug.natives ++ stdload.natives ++ stdpackage.natives ++ stdio.natives ++ stdos.natives ++
-    stdcoroutine.natives;
+    stdcoroutine.natives ++ stdaio.natives;
 
 comptime {
     // `pure ⇒ !effect` (doc 17, H-4 / 9-A(i)). `pure` and `effect` are independent
@@ -1125,6 +1126,24 @@ pub const Vm = struct {
     /// Doc 73 §7.5: the host's way to wait for its operations, if it has
     /// one (the C API's `mh_set_wait_fn`). The host owns it.
     host_wait: ?*const HostWait = null,
+    /// Doc 73 §7.6: the host that runs `aio` operations (`enableAio`); the
+    /// host owns it. Null in a replay, which takes the completions from
+    /// the log.
+    aio: ?system.AsyncHost = null,
+    /// The `aio` operations in flight, by id: each one's record
+    /// (`stdlib/aio.zig`). Made on the first operation. A VM-level root.
+    aio_ops: ?*table.Table = null,
+    /// The next `aio` operation id: a deterministic counter, so a replay
+    /// numbers the operations as the recording did.
+    aio_next_id: u64 = 1,
+    /// How many entries `aio_ops` holds. While any do, the task library's
+    /// host wait takes an `aio` completion (`stdaio.wait`).
+    aio_inflight: u32 = 0,
+    /// The operations a keyframe restore left in flight: ids below
+    /// `aio_live_from`. No host is running them, so a live wait refuses
+    /// while any remain; a replay settles them from the log.
+    aio_restored: u32 = 0,
+    aio_live_from: u64 = 0,
     /// Next proto id to hand out. Seeded to the static chunk's proto count in
     /// `run`/`start` so every dynamically-`load`ed proto gets a globally-unique id
     /// across the static + dynamic trees — purely so snapshot serialization can
@@ -2162,7 +2181,7 @@ pub const Vm = struct {
     /// enables the recording's groups with no host behind them.
     pub fn enableSystem(self: *Vm, groups: system.Groups) Error!void {
         for (base_natives, &base_templates) |bn, *template| {
-            if (bn.groups == system.Groups.none) continue;
+            if (bn.groups == system.Groups.none or bn.aio) continue;
             // Installed by this call when one of its groups is new and none
             // was on before.
             if (bn.groups.overlaps(groups) and !bn.groups.overlaps(self.system_groups)) try self.defineNative(bn, template);
@@ -2172,6 +2191,17 @@ pub const Vm = struct {
             self.io_input = try self.newStdStream(system.stdin_id, .stdin, .read, "stdin");
         }
         self.system_groups = self.system_groups.unite(groups);
+    }
+
+    /// Doc 73 §7.6: install `aio`, run by `host`, for the groups already
+    /// enabled (`aio.sleep` needs `clock`, the file operations `files`).
+    /// A replay passes null: it takes every completion from the log. Call
+    /// once, after `enableSystem`.
+    pub fn enableAio(self: *Vm, host: ?system.AsyncHost) Error!void {
+        self.aio = host;
+        for (base_natives, &base_templates) |bn, *template| {
+            if (bn.aio and bn.groups.overlaps(self.system_groups)) try self.defineNative(bn, template);
+        }
     }
 
     /// Reopen the files a keyframe restore left detached (doc 65 §4.1, Q7),
@@ -4094,8 +4124,9 @@ pub const Vm = struct {
         if (self.file_metatable) |fmt| cb(ctx, &fmt.header);
         if (self.io_input) |f| cb(ctx, &f.header);
         if (self.io_output) |f| cb(ctx, &f.header);
-        // 10. the task library (doc 73 §7).
+        // 10. the task library (doc 73 §7) and the `aio` operations (§7.6).
         if (self.task_lib) |t| cb(ctx, &t.header);
+        if (self.aio_ops) |t| cb(ctx, &t.header);
     }
 
     /// The tier-0 dispatch loop over the **explicit** call stack. Runs the top
@@ -12043,10 +12074,15 @@ fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// process stderr). Pure output, NOT a recorded effect (like `print`): the call is
 /// a trace barrier and is never replayed, so it carries no `EffectKind`.
 /// Doc 73 §7.5 `task.host_wait()`: wait on the host (`Vm.host_wait`) and
-/// return true, or false at once when it has no way to wait.
+/// return true, or false at once when it has no way to wait. With `aio`
+/// operations in flight (§7.6) the wait is the VM's own: one completion.
 fn nativeHostWait(ctx: *anyopaque, args: []const Value) anyerror!Value {
     _ = args;
     const vm: *Vm = @ptrCast(@alignCast(ctx));
+    if (vm.aio_inflight > 0) {
+        try stdaio.wait(vm);
+        return Value.boolean(true);
+    }
     const hw = vm.host_wait orelse return Value.boolean(false);
     try hw.wait(hw.ctx, vm);
     return Value.boolean(true);
@@ -12179,6 +12215,7 @@ test {
     _ = @import("interp_gc_test.zig");
     _ = @import("interp_coroutine_test.zig");
     _ = @import("interp_task_test.zig");
+    _ = @import("interp_aio_test.zig");
     _ = @import("interp_phaseq_test.zig");
     _ = @import("interp_trace_test.zig");
     _ = @import("interp_fastblock_test.zig");

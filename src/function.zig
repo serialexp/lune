@@ -453,6 +453,15 @@ pub const EffectKind = enum(u8) {
     /// results, so it is pinned once per session like `unicode_version` and a
     /// replay under the other mode refuses (`IoErrorModeMismatch`).
     io_error_mode = 16,
+    // Doc 73 §7.6: an `aio` operation finishing. The program's waits take
+    // the completions in the order they are logged, whatever order the
+    // host's threads finished them in.
+    /// The id of the operation that finished (an int); its `aio_result`
+    /// follows.
+    aio_complete = 17,
+    /// How it ended: `nil` (a sleep or write finished), the bytes a read
+    /// gave, or a failure.
+    aio_result = 18,
 };
 
 pub const Native = struct {
@@ -659,6 +668,9 @@ pub const BaseNative = struct {
     /// not `installBaseLib`, once any one of its groups is on — `io.read`
     /// serves stdin (`stdio`) and files (`files`) alike.
     groups: system.Groups = .none,
+    /// Doc 73 §7.6: an `aio` native. It needs an asynchronous host as well
+    /// as its groups, so `Vm.enableAio` installs it, not `enableSystem`.
+    aio: bool = false,
 };
 
 /// A built-in **constant** installed as a field of a module table — e.g.

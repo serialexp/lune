@@ -255,6 +255,51 @@ pub const HostSystem = struct {
     };
 };
 
+/// The host side of `aio` (doc 73 §7.6): operations that run while the
+/// program goes on, each awaited as a `pending` task. The VM numbers them
+/// (`OpId`, a deterministic counter) and hands each to `start`; `next`
+/// gives back the finished ones, one at a time, in whatever order they
+/// finished. Called only in `off`/`record`: a replay takes the completions
+/// from the log and never starts anything. Only the CLI has one
+/// (`aio_host.zig`); an embedder makes its own operations with
+/// `mh_pending_new`.
+pub const AsyncHost = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const OpId = u64;
+
+    /// What to do. The host copies what it keeps: the slices are the VM's
+    /// and valid only during `start`.
+    pub const Request = union(enum) {
+        /// Finish after this many nanoseconds.
+        sleep: u64,
+        /// The whole file at the path.
+        read: []const u8,
+        /// Write `data` to `path`, replacing the file or (`append`) at its end.
+        write: struct { path: []const u8, data: []const u8, append: bool },
+    };
+
+    /// How an operation ended: a sleep or a write finished, a read's
+    /// contents (borrowed until the next `next`), or a failure.
+    pub const Outcome = union(enum) {
+        done,
+        bytes: []const u8,
+        fail: ErrorClass,
+    };
+
+    pub const Completion = struct { id: OpId, outcome: Outcome };
+
+    pub const VTable = struct {
+        /// Begin operation `id` and return at once. False when the host
+        /// could not take it (out of memory).
+        start: *const fn (ctx: *anyopaque, id: OpId, request: Request) bool,
+        /// Block until an operation has finished and return it. The VM
+        /// calls it only with operations in flight.
+        next: *const fn (ctx: *anyopaque) Completion,
+    };
+};
+
 /// The local zone at one instant (doc 65 §8): what `os.date` needs beyond
 /// the instant itself. The abbreviation borrows host memory like the other
 /// borrowed results (valid until the next call), and is at most

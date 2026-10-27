@@ -1138,6 +1138,8 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
             .current_id = 0,
             .main_context = &.{},
             .task_lib_id = 0,
+            .aio_ops_id = 0,
+            .aio_next_id = 1,
         },
     };
 
@@ -1215,6 +1217,8 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.ArrayResidentKeyInHash);
 
     // Float-spelled 0.0 normalizes to integer 0 → same rejection.
@@ -1243,6 +1247,8 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.ArrayResidentKeyInHash);
 
     // A key just past the extent (== asize) is a legitimate hash resident.
@@ -1273,6 +1279,8 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
             .current_id = 0,
             .main_context = &.{},
             .task_lib_id = 0,
+            .aio_ops_id = 0,
+            .aio_next_id = 1,
         } }, .{ .image = &rootp }, NativeRegistry.base());
         defer {
             vm.deinit();
@@ -1305,6 +1313,8 @@ fn oneTableFile(obj: *[1]schema.HeapObject, ht: schema.HeapTable) schema.Snapsho
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } };
 }
 
@@ -1336,6 +1346,8 @@ fn tableInGlobalsFile(obj: *[2]schema.HeapObject, ht: schema.HeapTable) schema.S
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } };
 }
 
@@ -1494,6 +1506,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.UnresolvedHeapRef);
 
     // A closure naming a proto id the program image does not contain.
@@ -1514,6 +1528,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.UnknownProto);
 
     // A native whose name is not in the registry.
@@ -1534,6 +1550,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.UnknownNative);
 
     // globals_id resolves to a string, not a table.
@@ -1554,6 +1572,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.GlobalsNotATable);
 
     // Two objects sharing an id.
@@ -1577,6 +1597,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.DuplicateId);
 
     // A wrong-version file is rejected outright.
@@ -1597,6 +1619,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.UnsupportedVersion);
 
     // L-2: two HeapStrings carrying identical bytes under distinct ids. A valid
@@ -1622,6 +1646,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.DuplicateInternedString);
 
     // L-2: the restored id space is exhausted (an object names the top id) AND
@@ -1653,6 +1679,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.IdSpaceExhausted);
 
     // H-2 (v5): `next_obj_id` at/below a restored id is corrupt — a live object
@@ -1684,6 +1712,8 @@ test "restore surfaces specific errors for malformed snapshots" {
         .current_id = 0,
         .main_context = &.{},
         .task_lib_id = 0,
+        .aio_ops_id = 0,
+        .aio_next_id = 1,
     } }, .{ .image = &rootp }, error.NextObjIdBelowObjects);
 }
 

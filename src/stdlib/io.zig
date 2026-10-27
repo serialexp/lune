@@ -569,7 +569,7 @@ fn readOne(vm: *Vm, f: *File, fmt: Format) anyerror!ReadOut {
 }
 
 /// A fresh byte array holding `bytes`.
-fn byteArray(vm: *Vm, bytes: []const u8) anyerror!Value {
+pub fn byteArray(vm: *Vm, bytes: []const u8) anyerror!Value {
     const t = try vm.heap.newTable();
     try t.initBytes(vm.gpa, bytes);
     return Value.heap(&t.header);
@@ -728,7 +728,7 @@ fn linesIterN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize
 /// The bytes of byte array `t` (`t[1 .. #t]`), borrowed when it is a `u8`
 /// run, else gathered into `Vm.io_scratch`. `checkByteArray` has already
 /// passed it.
-fn byteArrayBytes(vm: *Vm, t: *Table) anyerror![]const u8 {
+pub fn byteArrayBytes(vm: *Vm, t: *Table) anyerror![]const u8 {
     if (t.byteRun()) |run| return run;
     const scratch = &vm.io_scratch;
     scratch.clearRetainingCapacity();
@@ -741,7 +741,7 @@ fn byteArrayBytes(vm: *Vm, t: *Table) anyerror![]const u8 {
 
 /// Raise unless every element of `t[1 .. #t]` is a byte (as `string.decode`
 /// does). A `u8` run is one by construction.
-fn checkByteArray(vm: *Vm, t: *Table) anyerror!void {
+pub fn checkByteArray(vm: *Vm, t: *Table) anyerror!void {
     if (t.array.isGrid()) try vm.heap.deflateGrid(t);
     if (t.byteRun() != null) return;
     const n = t.length();
@@ -753,7 +753,7 @@ fn checkByteArray(vm: *Vm, t: *Table) anyerror!void {
     }
 }
 
-fn asByteArray(v: Value) ?*Table {
+pub fn asByteArray(v: Value) ?*Table {
     if (v.isHeap() and v.heapType() == .table) return Table.fromHeader(v.asHeap());
     return null;
 }

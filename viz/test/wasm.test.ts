@@ -603,3 +603,30 @@ test("async functions: tasks run in the browser build, and a step inside one sho
   }
   expect(inTask).toBe(true);
 });
+test("aio in the browser build: sleeps finish on a virtual clock in deadline order, and every step replays", () => {
+  const src = [
+    "local got = {}",
+    "local async function nap(s, tag)",
+    "  await aio.sleep(s)",
+    "  got[#got + 1] = tag",
+    "end",
+    "local a, b, c = nap(30, 'c'), nap(10, 'a'), nap(20, 'b')",
+    "await a",
+    "await b",
+    "await c",
+    "print(table.concat(got, ' '), aio.read == nil)",
+  ].join("\n") + "\n";
+  // 60 virtual seconds of sleeping: a real wait would time the test out.
+  const run = mod.runSource(src);
+  expect(run.status).toBe(0);
+  expect(run.stdout).toBe("a b c\ttrue\n");
+  for (let k = 1; k <= run.safepointCount; k++) {
+    if (run.safepointStoppable[k - 1] !== 1) continue;
+    const step = mod.replay(src, run.effects, k);
+    expect(step.status).toBe(0);
+    expect(step.finished).toBe(false);
+  }
+  const whole = mod.replay(src, run.effects, run.safepointCount + 1);
+  expect(whole.finished).toBe(true);
+  expect(whole.stdout).toBe(run.stdout);
+});

@@ -107,6 +107,8 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
             .current_id = 0,
             .main_context = &.{},
             .task_lib_id = 0,
+            .aio_ops_id = 0,
+            .aio_next_id = 1,
         },
     };
 

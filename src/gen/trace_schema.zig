@@ -1345,6 +1345,8 @@ pub const Keyframe = struct {
     current_id: u32,
     main_context: []const ThreadContext,
     task_lib_id: u32,
+    aio_ops_id: u32,
+    aio_next_id: u64,
 
     pub fn encode(self: Keyframe, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -1390,6 +1392,8 @@ pub const Keyframe = struct {
             try _item_5.encodeInto(enc, ctx);
         }
         try enc.writeUint32(self.task_lib_id, .little_endian);
+        try enc.writeUint32(self.aio_ops_id, .little_endian);
+        try enc.writeUint64(self.aio_next_id, .little_endian);
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!Keyframe {
@@ -1451,6 +1455,8 @@ pub const Keyframe = struct {
         }
         result.main_context = _buf_35;
         result.task_lib_id = try dec.readUint32(.little_endian);
+        result.aio_ops_id = try dec.readUint32(.little_endian);
+        result.aio_next_id = try dec.readUint64(.little_endian);
         return result;
     }
 };

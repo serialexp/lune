@@ -39,6 +39,10 @@ pub const io = @import("io.zig");
 /// referenced by the wasm build).
 pub const system = @import("system.zig");
 pub const host_system = @import("host_system.zig");
+/// The CLI's `aio` host (doc 73 §7.6): worker threads and timers.
+pub const aio_host = @import("aio_host.zig");
+/// The wasm playground's `aio` host: sleeps on a virtual clock.
+pub const aio_virtual = @import("aio_virtual.zig");
 /// Calendar arithmetic and `strftime` (`os.date`/`os.time`), and the local
 /// zone from TZif / POSIX `TZ` (the host's `localZone`).
 pub const datetime = @import("datetime.zig");
@@ -165,6 +169,8 @@ test {
     _ = io;
     _ = system;
     _ = host_system;
+    _ = aio_host;
+    _ = aio_virtual;
     _ = @import("file.zig");
     _ = @import("coroutine.zig");
     _ = @import("stack_mem.zig");

@@ -1,11 +1,12 @@
 # 73 — Coroutines, and async on top of them — Design
 
-Status: partial — P0, P1, P3, P4a and P4b landed (resume/yield on separate
+Status: partial — P0, P1, P3 and P4 landed (resume/yield on separate
 stacks, stops and keyframes inside coroutines, the whole library including
 `wrap` and native bodies, the stack pool and its GC weight, coroutines in
 the step debugger, `async function`/`await` over a task library, the C
-API's host operations); the JIT boundary and the VM's own async functions
-(P4c) outstanding.
+API's host operations, the CLI's `aio` module and the playground's
+virtual-clock `aio.sleep`); the JIT boundary (P2)
+outstanding.
 Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-27
@@ -159,6 +160,25 @@ land; move whole phases to Done once everything inside them is checked.
   the C smoke test; `mahina-sys` mirrors it.
 - [x] **P5 (async, P4b part) — docs**: `include/mahina.h`'s TASKS block,
   doc 59 §3.10.
+- [x] **P4c — `aio`, async copies of the blocking functions** (§7.6):
+  `aio.sleep`, `aio.read`, `aio.write`, `aio.append`
+  (`src/stdlib/aio.zig`), installed by `Vm.enableAio` over a
+  `system.AsyncHost`; the CLI's host, `src/aio_host.zig`, runs file
+  operations on four worker threads and the sleeps in a timer heap. Each
+  completion is logged (effect format 8: `aio_complete`, `aio_result`);
+  a replay starts nothing. Keyframes carry the operations in flight
+  (format 18). Tests: `interp_aio_test.zig` (record ≡ replay with no
+  host, wake order, failures in both error modes, every keyframe cut, a
+  matrix leg per GC and trace mode), `aio_host.zig`'s against the real OS.
+- [x] **P5 (async, P4c part) — docs**: the `aio` rows in the inventory,
+  `docs/differences-from-lua.md`.
+- [x] **`aio` in the browser playground** (extended beyond the original
+  plan): wasm has no threads and no `files` group, so its host,
+  `src/aio_virtual.zig`, runs only `aio.sleep`, on a virtual clock that
+  jumps to each deadline: sleeps finish at once, in deadline order (ties
+  in start order). The record run installs it; the replay paths install
+  `aio` with no host. Tests: the host's own, and `viz/test/wasm.test.ts`
+  (wake order, every stoppable step replays).
 - [x] **P5 (coroutines) — docs and inventory**: the inventory rows and
   `docs/differences-from-lua.md` track the library; doc 00's Non-goal,
   its decision row and guiding principles, and doc 02's Non-goal and
@@ -173,15 +193,9 @@ land; move whole phases to Done once everything inside them is checked.
   coroutine body run as usual. Evidence from the first board: with the yield
   made 20 or 150 calls deep, `--jit-native` is 3.2–3.6× slower than t0
   (302.7 vs 95.7 ms, 2193.7 vs 610.4 ms) at ~41–46% residency.
-- [ ] **P4c — async copies of the blocking functions** (§7.2 A1, §7.4): a
-  timer and file reads/writes in a module of their own, on a worker-thread
-  pool in the CLI, each completion a logged effect (effect format 8), and
-  the CLI's `Vm.host_wait`.
 - [ ] **The Rust crate's task API**: `mahina` maps `MH_WAITING` to an
   `Error::Api` saying it can't continue the task; a safe surface over
   §7.5's functions is its own design (TODO.md).
-- [ ] **P5 — docs for the async layer, remainder**: P4c's module in
-  `docs/differences-from-lua.md` and the inventory.
 - [ ] **Traces over `intrinsic`**: the recorder doesn't know the op
   (`nyi_opcode`), so a loop that calls an async function or awaits never
   traces in its own frame. Performance work, deferred with P2 (TODO.md).
@@ -704,6 +718,88 @@ As built:
 - **A failing wait callback** raises its `mh_error_set` message where the
   guest awaits, as a host function's failure does. Operations still in
   flight are waited for again at the next drain.
+
+### 7.6 P4c design draft (2026-10-27)
+
+The module is `aio` (Bart, 2026-10-27). Each function starts an operation
+and returns it at once, as a host `pending` task, for the program to
+`await`.
+
+- **Surface.** `aio.sleep(s)` (seconds, a number; gives nothing) under the
+  `clock` group, and file reads and writes under `files` (their shape is
+  question C1 below). `aio` is installed only in a VM whose host can run
+  operations (`Vm.aio`, the CLI's); the C API and wasm have none (an
+  embedder makes its own operations with `mh_pending_new`).
+- **The host seam** is a vtable in `system.zig`, dependency-free like
+  `HostSystem`: `start(id, request)` hands an operation to the host and
+  returns at once; `next()` blocks until one has finished and returns its
+  id and result (borrowed bytes, copied by the VM at once). The CLI's
+  implementation, `aio_host.zig`, is the only file using threads and
+  `std.Io.Mutex`/`Condition` (Rule Z-2): a small pool of workers for file
+  operations, and the timers in a min-heap on the waiting thread, which
+  waits on the condition with a timeout until the earliest deadline.
+- **In the VM.** Operation ids come from a counter, so they are
+  deterministic. `Vm.aio_ops` (a VM root, in keyframes) maps an id to its
+  `pending` task. The CLI's `Vm.host_wait` is the VM's own `aioWait`:
+  - `off`/`record`: take **one** completion from the host (`next`), make
+    its result a value on the VM thread, log it, settle its operation.
+  - `replay`: read the next completion from the log and settle it; `start`
+    is never called, so nothing really sleeps, reads or writes.
+  One completion per wait means the order tasks wake in is exactly the
+  logged order, whatever the threads did.
+- **Effect format 8.** `aio_complete` (the operation id, an int), then
+  `aio_result` (the result as `file_read_op` logs one: a value, the bytes,
+  or a failure class).
+- **Keyframes** (format 18) carry `aio_ops` and the counter. A keyframe
+  restored to continue live (not replaying) with operations in flight
+  can't reattach them to the host's threads, so that restore refuses
+  (`AioInFlight`); restoring into a replay continues from the log.
+
+Open:
+
+- **C1 — the shape of the file operations.** (a) Path-based, whole-file:
+  `aio.read(path)` gives the file's contents, `aio.write(path, data)`
+  writes it (and `aio.append(path, data)`). A worker opens, does the whole
+  operation and closes on a descriptor of its own, sharing nothing with the
+  VM's open files. (b) On an open handle, mirroring `file:read` and
+  `file:write`: `aio.read(f, fmt...)`, `aio.write(f, ...)` with Lua's
+  formats. The handle is busy while an operation on it is in flight (a
+  synchronous call on it, or a second `aio` one, is an error), and the
+  worker runs the formats against the handle's own buffer, which the host
+  system then shares between threads.
+
+  **Decided (Bart, 2026-10-27): (a), path-based, whole file.**
+
+As built (2026-10-27), where it differs from or adds to the draft:
+
+- **Installing.** The `aio` rows are grouped natives flagged `aio`, so
+  `enableSystem` skips them and `Vm.enableAio(host)`, called after it,
+  installs the ones whose group is on. A replay calls it with no host. The
+  C API and wasm don't call it, so `aio` is nil there; a VM with `aio` and
+  no host (and not replaying) raises "aio: this host runs no asynchronous
+  operations" at the call.
+- **`aio.read(path, "b")`** gives a byte array; without it the contents
+  must be valid UTF-8 (`not_utf8` otherwise, decided in the VM after the
+  raw bytes are logged, so a replay decides the same). `write`/`append`
+  take a string, a number or a byte array, copied by the host at `start`,
+  and give `true`.
+- **Failures** are settled as the task's error, `cannot read 'path':
+  not found`, raised at the await; under `--lua-io-errors` the await
+  gives `nil, msg, code`. The error mode is pinned at the call
+  (`noteIoErrorMode`), as for `io`.
+- **The wait** is in `task.host_wait`: with `aio` operations in flight
+  (`Vm.aio_inflight`) it takes one completion (`stdaio.wait`), else it
+  falls to `Vm.host_wait`. The records live in `Vm.aio_ops` as
+  `{ pending, kind, path }`.
+- **A live restore with operations in flight** doesn't refuse at restore
+  (restore can't know whether the VM will replay, as with files, doc 65
+  Q7): the operations are marked restored (`Vm.aio_restored`), and a live
+  wait refuses while any remain ("aio: an operation in flight at the
+  keyframe cannot continue live"). A replay settles them from the log.
+- **The CLI's host** takes the process allocator (thread-safe; the
+  `--mem-stats` tracker isn't), so those buffers go uncounted. Workers
+  start on the first file operation; at exit, sleeps still pending are
+  dropped and the workers finish only the job each is on.
 
 ## 8. Open questions for review
 

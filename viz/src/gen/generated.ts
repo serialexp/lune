@@ -4340,7 +4340,7 @@ export class LoadedChunkDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`.
  */
 export interface KeyframeInput {
   /**
@@ -4453,10 +4453,20 @@ export interface KeyframeInput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   task_lib_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  aio_ops_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  aio_next_id: bigint;
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`.
  */
 export interface KeyframeOutput {
   /**
@@ -4569,6 +4579,16 @@ export interface KeyframeOutput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   task_lib_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  aio_ops_id: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  aio_next_id: bigint;
 }
 
 export type Keyframe = KeyframeOutput;
@@ -4648,6 +4668,8 @@ export class KeyframeEncoder extends BitStreamEncoder {
       }
     }
     this.writeUint32(value.task_lib_id, "little_endian");
+    this.writeUint32(value.aio_ops_id, "little_endian");
+    this.writeUint64(value.aio_next_id, "little_endian");
     return this.finish();
   }
 
@@ -4693,7 +4715,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
       const main_context_itemEncoder = new ThreadContextEncoder();
       size += main_context_itemEncoder.calculateSize(item);
     }
-    size += 5; // length prefix (uint8) + task_lib_id
+    size += 17; // length prefix (uint8) + task_lib_id + aio_ops_id + aio_next_id
     return size;
   }
 }
@@ -4938,6 +4960,8 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
       value.main_context.push(main_context__iter);
     }
     value.task_lib_id = this.readUint32("little_endian");
+    value.aio_ops_id = this.readUint32("little_endian");
+    value.aio_next_id = this.readUint64("little_endian");
     return value;
   }
 }
@@ -4952,7 +4976,7 @@ export interface SnapshotFileInput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`.
    */
   keyframe: KeyframeInput;
 }
@@ -4967,7 +4991,7 @@ export interface SnapshotFileOutput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`.
    */
   keyframe: KeyframeOutput;
 }
@@ -5250,6 +5274,8 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
       value.keyframe.main_context.push(keyframe_main_context__iter);
     }
     value.keyframe.task_lib_id = this.readUint32("little_endian");
+    value.keyframe.aio_ops_id = this.readUint32("little_endian");
+    value.keyframe.aio_next_id = this.readUint64("little_endian");
     return value;
   }
 }
@@ -5630,7 +5656,7 @@ export class HostFailDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * One recorded nondeterministic INPUT: the host effect that produced it and what it returned. `kind` mirrors mahina's function.EffectKind enum (clock=0, random_seed=1, getenv=2, file_read=5, unicode_version=6, file_open=7, file_read_op=8, file_write=9, file_seek=10, file_control=11, fs_mutate=12, fs_tmpname=13, wall_clock=14, local_zone=15, io_error_mode=16; 3 and 4 are retired). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars, inline string bytes, inline byte-array bytes, or a host failure class, never a heap_ref.
+ * One recorded nondeterministic INPUT: the host effect that produced it and what it returned. `kind` mirrors mahina's function.EffectKind enum (clock=0, random_seed=1, getenv=2, file_read=5, unicode_version=6, file_open=7, file_read_op=8, file_write=9, file_seek=10, file_control=11, fs_mutate=12, fs_tmpname=13, wall_clock=14, local_zone=15, io_error_mode=16, aio_complete=17, aio_result=18; 3 and 4 are retired). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars, inline string bytes, inline byte-array bytes, or a host failure class, never a heap_ref.
  */
 export interface EffectInput {
   /**
@@ -5645,7 +5671,7 @@ export interface EffectInput {
 }
 
 /**
- * One recorded nondeterministic INPUT: the host effect that produced it and what it returned. `kind` mirrors mahina's function.EffectKind enum (clock=0, random_seed=1, getenv=2, file_read=5, unicode_version=6, file_open=7, file_read_op=8, file_write=9, file_seek=10, file_control=11, fs_mutate=12, fs_tmpname=13, wall_clock=14, local_zone=15, io_error_mode=16; 3 and 4 are retired). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars, inline string bytes, inline byte-array bytes, or a host failure class, never a heap_ref.
+ * One recorded nondeterministic INPUT: the host effect that produced it and what it returned. `kind` mirrors mahina's function.EffectKind enum (clock=0, random_seed=1, getenv=2, file_read=5, unicode_version=6, file_open=7, file_read_op=8, file_write=9, file_seek=10, file_control=11, fs_mutate=12, fs_tmpname=13, wall_clock=14, local_zone=15, io_error_mode=16, aio_complete=17, aio_result=18; 3 and 4 are retired). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars, inline string bytes, inline byte-array bytes, or a host failure class, never a heap_ref.
  */
 export interface EffectOutput {
   /**

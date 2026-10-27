@@ -481,6 +481,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, args
     defer vm.deinit();
     // The recording's natives, installed in the recording's order (object ids).
     try vm.enableSystem(playground_groups);
+    try vm.enableAio(null);
 
     var out_buf: [64 * 1024]u8 = undefined;
     var sink = mahina.io.Writer.fixed(&out_buf);
@@ -732,6 +733,10 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8, files_blob: []co
     vm.setClockSource(.{ .ctx = &clock_ctx, .nowNs = &wasmClockNs });
     vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &wasmRandomSeed };
     try vm.enableSystem(playground_groups);
+    // Doc 73 §7.6: `aio.sleep` on a virtual clock (no threads here).
+    var virtual_aio = mahina.aio_virtual.VirtualAio.init(gpa);
+    defer virtual_aio.deinit();
+    try vm.enableAio(virtual_aio.host());
     // The program's other files: `require`/`loadfile`/`dofile` read them as
     // `file_read` effects, exactly as the CLI reads the disk.
     var file_paths: std.ArrayList(u8) = .empty;
@@ -887,6 +892,7 @@ fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, eff_
     var vm = try mahina.interp.Vm.init(gpa);
     defer vm.deinit();
     try vm.enableSystem(playground_groups);
+    try vm.enableAio(null);
 
     // stdout is irrelevant to the index; a throwaway sink (same size as the run
     // sink, so an over-printing program fails here identically rather than diverging).

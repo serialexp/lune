@@ -630,6 +630,8 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue)
             .current_id = 0,
             .main_context = &.{},
             .task_lib_id = 0,
+            .aio_ops_id = 0,
+            .aio_next_id = 1,
         },
     };
     try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);
@@ -718,6 +720,8 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             .current_id = 0,
             .main_context = &.{},
             .task_lib_id = 0,
+            .aio_ops_id = 0,
+            .aio_next_id = 1,
         },
     };
     try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);

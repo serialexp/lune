@@ -52,7 +52,8 @@ pub const schema = @import("gen/trace_schema.zig");
 /// class); `argc`/`argv` (3, 4) are retired.
 /// v7 (doc 65 Phase 4): kind 15 is `local_zone`, a byte record (offset,
 /// daylight saving, abbreviation) where v6's `local_offset` was an int.
-pub const effect_format_version: u32 = 7;
+/// v8 (doc 73 §7.6): `aio_complete` (17) and `aio_result` (18).
+pub const effect_format_version: u32 = 8;
 
 /// The encoded size of an `EffectFile` with no entries: the `version` word and
 /// the entry count.
@@ -105,11 +106,13 @@ const Shape = enum {
     /// A local-zone record: bytes, at least the fixed part
     /// (`system.LocalZone.fixed_len`).
     zone,
+    /// How an `aio` operation ended: `nil`, the bytes it read, or a failure.
+    nil_bytes_or_fail,
 };
 
 fn resultShapeOf(kind: EffectKind) Shape {
     return switch (kind) {
-        .random_seed, .unicode_version, .wall_clock, .io_error_mode => .int,
+        .random_seed, .unicode_version, .wall_clock, .io_error_mode, .aio_complete => .int,
         .local_zone => .zone,
         .clock => .number,
         .getenv, .file_read => .string_or_nil,
@@ -117,6 +120,7 @@ fn resultShapeOf(kind: EffectKind) Shape {
         .file_write, .file_control, .fs_mutate => .ok_or_fail,
         .fs_tmpname => .string_or_fail,
         .file_read_op => .read_value,
+        .aio_result => .nil_bytes_or_fail,
     };
 }
 
@@ -126,15 +130,15 @@ fn checkResultShape(kind: EffectKind, result: Effect.Result) DecodeError!void {
     const shape = resultShapeOf(kind);
     const ok = switch (result) {
         .fail => switch (shape) {
-            .int_or_fail, .ok_or_fail, .string_or_fail, .read_value => true,
+            .int_or_fail, .ok_or_fail, .string_or_fail, .read_value, .nil_bytes_or_fail => true,
             .int, .number, .string_or_nil, .zone => false,
         },
-        .bytes => |span| shape == .read_value or (shape == .zone and span.len >= system.local_zone_fixed_len),
+        .bytes => |span| shape == .read_value or shape == .nil_bytes_or_fail or (shape == .zone and span.len >= system.local_zone_fixed_len),
         .value => |v| switch (shape) {
             .int, .int_or_fail => v.tag == .int,
             .number => v.tag == .int or v.tag == .float,
             .string_or_nil => v.tag == .nil or isString(v),
-            .ok_or_fail => v.tag == .nil,
+            .ok_or_fail, .nil_bytes_or_fail => v.tag == .nil,
             .string_or_fail => isString(v),
             .read_value => v.tag == .nil or v.tag == .int or v.tag == .float or isString(v),
             .zone => false,
@@ -330,6 +334,11 @@ test "doc 65 host-operation results round-trip, failures as their class" {
         .{ .kind = .fs_mutate, .result = .{ .fail = .permission_denied } },
         .{ .kind = .fs_tmpname, .result = .{ .fail = .exists } },
         Effect.of(.wall_clock, Value.int(1_790_000_000)),
+        // Doc 73 §7.6: an `aio` completion is its id, then its outcome.
+        Effect.of(.aio_complete, Value.int(7)),
+        Effect.of(.aio_result, Value.nil()),
+        Effect.of(.aio_complete, Value.int(2)),
+        .{ .kind = .aio_result, .result = .{ .fail = .is_a_directory } },
     });
 }
 
@@ -495,7 +504,7 @@ test "an unknown effect kind is rejected" {
     var heap = gc.Heap.init(gpa);
     defer heap.deinit();
     // 3 and 4 are the retired argc/argv.
-    for ([_]u8{ 3, 4, 17, 250 }) |kind| {
+    for ([_]u8{ 3, 4, 19, 250 }) |kind| {
         const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{
             .{ .kind = kind, .result = .{ .tag = 2, .body = .{ .ConstInt = .{ .v = 1 } } } },
         } };
@@ -536,6 +545,11 @@ test "a result whose type contradicts its kind is rejected at decode (corrupt lo
         .{ .kind = .fs_tmpname, .result = nil },
         // Class 0 is no class.
         .{ .kind = .file_open, .result = bad_class },
+        // An operation id is an int; an outcome is nil, bytes or a failure.
+        .{ .kind = .aio_complete, .result = nil },
+        .{ .kind = .aio_complete, .result = fail },
+        .{ .kind = .aio_result, .result = int1 },
+        .{ .kind = .aio_result, .result = str },
     };
     for (cases) |c| {
         const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{

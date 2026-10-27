@@ -49,6 +49,10 @@ class Kf {
       keyframe: {
         globals_id: globalsId,
         string_metatable_id: 0,
+        file_metatable_id: 0,
+        io_input_id: 0,
+        io_output_id: 0,
+        next_file_id: 0,
         next_obj_id: this.id,
         gc_target: 1024n,
         objects: this.objs,
@@ -58,6 +62,9 @@ class Kf {
         loaded_chunks: loaded.map((l) => ({ source: enc(l.source), name: enc(l.name) })),
         current_id: 0,
         main_context: [],
+        task_lib_id: 0,
+        aio_ops_id: 0,
+        aio_next_id: 1n,
       },
     });
   }

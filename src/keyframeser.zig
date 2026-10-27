@@ -39,6 +39,7 @@ const system = @import("system.zig");
 const filemod = @import("file.zig");
 const File = filemod.File;
 const coroutine = @import("coroutine.zig");
+const stdaio = @import("stdlib/aio.zig");
 const Thread = coroutine.Thread;
 
 const Value = value.Value;
@@ -132,7 +133,11 @@ pub const schema = @import("gen/trace_schema.zig");
 ///
 /// v17 (doc 73 §7): `Keyframe.task_lib_id`, the task library's function
 /// table, a VM-level root (1-based optional id).
-pub const snapshot_format_version: u32 = 17;
+///
+/// v18 (doc 73 §7.6): `Keyframe.aio_ops_id`, the `aio` operations in
+/// flight (a VM-level root, 1-based optional id), and `aio_next_id`, the
+/// next operation id.
+pub const snapshot_format_version: u32 = 18;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -561,6 +566,8 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             .current_id = if (vm.current) |t| t.header.id + 1 else 0,
             .main_context = main_context,
             .task_lib_id = if (vm.task_lib) |t| t.header.id + 1 else 0,
+            .aio_ops_id = if (vm.aio_ops) |t| t.header.id + 1 else 0,
+            .aio_next_id = vm.aio_next_id,
         },
     };
     return file.encode(gpa);
@@ -613,6 +620,7 @@ pub const RestoreError = error{
     InvalidFile, // a file handle's kind or mode byte is not one the encoder writes, or it has more than one fingerprint
     FileRootNotAFile, // io_input_id / io_output_id resolves to a non-file object
     InvalidTaskLib, // task_lib_id resolves to something other than a table whose first entry is a closure of a loaded chunk
+    InvalidAioOps, // aio_ops_id resolves to a non-table, or one holding something other than an operation record under an id below aio_next_id (or aio_next_id is 0)
     NextFileIdBelowFiles, // next_file_id is at or below a restored file's id, or below the standard streams' 3
     InvalidThread, // a coroutine record no capture writes: an unknown kind or status, a stack that doesn't match the status, a running coroutine or a resumer (v13 captures only with none running), a second main thread, a non-function body
     UpvalueOpenTwice, // an open upvalue cell appears in two open lists
@@ -1417,6 +1425,15 @@ pub fn restoreSnapshot(
         Vm.markSystem(@constCast(vm.loaded_chunks.items[at].chunk.proto));
         vm.task_lib = lib;
     }
+
+    // Doc 73 §7.6: the `aio` operations in flight. No host runs them, so a
+    // live wait on one refuses; a replay settles them from the log.
+    if (kf.aio_ops_id != 0) {
+        const oh = idmap.get(kf.aio_ops_id - 1) orelse return error.UnresolvedHeapRef;
+        if (oh.type != .table) return error.InvalidAioOps;
+        vm.aio_ops = table.Table.fromHeader(oh);
+    }
+    try stdaio.restoreOps(vm, kf.aio_next_id);
 
     return vm;
 }

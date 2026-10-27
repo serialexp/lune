@@ -36,11 +36,20 @@ own code it suspends the task, elsewhere it runs the other ready tasks
 until the awaited one finishes. Tasks still ready when the main chunk
 returns run after it, and a failed task nothing awaited is then a
 fatal error. A task's own `coroutine.yield` is an error; coroutines
-inside a task work as usual. In the CLI nothing a program can call
-waits on the outside world yet, so every task runs to completion as it is
-called. An embedder's host functions can return operations to await
-(doc 59 §3.10); with no wait callback, `await` outside a task's own
-code then fails with "await would block".
+inside a task work as usual. An embedder's host functions can return
+operations to await (doc 59 §3.10); with no wait callback, `await`
+outside a task's own code then fails with "await would block".
+
+**`aio`** (doc 73 §7.6), a module Lua doesn't have:
+`aio.sleep(s)`, `aio.read(path [, "b"])`, `aio.write(path, data)` and
+`aio.append(path, data)` start an operation that runs while the program
+goes on and return it at once, for `await`. A read gives the whole file
+(a string that must be valid UTF-8, or with `"b"` a byte array); a write
+gives `true`. A failure raises at the await, or under `--lua-io-errors`
+the await gives `nil, msg, code`. Tasks wake in the order operations
+finish, which a recording logs, so a replay wakes them the same way.
+The browser playground has only `aio.sleep`, on a virtual clock: a sleep
+finishes at once, after every sleep due before it.
 
 **Numerals** read as in Lua, hex floats (`0x1.8p+1`) and wrapping hex
 integers included, with one exception: `..` ends a numeral, so `1..2` is
@@ -238,12 +247,12 @@ opened (`docs/design/65-cli-host-library.md` §5):
 
 | Interface | Functions |
 |---|---|
-| `files` | `io.open`, `io.tmpfile`, `os.remove`, `os.rename`, `os.tmpname` |
+| `files` | `io.open`, `io.tmpfile`, `os.remove`, `os.rename`, `os.tmpname`; `aio.read`, `aio.write`, `aio.append` with an async host |
 | `stdio` | `io.stdin` (and stdin as the default input) |
 | `files` or `stdio` | `io.read`, `io.lines`, `io.input`, `io.output`, `io.close`: either one installs them |
 | `env` | `os.getenv`, `os.exit` |
 | `time` | `os.time`, `os.date` |
-| `clock` | `os.clock` |
+| `clock` | `os.clock`; `aio.sleep` with an async host |
 | `random` | an entropy seed for `math.random` (without it, every run draws the same sequence) |
 
 `io.write`, `print`, `io.stdout`, `io.stderr`, `io.type` and the file
