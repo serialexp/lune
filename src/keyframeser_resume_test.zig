@@ -1235,11 +1235,10 @@ test "keyframe cut while a grid is live: a later deflation allocates the same id
 }
 
 test "doc 73: every cut with coroutines alive resumes after restore" {
-    // A cut lands only on the main stack (`canSuspendHere`), so every
-    // coroutine is captured suspended or dead: one stopped mid-body, one
+    // Coroutines in every state at the cuts: one stopped mid-body, one
     // not started, one killed by an error, one whose open upvalue a main
-    // closure reads, plus the main thread object. A cut due inside a
-    // coroutine defers to the main stack's next stoppable step.
+    // closure reads, plus the main thread object; cuts inside the
+    // coroutines too.
     const gpa = testing.allocator;
     const source =
         \\local shared = 0

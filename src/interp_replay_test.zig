@@ -263,7 +263,7 @@ test "replay: backtraceFrames reports a deepest-first chain at a suspend inside 
 
     var arena_inst = std.heap.ArenaAllocator.init(gpa);
     defer arena_inst.deinit();
-    const frames = try vm.backtraceFrames(arena_inst.allocator());
+    const frames = try vm.backtraceFrames(arena_inst.allocator(), .chain);
     // Deepest-first: inner (leaf), outer, main.
     try testing.expectEqual(@as(usize, 3), frames.len);
     try testing.expectEqualStrings("inner", frames[0].name);
@@ -374,6 +374,90 @@ test "doc 68 defer: a suspend due inside nested code stops at the next stoppable
     }
 }
 
+test "doc 73: a step in a coroutine reports the chain through its resumers, and the suspended ones" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const coroutine = @import("coroutine.zig");
+    const source: [:0]const u8 =
+        \\local inner = coroutine.create(function(a)
+        \\  local b = coroutine.yield(a + 1)
+        \\  return b
+        \\end)
+        \\local fresh = coroutine.create(function() return 1 end)
+        \\local function deep(x)
+        \\  return select(2, coroutine.resume(inner, x))
+        \\end
+        \\local outer = coroutine.wrap(function() return deep(1) end)
+        \\local w = coroutine.wrap(pcall)
+        \\print(outer(), w(function() return 2 end), coroutine.status(fresh))
+    ;
+    const index = try recordSafepointIndex(gpa, source);
+    defer gpa.free(index);
+    // A native body's frame is the native running: no step stops in it.
+    var in_shim: usize = 0;
+    for (index) |sp| if (sp.proto_id == coroutine.native_body_proto_id) {
+        in_shim += 1;
+        try testing.expect(!sp.stoppable);
+    };
+    try testing.expect(in_shim > 0);
+
+    var saw_nested = false;
+    var saw_native = false;
+    var saw_fresh = false;
+    var saw_yielded = false;
+    var k: u64 = 1;
+    while (k <= index.len) : (k += 1) {
+        if (!index[k - 1].stoppable) continue;
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var sink_buf: [256]u8 = undefined;
+        var sink = io.Writer.fixed(&sink_buf);
+        vm.out = &sink;
+        vm.setSuspendCtl(.{ .after_safepoints = k });
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect((try vm.start(chunk.proto)) == .suspended);
+
+        var arena_inst = std.heap.ArenaAllocator.init(gpa);
+        defer arena_inst.deinit();
+        const arena = arena_inst.allocator();
+        const running = try vm.backtraceFrames(arena, .running);
+        const chain = try vm.backtraceFrames(arena, .chain);
+        // The running stack comes first, the main chunk last.
+        try testing.expectEqual(@as(usize, vm.depth), running.len);
+        for (running, chain[0..running.len]) |a, b| try testing.expectEqual(a.thread, b.thread);
+        try testing.expectEqual(if (vm.current) |t| t.header.id else 0, chain[0].thread);
+        try testing.expectEqual(@as(u32, 0), chain[chain.len - 1].thread);
+        try testing.expect(chain[chain.len - 1].main_chunk);
+        if (chain.len == 4 and !chain[0].native and std.mem.eql(u8, chain[1].name, "deep")) {
+            // In `inner`, resumed by `deep` in `outer`, called from main.
+            saw_nested = true;
+            try testing.expectEqual(@as(usize, 1), running.len);
+            try testing.expectEqual(chain[1].thread, chain[2].thread);
+            try testing.expect(chain[0].thread != chain[1].thread and chain[1].thread != 0);
+            try testing.expectEqual(@as(u32, 7), chain[1].line);
+            try testing.expectEqual(@as(u32, 11), chain[3].line);
+        }
+        for (chain) |f| if (f.native) {
+            saw_native = true;
+            try testing.expectEqualStrings("pcall", f.name);
+            try testing.expectEqualStrings("", f.module);
+            try testing.expect(f.thread != 0);
+        };
+        for (try vm.suspendedCoroutines(arena)) |co| {
+            try testing.expectEqual(co.id, co.frames[0].thread);
+            if (!co.started and co.frames[0].line == 5) saw_fresh = true;
+            if (co.started and co.frames.len == 1 and co.frames[0].line == 2) saw_yielded = true;
+        }
+    }
+    try testing.expect(saw_nested and saw_native and saw_fresh and saw_yielded);
+}
+
 test "doc 68 defer: the safepoint index stops growing at its limit" {
     const gpa = testing.allocator;
     const parser = @import("parser.zig");
@@ -447,7 +531,7 @@ test "doc 68 §5: a pcall body is stoppable, in a frame of its own tagged protec
 
     var arena_inst = std.heap.ArenaAllocator.init(gpa);
     defer arena_inst.deinit();
-    const frames = try vm.backtraceFrames(arena_inst.allocator());
+    const frames = try vm.backtraceFrames(arena_inst.allocator(), .chain);
     try testing.expectEqual(@as(usize, 2), frames.len);
     try testing.expectEqualStrings("body", frames[0].name);
     try testing.expectEqualStrings("main", frames[1].name);

@@ -1054,10 +1054,31 @@ export async function loadProjectFromUrl(url: string): Promise<void> {
 }
 
 /** A backtrace frame as the UI writes it: `name:line` in the entry file, else
- *  `name (path:line)`. */
+ *  `name (path:line)`; a native, with no location, `name [C]`. */
 export function frameLabel(f: BacktraceFrame): string {
+  if (f.native) return `${f.name} [C]`;
   const path = runFileOf(f.protoId)?.path ?? state.entryPath;
   return path === state.entryPath ? `${f.name}:${f.line}` : `${f.name} (${path}:${f.line})`;
+}
+
+/** One stack's run of a call chain: `thread` (0 = the main stack) and its
+ *  frames, deepest-first. */
+export interface ChainSegment {
+  thread: number;
+  frames: BacktraceFrame[];
+}
+
+/** Split a deepest-first call chain where it crosses from a coroutine into
+ *  the stack that resumed it (doc 73), so the panel can mark each resume.
+ *  Pure. */
+export function chainSegments(frames: BacktraceFrame[]): ChainSegment[] {
+  const segs: ChainSegment[] = [];
+  for (const f of frames) {
+    const last = segs[segs.length - 1];
+    if (last !== undefined && last.thread === f.thread) last.frames.push(f);
+    else segs.push({ thread: f.thread, frames: [f] });
+  }
+  return segs;
 }
 
 export function selectTrace(index: number): void {

@@ -403,3 +403,15 @@ test "coroutine.wrap: the collector keeps a wrap function's coroutine" {
         \\print(s, n)
     , "38550\t2015000\n");
 }
+
+test "debug.traceback in a coroutine: its own stack, a native body as Lua's [C] row" {
+    // As Lua 5.4.6 lays the rows out (it names the functions `<main:2>`
+    // and `local 'f'`, docs/differences-from-lua.md).
+    try expectProgram(
+        \\local w = coroutine.wrap(pcall)
+        \\w(function() print(debug.traceback("m")) end)
+        \\local co = coroutine.create(function() local function f() print(debug.traceback()) end f() end)
+        \\coroutine.resume(co)
+    , "m\nstack traceback:\n\tmain:2: in function 'anonymous'\n\t[C]: in function 'pcall'\n" ++
+        "stack traceback:\n\tmain:3: in function 'f'\n\tmain:3: in function 'anonymous'\n");
+}

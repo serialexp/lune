@@ -1,4 +1,4 @@
-DOC 73 COROUTINES: P0 + P1 DONE (2026-10-27, coral-marten); next P3 viz.
+DOC 73 COROUTINES: P0 + P1 + P3 DONE (2026-10-27, coral-marten); next P4 async.
 - All questions decided. Bart accepted the frames-pointer cost; P0a landed
   (4e37dfd). The P0 runtime design is doc 73 §5.1 (stack = one allocation
   of tags+payloads+scratch+frames; active fields stay in Vm and are
@@ -55,9 +55,11 @@ DOC 73 COROUTINES: P0 + P1 DONE (2026-10-27, coral-marten); next P3 viz.
   call; keyframe format 16. Adding the coroutine.wrap native shifted every
   startup heap id by 2 (interp_gc_test / interp_phaseq_test print ids).
   A/B: pingpong −0.79%, everything else within ±0.21%.
-- Next: P3 viz — the call chain across coroutines (backtraceFrames lists
-  only the current stack; extend it through the resumer chain with
-  boundary markers; ReplayPanel shows `backtrace`). Then P4 async, P5 docs.
+- P3 viz landed: backtraceFrames(arena, .running|.chain) (FaultFrame.thread,
+  .native/.module for the native-body shim), Vm.suspendedCoroutines, wasm
+  ReplayResult.coroutines (@68), frame records gained thread+flags. The
+  shim is unstoppable (canSuspendHere(proto)).
+- Next: P4 async (doc 73 §7), then P5 docs.
   P2 lead (deferred): co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
   t0 (yield made deep in recursion) — start with --jit-stats/--dump-aborts.
 - gmatch/codes lone iterators can now use bound natives (TODO.md).

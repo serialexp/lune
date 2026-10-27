@@ -56,6 +56,11 @@ const enum ObjType {
   Upvalue = 4,
 }
 
+/** A coroutine as `tostring` renders it (src/io.zig): `thread: 0x…`. */
+export function threadLabel(id: number): string {
+  return `thread: 0x${id.toString(16)}`;
+}
+
 /** A short tag for a heap object reference, given the resolved object (or null
  *  if the id wasn't in the snapshot — should not happen for a reachable graph). */
 function heapRefDisplay(id: number, obj: HeapObjectOutput | undefined): string {
@@ -75,8 +80,7 @@ function heapRefDisplay(id: number, obj: HeapObjectOutput | undefined): string {
       // As `tostring` renders a handle (src/io.zig).
       return obj.body.value.closed !== 0 ? "file (closed)" : `file (0x${id.toString(16)})`;
     case "HeapThread":
-      // As `tostring` renders a coroutine (src/io.zig).
-      return `thread: 0x${id.toString(16)}`;
+      return threadLabel(id);
     default:
       return `#${id}`;
   }

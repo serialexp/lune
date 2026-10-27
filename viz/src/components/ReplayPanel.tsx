@@ -19,7 +19,9 @@ import {
   replayLoc,
   locLabel,
   frameLabel,
+  chainSegments,
 } from "../store";
+import { threadLabel } from "../snapshot";
 
 /** Milliseconds between auto-advance steps while playing. */
 const PLAY_INTERVAL_MS = 220;
@@ -183,10 +185,41 @@ export default function ReplayPanel() {
         </Show>
       </div>
 
-      {/* Call chain at this step (deepest-first), flattened like the error traceback. */}
+      {/* Call chain at this step (deepest-first), flattened like the error
+          traceback. In a coroutine it goes on through the stacks that resumed
+          it, each run tagged with its coroutine (doc 73). */}
       <Show when={(state.replayState?.backtrace.length ?? 0) > 0}>
         <div class="replay-frames">
-          {state.replayState!.backtrace.map(frameLabel).join(" → ")}
+          <For each={chainSegments(state.replayState!.backtrace)}>
+            {(seg, i) => (
+              <>
+                <Show when={i() > 0}>
+                  <span class="replay-resume" title="the stack that resumed the coroutine, stopped at its resume"> ⇐ resumed by </span>
+                </Show>
+                <Show when={seg.thread !== 0}>
+                  <span class="replay-thread">{threadLabel(seg.thread)}</span>{" "}
+                </Show>
+                {seg.frames.map(frameLabel).join(" → ")}
+              </>
+            )}
+          </For>
+        </div>
+      </Show>
+
+      {/* The coroutines stopped at a yield or not yet started. */}
+      <Show when={(state.replayState?.coroutines.length ?? 0) > 0}>
+        <div class="replay-frames replay-coroutines">
+          <div class="replay-col-title">suspended coroutines</div>
+          <For each={state.replayState!.coroutines}>
+            {(co) => (
+              <div>
+                <span class="replay-thread">{threadLabel(co.id)}</span>{" "}
+                {co.started
+                  ? co.frames.map(frameLabel).join(" → ")
+                  : <span class="muted">not started · {co.frames.map(frameLabel).join(" → ")}</span>}
+              </div>
+            )}
+          </For>
         </div>
       </Show>
 

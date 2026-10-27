@@ -1,9 +1,9 @@
 # 73 — Coroutines, and async on top of them — Design
 
-Status: partial — P0 and P1 landed (resume/yield on separate stacks, stops
-and keyframes inside coroutines, the whole library including `wrap` and
-native bodies, the stack pool and its GC weight); JIT, viz and async
-outstanding.
+Status: partial — P0, P1 and P3 landed (resume/yield on separate stacks,
+stops and keyframes inside coroutines, the whole library including `wrap`
+and native bodies, the stack pool and its GC weight, coroutines in the
+step debugger); JIT and async outstanding.
 Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-27
@@ -126,6 +126,18 @@ land; move whole phases to Done once everything inside them is checked.
   against Lua 5.4.6 output on every tier, every-cut resume, malformed
   records, a wasm ≡ native case. The same primitive can carry gmatch's and
   codes' iterator state (TODO.md).
+- [x] **P3 — the visualiser** (§6.5): a replay step's call chain goes on
+  from the running coroutine through every resumer stopped at its resume
+  (`Vm.backtraceFrames(.chain)`; each `FaultFrame` carries its stack's
+  thread id), and the panel tags each coroutine's run and marks the
+  resume. The suspended coroutines are listed with their chains
+  (`Vm.suspendedCoroutines`; the wasm `ReplayResult.coroutines` blob), a
+  not-started one at its body's first instruction. A native body's shim
+  frame is the native to Lua: no step stops in it (`canSuspendHere`), and
+  a traceback names it `[C]: in function 'pcall'`, as Lua does.
+  `describeFault` and `debug.traceback` stay on the running stack, as
+  Lua's tracebacks do. Tests: a Zig replay test over every stop of a
+  nested program, a wasm test, `chainSegments`.
 
 ### Outstanding
 
@@ -136,7 +148,6 @@ land; move whole phases to Done once everything inside them is checked.
   coroutine body run as usual. Evidence from the first board: with the yield
   made 20 or 150 calls deep, `--jit-native` is 3.2–3.6× slower than t0
   (302.7 vs 95.7 ms, 2193.7 vs 610.4 ms) at ~41–46% residency.
-- [ ] **P3 — the visualiser** (§6.5): coroutines in the frame view.
 - [ ] **P4 — the async layer** (§7): `async function` / `await`, the
   host-owned scheduler with logged choices, unobserved-error handling.
 - [ ] **P5 — docs and inventory**: the inventory rows and
@@ -406,6 +417,18 @@ deopts restore into the active coroutine's frames.
 
 The frame view shows the active coroutine's stack and lists suspended ones;
 a step into `resume` moves to the coroutine's stack.
+
+As built (2026-10-27): the step into `resume` needed nothing, since a stop
+inside a coroutine already captures its stack as the keyframe's live one,
+so the locals and bytecode views follow it. The call chain shows more
+than the active stack: it continues through the resumers, because a
+coroutine's frames alone don't say who is waiting on it. Lua's own
+tracebacks stop at the coroutine's body, so `debug.traceback` and the
+uncaught-error traceback still do. The suspended list comes from the VM
+(a heap walk per replay step), not from decoding the keyframe in the
+viz, so the leaf-versus-call-site rule for each frame stays in one place.
+It can list a coroutine that is already garbage, until the next
+collection frees it.
 
 ## 7. The async layer (Q4, option 4.3)
 

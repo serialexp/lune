@@ -46,7 +46,9 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 ///
 /// Each line follows Lua's `chunk:line:` convention: `<chunk>:<line>: in main
 /// chunk` for a chunk's top level (`Proto.main_chunk`), else
-/// `<chunk>:<line>: in function '<name>'`.
+/// `<chunk>:<line>: in function '<name>'`; a native-body coroutine's frame
+/// reads `[C]: in function '<module.name>'`. Only the running stack, as in
+/// Lua: a coroutine's traceback ends at its body.
 fn nTraceback(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
 
@@ -70,7 +72,7 @@ fn nTraceback(ctx: *anyopaque, args: []const Value) anyerror!Value {
     // backtraceFrames allocates the frame slice; an arena keeps it scratch.
     var arena_inst = std.heap.ArenaAllocator.init(vm.gpa);
     defer arena_inst.deinit();
-    const frames = try vm.backtraceFrames(arena_inst.allocator());
+    const frames = try vm.backtraceFrames(arena_inst.allocator(), .running);
 
     // Skip the first `level-1` leaf frames, clamped to the frame count. Computed
     // in i64 and narrowed only once it is known to be `< frames.len`
@@ -90,6 +92,20 @@ fn nTraceback(ctx: *anyopaque, args: []const Value) anyerror!Value {
     }
     try buf.appendSlice(vm.gpa, "stack traceback:");
     for (frames[start..]) |fr| {
+        if (fr.native) {
+            // A native-body coroutine's frame, as Lua writes a C level.
+            try buf.appendSlice(vm.gpa, "\n\t[C]: in ");
+            if (fr.module.len == 0 and std.mem.eql(u8, fr.name, "?")) {
+                try buf.append(vm.gpa, '?');
+            } else {
+                try buf.appendSlice(vm.gpa, "function '");
+                try buf.appendSlice(vm.gpa, fr.module);
+                try buf.appendSlice(vm.gpa, fr.dot());
+                try buf.appendSlice(vm.gpa, fr.name);
+                try buf.append(vm.gpa, '\'');
+            }
+            continue;
+        }
         var nbuf: [16]u8 = undefined;
         const line_digits = std.fmt.bufPrint(&nbuf, "{d}", .{fr.line}) catch unreachable;
         try buf.appendSlice(vm.gpa, "\n\t");

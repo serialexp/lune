@@ -526,3 +526,51 @@ test("nested code (pcall, sort, gsub, metamethods): every stoppable step replays
   }
   expect(mod.replay(src, run.effects, run.safepointCount + 1).stdout).toBe(run.stdout);
 });
+
+// Doc 73: a step in a coroutine shows the call chain on through the stacks
+// that resumed it, a native body as a [C] frame no step stops in, and the
+// suspended coroutines.
+test("replay in coroutines: the chain crosses resumes, and suspended coroutines are listed", () => {
+  const src = [
+    "local inner = coroutine.create(function(a)",
+    "  local b = coroutine.yield(a + 1)",
+    "  return b",
+    "end)",
+    "local fresh = coroutine.create(function() return 1 end)",
+    "local function deep(x)",
+    "  return select(2, coroutine.resume(inner, x))",
+    "end",
+    "local outer = coroutine.wrap(function() return deep(1) end)",
+    "local w = coroutine.wrap(pcall)",
+    "print(outer(), w(function() return 2 end), coroutine.status(fresh))",
+  ].join("\n") + "\n";
+  const run = mod.runSource(src);
+  expect(run.status).toBe(0);
+  expect(run.stdout).toBe("2\ttrue\tsuspended\n");
+  let nested = false;
+  let native = false;
+  let listed = false;
+  for (let k = 1; k <= run.safepointCount; k++) {
+    if (run.safepointStoppable[k - 1] !== 1) continue;
+    const step = mod.replay(src, run.effects, k);
+    expect(step.finished).toBe(false);
+    const bt = step.backtrace;
+    expect(bt[bt.length - 1].thread).toBe(0);
+    // The leaf is a Lua frame: no step stops in a native body.
+    expect(bt[0].native).toBe(false);
+    if (bt.map((f) => f.name).join(",") === "anonymous,deep,anonymous,main") {
+      nested = true;
+      expect(bt.map((f) => f.line)).toEqual([2, 7, 9, 11]);
+      expect(bt[1].thread).toBe(bt[2].thread);
+      expect(new Set(bt.map((f) => f.thread)).size).toBe(3);
+    }
+    if (bt.some((f) => f.native)) {
+      native = true;
+      expect(bt.find((f) => f.native)!.name).toBe("pcall");
+    }
+    const ids = step.coroutines.map((c) => c.id);
+    expect([...ids].sort((a, b) => a - b)).toEqual(ids);
+    if (step.coroutines.some((c) => !c.started && c.frames[0].line === 5)) listed = true;
+  }
+  expect(nested && native && listed).toBe(true);
+});

@@ -42,7 +42,8 @@
 //!   {u32 ptr,u32 len} backtrace  structured call chain blob (see encodeBacktrace;
 //!                                empty when there's no located runtime error):
 //!                                u32 frame_count, then per frame deepest-first
-//!                                { u32 proto_id, line, start, end, name_len, [name_len]u8 }
+//!                                { u32 proto_id, line, start, end, thread, flags,
+//!                                  name_len, [name_len]u8 }
 //!   (further fields are appended after `backtrace` — exec timing, the step-replay
 //!    index `safepoint_*`/`safepoint_lines`, the bytecode-view `disasm` blob, and
 //!    the `chunks` table that names the file every `proto_id` is in; each is
@@ -255,6 +256,9 @@ const ReplayResult = extern struct {
     /// through a Zig re-entry) is not, and a stop asked for there lands at
     /// the first stoppable step after it (doc 68 §8).
     stopped_at: u32 = 0,
+    /// The suspended coroutines at this step and their call chains (see
+    /// `encodeCoroutines`). Empty when there are none or finished.
+    coroutines: Buf = .{},
 };
 
 /// Wrap an owned byte slice as a `Buf` (transfers ownership to JS; freed by
@@ -449,6 +453,7 @@ export fn mahina_free_replay_result(res: ?*ReplayResult) void {
     freeBuf(r.keyframe);
     freeBuf(r.diag);
     freeBuf(r.backtrace);
+    freeBuf(r.coroutines);
     gpa.destroy(r);
 }
 
@@ -544,11 +549,14 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, args
                 res.current_start = span.start;
                 res.current_end = span.end;
             }
-            // Deepest-first call chain at this step (same encoding as a fault's).
+            // Deepest-first call chain at this step (same encoding as a fault's),
+            // through the resumers of a running coroutine, and the suspended
+            // coroutines' chains (doc 73).
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const frames = try vm.backtraceFrames(arena.allocator());
+            const frames = try vm.backtraceFrames(arena.allocator(), .chain);
             res.backtrace = bufFromSlice(try encodeBacktrace(frames));
+            res.coroutines = bufFromSlice(try encodeCoroutines(try vm.suspendedCoroutines(arena.allocator())));
         },
         .finished => {
             // Ran to completion before `stop_after`: final state, no pending line.
@@ -1065,21 +1073,48 @@ fn renderDiagnostics(diags: *const Diagnostics) ![]u8 {
 
 /// Serialize a runtime-error backtrace into a self-describing little-endian blob
 /// for JS: `u32 frame_count`, then per frame (deepest-first)
-/// `{ u32 proto_id, u32 line, u32 start, u32 end, u32 name_len, [name_len]u8 name }`
-/// (`proto_id` names the frame's file, see `Result.chunks`). Empty
-/// chain → empty slice (a null `Buf`).
+/// `{ u32 proto_id, u32 line, u32 start, u32 end, u32 thread, u32 flags,
+/// u32 name_len, [name_len]u8 name }` (`proto_id` names the frame's file, see
+/// `Result.chunks`; `thread` is the `GcHeader.id` of the coroutine whose
+/// stack the frame is on, 0 for the main stack; `flags` bit 0 marks a
+/// native-body coroutine's frame, a C level with no location, whose `name`
+/// is `module.name`). Empty chain → empty slice (a null `Buf`).
 fn encodeBacktrace(frames: []const mahina.interp.FaultFrame) ![]u8 {
     if (frames.len == 0) return &[_]u8{};
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
-    try appendU32(&buf, @intCast(frames.len));
+    try appendFrames(&buf, frames);
+    return buf.toOwnedSlice(gpa);
+}
+
+fn appendFrames(buf: *std.ArrayList(u8), frames: []const mahina.interp.FaultFrame) !void {
+    try appendU32(buf, @intCast(frames.len));
     for (frames) |f| {
-        try appendU32(&buf, f.proto_id);
-        try appendU32(&buf, f.line);
-        try appendU32(&buf, f.start);
-        try appendU32(&buf, f.end);
-        try appendU32(&buf, @intCast(f.name.len));
+        try appendU32(buf, f.proto_id);
+        try appendU32(buf, f.line);
+        try appendU32(buf, f.start);
+        try appendU32(buf, f.end);
+        try appendU32(buf, f.thread);
+        try appendU32(buf, @intFromBool(f.native));
+        try appendU32(buf, @intCast(f.module.len + f.dot().len + f.name.len));
+        try buf.appendSlice(gpa, f.module);
+        try buf.appendSlice(gpa, f.dot());
         try buf.appendSlice(gpa, f.name);
+    }
+}
+
+/// Serialize the suspended coroutines (`Vm.suspendedCoroutines`) for JS:
+/// `u32 count`, then per coroutine `{ u32 id, u32 started, frames }`, the
+/// frames as `encodeBacktrace` writes them (count first). None → empty.
+fn encodeCoroutines(cos: []const mahina.interp.SuspendedCoroutine) ![]u8 {
+    if (cos.len == 0) return &[_]u8{};
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try appendU32(&buf, @intCast(cos.len));
+    for (cos) |c| {
+        try appendU32(&buf, c.id);
+        try appendU32(&buf, @intFromBool(c.started));
+        try appendFrames(&buf, c.frames);
     }
     return buf.toOwnedSlice(gpa);
 }

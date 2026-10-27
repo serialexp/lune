@@ -21,6 +21,7 @@ import {
   execLogFor,
   sourceLineOf,
   traceLoc,
+  chainSegments,
   fileText,
   replaceWorkspace,
   newFile,
@@ -280,4 +281,15 @@ test("buildStops offers only stoppable steps, and one per line", () => {
   // With every step stoppable, a line stop is the line's first step.
   expect(buildStops("line", { ...index, stoppable: new Uint8Array(6).fill(1) }, fileKey)).toEqual([1, 2, 4, 6, 7]);
   expect(buildStops("instr", { ...index, count: 0 }, fileKey)).toEqual([]);
+});
+
+test("chainSegments splits a call chain where it crosses a resume", () => {
+  const f = (name: string, thread: number) => ({ name, protoId: 0, line: 1, start: 0, end: 0, thread, native: false });
+  expect(chainSegments([])).toEqual([]);
+  const segs = chainSegments([f("g", 7), f("h", 7), f("deep", 5), f("main", 0)]);
+  expect(segs.map((s) => [s.thread, s.frames.map((x) => x.name)])).toEqual([
+    [7, ["g", "h"]],
+    [5, ["deep"]],
+    [0, ["main"]],
+  ]);
 });

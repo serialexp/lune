@@ -759,6 +759,21 @@ button.secondary {
   word-break: break-word;
 }
 
+/* A coroutine's run of the call chain, and the resume that joins it to its
+   resumer's (doc 73). */
+.replay-thread {
+  color: var(--accent);
+}
+
+.replay-resume {
+  font-style: italic;
+}
+
+.replay-coroutines {
+  max-height: 8rem;
+  overflow-y: auto;
+}
+
 /* Output / locals / globals side by side when there is room; each wraps onto
    its own row before it gets too narrow to read (it used to squeeze values to
    one character per line at 1024px). */

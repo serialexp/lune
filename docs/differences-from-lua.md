@@ -196,11 +196,13 @@ Other differences:
   default is `(load)`, not `[string "..."]`.
 - Some wording differs: arithmetic on a string says "attempt to perform
   arithmetic on a string value"; `ipairs` takes only a table ("table
-  expected"), where Lua takes any value; a library function called
-  straight from `pcall` is named `'insert'`, where Lua says
-  `'table.insert'`.
+  expected"), where Lua takes any value.
 - An uncaught error prints `mahina: runtime error: message at file:line`
-  and an indented traceback without `[C]` frames. An error object's
+  and an indented traceback. Tracebacks (this one and `debug.traceback`'s)
+  have no `[C]` rows except a coroutine whose body is a library function
+  (`[C]: in function 'pcall'`), and name every Lua function `function
+  'name'`, an unnamed one `'anonymous'`, where Lua says `local 'f'` or
+  `function <main:2>`. An error object's
   `__tostring` gives the message, as in Lua; if that `__tostring` itself
   fails, mahina prints `(error object is a table value)` where Lua reports
   the handler's error.

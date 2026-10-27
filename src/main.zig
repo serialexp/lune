@@ -644,7 +644,9 @@ fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source:
             if (fault.frames.len > 1) {
                 mahina.io.eprint("stack traceback:\n", .{});
                 for (fault.frames) |f| {
-                    if (f.main_chunk)
+                    if (f.native)
+                        mahina.io.eprint("    [C]: in function '{s}{s}{s}'\n", .{ f.module, f.dot(), f.name })
+                    else if (f.main_chunk)
                         mahina.io.eprint("    {s}:{d}: in main chunk\n", .{ f.chunk, f.line })
                     else
                         mahina.io.eprint("    {s}:{d}: in function '{s}'\n", .{ f.chunk, f.line, f.name });

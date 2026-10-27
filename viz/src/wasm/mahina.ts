@@ -179,11 +179,14 @@ export interface MahinaReplayResult {
   /** The step the replay actually stopped at (0 when finished): `stopAfter`
    *  for a stoppable step, else the next stoppable one. */
   stoppedAt: number;
+  /** The suspended coroutines at this step, oldest first (doc 73). */
+  coroutines: SuspendedCoroutine[];
 }
 
 /** One row of a runtime-error backtrace. `start`/`end` are UTF-8 byte offsets. */
 export interface BacktraceFrame {
-  /** Function name (`"main"` for the top-level chunk). */
+  /** Function name (`"main"` for the top-level chunk; `module.name` for a
+   *  native). */
   name: string;
   /** The frame's proto, which names its file (see `MahinaRunResult.chunks`). */
   protoId: number;
@@ -191,6 +194,22 @@ export interface BacktraceFrame {
   line: number;
   start: number;
   end: number;
+  /** The id of the coroutine whose stack the frame is on (as `tostring`
+   *  prints it, `thread: 0x…`), 0 for the main stack. A replay step's chain
+   *  goes on through the resumers of a running coroutine. */
+  thread: number;
+  /** A native-body coroutine's frame: the native running, no location. */
+  native: boolean;
+}
+
+/** A coroutine suspended at a replay step: stopped at a yield (`started`),
+ *  with its call chain deepest-first, or not started, `frames` then holding
+ *  its body alone, at its first instruction. It may be garbage the next
+ *  collection frees. */
+export interface SuspendedCoroutine {
+  id: number;
+  started: boolean;
+  frames: BacktraceFrame[];
 }
 
 /** One compile diagnostic from `check` (parse/compile only — no execution). The
@@ -247,8 +266,8 @@ const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 4;
 //   u32 status; { u32 ptr; u32 len } stdout/keyframe/diag; u32 current_line (@28),
 //   current_start (@32), current_end (@36), depth (@40), finished (@44);
 //   { u32 ptr; u32 len } backtrace (@48); u32 proto_id (@56), u32 pc (@60),
-//   u32 stopped_at (@64). Total 68 bytes.
-const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4 + 4;
+//   u32 stopped_at (@64); { u32 ptr; u32 len } coroutines (@68). Total 76 bytes.
+const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4 + 4 + 8;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
@@ -373,25 +392,51 @@ function decodeChunks(blob: Uint8Array): RunChunk[] {
 
 /** Decode the structured backtrace blob (see `encodeBacktrace` in
  *  wasm_entry.zig): `u32 frame_count`, then per frame (deepest-first)
- *  `{ u32 proto_id, line, start, end, name_len, [name_len]u8 name }`. Empty → []. */
+ *  `{ u32 proto_id, line, start, end, thread, flags, name_len, [name_len]u8
+ *  name }`. Empty → []. */
 function decodeBacktrace(blob: Uint8Array): BacktraceFrame[] {
   if (blob.length < 4) return [];
-  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
-  const count = dv.getUint32(0, true);
+  return decodeFrames(blob, new DataView(blob.buffer, blob.byteOffset, blob.byteLength), 0).frames;
+}
+
+/** `decodeBacktrace`'s frames at `off`; returns them and the offset after. */
+function decodeFrames(blob: Uint8Array, dv: DataView, off: number): { frames: BacktraceFrame[]; off: number } {
+  const count = dv.getUint32(off, true);
   const frames: BacktraceFrame[] = [];
-  let off = 4;
+  off += 4;
   for (let i = 0; i < count; i++) {
     const protoId = dv.getUint32(off, true);
     const line = dv.getUint32(off + 4, true);
     const start = dv.getUint32(off + 8, true);
     const end = dv.getUint32(off + 12, true);
-    const nameLen = dv.getUint32(off + 16, true);
-    off += 20;
+    const thread = dv.getUint32(off + 16, true);
+    const native = (dv.getUint32(off + 20, true) & 1) !== 0;
+    const nameLen = dv.getUint32(off + 24, true);
+    off += 28;
     const name = decoder.decode(blob.subarray(off, off + nameLen));
     off += nameLen;
-    frames.push({ name, protoId, line, start, end });
+    frames.push({ name, protoId, line, start, end, thread, native });
   }
-  return frames;
+  return { frames, off };
+}
+
+/** Decode the suspended-coroutines blob (see `encodeCoroutines` in
+ *  wasm_entry.zig): `u32 count`, then per coroutine `{ u32 id, u32 started,
+ *  frames }`, the frames as in `decodeBacktrace`. Empty → []. */
+function decodeCoroutines(blob: Uint8Array): SuspendedCoroutine[] {
+  if (blob.length < 4) return [];
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const count = dv.getUint32(0, true);
+  const cos: SuspendedCoroutine[] = [];
+  let off = 4;
+  for (let i = 0; i < count; i++) {
+    const id = dv.getUint32(off, true);
+    const started = dv.getUint32(off + 4, true) !== 0;
+    const r = decodeFrames(blob, dv, off + 8);
+    off = r.off;
+    cos.push({ id, started, frames: r.frames });
+  }
+  return cos;
 }
 
 /** Decode the static disassembly blob (see `buildDisasmBlob` in wasm_entry.zig):
@@ -566,6 +611,7 @@ function wrap(exports: MahinaExports): MahinaModule {
     const protoId = dv.getUint32(56, true);
     const pc = dv.getUint32(60, true);
     const stoppedAt = dv.getUint32(64, true);
+    const coroutines = decodeCoroutines(readBuf(exports.memory, dv, 68));
 
     exports.mahina_free_replay_result(resPtr);
 
@@ -583,6 +629,7 @@ function wrap(exports: MahinaExports): MahinaModule {
       protoId,
       pc,
       stoppedAt,
+      coroutines,
     };
   };
 

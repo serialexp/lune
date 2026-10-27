@@ -666,7 +666,34 @@ pub const FaultFrame = struct {
     line: u32 = 0,
     start: u32 = 0,
     end: u32 = 0,
+    /// A native-body coroutine's frame (doc 73): to Lua the native itself,
+    /// a C level with no location, named `module.name` (Lua's
+    /// pushglobalfuncname) when `module` is set.
+    native: bool = false,
+    module: []const u8 = "",
+    /// The `GcHeader.id` of the coroutine whose stack the frame is on, 0
+    /// for the main stack (id 0 is the globals table, never a coroutine).
+    thread: u32 = 0,
+
+    /// The `.` between `module` and `name`, if any.
+    pub fn dot(self: FaultFrame) []const u8 {
+        return if (self.module.len != 0) "." else "";
+    }
 };
+
+/// A suspended coroutine as the step debugger lists it
+/// (`Vm.suspendedCoroutines`): its `GcHeader.id`, whether it has started,
+/// and its call chain, deepest-first.
+pub const SuspendedCoroutine = struct {
+    id: u32,
+    started: bool,
+    frames: []FaultFrame,
+};
+
+/// Which stacks `Vm.backtraceFrames` walks: the running one, as Lua's
+/// tracebacks do, or on through the resumers stopped at their resumes
+/// (doc 73), as the step debugger shows the call chain.
+pub const BacktraceScope = enum { running, chain };
 
 /// A located, human-readable description of a runtime error — what
 /// `describeFault` synthesizes from the faulting frame. `start`/`end` are byte
@@ -2610,7 +2637,7 @@ pub const Vm = struct {
                 .line = if (cs) |c| c.line else 0,
                 .start = if (cs) |c| c.span.start else 0,
                 .end = if (cs) |c| c.span.end else 0,
-                .frames = try self.backtraceFrames(arena),
+                .frames = try self.backtraceFrames(arena, .running),
                 .self_located = true,
             };
         }
@@ -2721,7 +2748,7 @@ pub const Vm = struct {
             },
         };
 
-        const frames = try self.backtraceFrames(arena);
+        const frames = try self.backtraceFrames(arena, .running);
         return .{ .message = message, .chunk = proto.chunk, .proto_id = proto.id, .line = line, .start = span.start, .end = span.end, .frames = frames };
     }
 
@@ -2894,18 +2921,46 @@ pub const Vm = struct {
     /// call-site instruction is `pc -| 1` — unless it is in flight (doc 61 §4.2:
     /// a metamethod or a native's callback re-entered from inside its own
     /// instruction, which `pc` names). Shared by `describeFault` (runtime
-    /// errors) and the replay driver (per-step backtrace), so the leaf-vs-call-site
-    /// logic can never drift. `arena` owns the returned slice.
-    pub fn backtraceFrames(self: *Vm, arena: std.mem.Allocator) std.mem.Allocator.Error![]FaultFrame {
-        const frames = try arena.alloc(FaultFrame, self.depth);
-        var i: usize = self.depth;
-        while (i > 0) {
-            i -= 1;
-            const f = &self.frames[i];
+    /// errors), `debug.traceback` and the replay driver (per-step backtrace),
+    /// so the leaf-vs-call-site logic can never drift. With `.chain`, the
+    /// stacks of the running coroutine's resumers follow its own, each topped
+    /// by its resume's call. `arena` owns the returned slice.
+    pub fn backtraceFrames(self: *Vm, arena: std.mem.Allocator, scope: BacktraceScope) std.mem.Allocator.Error![]FaultFrame {
+        var n: usize = self.depth;
+        if (scope == .chain) {
+            var t = self.current;
+            while (t) |x| : (t = x.resumer) n += coroutine.savedOf(self, x.resumer).depth;
+        }
+        const frames = try arena.alloc(FaultFrame, n);
+        var at = self.contextFrames(frames, self.frames[0..self.depth], true, self.current);
+        if (scope == .chain) {
+            var t = self.current;
+            while (t) |x| : (t = x.resumer) {
+                const saved = coroutine.savedOf(self, x.resumer);
+                at += self.contextFrames(frames[at..], saved.frames[0..saved.depth], false, x.resumer);
+            }
+        }
+        std.debug.assert(at == n);
+        return frames;
+    }
+
+    /// `backtraceFrames` of one stack, `frames` (bottom first), into `out`,
+    /// deepest-first; the stack is `thread`'s (null = the main one), running
+    /// when `live`. Returns how many rows it wrote.
+    fn contextFrames(self: *const Vm, out: []FaultFrame, frames: []const CallFrame, live: bool, thread: ?*const coroutine.Thread) usize {
+        const tid: u32 = if (thread) |t| t.header.id else 0;
+        for (frames, 0..) |*f, i| {
             const fp = f.closure.proto;
-            const fpc: usize = if (i == self.depth - 1 or f.in_flight) f.pc else f.pc -| 1;
+            const row = &out[frames.len - 1 - i];
+            if (fp.id == coroutine.native_body_proto_id) {
+                // Only a coroutine's bottom frame runs it, for its body.
+                const nm = self.loadedNativeName(function.Native.fromHeader(thread.?.body.asHeap()));
+                row.* = .{ .name = nm.field, .module = nm.module, .chunk = "[C]", .proto_id = fp.id, .native = true, .thread = tid };
+                continue;
+            }
+            const fpc: usize = if ((live and i == frames.len - 1) or f.in_flight) f.pc else f.pc -| 1;
             const fspan: bytecode.Span = if (fpc < fp.spans.len) fp.spans[fpc] else .{};
-            frames[self.depth - 1 - i] = .{
+            row.* = .{
                 .name = fp.name,
                 .chunk = fp.chunk,
                 .main_chunk = fp.main_chunk,
@@ -2913,9 +2968,44 @@ pub const Vm = struct {
                 .line = fspan.line,
                 .start = fspan.start,
                 .end = fspan.end,
+                .thread = tid,
             };
         }
-        return frames;
+        return frames.len;
+    }
+
+    /// Doc 73: the suspended coroutines' call chains, for the step debugger,
+    /// oldest first: each stopped at its yield, or not yet started (`frames`
+    /// then holds its body alone, at its first instruction). The list may hold coroutines
+    /// no longer reachable that the next collection frees. A walk of the
+    /// heap, made once per replay step. `arena` owns the result.
+    pub fn suspendedCoroutines(self: *Vm, arena: std.mem.Allocator) std.mem.Allocator.Error![]SuspendedCoroutine {
+        var list: std.ArrayList(SuspendedCoroutine) = .empty;
+        var it = self.heap.objects;
+        while (it) |h| : (it = h.next) {
+            if (h.type != .thread) continue;
+            const t = coroutine.Thread.fromHeader(h);
+            if (t.status != .suspended or t.stack == null) continue;
+            const frames = try arena.alloc(FaultFrame, @max(t.saved.depth, 1));
+            if (t.saved.depth > 0) {
+                _ = self.contextFrames(frames, t.saved.frames[0..t.saved.depth], false, t);
+            } else if (t.body.heapType() == .native) {
+                const nm = self.loadedNativeName(function.Native.fromHeader(t.body.asHeap()));
+                frames[0] = .{ .name = nm.field, .module = nm.module, .chunk = "[C]", .native = true, .thread = h.id };
+            } else {
+                // Located at the body's first instruction.
+                const fp = Closure.fromHeader(t.body.asHeap()).proto;
+                const sp: bytecode.Span = if (fp.spans.len > 0) fp.spans[0] else .{};
+                frames[0] = .{ .name = fp.name, .chunk = fp.chunk, .main_chunk = fp.main_chunk, .proto_id = fp.id, .line = sp.line, .start = sp.start, .end = sp.end, .thread = h.id };
+            }
+            try list.append(arena, .{ .id = h.id, .started = t.saved.depth > 0, .frames = frames });
+        }
+        std.mem.sort(SuspendedCoroutine, list.items, {}, struct {
+            fn lt(_: void, a: SuspendedCoroutine, b: SuspendedCoroutine) bool {
+                return a.id < b.id;
+            }
+        }.lt);
+        return list.toOwnedSlice(arena);
     }
 
     /// Push a new activation onto the explicit call stack and make it the top
@@ -4475,7 +4565,8 @@ pub const Vm = struct {
                 self.leaveRunning(.suspended);
                 return n;
             },
-            // A suspend never stops a coroutine (`canSuspendHere`).
+            // A suspend waits out a Zig re-entry (`canSuspendHere`), and a
+            // resume from Zig runs inside one.
             .suspended => unreachable,
         }
     }
@@ -4548,11 +4639,13 @@ pub const Vm = struct {
     /// frame could not be resumed), nor while a multret result is pending
     /// (`reg_top_pending`: its producer and consumer are one step). A
     /// coroutine may stop (doc 73): its resumers are stopped at their
-    /// resumes, out of flight, and a keyframe carries them all. The replay
-    /// index records the same predicate per safepoint, so the steps it
-    /// offers are exactly the ones a replay stops at.
-    pub inline fn canSuspendHere(self: *const Vm) bool {
-        return self.native_reentry_depth == 0 and !self.reg_top_pending;
+    /// resumes, out of flight, and a keyframe carries them all. Not in a
+    /// native-body coroutine's frame, `proto` (doc 73): to Lua that is the
+    /// native running, with no instructions to step. The replay index
+    /// records the same predicate per safepoint, so the steps it offers are
+    /// exactly the ones a replay stops at.
+    pub inline fn canSuspendHere(self: *const Vm, proto: *const Proto) bool {
+        return self.native_reentry_depth == 0 and !self.reg_top_pending and proto.id != coroutine.native_body_proto_id;
     }
 
     /// Arm (or, with null, disarm) the mid-execution suspend trigger.
@@ -4949,7 +5042,7 @@ pub const Vm = struct {
                 self.safepoint_lines.append(self.gpa, .{
                     .proto_id = proto.id,
                     .line = sp_line,
-                    .stoppable = self.canSuspendHere(),
+                    .stoppable = self.canSuspendHere(proto),
                 }) catch |e| {
                     // Park at the instruction about to run, as step (4)
                     // does: step (6) has not stored it yet.
@@ -4972,7 +5065,7 @@ pub const Vm = struct {
                     self.committed_effect_seq >= n
                 else
                     true;
-                if (self.canSuspendHere() and effect_cut_reached and
+                if (self.canSuspendHere(st.proto) and effect_cut_reached and
                     self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth)
                 {
                     std.debug.assert(self.pending_error == null);
