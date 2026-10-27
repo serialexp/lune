@@ -59,7 +59,14 @@ DOC 73 COROUTINES: P0 + P1 + P3 DONE (2026-10-27, coral-marten); next P4 async.
   .native/.module for the native-body shim), Vm.suspendedCoroutines, wasm
   ReplayResult.coroutines (@68), frame records gained thread+flags. The
   shim is unstoppable (canSuspendHere(proto)).
-- Next: P4 async (doc 73 §7), then P5 docs.
+- P5 (coroutine docs) landed: doc 00/02 follow-up paragraphs (eab6a0c).
+- BLOCKED: P4 async waits on Bart. Doc 73 §7.1 lists A1 (what can be
+  awaited: tasks only / + host pendings with a CLI timer / + async I/O),
+  A2 (await in the main chunk), A3 (reserved vs contextual words), A4
+  (cancel, task.onerror, all/any). Also asked: tasks as a native heap
+  type vs a library written in mahina over coroutine.*. Asked twice via
+  ask on 2026-10-27, no answer; deliberately not defaulted, since they
+  shape the whole layer.
   P2 lead (deferred): co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
   t0 (yield made deep in recursion) — start with --jit-stats/--dump-aborts.
 - gmatch/codes lone iterators can now use bound natives (TODO.md).
