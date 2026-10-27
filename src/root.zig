@@ -57,6 +57,9 @@ pub const token = @import("token.zig");
 pub const lexer = @import("lexer.zig");
 pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
+/// Name resolution (doc 74 §6.3): the one scoping model the compiler and the
+/// language server share.
+pub const resolve = @import("resolve.zig");
 /// Doc 74: the language server (positions, JSON-RPC framing, the sans-IO core).
 pub const lsp = @import("lsp.zig");
 
@@ -184,6 +187,7 @@ test {
     _ = lexer;
     _ = ast;
     _ = parser;
+    _ = resolve;
     _ = lsp;
     _ = string;
     _ = array;
