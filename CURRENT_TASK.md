@@ -1,4 +1,4 @@
-DOC 73 COROUTINES: P0 + P1 + P3 + P4a + P4b DONE (2026-10-27, coral-marten); next P4c.
+DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT) deferred.
 - All questions decided. Bart accepted the frames-pointer cost; P0a landed
   (4e37dfd). The P0 runtime design is doc 73 §5.1 (stack = one allocation
   of tags+payloads+scratch+frames; active fields stay in Vm and are
@@ -82,9 +82,14 @@ DOC 73 COROUTINES: P0 + P1 + P3 + P4a + P4b DONE (2026-10-27, coral-marten); nex
 - The P4a commit (cfc70ab) broke `zig build lib -Doptimize=ReleaseFast`:
   only the safety block of offsets_x64.inc was updated. Fixed with P4b.
   Nothing in `just test` builds the release lib; bundle-smoke would.
-- Next, P4c (decided, doc 73 §7.4): sleep + file read/write in their own
-  module on a CLI worker-thread pool, completions as a logged effect
-  (effect format 8), the CLI's Vm.host_wait.
+- P4c landed (aedb39f, doc 73 §7.6): `aio.sleep/read/write/append`
+  (src/stdlib/aio.zig) over system.AsyncHost, installed by Vm.enableAio.
+  CLI host src/aio_host.zig (4 workers + timer heap; needs a thread-safe
+  gpa, so runSource takes thread_gpa); wasm host src/aio_virtual.zig
+  (Bart: virtual clock, sleeps only). Effect format 8 (aio_complete,
+  aio_result), snapshot 18 (aio_ops_id, aio_next_id). A/B vs HEAD:
+  ±0.03% except pcall_faults +0.12% (same with --system none; perf
+  shows inlining shifts in describeFault/bc_names, no new code path).
   P2 lead (deferred): co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
   t0 (yield made deep in recursion) — start with --jit-stats/--dump-aborts.
 - gmatch/codes lone iterators can now use bound natives (TODO.md).
