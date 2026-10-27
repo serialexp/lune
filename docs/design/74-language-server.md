@@ -110,6 +110,16 @@ land; move whole phases to Done once everything inside them is checked.
     still parses. The compiler treats error nodes as nothing / nil. The
     damaged-scope marking and the compile-after-error steps wait for the
     resolver (P1c) and P2.
+  - [x] P1c shared resolver (§6.3): `src/resolve.zig` (`Resolution`:
+    `bindings`, `occurrences` sorted by start, `bindingAt` /
+    `occurrenceAt` / `occurrenceCovering`; one hash probe per use through
+    shadow chains). The compiler consults it instead of matching names:
+    `Local` carries a `BindingId`, `declareLocal` takes the name token's
+    span, and `endScope` asserts the compiler's dynamic capture marking
+    equals the resolver's `captured`, so the two cannot drift. `builtin`
+    and `unresolved` binding kinds are not produced yet (P5 and P1d), and
+    `scope_end` is the end of the owning construct, since the AST does not
+    record a block's closing keyword.
   - [x] Wasm host: `mahina_lsp_open/send/tick/next_deadline/message_ptr/
     message_len/is_done/close` in `src/wasm_entry.zig` (message bodies, no
     framing; JS owns the debounce timer). `viz/test/lsp-wasm.test.ts`.
@@ -120,10 +130,6 @@ land; move whole phases to Done once everything inside them is checked.
   host's `cancelled` hook once per request; the phase-boundary checks
   (after parse, resolve, compile) and the newest-version atomic arrive with
   the analysis in P2, since there is nothing long-running to abandon yet.
-- [ ] **P1c — the shared resolver** (§6.3): `src/resolve.zig`, a pass over
-  the AST producing bindings and occurrences; the compiler reads its
-  results instead of resolving names itself; equivalence tests on the
-  whole test corpus.
 - [ ] **P1d — diagnostics model** (§6.4): codes and related spans on
   `Diagnostic`; message ownership (copied out of the compile arena);
   OOM reported as "analysis incomplete", not silently dropped; the
@@ -378,9 +384,9 @@ So scoping moves into **one pass**, `src/resolve.zig`, which walks the AST
 before code generation and produces:
 
 ```
-Binding    { id, kind: local|param|for_var|local_function|self|global|builtin|unresolved,
-             decl_span, visible_from, scope_span, captured: bool }
-Occurrence { span, binding: BindingId, access: read|write|read_write }
+Binding    { kind: local|param|self|for_var|local_function|global,
+             name, decl_span, visible_from, scope_end, func, captured: bool }
+Occurrence { span, binding: BindingId, access: declare|read|write|read_write }
 ```
 
 as flat arrays sorted by span start (lookups are a binary search; "all

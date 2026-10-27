@@ -3607,3 +3607,5 @@ test in `src/interp_phaseq_test.zig` and were dodged there, not fixed.
       `bad_type` at the `set_index` (op 40).** Seen as `hold[1] = nil` on a
       one-element `{ p }`, in a side recording. Storing nil (an array
       shrink / hole) seems to have no recorded store shape.
+
+- doc 74: `resolve.Binding.scope_end` is the end of the owning construct (an `if` branch ends at the next branch's condition), not the block's closing keyword, because `ast.Block` has no span. Completion at a new line just before `end` needs the real end: record each block's closing-token start in the parser (P3).

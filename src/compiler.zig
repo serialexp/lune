@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const resolve = @import("resolve.zig");
 const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
 const gc = @import("gc.zig");
@@ -119,6 +120,9 @@ pub fn compileWithOptions(
     const lines = try LineTable.build(gpa, source);
     defer lines.deinit(gpa);
 
+    var res = try resolve.resolve(gpa, root, @intCast(source.len));
+    defer res.deinit();
+
     var c = Compiler{
         .arena = arena.allocator(),
         .scratch = gpa,
@@ -127,6 +131,7 @@ pub fn compileWithOptions(
         .lines = &lines,
         .diags = diags,
         .globals_usage = &usage,
+        .res = &res,
         .is_vararg = opts.vararg_root,
     };
     defer c.deinitScratch();
@@ -292,7 +297,7 @@ const GlobalUsage = struct {
 };
 
 const Local = struct {
-    name: []const u8,
+    binding: resolve.BindingId,
     reg: u16,
     depth: u32,
     /// Set when an inner function captures this local as an upvalue: its cell
@@ -325,6 +330,9 @@ const Compiler = struct {
     /// root owns it (in `compileWithOptions`); nested functions inherit the same
     /// pointer (see `compileFunction`).
     globals_usage: *GlobalUsage,
+    /// Which declaration every name in the chunk refers to (`resolve.zig`).
+    /// Shared like `globals_usage`: the root owns it.
+    res: *const resolve.Resolution,
 
     /// The lexically-enclosing function being compiled, if this is a nested
     /// function body. Used to detect references to an outer function's locals
@@ -598,7 +606,11 @@ const Compiler = struct {
         var any_captured = false;
         while (n > 0 and self.locals.items[n - 1].depth > self.scope_depth) {
             n -= 1;
-            if (self.locals.items[n].captured) any_captured = true;
+            const local = self.locals.items[n];
+            // The resolver's whole-chunk answer and the capture marking done
+            // while compiling closures must agree: one scoping model.
+            std.debug.assert(local.captured == self.res.binding(local.binding).captured);
+            if (local.captured) any_captured = true;
             self.next_reg -= 1; // local registers are contiguous at the top
         }
         self.locals.items.len = n;
@@ -607,26 +619,37 @@ const Compiler = struct {
         if (any_captured) _ = try self.emit(Instr.opA(.close_upvalues, self.next_reg));
     }
 
-    fn declareLocal(self: *Compiler, name: []const u8, reg: u16) Error!void {
-        try self.locals.append(self.scratch, .{ .name = name, .reg = reg, .depth = self.scope_depth });
+    /// The binding of the name written at `span`. The resolver saw every
+    /// name token of the tree being compiled, so a miss is a compiler bug.
+    fn bindingAt(self: *const Compiler, span: ast.Span) resolve.BindingId {
+        return self.res.bindingAt(span.start) orelse @panic("resolver missed a name");
     }
 
-    fn resolveLocal(self: *Compiler, name: []const u8) ?u16 {
+    /// Declare the local the name token at `span` introduces, in `reg`.
+    fn declareLocal(self: *Compiler, span: ast.Span, reg: u16) Error!void {
+        const b = self.bindingAt(span);
+        try self.locals.append(self.scratch, .{ .binding = b, .reg = reg, .depth = self.scope_depth });
+    }
+
+    fn isGlobalBinding(self: *const Compiler, b: resolve.BindingId) bool {
+        return self.res.binding(b).kind == .global;
+    }
+
+    /// The register of binding `b` in this function, null for a global or a
+    /// binding of an enclosing function.
+    fn resolveLocal(self: *const Compiler, b: resolve.BindingId) ?u16 {
+        const slot = self.resolveLocalSlot(b) orelse return null;
+        return self.locals.items[slot].reg;
+    }
+
+    /// Index of the local for binding `b`, if this function has it (the slot,
+    /// not the register — so the caller can mark it captured).
+    fn resolveLocalSlot(self: *const Compiler, b: resolve.BindingId) ?usize {
+        if (self.isGlobalBinding(b)) return null;
         var i = self.locals.items.len;
         while (i > 0) {
             i -= 1;
-            if (std.mem.eql(u8, self.locals.items[i].name, name)) return self.locals.items[i].reg;
-        }
-        return null;
-    }
-
-    /// Index of the innermost local named `name`, if any (the slot, not the
-    /// register — so the caller can mark it captured).
-    fn resolveLocalSlot(self: *Compiler, name: []const u8) ?usize {
-        var i = self.locals.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (std.mem.eql(u8, self.locals.items[i].name, name)) return i;
+            if (self.locals.items[i].binding == b) return i;
         }
         return null;
     }
@@ -636,13 +659,14 @@ const Compiler = struct {
     /// of the immediate parent becomes a direct (`in_stack`) capture and marks
     /// that local for closing; a parent upvalue is inherited. Returns null if the
     /// name is not visible in any enclosing function (→ a global).
-    fn resolveUpvalue(self: *Compiler, name: []const u8) Error!?u16 {
+    fn resolveUpvalue(self: *Compiler, b: resolve.BindingId) Error!?u16 {
+        if (self.isGlobalBinding(b)) return null;
         const parent = self.parent orelse return null;
-        if (parent.resolveLocalSlot(name)) |slot| {
+        if (parent.resolveLocalSlot(b)) |slot| {
             parent.locals.items[slot].captured = true;
             return try self.addUpvalue(.{ .in_stack = true, .index = parent.locals.items[slot].reg });
         }
-        if (try parent.resolveUpvalue(name)) |up| {
+        if (try parent.resolveUpvalue(b)) |up| {
             return try self.addUpvalue(.{ .in_stack = false, .index = up });
         }
         return null;
@@ -664,12 +688,13 @@ const Compiler = struct {
 
     /// Load the value of `name` into `dest`: a local move, an upvalue read, or a
     /// global read (resolution order is local → upvalue → global).
-    fn loadName(self: *Compiler, name: []const u8, dest: u16, span: ast.Span) Error!void {
-        if (self.resolveLocal(name)) |r| {
+    fn loadName(self: *Compiler, b: resolve.BindingId, dest: u16, span: ast.Span) Error!void {
+        if (self.resolveLocal(b)) |r| {
             if (r != dest) _ = try self.emit(Instr.opAB(.move, dest, r));
-        } else if (try self.resolveUpvalue(name)) |up| {
+        } else if (try self.resolveUpvalue(b)) |up| {
             _ = try self.emit(Instr.opAB(.get_upval, dest, up));
         } else {
+            const name = self.res.binding(b).name;
             const k = try self.stringConstant(name);
             _ = try self.emit(Instr.opAB(.get_global, dest, k));
             // Record the read site for the unknown-global post-pass.
@@ -684,7 +709,7 @@ const Compiler = struct {
         var cur = e;
         while (cur.data == .paren) cur = cur.data.paren;
         return switch (cur.data) {
-            .name => |nm| self.resolveLocal(nm),
+            .name => self.resolveLocal(self.bindingAt(cur.span)),
             else => null,
         };
     }
@@ -753,13 +778,13 @@ const Compiler = struct {
 
     /// Store register `src` into `name`: a local move, an upvalue write, or a
     /// global write.
-    fn storeName(self: *Compiler, name: []const u8, src: u16, span: ast.Span) Error!void {
-        _ = span;
-        if (self.resolveLocal(name)) |r| {
+    fn storeName(self: *Compiler, b: resolve.BindingId, src: u16) Error!void {
+        if (self.resolveLocal(b)) |r| {
             if (r != src) _ = try self.emit(Instr.opAB(.move, r, src));
-        } else if (try self.resolveUpvalue(name)) |up| {
+        } else if (try self.resolveUpvalue(b)) |up| {
             _ = try self.emit(Instr.opAB(.set_upval, src, up));
         } else {
+            const name = self.res.binding(b).name;
             const k = try self.stringConstant(name);
             _ = try self.emit(Instr.opAB(.set_global, src, k));
             // Mark this global as defined-in-chunk so reads of it don't warn.
@@ -778,18 +803,8 @@ const Compiler = struct {
             },
             else => return,
         };
-        if (obj.data != .name or !std.mem.eql(u8, obj.data.name, "_G") or !self.isGlobal("_G")) return;
+        if (obj.data != .name or !std.mem.eql(u8, obj.data.name, "_G") or !self.isGlobalBinding(self.bindingAt(obj.span))) return;
         try self.globals_usage.writes.put(name, {});
-    }
-
-    /// Whether `name` here is a global: no local of this function or of an
-    /// enclosing one is in scope. Unlike `resolveUpvalue`, captures nothing.
-    fn isGlobal(self: *Compiler, name: []const u8) bool {
-        var c: ?*Compiler = self;
-        while (c) |cc| : (c = cc.parent) {
-            if (cc.resolveLocalSlot(name) != null) return false;
-        }
-        return true;
     }
 
     /// Emit a warning for every global *read* of a name that is never assigned
@@ -854,7 +869,7 @@ const Compiler = struct {
         // Declare names only after the RHS is evaluated (Lua scoping: `local x = x`
         // reads the outer `x`).
         for (l.names, 0..) |nm, j| {
-            try self.declareLocal(nm.name, @intCast(start + j));
+            try self.declareLocal(nm.name_span, @intCast(start + j));
         }
     }
 
@@ -888,7 +903,7 @@ const Compiler = struct {
     /// evaluated, and the span its store reports a fault at.
     const PreparedTarget = struct {
         place: union(enum) {
-            name: []const u8,
+            name: resolve.BindingId,
             index: struct { obj: u16, key: IndexKey },
             /// `obj[i][j]`, stored by one fused `set_index2` (see
             /// `compileStore`); the row `obj[i]` is looked up at the store.
@@ -903,7 +918,7 @@ const Compiler = struct {
     /// one would see the new value (Lua's `check_conflict` copies it too).
     fn prepareTarget(self: *Compiler, tgt: *const ast.Expr, later: []const *ast.Expr) Error!PreparedTarget {
         switch (tgt.data) {
-            .name => |nm| return .{ .place = .{ .name = nm }, .span = tgt.span },
+            .name => return .{ .place = .{ .name = self.bindingAt(tgt.span) }, .span = tgt.span },
             .field => |f| {
                 const obj = try self.prepareOperand(f.obj, later);
                 return .{
@@ -935,7 +950,7 @@ const Compiler = struct {
     fn prepareOperand(self: *Compiler, e: *const ast.Expr, later: []const *ast.Expr) Error!u16 {
         if (self.localRegOf(e)) |r| {
             for (later) |t| {
-                if (t.data == .name and self.resolveLocal(t.data.name) == r) {
+                if (t.data == .name and self.resolveLocal(self.bindingAt(t.span)) == r) {
                     const copy = try self.alloc1();
                     try self.compileExprTo(e, copy);
                     return copy;
@@ -948,7 +963,7 @@ const Compiler = struct {
     fn storePrepared(self: *Compiler, p: PreparedTarget, src: u16) Error!void {
         self.cur_span = p.span;
         switch (p.place) {
-            .name => |nm| try self.storeName(nm, src, p.span),
+            .name => |b| try self.storeName(b, src),
             .index => |ix| try self.emitSetIndex(ix.obj, ix.key, src),
             .index2 => |ix| _ = try self.emit(.{ .op = .set_index2, .a = ix.obj, .b = ix.key1, .c = ix.key2, .aux = @intCast(src) }),
         }
@@ -963,14 +978,15 @@ const Compiler = struct {
     /// register (`u = v`, `t.x = v` need no `move`).
     fn compileSingleAssign(self: *Compiler, tgt: *const ast.Expr, val: *const ast.Expr) Error!bool {
         switch (tgt.data) {
-            .name => |nm| {
-                if (self.resolveLocal(nm)) |r| {
+            .name => {
+                const b = self.bindingAt(tgt.span);
+                if (self.resolveLocal(b)) |r| {
                     if (!writesDestLast(val)) return false;
                     try self.compileExprTo(val, r);
                     return true;
                 }
                 const src = self.localRegOf(val) orelse return false;
-                try self.storeName(nm, src, tgt.span);
+                try self.storeName(b, src);
                 return true;
             },
             .field => |f| {
@@ -1000,8 +1016,9 @@ const Compiler = struct {
         try self.noteGlobalTableWrite(tgt);
         const op_span = ast.Span{ .start = tgt.span.start, .end = ca.value.span.end };
         switch (tgt.data) {
-            .name => |nm| {
-                if (self.resolveLocal(nm)) |r| {
+            .name => {
+                const b = self.bindingAt(tgt.span);
+                if (self.resolveLocal(b)) |r| {
                     // A local combines in place: `s += i` is `add s, s, i`.
                     // `s` is read where the value was before `value` ran
                     // unless `value` is inert.
@@ -1021,9 +1038,9 @@ const Compiler = struct {
                 // No side-effecting prefix: load current, combine, store back.
                 const m = self.next_reg;
                 const acc = try self.alloc1();
-                try self.loadName(nm, acc, tgt.span);
+                try self.loadName(b, acc, tgt.span);
                 try self.emitCompoundOp(ca.op, acc, ca.value, op_span);
-                try self.storeName(nm, acc, tgt.span);
+                try self.storeName(b, acc);
                 self.freeTo(m);
             },
             .field => |f| {
@@ -1209,7 +1226,7 @@ const Compiler = struct {
     /// Emit a store of register `src` into the assignable target `tgt`.
     fn compileStore(self: *Compiler, tgt: *const ast.Expr, src: u16) Error!void {
         switch (tgt.data) {
-            .name => |nm| try self.storeName(nm, src, tgt.span),
+            .name => try self.storeName(self.bindingAt(tgt.span), src),
             .field => |f| {
                 const m = self.next_reg;
                 const obj = try self.operandReg(f.obj);
@@ -1605,7 +1622,7 @@ const Compiler = struct {
         const loop_idx = self.loops.items.len - 1;
 
         self.beginScope();
-        try self.declareLocal(nf.name, @intCast(base + 3));
+        try self.declareLocal(nf.name_span, @intCast(base + 3));
         try self.compileBlock(nf.body);
         try self.endScope();
 
@@ -1653,8 +1670,7 @@ const Compiler = struct {
 
         self.beginScope();
         for (gf.names, 0..) |ident, i| {
-            const name = ident.text;
-            try self.declareLocal(name, @intCast(base + 3 + i));
+            try self.declareLocal(ident.span, @intCast(base + 3 + i));
         }
         try self.compileBlock(gf.body);
         try self.endScope();
@@ -1717,7 +1733,7 @@ const Compiler = struct {
                 const k = try self.stringConstant(bytes);
                 _ = try self.emit(Instr.opAB(.load_const, dest, k));
             },
-            .name => |nm| try self.loadName(nm, dest, e.span),
+            .name => try self.loadName(self.bindingAt(e.span), dest, e.span),
             .paren => |inner| try self.compileExprTo(inner, dest),
             .unary => |u| try self.compileUnary(u.op, u.operand, dest),
             .binary => |b| try self.compileBinary(b.op, b.lhs, b.rhs, dest),
@@ -1974,6 +1990,7 @@ const Compiler = struct {
             .lines = self.lines,
             .diags = self.diags,
             .globals_usage = self.globals_usage,
+            .res = self.res,
             .parent = self,
         };
         defer child.deinitScratch();
@@ -1981,7 +1998,7 @@ const Compiler = struct {
         // Parameters occupy the first registers, in order.
         for (body.params, 0..) |p, i| {
             _ = try child.alloc1();
-            try child.declareLocal(p.name, @intCast(i));
+            try child.declareLocal(p.name_span, @intCast(i));
         }
         child.num_params = @intCast(body.params.len);
         child.is_vararg = body.is_vararg;
@@ -2054,7 +2071,7 @@ const Compiler = struct {
     /// refer to `f` (recursion), capturing it as an upvalue.
     fn compileLocalFunction(self: *Compiler, lf: anytype) Error!void {
         const r = try self.alloc1();
-        try self.declareLocal(lf.name, r); // visible inside its own body
+        try self.declareLocal(lf.name_span, r); // visible inside its own body
         try self.compileFunction(lf.body, lf.name, r);
     }
 
@@ -2179,7 +2196,7 @@ const Compiler = struct {
             const mark = self.next_reg;
             const fnr = try self.alloc1();
             try self.compileFunction(fd.body, path[0].text, fnr);
-            try self.storeName(path[0].text, fnr, fd.body.span);
+            try self.storeName(self.bindingAt(path[0].span), fnr);
             self.freeTo(mark);
             return;
         }
@@ -2188,7 +2205,7 @@ const Compiler = struct {
         // `set_index` the final key.
         const mark = self.next_reg;
         const objr = try self.alloc1();
-        try self.loadName(path[0].text, objr, fd.body.span);
+        try self.loadName(self.bindingAt(path[0].span), objr, path[0].span);
 
         const final_count = if (method != null) path.len else path.len - 1;
         var i: usize = 1;
