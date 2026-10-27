@@ -349,6 +349,10 @@ const Compiler = struct {
     line_memo_start: u32 = std.math.maxInt(u32),
     line_memo: u32 = 0,
     constants: std.ArrayList(Value) = .empty,
+    /// Pool slot of each constant, keyed by exact identity (`ConstKey`), so
+    /// `addConstant` dedups in O(1) instead of scanning `constants`. Scratch
+    /// memory: the pool itself is arena-owned and outlives this.
+    const_index: std.AutoHashMapUnmanaged(ConstKey, u16) = .empty,
     locals: std.ArrayList(Local) = .empty,
     loops: std.ArrayList(Loop) = .empty,
     /// Nested function prototypes compiled within this function (arena-owned),
@@ -368,6 +372,7 @@ const Compiler = struct {
     max_reg: u16 = 0,
 
     fn deinitScratch(self: *Compiler) void {
+        self.const_index.deinit(self.scratch);
         self.locals.deinit(self.scratch);
         for (self.loops.items) |*lp| lp.breaks.deinit(self.scratch);
         self.loops.deinit(self.scratch);
@@ -458,15 +463,16 @@ const Compiler = struct {
     /// Append a constant (deduplicated by *exact* identity — not `Value.eql`,
     /// which would conflate `1` and `1.0` into one pool slot).
     fn addConstant(self: *Compiler, v: Value) Error!u16 {
-        for (self.constants.items, 0..) |existing, i| {
-            if (sameConstant(existing, v)) return @intCast(i);
-        }
+        const slot = try self.const_index.getOrPut(self.scratch, ConstKey.of(v));
+        if (slot.found_existing) return slot.value_ptr.*;
         const idx = self.constants.items.len;
         if (idx > std.math.maxInt(u16)) {
+            _ = self.const_index.remove(slot.key_ptr.*);
             self.diags.err("too many constants", 0, 0, 0);
             return Error.CompileError;
         }
         try self.constants.append(self.arena, v);
+        slot.value_ptr.* = @intCast(idx);
         return @intCast(idx);
     }
 
@@ -2347,16 +2353,28 @@ const Compiler = struct {
 
 /// Exact constant identity (tag + bit pattern), so `1` and `1.0` stay distinct
 /// pool entries and a `load_const` always reads the literal it was compiled for.
-fn sameConstant(a: Value, b: Value) bool {
-    if (a.tag != b.tag) return false;
-    return switch (a.tag) {
-        .nil => true,
-        .boolean, .int, .float => a.payload.bits == b.payload.bits,
-        .heap_ref => a.payload.ptr == b.payload.ptr,
-        // A grid row handle is a runtime transient, never a compiled constant.
-        .row_view => unreachable,
-    };
-}
+/// A constant's identity for pool dedup: its tag and exact payload bits (a
+/// heap constant by address — interning makes equal strings one object). Not
+/// `Value.eql`, which would conflate `1` and `1.0`.
+const ConstKey = struct {
+    tag: value.Tag,
+    bits: u64,
+
+    fn of(v: Value) ConstKey {
+        return .{
+            .tag = v.tag,
+            .bits = switch (v.tag) {
+                .nil => 0,
+                .boolean, .int, .float => v.payload.bits,
+                // Through the pointer, not `bits`: on a 32-bit target the
+                // upper half of the payload is not defined by a pointer store.
+                .heap_ref => @intFromPtr(v.payload.ptr),
+                // A grid row handle is a runtime transient, never a compiled constant.
+                .row_view => unreachable,
+            },
+        };
+    }
+};
 
 fn binOpCode(op: ast.BinaryOp) OpCode {
     return switch (op) {
@@ -3621,4 +3639,70 @@ test "unknown global: a forward reference to a later global function does NOT wa
         \\end
         \\
     , &.{}, Probe.check);
+}
+
+test "constant pool: exact-identity dedup, 1 and 1.0 stay distinct" {
+    var r = try run(
+        \\g = 5
+        \\local x = g
+        \\return x + 100000 + 100000.0 + 100000 + 2.5 + 2.5 + g
+    );
+    defer r.deinit();
+    const ks = r.chunk.proto.constants;
+    var ints: usize = 0;
+    var floats_one: usize = 0;
+    var floats_25: usize = 0;
+    var strs: usize = 0;
+    for (ks) |k| {
+        if (k.isHeap()) strs += 1;
+        if (k.tag == .int and k.asInt() == 100000) ints += 1;
+        if (k.tag == .float and k.asFloat() == 100000.0) floats_one += 1;
+        if (k.tag == .float and k.asFloat() == 2.5) floats_25 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), ints);
+    try testing.expectEqual(@as(usize, 1), floats_one);
+    try testing.expectEqual(@as(usize, 1), floats_25);
+    try testing.expectEqual(@as(usize, 1), strs);
+}
+
+test "constant pool: many distinct constants fill the pool exactly, the next is refused" {
+    // 65536 slots are addressable (u16); the 65537th distinct constant is the
+    // "too many constants" error. Counts, not time (Rule 22).
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "local t = {");
+    var i: usize = 0;
+    while (i < 65536) : (i += 1) {
+        const piece = try std.fmt.allocPrint(testing.allocator, "{d}.5,", .{i});
+        defer testing.allocator.free(piece);
+        try src.appendSlice(testing.allocator, piece);
+    }
+    try src.appendSlice(testing.allocator, "}\n");
+    const z = try testing.allocator.dupeSentinel(u8, src.items, 0);
+    defer testing.allocator.free(z);
+
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, z, &diags);
+    defer tree.deinit();
+    var vm = try interp.Vm.init(testing.allocator);
+    defer vm.deinit();
+    var chunk = try compile(testing.allocator, vm.heap, z, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    try testing.expectEqual(@as(usize, 65536), chunk.proto.constants.len);
+
+    // One more distinct constant overflows the pool.
+    var more: std.ArrayList(u8) = .empty;
+    defer more.deinit(testing.allocator);
+    try more.appendSlice(testing.allocator, src.items[0 .. src.items.len - 2]);
+    try more.appendSlice(testing.allocator, "0.25}\n");
+    const z2 = try testing.allocator.dupeSentinel(u8, more.items, 0);
+    defer testing.allocator.free(z2);
+    var diags2 = Diagnostics.init(testing.allocator);
+    defer diags2.deinit();
+    var tree2 = try parser.parse(testing.allocator, z2, &diags2);
+    defer tree2.deinit();
+    try testing.expectError(Error.CompileError, compile(testing.allocator, vm.heap, z2, tree2.root, &diags2));
+    try testing.expect(diags2.hasErrors());
 }

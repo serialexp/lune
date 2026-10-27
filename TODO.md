@@ -2,16 +2,6 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## Compiler constant dedup is quadratic (noted 2026-10-27)
-
-- [ ] `Compiler.addConstant` (`src/compiler.zig:454`) dedups by scanning the
-      whole constant pool linearly, so a function with N distinct constants
-      costs O(N²) to compile (capped at 65536 constants per proto). Found in
-      the Codex review of doc 74 (the LSP re-compiles on every edit, §9);
-      it also hits every ordinary `load`/`require`. Fix: a per-proto hash
-      map keyed by exact constant identity (`sameConstant` semantics, so
-      `1` and `1.0` stay distinct), plus a large-constant-pool benchmark.
-
 ## Small library-message divergences from Lua 5.4.6 (noted 2026-10-27)
 
 - [ ] `file:seek("bogus")` and `file:setvbuf("bogus")` say `invalid option`;

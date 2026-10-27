@@ -59,13 +59,16 @@ land; move whole phases to Done once everything inside them is checked.
   P6 includes a small one for the subset the config uses.
 - [x] **Q12 — the §9 budget**: confirmed by Bart 2026-10-27 (≤ 10 ms at
   10k lines, ≤ 100 ms at 100k lines).
+- [x] **Prerequisite — constant dedup was quadratic** (§9): 2026-10-27.
+  `Compiler.addConstant` now looks the pool slot up in a per-compiler hash
+  map keyed by exact identity (`ConstKey`: tag + payload bits, heap
+  constants by address), so `1` and `1.0` stay distinct and the pool order
+  is unchanged. Tests: exact-identity dedup, and a 65 536-constant pool
+  that fills exactly with the 65 537th refused. The scaling measurement
+  belongs to the P2 bench's 60k-distinct-constants file.
 
 ### Outstanding
 
-- [ ] **Prerequisite — constant dedup is quadratic** (§9, `TODO.md`):
-  `Compiler.addConstant` (`src/compiler.zig:454`) scans the pool per
-  constant. Fix with an identity-keyed map before the P2 benchmark can
-  meet budget.
 - [ ] **P0 — transport, lifecycle, snapshots** (§5): the sans-IO server
   core (`src/lsp/server.zig`: message in, messages out, host-driven timers
   and cancellation), `src/lsp/jsonrpc.zig` framing with limits, the stdio
