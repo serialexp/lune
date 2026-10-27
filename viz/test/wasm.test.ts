@@ -574,3 +574,32 @@ test("replay in coroutines: the chain crosses resumes, and suspended coroutines 
   }
   expect(nested && native && listed).toBe(true);
 });
+
+test("async functions: tasks run in the browser build, and a step inside one shows the library as natives", () => {
+  const src = [
+    "local async function add(a, b)",
+    "  local s = a + b",
+    "  return s",
+    "end",
+    "print(await add(1, 2), await 5)",
+  ].join("\n") + "\n";
+  const run = mod.runSource(src);
+  expect(run.status).toBe(0);
+  expect(run.stdout).toBe("3\t5\n");
+  let inTask = false;
+  for (let k = 1; k <= run.safepointCount; k++) {
+    if (run.safepointStoppable[k - 1] !== 1) continue;
+    const step = mod.replay(src, run.effects, k);
+    expect(step.finished).toBe(false);
+    const bt = step.backtrace;
+    // No step stops in the task library.
+    expect(bt[0].native).toBe(false);
+    if (bt[0].name === "add" && bt[0].line === 2) {
+      inTask = true;
+      expect(bt[0].thread).not.toBe(0);
+      expect(bt.filter((f) => f.native).map((f) => f.name)).toEqual(["task.step", "task.spawn"]);
+      expect(bt[bt.length - 1].name).toBe("main");
+    }
+  }
+  expect(inTask).toBe(true);
+});

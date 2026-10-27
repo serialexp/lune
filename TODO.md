@@ -41,6 +41,11 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       only; Windows keeps a pooled block's touched pages until the pool
       frees it (`VirtualAlloc(MEM_RESET)` or `DiscardVirtualMemory` would
       be the equivalent, behind the same wrapper, Rule Z-2).
+- [ ] Doc 73 §7: the trace recorder doesn't know `intrinsic`
+      (`nyi_opcode`), so a loop that calls an async function or uses
+      `await` never traces in its own frame. The op loads a VM-lifetime
+      closure, so it could record as a constant. Deferred with the rest of
+      coroutine performance (Bart, 2026-10-27).
 - [ ] A live coroutine commits at least one page in each of its four
       regions (scratch, payloads, tags, frames): ~16 KiB each, so
       `co_many` (10k live) holds 164 MB where LuaJIT holds 7.6 MB.

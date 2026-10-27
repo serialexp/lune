@@ -177,6 +177,8 @@ const Parser = struct {
                 .keyword_repeat,
                 .keyword_for,
                 .keyword_function,
+                .keyword_async,
+                .keyword_await,
                 .keyword_do,
                 .keyword_return,
                 .keyword_break,
@@ -197,7 +199,22 @@ const Parser = struct {
             .keyword_repeat => self.parseRepeat(),
             .keyword_for => self.parseFor(),
             .keyword_do => self.parseDo(),
-            .keyword_function => self.parseFunctionDecl(),
+            .keyword_function => self.parseFunctionDecl(false),
+            .keyword_async => blk: {
+                // Doc 73 §7: `async function a.b:c(...) ... end`.
+                const start = self.advance().start;
+                if (!self.check(.keyword_function)) break :blk self.fail("expected 'function' after 'async'");
+                var s = try self.parseFunctionDecl(true);
+                s.span.start = start;
+                break :blk s;
+            },
+            // Doc 73 §7: `await e` is a call, so it is a statement too.
+            .keyword_await => blk: {
+                const start = self.current().start;
+                const e = try self.parseExpr(0);
+                if (!e.isCall()) break :blk self.fail("expected a statement (assignment or call)");
+                break :blk Stmt{ .span = self.spanFrom(start), .data = .{ .call = e } };
+            },
             .keyword_break => blk: {
                 const t = self.advance();
                 break :blk Stmt{ .span = .{ .start = t.start, .end = t.end }, .data = .break_ };
@@ -209,9 +226,12 @@ const Parser = struct {
     fn parseLocal(self: *Parser) Error!Stmt {
         const start = self.advance().start; // 'local'
 
+        const is_async = self.match(.keyword_async);
+        if (is_async and !self.check(.keyword_function)) return self.fail("expected 'function' after 'async'");
         if (self.match(.keyword_function)) {
             const name_tok = try self.expect(.identifier, "expected function name");
             const body = try self.parseFunctionBody();
+            body.is_async = is_async;
             return .{
                 .span = self.spanFrom(start),
                 .data = .{ .local_function = .{ .name = name_tok.lexeme(self.source), .body = body } },
@@ -399,7 +419,7 @@ const Parser = struct {
         return .{ .span = self.spanFrom(start), .data = .{ .do = body } };
     }
 
-    fn parseFunctionDecl(self: *Parser) Error!Stmt {
+    fn parseFunctionDecl(self: *Parser, is_async: bool) Error!Stmt {
         const start = self.advance().start; // 'function'
         var path: std.ArrayList([]const u8) = .empty;
         const first = try self.expect(.identifier, "expected function name");
@@ -415,6 +435,7 @@ const Parser = struct {
         }
 
         const body = try self.parseFunctionBody();
+        body.is_async = is_async;
         // A method `a:m` gets an implicit leading `self` parameter.
         const final_body = if (method != null) try self.prependSelf(body) else body;
 
@@ -589,6 +610,18 @@ const Parser = struct {
                 .{ .unary = .{ .op = op, .operand = operand } },
             );
         }
+        if (t.tag == .keyword_await) {
+            // Doc 73 §7: `await e` binds as a unary operator and is the call
+            // `task_await(e)`, so it is a statement and yields what the
+            // task returned, as many values as a call.
+            _ = self.advance();
+            const operand = try self.parseExpr(unary_bp);
+            const span: ast.Span = .{ .start = t.start, .end = operand.span.end };
+            const callee = try self.newExpr(.{ .start = t.start, .end = t.end }, .{ .intrinsic = .task_await });
+            const args = try self.arena.alloc(*Expr, 1);
+            args[0] = operand;
+            return self.newExpr(span, .{ .call = .{ .callee = callee, .args = args } });
+        }
         return self.parseSuffixed();
     }
 
@@ -696,6 +729,14 @@ const Parser = struct {
                 _ = self.advance();
                 const body = try self.parseFunctionBody();
                 return self.newExpr(body.span, .{ .function = body });
+            },
+            .keyword_async => {
+                _ = self.advance();
+                if (!self.check(.keyword_function)) return self.fail("expected 'function' after 'async'");
+                _ = self.advance();
+                const body = try self.parseFunctionBody();
+                body.is_async = true;
+                return self.newExpr(.{ .start = t.start, .end = body.span.end }, .{ .function = body });
             },
             else => return self.fail("expected an expression"),
         }
@@ -914,6 +955,39 @@ test "hex int wraps, big decimal promotes to float" {
     const vals = tree.root[0].data.local.values;
     try testing.expectEqual(@as(i64, -1), vals[0].data.int); // wrapped
     try testing.expect(vals[1].data == .float); // promoted
+}
+
+test "doc 73 §7: async marks function bodies, and await is a call of the await intrinsic" {
+    var tree = try parseOk(
+        \\async function a.b:c(x) end
+        \\local async function f(...) end
+        \\local g = async function() end
+        \\await f(1)
+        \\local v = await g() + 1
+    );
+    defer tree.deinit();
+    const decl = tree.root[0].data.function_decl;
+    try testing.expect(decl.body.is_async);
+    try testing.expectEqualStrings("self", decl.body.params[0].name);
+    try testing.expect(tree.root[1].data.local_function.body.is_async);
+    try testing.expect(tree.root[2].data.local.values[0].data.function.is_async);
+    const stmt = tree.root[3].data.call.data.call;
+    try testing.expectEqual(ast.Intrinsic.task_await, stmt.callee.data.intrinsic);
+    try testing.expect(stmt.args[0].data == .call);
+    // `await` binds as a unary operator: `(await g()) + 1`.
+    const sum = tree.root[4].data.local.values[0].data.binary;
+    try testing.expectEqual(ast.BinaryOp.add, sum.op);
+    try testing.expectEqual(ast.Intrinsic.task_await, sum.lhs.data.call.callee.data.intrinsic);
+}
+
+test "doc 73 §7: async and await are reserved, and async takes a function" {
+    for ([_][:0]const u8{ "local async = 1", "local t = { await = 1 }.await", "await = 2", "async local x = 1", "local async x = 1", "local f = async 1", "await x + 1" }) |src| {
+        var diags = Diagnostics.init(testing.allocator);
+        defer diags.deinit();
+        var tree = try parse(testing.allocator, src, &diags);
+        defer tree.deinit();
+        try testing.expect(diags.hasErrors());
+    }
 }
 
 test "error recovery: bad statement, then a good one" {

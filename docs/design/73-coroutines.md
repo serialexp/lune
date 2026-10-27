@@ -1,9 +1,10 @@
 # 73 — Coroutines, and async on top of them — Design
 
-Status: partial — P0, P1 and P3 landed (resume/yield on separate stacks,
-stops and keyframes inside coroutines, the whole library including `wrap`
-and native bodies, the stack pool and its GC weight, coroutines in the
-step debugger); JIT and async outstanding.
+Status: partial — P0, P1, P3 and P4a landed (resume/yield on separate
+stacks, stops and keyframes inside coroutines, the whole library including
+`wrap` and native bodies, the stack pool and its GC weight, coroutines in
+the step debugger, `async function`/`await` over a task library); the JIT
+boundary and async's host pendings (P4b/P4c) outstanding.
 Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-27
@@ -138,6 +139,15 @@ land; move whole phases to Done once everything inside them is checked.
   `describeFault` and `debug.traceback` stay on the running stack, as
   Lua's tracebacks do. Tests: a Zig replay test over every stop of a
   nested program, a wasm test, `chainSegments`.
+- [x] **P4 decisions — §7.1 A1–A4**: decided 2026-10-27 (§7.2).
+- [x] **P4a — `async function`, `await` and the task library** (§7.3):
+  reserved words, the `intrinsic` op, `stdlib/task.lua` loaded on first
+  use, the drain after the main chunk as the main stack's bottom frame,
+  snapshot format 17 (`task_lib_id`); tests on every leg
+  (`interp_task_test.zig`), every keyframe cut through waiting tasks and
+  the drain, a replay step in a drained task, and the parser's.
+- [x] **P5 (async, P4a part) — docs**: `docs/differences-from-lua.md`
+  (the reserved words and the syntax), the viz editor's keywords.
 - [x] **P5 (coroutines) — docs and inventory**: the inventory rows and
   `docs/differences-from-lua.md` track the library; doc 00's Non-goal,
   its decision row and guiding principles, and doc 02's Non-goal and
@@ -152,14 +162,20 @@ land; move whole phases to Done once everything inside them is checked.
   coroutine body run as usual. Evidence from the first board: with the yield
   made 20 or 150 calls deep, `--jit-native` is 3.2–3.6× slower than t0
   (302.7 vs 95.7 ms, 2193.7 vs 610.4 ms) at ~41–46% residency.
-- [ ] **P4 — the async layer** (§7): `async function` / `await`, the
-  host-owned scheduler with logged choices, unobserved-error handling.
-- [ ] **P4 decisions — §7.1 A1–A4** (what can be awaited, `await` in the
-  main chunk, reserved or contextual words, the task library's extras):
-  asked 2026-10-27, unanswered so far. P4 waits on them.
-- [ ] **P5 — docs for the async layer**: its inventory rows, its
-  `docs/differences-from-lua.md` entry (new syntax), and doc 59's C API
-  section if A1 adds host pendings.
+- [ ] **P4b — host pendings** (§7.2, §7.3): the C API over the library's
+  `pending`/`settle`, the completion as a logged effect (effect format 8),
+  and a drain that waits for the host while operations are in flight
+  (today tasks still waiting when the queue empties are dropped). The C
+  API needs its own way to run the drain: it enters guest code through
+  `callValue`, not `Vm.exec`, so an embedder's ready tasks don't run
+  yet.
+- [ ] **P4c — async copies of the blocking functions** (§7.2 A1): which
+  functions, and their names, to decide with Bart.
+- [ ] **P5 — docs for the async layer, remainder**: doc 59's C API section
+  for P4b's host pendings.
+- [ ] **Traces over `intrinsic`**: the recorder doesn't know the op
+  (`nyi_opcode`), so a loop that calls an async function or awaits never
+  traces in its own frame. Performance work, deferred with P2 (TODO.md).
 
 ## 1. Why this exists
 
@@ -527,6 +543,68 @@ Open:
   unobserved-error handler (`task.onerror(h)` in the language, or only a C
   API hook), and combinators (`task.all`, `task.any`), which a program
   can also write itself.
+
+### 7.2 Decisions on §7.1 (Bart, 2026-10-27)
+
+- **A1:** awaiting something outside the VM needs async copies of the
+  library functions that block; a task waits on those. So a host pending
+  (a value a host function completes later, its completion order the
+  logged effect) is the primitive under them.
+- **A2:** `await` works anywhere once the VM runs, not only in async
+  functions or the main chunk (an ES-module top-level await would come
+  to the same thing later). In a task's own coroutine it suspends the
+  task; anywhere else it runs the scheduler until what it awaits settles.
+- **A3:** `async` and `await` are reserved words.
+- **A4:** no extras in v1 (no cancellation, no `task.onerror`, no
+  combinators); a follow-up.
+- **Tasks:** a library written in mahina over `coroutine.*`, tasks as
+  tables; made native only if measurement shows a significant speedup.
+
+Phasing: **P4a** syntax, the task library and its scheduler (tasks wait
+only on tasks); **P4b** host pendings (the C API and the effect); **P4c**
+the async copies of the blocking functions.
+
+### 7.3 P4a as built (2026-10-27)
+
+- **Syntax.** `async function` (statement, `local`, expression) sets
+  `ast.FunctionBody.is_async`; `await e` parses at unary precedence into
+  the call `intrinsic(task_await)(e)`, so it gives a call's values and is
+  a statement too. The compiler turns an async body into
+  `function(...) return intrinsic(task_spawn)(function(params) body end, ...) end`,
+  the inner function keeping the declared name for backtraces.
+- **`intrinsic a, b`** (new op): `R[a]` = the task library's function `b`
+  (`ast.Intrinsic`). A program can't rebind what it names, as it could a
+  global.
+- **The library** is `src/stdlib/task.lua`, compiled the first time an
+  `intrinsic` runs, through `load`'s path into `loaded_chunks` (so a
+  restore recompiles it), and called with fresh copies of the natives it
+  uses. Its protos are flagged `Proto.system`: no replay step stops in
+  them, and a backtrace shows each frame as a native row
+  (`[C]: in function 'task.wait'`). It returns
+  `{spawn, wait, drain, pending, settle}`, held in `Vm.task_lib`, a VM
+  root and the keyframe's `task_lib_id` (format 17); a restore re-flags
+  the chunk's protos.
+- **Tasks** are tables marked by a private key, each running its function
+  in a coroutine of its own that yields only from `await`. A task's own
+  `coroutine.yield` is an error ("attempt to yield from outside a
+  coroutine"), the task's coroutine being the library's. `await` in the
+  task's own coroutine suspends it on what it awaits; anywhere else
+  (the main chunk, a plain function, a coroutine inside a task) it runs
+  ready tasks in place until what it awaits settles, and an empty queue
+  then is a deadlock error (after an unobserved failure, which goes
+  first). A task can't await itself. Waiters wake first in, first out.
+- **The drain.** When the main chunk returns in a VM that loaded the
+  library, `Vm.exec` runs the library's drain as the main stack's bottom
+  frame, so a step debugger stops in the tasks it runs and a keyframe
+  can be cut in it. Drain takes the main chunk's results packed in a
+  table and returns them. After the ready tasks it raises the first
+  unobserved failure ("unobserved task error: " before a string); tasks
+  still waiting are dropped, until P4b gives them something to wait for.
+- **What waits, in P4a.** Nothing a program calls can be pending yet, so
+  a task only waits on a task that is itself waiting: in practice every
+  P4a program runs synchronously. `pending()` / `settle(op, ok, ...)` are
+  the host's half (P4b's foundation) and the tests' stand-in for a host,
+  not reachable from a program.
 
 ## 8. Open questions for review
 

@@ -80,6 +80,15 @@ pub const RefRun = struct {
 };
 
 pub fn referenceRun(gpa: std.mem.Allocator, source: [:0]const u8) !RefRun {
+    return referenceRunWith(gpa, source, null);
+}
+
+/// Prepares a VM for a program before it starts (`referenceRunWith`):
+/// installs globals the program uses, given its compiled root.
+pub const Setup = *const fn (*Vm, *const bytecode.Proto) anyerror!void;
+
+/// `referenceRun` with `setup` run on the VM before the program starts.
+pub fn referenceRunWith(gpa: std.mem.Allocator, source: [:0]const u8, setup: ?Setup) !RefRun {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
     var tree = try mahina_parser.parse(gpa, source, &diags);
@@ -94,6 +103,7 @@ pub fn referenceRun(gpa: std.mem.Allocator, source: [:0]const u8) !RefRun {
     var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
+    if (setup) |s| try s(&vm, chunk.proto);
 
     _ = try vm.run(chunk.proto);
 

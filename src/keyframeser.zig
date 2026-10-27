@@ -129,7 +129,10 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v16 (doc 73): `coroutine.wrap`. `HeapNative` gained `bound`, the values
 /// bound to the native (a wrap function's coroutine), and `HeapThread`
 /// `wrapped`, set while its resume is a wrap function's call.
-pub const snapshot_format_version: u32 = 16;
+///
+/// v17 (doc 73 §7): `Keyframe.task_lib_id`, the task library's function
+/// table, a VM-level root (1-based optional id).
+pub const snapshot_format_version: u32 = 17;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -557,6 +560,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             .loaded_chunks = loaded,
             .current_id = if (vm.current) |t| t.header.id + 1 else 0,
             .main_context = main_context,
+            .task_lib_id = if (vm.task_lib) |t| t.header.id + 1 else 0,
         },
     };
     return file.encode(gpa);
@@ -608,6 +612,7 @@ pub const RestoreError = error{
     InvalidRehashThreshold, // a table's rehash trigger is below 4 or past usize
     InvalidFile, // a file handle's kind or mode byte is not one the encoder writes, or it has more than one fingerprint
     FileRootNotAFile, // io_input_id / io_output_id resolves to a non-file object
+    InvalidTaskLib, // task_lib_id resolves to something other than a table whose first entry is a closure of a loaded chunk
     NextFileIdBelowFiles, // next_file_id is at or below a restored file's id, or below the standard streams' 3
     InvalidThread, // a coroutine record no capture writes: an unknown kind or status, a stack that doesn't match the status, a running coroutine or a resumer (v13 captures only with none running), a second main thread, a non-function body
     UpvalueOpenTwice, // an open upvalue cell appears in two open lists
@@ -1399,6 +1404,19 @@ pub fn restoreSnapshot(
     }
     vm.io_input = try fileRoot(&idmap, kf.io_input_id);
     vm.io_output = try fileRoot(&idmap, kf.io_output_id);
+
+    // Doc 73 §7: the task library, whose chunk the recompile made a plain
+    // loaded one: flag its protos the VM's own again.
+    if (kf.task_lib_id != 0) {
+        const th = idmap.get(kf.task_lib_id - 1) orelse return error.UnresolvedHeapRef;
+        if (th.type != .table) return error.InvalidTaskLib;
+        const lib = table.Table.fromHeader(th);
+        const spawn = lib.get(Value.int(1));
+        if (!spawn.isHeap() or spawn.heapType() != .function) return error.InvalidTaskLib;
+        const at = vm.loadedChunkIndexOf(function.Closure.fromHeader(spawn.asHeap()).proto.id) orelse return error.InvalidTaskLib;
+        Vm.markSystem(@constCast(vm.loaded_chunks.items[at].chunk.proto));
+        vm.task_lib = lib;
+    }
 
     return vm;
 }

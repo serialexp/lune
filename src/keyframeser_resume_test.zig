@@ -66,6 +66,12 @@ const SuspendCtl = interp.SuspendCtl;
 ///   (d) the resumed final-state snapshot `== Sf`  (state equivalence).
 /// Returns the mid snapshot bytes (caller owns) so determinism can be cross-checked.
 fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, ref: RefRun) ![]u8 {
+    return expectResumeWith(gpa, source, ctl, ref, null);
+}
+
+/// `expectResume` with `setup` run on the VM before the program starts, as
+/// `util.referenceRunWith` ran it for `ref`.
+fn expectResumeWith(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, ref: RefRun, setup: ?util.Setup) ![]u8 {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
     var tree = try mahina_parser.parse(gpa, source, &diags);
@@ -80,6 +86,7 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
     var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
+    if (setup) |s| try s(&vm, chunk.proto);
 
     vm.setSuspendCtl(ctl);
     try testing.expect((try vm.start(chunk.proto)) == .suspended); // (a)
@@ -622,6 +629,7 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue)
             .loaded_chunks = &.{},
             .current_id = 0,
             .main_context = &.{},
+            .task_lib_id = 0,
         },
     };
     try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);
@@ -709,6 +717,7 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             .loaded_chunks = &.{},
             .current_id = 0,
             .main_context = &.{},
+            .task_lib_id = 0,
         },
     };
     try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);
@@ -1379,5 +1388,64 @@ test "doc 73: every cut through coroutine.wrap functions resumes after restore" 
     var cut: u64 = 1;
     while (cut < ref.total_safepoints) : (cut += 1) {
         gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}
+/// Whether `source`, prepared by `setup`, stops at a cut after `cut`
+/// safepoints rather than running to its end.
+fn suspendsAt(gpa: std.mem.Allocator, source: [:0]const u8, cut: u64, setup: util.Setup) !bool {
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [512]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try setup(&vm, chunk.proto);
+    vm.setSuspendCtl(.{ .after_safepoints = cut });
+    return (try vm.start(chunk.proto)) == .suspended;
+}
+
+const installTaskGlobals = @import("interp_testutil.zig").installTaskGlobals;
+
+test "doc 73 §7: every cut through waiting tasks and the drain resumes after restore" {
+    // Cuts land in the main chunk with tasks waiting, inside tasks the
+    // main chunk's awaits run, and inside the ones the drain runs after
+    // the main chunk returned, where the main stack's bottom frame is the
+    // drain's. A task's failure is awaited, so the run ends cleanly.
+    const gpa = testing.allocator;
+    const source =
+        \\local p, q = pending(), pending()
+        \\local log = {}
+        \\local async function w(name, op)
+        \\  local v = await op
+        \\  log[#log + 1] = name .. v
+        \\  return v
+        \\end
+        \\local a = w("a", p)
+        \\local b = w("b", q)
+        \\local c = (async function() local x = await a local y = await b return x + y end)()
+        \\local f = (async function() await q error("late", 0) end)()
+        \\settle(p, true, 1)
+        \\print(await a)
+        \\settle(q, true, 2)
+        \\local async function tail() print("tail", await c, pcall(function() return await f end)) end
+        \\tail()
+        \\print("main end", #log)
+        \\return "result"
+    ;
+    const ref = try util.referenceRunWith(gpa, source, &installTaskGlobals);
+    defer ref.deinit(gpa);
+    try testing.expectEqualStrings("1\nmain end\t1\ntail\t3\tfalse\tlate\n", ref.full_out);
+    // The run ends in the library, where no cut stops: the last cut that
+    // does is in `tail`, which the drain runs.
+    var last = ref.total_safepoints;
+    while (!try suspendsAt(gpa, source, last, &installTaskGlobals)) last -= 1;
+    var cut: u64 = 1;
+    while (cut <= last) : (cut += 1) {
+        gpa.free(try expectResumeWith(gpa, source, .{ .after_safepoints = cut }, ref, &installTaskGlobals));
     }
 }

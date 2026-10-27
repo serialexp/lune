@@ -32,6 +32,9 @@ pub const Token = struct {
 
         // keywords
         keyword_and,
+        /// Doc 73 §7: mahina's, reserved as Lua's are.
+        keyword_async,
+        keyword_await,
         keyword_break,
         keyword_do,
         keyword_else,
@@ -129,6 +132,8 @@ pub const Token = struct {
         pub fn symbol(tag: Tag) ?[]const u8 {
             return switch (tag) {
                 .keyword_and => "and",
+                .keyword_async => "async",
+                .keyword_await => "await",
                 .keyword_break => "break",
                 .keyword_do => "do",
                 .keyword_else => "else",
@@ -207,6 +212,8 @@ pub const Token = struct {
 /// identifier. Built at comptime.
 pub const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
     .{ "and", .keyword_and },
+    .{ "async", .keyword_async },
+    .{ "await", .keyword_await },
     .{ "break", .keyword_break },
     .{ "do", .keyword_do },
     .{ "else", .keyword_else },

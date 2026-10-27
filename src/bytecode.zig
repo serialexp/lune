@@ -362,6 +362,13 @@ pub const OpCode = enum(u8) {
     ///             `Table.storeRun` takes the run in one step when they are
     ///             appends.
     set_list,
+
+    // ---- the task library (doc 73 §7) ----
+    /// `a, b`      R[a] = the task library's function `b` (`ast.Intrinsic`:
+    ///             spawn, await), loading the library the first time. What
+    ///             `async function` and `await` compile to, so no program
+    ///             name can rebind them.
+    intrinsic,
 };
 
 /// The most values one `set_list` stores from fixed registers (a longer
@@ -1207,6 +1214,11 @@ pub const Proto = struct {
     /// True for a chunk's top-level proto (Lua's `what == "main"`): a
     /// traceback calls its frame "main chunk".
     main_chunk: bool = false,
+    /// Doc 73 §7: a proto of the task library (`stdlib/task.lua`), the
+    /// VM's own code: a step debugger never stops in it, and a backtrace
+    /// shows its frames as the natives they stand for. Set when the VM
+    /// compiles the library.
+    system: bool = false,
     /// Stable, unique id assigned at compile time (pre-order over the proto
     /// tree, root = 0). This — not the in-memory `*const Proto` address — is how
     /// a serialized trace names its anchor (`src/traceser.zig`): a pointer is
@@ -1256,6 +1268,7 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .set_upval,
         .ret,
         .vararg_get,
+        .intrinsic,
         => try w.print(" r{d}  {d}", .{ instr.a, instr.b }),
         .eq_p, .ne_p => try w.print(" r{d}  {d}  {s}", .{ instr.a, instr.b, @tagName(@as(Prim, @enumFromInt(instr.c))) }),
         // Doc 66 P1: the control base and the wanted result count.

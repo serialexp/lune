@@ -298,6 +298,11 @@ const nested_reentry_programs = [_][:0]const u8{
 
 /// The program's safepoint index (owned), recorded by a run to completion.
 fn recordSafepointIndex(gpa: std.mem.Allocator, source: [:0]const u8) ![]Vm.SafepointLine {
+    return recordSafepointIndexWith(gpa, source, null);
+}
+
+/// `recordSafepointIndex` with `setup` run before the program starts.
+fn recordSafepointIndexWith(gpa: std.mem.Allocator, source: [:0]const u8, setup: ?*const fn (*Vm, *const Proto) anyerror!void) ![]Vm.SafepointLine {
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
     var diags = diag.Diagnostics.init(gpa);
@@ -314,8 +319,63 @@ fn recordSafepointIndex(gpa: std.mem.Allocator, source: [:0]const u8) ![]Vm.Safe
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
+    if (setup) |s| try s(&vm, chunk.proto);
     _ = try vm.run(chunk.proto);
     return gpa.dupe(Vm.SafepointLine, vm.safepoint_lines.items);
+}
+
+test "doc 73 §7: a step in a task the drain runs shows the library as natives, and none stops in it" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source: [:0]const u8 =
+        \\local p = pending()
+        \\local async function w()
+        \\  local v = await p
+        \\  return v + 1
+        \\end
+        \\w()
+        \\settle(p, true, 1)
+    ;
+    const index = try recordSafepointIndexWith(gpa, source, &util.installTaskGlobals);
+    defer gpa.free(index);
+    var saw_drained = false;
+    var k: u64 = 1;
+    while (k <= index.len) : (k += 1) {
+        if (!index[k - 1].stoppable) continue;
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var sink_buf: [256]u8 = undefined;
+        var sink = io.Writer.fixed(&sink_buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try util.installTaskGlobals(&vm, chunk.proto);
+        vm.setSuspendCtl(.{ .after_safepoints = k });
+        try testing.expect((try vm.start(chunk.proto)) == .suspended);
+        // No step stops in the library.
+        try testing.expect(!vm.frames[vm.depth - 1].closure.proto.system);
+
+        var arena_inst = std.heap.ArenaAllocator.init(gpa);
+        defer arena_inst.deinit();
+        const chain = try vm.backtraceFrames(arena_inst.allocator(), .chain);
+        const bottom = chain[chain.len - 1];
+        if (std.mem.eql(u8, chain[0].name, "w") and bottom.native) {
+            // Line 4 after the drain resumed `w`: through the library's
+            // frames, the drain's at the bottom of the main stack.
+            saw_drained = true;
+            try testing.expect(chain[0].thread != 0);
+            try testing.expectEqualStrings("task", bottom.module);
+            try testing.expectEqualStrings("drain", bottom.name);
+            try testing.expectEqual(@as(u32, 0), bottom.thread);
+            for (chain[1..]) |f| try testing.expect(f.native);
+        }
+    }
+    try testing.expect(saw_drained);
 }
 
 test "doc 68 defer: a suspend due inside nested code stops at the next stoppable step, and resumes" {

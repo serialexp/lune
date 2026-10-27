@@ -194,6 +194,7 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
         .get_upval,
         .vararg_first,
         .vararg_len,
+        .intrinsic,
         .closure, // its captures are `captured`, live everywhere
         => {
             e.kill(a, a + 1);

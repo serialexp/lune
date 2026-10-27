@@ -42,6 +42,7 @@ const system = @import("system.zig");
 const effectlog = @import("effectlog.zig");
 const effectser = @import("effectser.zig");
 const bc_names = @import("bc_names.zig");
+const ast = @import("ast.zig");
 const stdmath = @import("stdlib/math.zig");
 const stdtable = @import("stdlib/table.zig");
 const stdbase = @import("stdlib/base.zig");
@@ -1105,6 +1106,11 @@ pub const Vm = struct {
     /// (`coroutine.native_body_source`), compiled the first time one starts
     /// (`nativeBodyProto`). No constants, so compiling it touches no heap.
     native_body_chunk: ?compiler.Chunk = null,
+    /// Doc 73 §7: the task library's functions, `{spawn, await, drain}`
+    /// (`ast.Intrinsic` order, then drain), from `stdlib/task.lua`, which
+    /// the first `intrinsic` compiles (`taskLib`) into `loaded_chunks`.
+    /// Null in a VM that never ran async code. A VM-level root.
+    task_lib: ?*table.Table = null,
     /// Next proto id to hand out. Seeded to the static chunk's proto count in
     /// `run`/`start` so every dynamically-`load`ed proto gets a globally-unique id
     /// across the static + dynamic trees — purely so snapshot serialization can
@@ -1306,6 +1312,75 @@ pub const Vm = struct {
     /// to Lua that frame is the native itself, a C level with no location.
     pub fn isNativeBodyFrame(self: *const Vm, idx: usize) bool {
         return self.frames[idx].closure.proto.id == coroutine.native_body_proto_id;
+    }
+
+    /// The task library's chunk name: how its rows and messages name it.
+    pub const task_chunk_name = "=[task]";
+    const task_source = @embedFile("stdlib/task.lua");
+    /// `task_lib`'s index of the drain function, after the intrinsics'.
+    const task_drain_index = @typeInfo(ast.Intrinsic).@"enum".field_names.len + 1;
+
+    /// Doc 73 §7: the task library, compiled and run the first time a
+    /// program uses it. The chunk gets fresh copies of the natives it
+    /// uses, so rebinding a global can't change what it calls; it is a
+    /// loaded chunk, so a keyframe restore recompiles it.
+    pub fn taskLib(self: *Vm) Error!*table.Table {
+        if (self.task_lib) |t| return t;
+        return self.loadTaskLib();
+    }
+
+    fn loadTaskLib(self: *Vm) Error!*table.Table {
+        @branchHint(.cold);
+        var chunk_out: [2]Value = undefined;
+        const n = stdload.compileToClosure(self, task_source, task_chunk_name, &chunk_out) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable, // a constant source that compiles
+        };
+        std.debug.assert(n == 1);
+        const last = self.loaded_chunks.items.len - 1;
+        markSystem(@constCast(self.loaded_chunks.items[last].chunk.proto));
+        const names = .{ "coroutine.create", "coroutine.resume", "coroutine.yield", "coroutine.running", "coroutine.status", "coroutine.close", "error", "select", "table.unpack", "type", "rawget" };
+        var args: [names.len]Value = undefined;
+        // No safepoint until `callValue` has them in its window.
+        inline for (names, &args) |name, *arg| arg.* = Value.heap(&(try self.heap.newNativeFrom(templateOf(name))).header);
+        var out: [1]Value = undefined;
+        _ = try self.callValue(chunk_out[0], &args, &out);
+        const lib = table.Table.fromHeader(out[0].asHeap());
+        self.task_lib = lib;
+        return lib;
+    }
+
+    /// Flag `proto` and every proto nested in it as the task library's.
+    pub fn markSystem(proto: *Proto) void {
+        proto.system = true;
+        for (proto.protos) |child| markSystem(@constCast(child));
+    }
+
+    /// Whether `cl` is the task library's drain function, which the main
+    /// stack's bottom frame runs once the main chunk has returned.
+    fn isTaskDrain(self: *const Vm, cl: *const Closure) bool {
+        const lib = self.task_lib orelse return false;
+        const v = lib.get(Value.int(task_drain_index));
+        return v.isHeap() and v.asHeap() == &cl.header;
+    }
+
+    /// Doc 73 §7: run the ready tasks after the main chunk returned
+    /// `fr`, as the main stack's bottom frame, so a step debugger can stop
+    /// in them as in the main chunk. Drain returns the chunk's results,
+    /// which it takes packed in a table.
+    fn startTaskDrain(self: *Vm, fr: FrameResult) Error!ExecOutcome {
+        const lib = self.task_lib.?;
+        const drain = Closure.fromHeader(lib.get(Value.int(task_drain_index)).asHeap());
+        const results = try self.heap.newTable();
+        var i: u16 = 0;
+        while (i < fr.count) : (i += 1) try results.set(self.gpa, Value.int(@as(i64, i) + 1), self.regGet(@as(usize, fr.reg) + i));
+        try results.set(self.gpa, try self.heap.internValue("n"), Value.int(fr.count));
+        const nreg = drain.proto.num_registers;
+        if (nreg > self.regCapacity()) return Error.StackOverflow;
+        self.fillNil(0, nreg);
+        self.regSet(0, Value.heap(&results.header));
+        try self.pushFrame(drain, 0, 0, 0);
+        return self.execWith(1, null);
     }
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
@@ -2958,6 +3033,11 @@ pub const Vm = struct {
                 row.* = .{ .name = nm.field, .module = nm.module, .chunk = "[C]", .proto_id = fp.id, .native = true, .thread = tid };
                 continue;
             }
+            if (fp.system) {
+                // Doc 73 §7: the task library stands for natives.
+                row.* = .{ .name = fp.name, .module = "task", .chunk = "[C]", .proto_id = fp.id, .native = true, .thread = tid };
+                continue;
+            }
             const fpc: usize = if ((live and i == frames.len - 1) or f.in_flight) f.pc else f.pc -| 1;
             const fspan: bytecode.Span = if (fpc < fp.spans.len) fp.spans[fpc] else .{};
             row.* = .{
@@ -3986,6 +4066,8 @@ pub const Vm = struct {
         if (self.file_metatable) |fmt| cb(ctx, &fmt.header);
         if (self.io_input) |f| cb(ctx, &f.header);
         if (self.io_output) |f| cb(ctx, &f.header);
+        // 10. the task library (doc 73 §7).
+        if (self.task_lib) |t| cb(ctx, &t.header);
     }
 
     /// The tier-0 dispatch loop over the **explicit** call stack. Runs the top
@@ -4022,12 +4104,17 @@ pub const Vm = struct {
         const main_depth = if (self.current == null) self.depth else self.main_saved.depth;
         const main_frames = if (self.current == null) self.frames else self.main_saved.frames;
         const root_base_ok = main_depth >= 1 and main_frames[0].base == 0;
+        // Doc 73 §7: a resume inside the task drain, not the main chunk.
+        const draining = main_depth >= 1 and self.isTaskDrain(main_frames[0].closure);
         // Doc 63 §5.6: every guest execution moves the epoch. `run`, `start`
         // and a resume reach the dispatch loop here, not via `execWithEntry`.
         self.heap.bumpHostEpoch();
         // After a stop inside a coroutine, the dispatch resumes it; the main
         // stack is the context this dispatch belongs to either way.
-        const outcome = try self.execWith(1, null);
+        var outcome = try self.execWith(1, null);
+        // The main chunk returned, having started tasks: run them.
+        if (outcome == .finished and self.depth == 0 and root_base_ok and !draining and self.task_lib != null)
+            outcome = try self.startTaskDrain(outcome.finished);
         if (outcome == .finished and self.depth == 0 and root_base_ok) {
             const fr = outcome.finished;
             // Codex doc-21 B-6: an `all_results` return resolves its count from
@@ -4645,7 +4732,7 @@ pub const Vm = struct {
     /// records the same predicate per safepoint, so the steps it offers are
     /// exactly the ones a replay stops at.
     pub inline fn canSuspendHere(self: *const Vm, proto: *const Proto) bool {
-        return self.native_reentry_depth == 0 and !self.reg_top_pending and proto.id != coroutine.native_body_proto_id;
+        return self.native_reentry_depth == 0 and !self.reg_top_pending and proto.id != coroutine.native_body_proto_id and !proto.system;
     }
 
     /// Arm (or, with null, disarm) the mid-execution suspend trigger.
@@ -7591,6 +7678,7 @@ pub const Vm = struct {
             .get_index2 => opGetIndex2(mode),
             .set_index2 => opSetIndex2(mode),
             .set_list => opSetList(mode),
+            .intrinsic => opIntrinsic(mode),
             .get_global => opGetGlobal(mode),
             .set_global => opSetGlobal(mode),
             .closure => opClosure(mode),
@@ -9326,6 +9414,19 @@ pub const Vm = struct {
                 while (i < n) : (i += 1) {
                     vm.indexSet(tv, Value.int(k0 + @as(i64, @intCast(i))), vals.get(i)) catch |e| return parkErr(st, e);
                 }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Doc 73 §7: `intrinsic a, b` is `R[a]` = the task library's
+    /// function `b` (`ast.Intrinsic`), compiling the library the first time.
+    fn opIntrinsic(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const lib = vm.taskLib() catch |e| return parkErr(st, e);
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                regs.set(instr.a, lib.get(Value.int(@as(i64, instr.b) + 1)));
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -12039,6 +12140,7 @@ test {
     _ = @import("interp_dispatch_test.zig");
     _ = @import("interp_gc_test.zig");
     _ = @import("interp_coroutine_test.zig");
+    _ = @import("interp_task_test.zig");
     _ = @import("interp_phaseq_test.zig");
     _ = @import("interp_trace_test.zig");
     _ = @import("interp_fastblock_test.zig");

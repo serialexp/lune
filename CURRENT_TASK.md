@@ -1,4 +1,4 @@
-DOC 73 COROUTINES: P0 + P1 + P3 DONE (2026-10-27, coral-marten); next P4 async.
+DOC 73 COROUTINES: P0 + P1 + P3 + P4a DONE (2026-10-27, coral-marten); next P4b.
 - All questions decided. Bart accepted the frames-pointer cost; P0a landed
   (4e37dfd). The P0 runtime design is doc 73 §5.1 (stack = one allocation
   of tags+payloads+scratch+frames; active fields stay in Vm and are
@@ -60,13 +60,20 @@ DOC 73 COROUTINES: P0 + P1 + P3 DONE (2026-10-27, coral-marten); next P4 async.
   ReplayResult.coroutines (@68), frame records gained thread+flags. The
   shim is unstoppable (canSuspendHere(proto)).
 - P5 (coroutine docs) landed: doc 00/02 follow-up paragraphs (eab6a0c).
-- BLOCKED: P4 async waits on Bart. Doc 73 §7.1 lists A1 (what can be
-  awaited: tasks only / + host pendings with a CLI timer / + async I/O),
-  A2 (await in the main chunk), A3 (reserved vs contextual words), A4
-  (cancel, task.onerror, all/any). Also asked: tasks as a native heap
-  type vs a library written in mahina over coroutine.*. Asked twice via
-  ask on 2026-10-27, no answer; deliberately not defaulted, since they
-  shape the whole layer.
+- P4 decided by Bart 2026-10-27 (doc 73 §7.2): host pendings under async
+  copies of blocking functions; await anywhere; reserved words; no extras
+  in v1; tasks as a mahina library over coroutine.*.
+- P4a landed (doc 73 §7.3): `intrinsic` op, src/stdlib/task.lua (loaded on
+  first intrinsic via compileToClosure; Proto.system = unstoppable +
+  `[C]` rows), drain in Vm.exec after the main chunk (bottom frame, takes
+  and returns the main results), Vm.task_lib root, snapshot format 17
+  (task_lib_id). Tests: interp_task_test.zig (pending/settle natives as a
+  stand-in host), every-cut keyframe test, replay step test, parser tests.
+  The library's `await` local is `wait` (await is reserved).
+- Next, P4b: C API over lib[4] pending / lib[5] settle, the completion as
+  a logged effect (effect format 8), drain waiting on the host while
+  operations are in flight. Then P4c: ask Bart which blocking functions
+  get async copies and how they are named.
   P2 lead (deferred): co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
   t0 (yield made deep in recursion) — start with --jit-stats/--dump-aborts.
 - gmatch/codes lone iterators can now use bound natives (TODO.md).

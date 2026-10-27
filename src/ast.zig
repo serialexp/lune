@@ -90,6 +90,21 @@ pub const FunctionBody = struct {
     /// Reserved return-type annotation (unchecked in v1).
     ret_type: ?*TypeExpr = null,
     body: Block,
+    /// `async function` (doc 73 §7): a call starts a task running the body.
+    is_async: bool = false,
+    /// The proto's name when the compiler can't take it from where the
+    /// function is written: an async function's body, named as the function.
+    name: ?[]const u8 = null,
+};
+
+/// A library function the compiler calls by itself, not by any name a
+/// program can rebind (bytecode `intrinsic`): the task library's, which
+/// `async function` and `await` compile to (doc 73 §7).
+pub const Intrinsic = enum(u8) {
+    /// `spawn(f, ...)`: start a task running `f(...)`; returns the task.
+    task_spawn,
+    /// `await(x)`: `x`'s results once it settles (a task), else `x`.
+    task_await,
 };
 
 pub const Expr = struct {
@@ -123,6 +138,9 @@ pub const Expr = struct {
         method_call: struct { obj: *Expr, name: []const u8, args: []const *Expr },
         /// `function (...) ... end` literal.
         function: *FunctionBody,
+        /// An intrinsic as a value; only the parser makes one, as the
+        /// callee of the call `await e` is.
+        intrinsic: Intrinsic,
         /// `{ ... }`
         table: []const TableField,
     };

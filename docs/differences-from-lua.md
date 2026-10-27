@@ -23,6 +23,23 @@ is `nil`), `!=`, `!`, `&&`, `||`, and optional type annotations
 (`local x: number = 3`) (`docs/design/13-luajit-syntax-parity.md`). One
 catch: as a statement, `x ~= 1` is xor-assignment, not a comparison.
 
+**Async functions** (`docs/design/73-coroutines.md` §7). `async` and
+`await` are reserved words, so a Lua program using either as a name
+doesn't compile. `async function f() … end` (also `local async
+function` and `async function (…) … end`) makes a function whose call
+starts a task running the body at once and returns the task; `await e`
+(a prefix operator binding like `not`, and a call, so a statement too)
+gives the task's results once it has finished, raising its error if it
+failed, or `e` itself when it isn't a task. An error before the task's
+first wait is raised at the call. `await` works anywhere: in the task's
+own code it suspends the task, elsewhere it runs the other ready tasks
+until the awaited one finishes. Tasks still ready when the main chunk
+returns run after it, and a failed task nothing awaited is then a
+fatal error. A task's own `coroutine.yield` is an error; coroutines
+inside a task work as usual. Nothing a program can call waits on the
+outside world yet, so today every task runs to completion as it is
+called.
+
 **Numerals** read as in Lua, hex floats (`0x1.8p+1`) and wrapping hex
 integers included, with one exception: `..` ends a numeral, so `1..2` is
 `1 .. 2` where Lua reports a malformed number.
@@ -200,7 +217,8 @@ Other differences:
 - An uncaught error prints `mahina: runtime error: message at file:line`
   and an indented traceback. Tracebacks (this one and `debug.traceback`'s)
   have no `[C]` rows except a coroutine whose body is a library function
-  (`[C]: in function 'pcall'`), and name every Lua function `function
+  (`[C]: in function 'pcall'`) and the task library's frames under an
+  `await` or an async call (`[C]: in function 'task.wait'`), and name every Lua function `function
   'name'`, an unnamed one `'anonymous'`, where Lua says `local 'f'` or
   `function <main:2>`. An error object's
   `__tostring` gives the message, as in Lua; if that `__tostring` itself

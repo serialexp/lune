@@ -124,6 +124,19 @@ pub fn runCapturedTuned(
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
+    try configureLeg(&vm, sink, stress, mode, opts);
+
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto);
+    if (opts.inspect) |inspect| try inspect(&vm, mode);
+}
+
+/// Configure `vm` as one leg of the matrix: its output, GC discipline and
+/// trace mode, then `opts`' knobs and setup.
+fn configureLeg(vm: *Vm, sink: *io.Writer, stress: bool, mode: TraceMode, opts: CapturedOpts) !void {
     vm.out = sink;
     vm.heap.setGcStress(stress);
     vm.trace.config.enabled = mode != .off;
@@ -139,14 +152,51 @@ pub fn runCapturedTuned(
     if (opts.hotexit) |he| vm.trace.config.hotexit = he;
     if (opts.instunroll) |n| vm.trace.config.instunroll = n;
     if (opts.silent_promotion) |on| vm.trace.config.silent_promotion_enabled = on;
-    if (opts.setup) |setup| try setup(&vm);
+    if (opts.setup) |setup| try setup(vm);
+}
 
-    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
-    defer chunk.deinit();
-    try testing.expect(!diags.hasErrors());
+/// Doc 73 §7: the task library's `pending` and `settle`, the host's half
+/// of a pending operation, as globals: the library's own closures, which a
+/// keyframe restore rebuilds as it rebuilds the library. Loaded after the
+/// program `root`'s proto ids are taken, as a run would load it.
+pub fn installTaskGlobals(vm: *Vm, root: *const bytecode.Proto) anyerror!void {
+    vm.seedProtoIds(root);
+    const lib = try vm.taskLib();
+    try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("pending"), lib.get(Value.int(4)));
+    try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("settle"), lib.get(Value.int(5)));
+}
 
-    _ = try vm.run(chunk.proto);
-    if (opts.inspect) |inspect| try inspect(&vm, mode);
+/// `expectProgramTuned` for a program that fails: on every leg it prints
+/// exactly `expected` and then raises a runtime error whose message
+/// (`Vm.describeFault`) is `message`.
+pub fn expectProgramFault(source: [:0]const u8, expected: []const u8, message: []const u8, opts: CapturedOpts) !void {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const gpa = testing.allocator;
+    inline for (.{ false, true }) |stress| {
+        inline for (.{ .off, .record_only, .record_execute_noopt, .record_execute, .record_execute_native }) |mode| {
+            var buf: [256]u8 = undefined;
+            var sink = io.Writer.fixed(&buf);
+            var diags = diag.Diagnostics.init(gpa);
+            defer diags.deinit();
+            var tree = try parser.parse(gpa, source, &diags);
+            defer tree.deinit();
+            try testing.expect(!diags.hasErrors());
+            var vm = try Vm.init(gpa);
+            defer vm.deinit();
+            try configureLeg(&vm, &sink, stress, mode, opts);
+            var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+            defer chunk.deinit();
+            try testing.expect(!diags.hasErrors());
+            if (vm.run(chunk.proto)) |_| return error.TestExpectedError else |err| {
+                var arena = std.heap.ArenaAllocator.init(gpa);
+                defer arena.deinit();
+                const fault = try vm.describeFault(err, arena.allocator());
+                try testing.expectEqualStrings(message, fault.message);
+            }
+            try testing.expectEqualStrings(expected, sink.buffered());
+        }
+    }
 }
 
 /// Run `source` across the full matrix of GC discipline × trace mode and assert

@@ -15,8 +15,9 @@ import type { Extension } from "@codemirror/state";
 
 /** Keywords — the exact set from src/token.zig's `keywords` map. */
 const KEYWORDS = new Set([
-  "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
-  "if", "in", "local", "nil", "not", "or", "return", "then", "true", "while",
+  "and", "async", "await", "break", "do", "else", "elseif", "end", "false", "for",
+  "function", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then",
+  "true", "until", "while",
 ]);
 
 /** Builtins — the `base_natives` registry in src/interp.zig. The

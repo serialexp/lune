@@ -1344,6 +1344,7 @@ pub const Keyframe = struct {
     loaded_chunks: []const LoadedChunk,
     current_id: u32,
     main_context: []const ThreadContext,
+    task_lib_id: u32,
 
     pub fn encode(self: Keyframe, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -1388,6 +1389,7 @@ pub const Keyframe = struct {
         for (self.main_context) |_item_5| {
             try _item_5.encodeInto(enc, ctx);
         }
+        try enc.writeUint32(self.task_lib_id, .little_endian);
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!Keyframe {
@@ -1448,6 +1450,7 @@ pub const Keyframe = struct {
             _buf_35[_i_32] = try ThreadContext.decodeWith(allocator, dec, root);
         }
         result.main_context = _buf_35;
+        result.task_lib_id = try dec.readUint32(.little_endian);
         return result;
     }
 };

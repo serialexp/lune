@@ -106,6 +106,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
             .loaded_chunks = &.{},
             .current_id = 0,
             .main_context = &.{},
+            .task_lib_id = 0,
         },
     };
 

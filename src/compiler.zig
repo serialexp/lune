@@ -1321,7 +1321,7 @@ const Compiler = struct {
     /// the scope of.)
     fn hasFunction(e: *const ast.Expr) bool {
         return switch (e.data) {
-            .nil, .bool, .int, .float, .string_raw, .name, .vararg => false,
+            .nil, .bool, .int, .float, .string_raw, .name, .vararg, .intrinsic => false,
             .function => true,
             .paren => |inner| hasFunction(inner),
             .unary => |u| hasFunction(u.operand),
@@ -1742,6 +1742,7 @@ const Compiler = struct {
             .call => |c| try self.compileCall(c.callee, c.args, dest, 1),
             .method_call => |mc| try self.compileMethodCall(mc.obj, mc.name, mc.args, dest, 1),
             .function => |body| try self.compileFunction(body, "anonymous", dest),
+            .intrinsic => |k| _ = try self.emit(Instr.opAB(.intrinsic, dest, @intFromEnum(k))),
 
             // `...` in single-value position yields its *first* value (or nil).
             // Tail/expanding positions are handled by the spread sites below.
@@ -1942,6 +1943,7 @@ const Compiler = struct {
     /// function's `protos`, and emit a `closure` into `dest`. `name` is for
     /// disassembly only.
     fn compileFunction(self: *Compiler, body: *const ast.FunctionBody, name: []const u8, dest: u16) Error!void {
+        if (body.is_async) return self.compileAsyncFunction(body, name, dest);
         if (body.params.len > std.math.maxInt(u8)) return self.fail(body.span, "too many parameters");
 
         var child = Compiler{
@@ -1982,7 +1984,7 @@ const Compiler = struct {
             .protos = child.protos.items,
             .upvalues = child.upvalues.items,
             .global_slot_hints = try zeroedHints(self.arena, child.constants.items.len),
-            .name = name,
+            .name = body.name orelse name,
             // Doc 56 §4.2: per-pc register liveness, from the finished code.
             .reg_live = try bc_liveness.compute(self.arena, self.scratch, child.code.items, child.max_reg, child.protos.items),
             // Doc 58 §4.8: the CFG's dominator tree, from the finished code.
@@ -1997,6 +1999,34 @@ const Compiler = struct {
         const idx: u16 = @intCast(self.protos.items.len);
         try self.protos.append(self.arena, proto);
         _ = try self.emit(Instr.opAB(.closure, dest, idx));
+    }
+
+    /// Doc 73 §7: `async function (params) body end` is the function
+    /// `function (...) return task_spawn(function (params) body end, ...) end`:
+    /// a call starts a task running the body on the arguments and returns
+    /// the task. The body keeps the function's name, so a backtrace names it.
+    fn compileAsyncFunction(self: *Compiler, body: *const ast.FunctionBody, name: []const u8, dest: u16) Error!void {
+        const span = body.span;
+        const inner = try self.arena.create(ast.FunctionBody);
+        inner.* = body.*;
+        inner.is_async = false;
+        inner.name = body.name orelse name;
+
+        const exprs = try self.arena.alloc(ast.Expr, 4);
+        exprs[0] = .{ .span = span, .data = .{ .intrinsic = .task_spawn } };
+        exprs[1] = .{ .span = span, .data = .{ .function = inner } };
+        exprs[2] = .{ .span = span, .data = .vararg };
+        const args = try self.arena.alloc(*ast.Expr, 2);
+        args[0] = &exprs[1];
+        args[1] = &exprs[2];
+        exprs[3] = .{ .span = span, .data = .{ .call = .{ .callee = &exprs[0], .args = args } } };
+        const values = try self.arena.alloc(*ast.Expr, 1);
+        values[0] = &exprs[3];
+        const stmts = try self.arena.alloc(ast.Stmt, 1);
+        stmts[0] = .{ .span = span, .data = .{ .return_ = values } };
+
+        const outer: ast.FunctionBody = .{ .span = span, .params = &.{}, .is_vararg = true, .body = stmts, .name = inner.name };
+        return self.compileFunction(&outer, name, dest);
     }
 
     /// `local function f() … end` — sugar for `local f; f = function … end`,
