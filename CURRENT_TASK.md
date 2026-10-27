@@ -1,4 +1,15 @@
-DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT) deferred.
+DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT) diagnosed, fix awaits Bart.
+- P2 DIAGNOSIS (2026-10-27): the co_pingpong_d20/_d150 jit slowdown is NOT a
+  coroutine cost. /tmp/nb/rec_plain.lua (the same `deep` recursion, no
+  coroutine) is 297 ms jit vs 90 ms t0; with the base case written
+  `local r = leaf(i); return r` it is 85 ms (3.8M self-call pushes/pops).
+  Cause: a one-shot (head/cont) recording refuses a depth-0 `ret` with
+  b == all_results (trace_recorder.zig ~1638; doc 44 §D4 "revisit in P1":
+  the terminal snapshot doesn't carry the dynamic result top), so the
+  base-case head sibling aborts (nyi_opcode), deep's ret-cont/call-head
+  links never arm, and each return pays a dispatcher entry. Doc 73's P2
+  bullet is corrected. Fix = doc 44's deferred all_results terminal; needs
+  Bart's go-ahead on the approach (soundness: multret_top at the terminal).
 - All questions decided. Bart accepted the frames-pointer cost; P0a landed
   (4e37dfd). The P0 runtime design is doc 73 §5.1 (stack = one allocation
   of tags+payloads+scratch+frames; active fields stay in Vm and are

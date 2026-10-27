@@ -190,9 +190,20 @@ land; move whole phases to Done once everything inside them is checked.
   (a page per region) against LuaJIT's ~1 KiB; `co_many` 164 MB vs 7.4 MB,
   and with it the GC weight below (TODO.md).
 - [ ] **P2 — the JIT boundary** (§6.4): a switch ends a trace; traces inside a
-  coroutine body run as usual. Evidence from the first board: with the yield
-  made 20 or 150 calls deep, `--jit-native` is 3.2–3.6× slower than t0
-  (302.7 vs 95.7 ms, 2193.7 vs 610.4 ms) at ~41–46% residency.
+  coroutine body run as usual. The first board's evidence (with the yield
+  made 20 or 150 calls deep, `--jit-native` 3.2–3.6× slower than t0:
+  302.7 vs 95.7 ms, 2193.7 vs 610.4 ms, at ~41–46% residency) is **not a
+  coroutine cost** (diagnosed 2026-10-27): the same `deep` recursion with
+  no coroutine at all runs 297 ms against 90 ms at t0. `deep`'s base case
+  is `return yield(i)` / `return leaf(i)`, a depth-0 `ret` with
+  `b == all_results`, which a one-shot (head/cont) recording refuses
+  (`nyi_opcode`, doc 44 §D4 "revisit in P1"), so the base-case sibling
+  never records, `deep` never arms its ret-cont/call-head links (frame
+  links 0, `self-ret pops` 0), and each of the 19 returns pays a
+  dispatcher entry (`enterSelectedTrace` 28%, `driveDispatcherSilentResult`
+  10%). Writing the base case as `local r = leaf(i); return r` gives 85 ms
+  with 3.8M native descents and pops. What remains coroutine-specific:
+  a loop containing `resume` never traces (d1: 100% tier-0, no trace).
 - [ ] **The Rust crate's task API**: `mahina` maps `MH_WAITING` to an
   `Error::Api` saying it can't continue the task; a safe surface over
   §7.5's functions is its own design (TODO.md).
