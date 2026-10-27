@@ -64,6 +64,13 @@ pub const TypeExpr = struct {
     optional: bool = false,
 };
 
+/// A name and where it is written: the unit for name lists (`for` variables,
+/// `function a.b:m` components) so every name keeps its own span.
+pub const Ident = struct {
+    text: []const u8,
+    span: Span,
+};
+
 /// A name optionally annotated with a type (function params, `local` names).
 pub const TypedName = struct {
     name: []const u8,
@@ -78,7 +85,7 @@ pub const TableField = union(enum) {
     /// `expr` — positional/array entry.
     positional: *Expr,
     /// `name = expr`.
-    named: struct { name: []const u8, value: *Expr },
+    named: struct { name: []const u8, name_span: Span, value: *Expr },
     /// `[key] = expr`.
     keyed: struct { key: *Expr, value: *Expr },
 };
@@ -129,13 +136,13 @@ pub const Expr = struct {
         unary: struct { op: UnaryOp, operand: *Expr },
         binary: struct { op: BinaryOp, lhs: *Expr, rhs: *Expr },
         /// `obj.name`
-        field: struct { obj: *Expr, name: []const u8 },
+        field: struct { obj: *Expr, name: []const u8, name_span: Span },
         /// `obj[key]`
         index: struct { obj: *Expr, key: *Expr },
         /// `callee(args)`
         call: struct { callee: *Expr, args: []const *Expr },
         /// `obj:name(args)`
-        method_call: struct { obj: *Expr, name: []const u8, args: []const *Expr },
+        method_call: struct { obj: *Expr, name: []const u8, name_span: Span, args: []const *Expr },
         /// `function (...) ... end` literal.
         function: *FunctionBody,
         /// An intrinsic as a value; only the parser makes one, as the
@@ -165,9 +172,9 @@ pub const Expr = struct {
 /// A `function a.b.c:m` declaration target.
 pub const FuncName = struct {
     /// Dotted path, e.g. `a.b.c` → `["a","b","c"]`. At least one element.
-    path: []const []const u8,
+    path: []const Ident,
     /// Method component after `:`, if any (`:m`). Implies an implicit `self`.
-    method: ?[]const u8 = null,
+    method: ?Ident = null,
 };
 
 pub const Stmt = struct {
@@ -178,7 +185,7 @@ pub const Stmt = struct {
         /// `local a, b: T = e1, e2`
         local: struct { names: []const TypedName, values: []const *Expr },
         /// `local function f() ... end`
-        local_function: struct { name: []const u8, body: *FunctionBody },
+        local_function: struct { name: []const u8, name_span: Span, body: *FunctionBody },
         /// `t1, t2 = e1, e2` (targets are assignable exprs).
         assign: struct { targets: []const *Expr, values: []const *Expr },
         /// `target OP= value` (single target). The compiler evaluates `target`'s
@@ -201,6 +208,7 @@ pub const Stmt = struct {
         /// `for i = a, b, c do ... end`
         numeric_for: struct {
             name: []const u8,
+            name_span: Span,
             start: *Expr,
             stop: *Expr,
             step: ?*Expr,
@@ -208,7 +216,7 @@ pub const Stmt = struct {
         },
         /// `for k, v in e1, e2 do ... end`
         generic_for: struct {
-            names: []const []const u8,
+            names: []const Ident,
             exprs: []const *Expr,
             body: Block,
         },

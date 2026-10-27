@@ -107,6 +107,12 @@ const Parser = struct {
     fn spanFrom(self: *const Parser, start: u32) Span {
         return .{ .start = start, .end = self.lastEnd() };
     }
+    fn tokSpan(t: Token) Span {
+        return .{ .start = t.start, .end = t.end };
+    }
+    fn ident(self: *const Parser, t: Token) ast.Ident {
+        return .{ .text = t.lexeme(self.source), .span = tokSpan(t) };
+    }
 
     // =====================================================================
     // Blocks & statements
@@ -234,7 +240,7 @@ const Parser = struct {
             body.is_async = is_async;
             return .{
                 .span = self.spanFrom(start),
-                .data = .{ .local_function = .{ .name = name_tok.lexeme(self.source), .body = body } },
+                .data = .{ .local_function = .{ .name = name_tok.lexeme(self.source), .name_span = tokSpan(name_tok), .body = body } },
             };
         }
 
@@ -386,6 +392,7 @@ const Parser = struct {
             _ = try self.expect(.keyword_end, "expected 'end' to close 'for'");
             return .{ .span = self.spanFrom(start), .data = .{ .numeric_for = .{
                 .name = first_name.lexeme(self.source),
+                .name_span = tokSpan(first_name),
                 .start = start_expr,
                 .stop = stop_expr,
                 .step = step,
@@ -394,11 +401,11 @@ const Parser = struct {
         }
 
         // generic for: for a, b in explist do ... end
-        var names: std.ArrayList([]const u8) = .empty;
-        try names.append(self.arena, first_name.lexeme(self.source));
+        var names: std.ArrayList(ast.Ident) = .empty;
+        try names.append(self.arena, self.ident(first_name));
         while (self.match(.comma)) {
             const n = try self.expect(.identifier, "expected loop variable");
-            try names.append(self.arena, n.lexeme(self.source));
+            try names.append(self.arena, self.ident(n));
         }
         _ = try self.expect(.keyword_in, "expected '=' or 'in' in for-loop");
         const exprs = try self.parseExprList();
@@ -421,23 +428,23 @@ const Parser = struct {
 
     fn parseFunctionDecl(self: *Parser, is_async: bool) Error!Stmt {
         const start = self.advance().start; // 'function'
-        var path: std.ArrayList([]const u8) = .empty;
+        var path: std.ArrayList(ast.Ident) = .empty;
         const first = try self.expect(.identifier, "expected function name");
-        try path.append(self.arena, first.lexeme(self.source));
+        try path.append(self.arena, self.ident(first));
         while (self.match(.dot)) {
             const n = try self.expect(.identifier, "expected name after '.'");
-            try path.append(self.arena, n.lexeme(self.source));
+            try path.append(self.arena, self.ident(n));
         }
-        var method: ?[]const u8 = null;
+        var method: ?ast.Ident = null;
         if (self.match(.colon)) {
             const m = try self.expect(.identifier, "expected method name after ':'");
-            method = m.lexeme(self.source);
+            method = self.ident(m);
         }
 
         const body = try self.parseFunctionBody();
         body.is_async = is_async;
         // A method `a:m` gets an implicit leading `self` parameter.
-        const final_body = if (method != null) try self.prependSelf(body) else body;
+        const final_body = if (method) |m| try self.prependSelf(body, m.span.start) else body;
 
         return .{ .span = self.spanFrom(start), .data = .{ .function_decl = .{
             .name = .{ .path = try path.toOwnedSlice(self.arena), .method = method },
@@ -445,9 +452,11 @@ const Parser = struct {
         } } };
     }
 
-    fn prependSelf(self: *Parser, body: *ast.FunctionBody) Error!*ast.FunctionBody {
+    /// `at` is where `self` would be written if it were: the method name's start,
+    /// as a zero-width span, so no navigation lands on the whole function.
+    fn prependSelf(self: *Parser, body: *ast.FunctionBody, at: u32) Error!*ast.FunctionBody {
         var params: std.ArrayList(ast.Param) = .empty;
-        try params.append(self.arena, .{ .name = "self", .name_span = body.span, .type = null });
+        try params.append(self.arena, .{ .name = "self", .name_span = .{ .start = at, .end = at }, .type = null });
         try params.appendSlice(self.arena, body.params);
         body.params = try params.toOwnedSlice(self.arena);
         return body;
@@ -634,7 +643,7 @@ const Parser = struct {
                     const name_tok = try self.expect(.identifier, "expected field name after '.'");
                     e = try self.newExpr(
                         .{ .start = e.span.start, .end = name_tok.end },
-                        .{ .field = .{ .obj = e, .name = name_tok.lexeme(self.source) } },
+                        .{ .field = .{ .obj = e, .name = name_tok.lexeme(self.source), .name_span = tokSpan(name_tok) } },
                     );
                 },
                 .lbracket => {
@@ -659,7 +668,7 @@ const Parser = struct {
                     const args = try self.parseCallArgs();
                     e = try self.newExpr(
                         .{ .start = e.span.start, .end = self.lastEnd() },
-                        .{ .method_call = .{ .obj = e, .name = name_tok.lexeme(self.source), .args = args } },
+                        .{ .method_call = .{ .obj = e, .name = name_tok.lexeme(self.source), .name_span = tokSpan(name_tok), .args = args } },
                     );
                 },
                 else => break,
@@ -772,7 +781,7 @@ const Parser = struct {
                 const name_tok = self.advance();
                 _ = self.advance(); // '='
                 const value = try self.parseExpr(0);
-                try fields.append(self.arena, .{ .named = .{ .name = name_tok.lexeme(self.source), .value = value } });
+                try fields.append(self.arena, .{ .named = .{ .name = name_tok.lexeme(self.source), .name_span = tokSpan(name_tok), .value = value } });
             } else {
                 const value = try self.parseExpr(0);
                 try fields.append(self.arena, .{ .positional = value });
@@ -898,7 +907,7 @@ test "numeric and generic for" {
     try testing.expect(nf.step != null);
     const gf = tree.root[1].data.generic_for;
     try testing.expectEqual(@as(usize, 2), gf.names.len);
-    try testing.expectEqualStrings("v", gf.names[1]);
+    try testing.expectEqualStrings("v", gf.names[1].text);
 }
 
 test "method declaration gets implicit self" {
@@ -906,8 +915,8 @@ test "method declaration gets implicit self" {
     defer tree.deinit();
     const fd = tree.root[0].data.function_decl;
     try testing.expectEqual(@as(usize, 1), fd.name.path.len);
-    try testing.expectEqualStrings("obj", fd.name.path[0]);
-    try testing.expectEqualStrings("greet", fd.name.method.?);
+    try testing.expectEqualStrings("obj", fd.name.path[0].text);
+    try testing.expectEqualStrings("greet", fd.name.method.?.text);
     // self prepended before the declared param.
     try testing.expectEqual(@as(usize, 2), fd.body.params.len);
     try testing.expectEqualStrings("self", fd.body.params[0].name);
@@ -1005,3 +1014,53 @@ test "error recovery: bad statement, then a good one" {
     try testing.expect(found_y);
 }
 
+
+/// The source text a span covers.
+fn spanText(src: []const u8, sp: ast.Span) []const u8 {
+    return src[sp.start..sp.end];
+}
+
+test "doc 74 P1a: every declared or accessed name carries its own span" {
+    const src =
+        \\local function f() end
+        \\for i = 1, 2 do end
+        \\for k, v in pairs(t) do end
+        \\function a.b:m() end
+        \\local t = { key = 1 }
+        \\t.fld = o:meth()
+    ;
+    var tree = try parseOk(src);
+    defer tree.deinit();
+
+    try testing.expectEqualStrings("f", spanText(src, tree.root[0].data.local_function.name_span));
+    try testing.expectEqualStrings("i", spanText(src, tree.root[1].data.numeric_for.name_span));
+
+    const gf = tree.root[2].data.generic_for;
+    try testing.expectEqualStrings("k", spanText(src, gf.names[0].span));
+    try testing.expectEqualStrings("v", spanText(src, gf.names[1].span));
+
+    const fd = tree.root[3].data.function_decl;
+    try testing.expectEqualStrings("a", spanText(src, fd.name.path[0].span));
+    try testing.expectEqualStrings("b", spanText(src, fd.name.path[1].span));
+    try testing.expectEqualStrings("m", spanText(src, fd.name.method.?.span));
+
+    const fields = tree.root[4].data.local.values[0].data.table;
+    try testing.expectEqualStrings("key", spanText(src, fields[0].named.name_span));
+
+    const assign = tree.root[5].data.assign;
+    try testing.expectEqualStrings("fld", spanText(src, assign.targets[0].data.field.name_span));
+    const call = assign.values[0].data.method_call;
+    try testing.expectEqualStrings("meth", spanText(src, call.name_span));
+}
+
+test "doc 74 P1a: the implicit self of a method is a zero-width span at the method name" {
+    const src = "function obj:greet(name) end";
+    var tree = try parseOk(src);
+    defer tree.deinit();
+    const params = tree.root[0].data.function_decl.body.params;
+    try testing.expectEqualStrings("self", params[0].name);
+    const at = std.mem.find(u8, src, "greet").?;
+    try testing.expectEqual(ast.Span{ .start = @intCast(at), .end = @intCast(at) }, params[0].name_span);
+    // The declared parameter keeps its own span.
+    try testing.expectEqualStrings("name", spanText(src, params[1].name_span));
+}

@@ -96,6 +96,10 @@ land; move whole phases to Done once everything inside them is checked.
     oversize bodies, EOF, the timer, cancellation) plus a real-pipe check
     and `tools/cli-smoke.sh` coverage.
   - [x] The core and its modules build for wasm32 (`zig build wasm`).
+  - [x] P1a name spans (§6.3): `ast.Ident` (text + span) for `for` variables
+    and `function a.b:m` components; `name_span` on `local_function`,
+    `numeric_for`, `field`, `method_call` and named table fields; the
+    implicit `self` is a zero-width span at the method name.
   - [x] Wasm host: `mahina_lsp_open/send/tick/next_deadline/message_ptr/
     message_len/is_done/close` in `src/wasm_entry.zig` (message bodies, no
     framing; JS owns the debounce timer). `viz/test/lsp-wasm.test.ts`.
@@ -106,10 +110,6 @@ land; move whole phases to Done once everything inside them is checked.
   host's `cancelled` hook once per request; the phase-boundary checks
   (after parse, resolve, compile) and the newest-version atomic arrive with
   the analysis in P2, since there is nothing long-running to abandon yet.
-- [ ] **P1a — AST name spans** (§6.3): `name_span` on `local_function`,
-  numeric/generic `for` variables, `FuncName` components, named table
-  fields; implicit `self` gets a synthetic, zero-width span instead of the
-  body's.
 - [ ] **P1b — parser recovery regions** (§6.2): `synchronize` records the
   skipped span; error nodes where a statement was dropped; recovered
   declarations kept where they are trustworthy.

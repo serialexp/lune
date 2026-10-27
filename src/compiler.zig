@@ -1652,7 +1652,8 @@ const Compiler = struct {
         const loop_idx = self.loops.items.len - 1;
 
         self.beginScope();
-        for (gf.names, 0..) |name, i| {
+        for (gf.names, 0..) |ident, i| {
+            const name = ident.text;
             try self.declareLocal(name, @intCast(base + 3 + i));
         }
         try self.compileBlock(gf.body);
@@ -2175,8 +2176,8 @@ const Compiler = struct {
         if (path.len == 1 and method == null) {
             const mark = self.next_reg;
             const fnr = try self.alloc1();
-            try self.compileFunction(fd.body, path[0], fnr);
-            try self.storeName(path[0], fnr, fd.body.span);
+            try self.compileFunction(fd.body, path[0].text, fnr);
+            try self.storeName(path[0].text, fnr, fd.body.span);
             self.freeTo(mark);
             return;
         }
@@ -2185,15 +2186,15 @@ const Compiler = struct {
         // `set_index` the final key.
         const mark = self.next_reg;
         const objr = try self.alloc1();
-        try self.loadName(path[0], objr, fd.body.span);
+        try self.loadName(path[0].text, objr, fd.body.span);
 
         const final_count = if (method != null) path.len else path.len - 1;
         var i: usize = 1;
         while (i < final_count) : (i += 1) {
-            try self.emitGetIndex(objr, objr, .{ .konst = try self.stringConstant(path[i]) });
+            try self.emitGetIndex(objr, objr, .{ .konst = try self.stringConstant(path[i].text) });
         }
 
-        const final_key = method orelse path[path.len - 1];
+        const final_key = if (method) |m| m.text else path[path.len - 1].text;
         const kk = try self.stringConstant(final_key);
         const fnr = try self.alloc1();
         try self.compileFunction(fd.body, final_key, fnr);
