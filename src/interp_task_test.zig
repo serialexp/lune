@@ -128,18 +128,27 @@ test "async: a failure no one awaited is fatal once nothing is ready" {
     , "end\n", "unobserved task error: main:2: lost");
 }
 
-test "async: awaiting what can never finish is a deadlock, and a task can't await itself" {
+test "async: awaiting what can never finish is a deadlock, an operation the host can't wait for would block, and a task can't await itself" {
     try expectTasks(
         \\local p = pending()
         \\print(pcall(function() return await p end))
+        \\settle(p, true)
         \\local q = pending()
-        \\local t
-        \\local async function f() await q return await t end
-        \\t = f()
+        \\local t1, t2
+        \\local async function f1() await q return await t2 end
+        \\local async function f2() await q return await t1 end
+        \\t1, t2 = f1(), f2()
         \\settle(q, true)
+        \\print(pcall(function() return await t1 end))
+        \\local r = pending()
+        \\local t
+        \\local async function f() await r return await t end
+        \\t = f()
+        \\settle(r, true)
         \\print(pcall(function() return await t end))
-    , "false\tmain:2: deadlock: the awaited task can never finish\n" ++
-        "false\tmain:5: a task cannot await itself\n");
+    , "false\tmain:2: await would block: the host has no way to wait outside a task\n" ++
+        "false\tmain:10: deadlock: the awaited task can never finish\n" ++
+        "false\tmain:13: a task cannot await itself\n");
 }
 
 test "async: await in a coroutine inside a task runs the ready tasks in place" {

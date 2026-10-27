@@ -161,9 +161,8 @@ fn configureLeg(vm: *Vm, sink: *io.Writer, stress: bool, mode: TraceMode, opts: 
 /// program `root`'s proto ids are taken, as a run would load it.
 pub fn installTaskGlobals(vm: *Vm, root: *const bytecode.Proto) anyerror!void {
     vm.seedProtoIds(root);
-    const lib = try vm.taskLib();
-    try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("pending"), lib.get(Value.int(4)));
-    try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("settle"), lib.get(Value.int(5)));
+    try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("pending"), try vm.taskFn(.pending));
+    try vm.globals.set(vm.heap.gpa, try vm.heap.internValue("settle"), try vm.taskFn(.settle));
 }
 
 /// `expectProgramTuned` for a program that fails: on every leg it prints

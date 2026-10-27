@@ -46,6 +46,11 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       `await` never traces in its own frame. The op loads a VM-lifetime
       closure, so it could record as a constant. Deferred with the rest of
       coroutine performance (Bart, 2026-10-27).
+- [ ] Doc 73 §7.5: the `mahina` Rust crate has no task API. `MH_WAITING`
+      maps to an `Error::Api` saying the task can't be continued; a safe
+      surface over `mh_set_wait_fn`/`mh_pending_*`/`mh_tasks_run`/
+      `mh_task_result` (a closure wait callback, a pending handle, an
+      entry result that can be a task) needs a design pass with Bart.
 - [ ] A live coroutine commits at least one page in each of its four
       regions (scratch, payloads, tags, frames): ~16 KiB each, so
       `co_many` (10k live) holds 164 MB where LuaJIT holds 7.6 MB.

@@ -322,7 +322,7 @@ test "doc 63 suspend: a suspended callback leaves an active outer recording unto
     ), s("outer"), &sb));
     defer capi.mh_script_free(sb);
     vm.setSuspendCtl(.{ .after_safepoints = vm.safepoint_seq + 1 });
-    try testing.expect(try stepUntilRecording(vm, try vm.start(sb.proto)));
+    try testing.expect(try stepUntilRecording(vm, try vm.start(sb.image.proto)));
     vm.setSuspendCtl(null);
 
     // A suspended callback runs loops, calls and returns (and a raise that
@@ -449,7 +449,7 @@ test "doc 63 suspend: abortRaised leaves an active recording to its owner only w
     ), s("outer"), &sb));
     defer capi.mh_script_free(sb);
     vm.setSuspendCtl(.{ .after_safepoints = vm.safepoint_seq + 1 });
-    try testing.expect(try stepUntilRecording(vm, try vm.start(sb.proto)));
+    try testing.expect(try stepUntilRecording(vm, try vm.start(sb.image.proto)));
     vm.setSuspendCtl(null);
 
     vm.trace.raiseSuspend();

@@ -137,6 +137,8 @@ impl VmInner {
             sys::MH_ERR_RUNTIME => Error::Runtime(self.last_error()),
             sys::MH_ERR_OOM => Error::Oom,
             sys::MH_EXIT => Error::Exit(unsafe { sys::mh_exit_status(self.raw) }),
+            // Doc 73 §7.5: this crate has no task API yet (TODO.md).
+            sys::MH_WAITING => Error::Api("the call's task waits on host operations (MH_WAITING), which this crate can't continue yet".into()),
             _ => Error::Api(self.last_error()),
         }
     }

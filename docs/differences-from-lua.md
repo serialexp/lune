@@ -36,9 +36,11 @@ own code it suspends the task, elsewhere it runs the other ready tasks
 until the awaited one finishes. Tasks still ready when the main chunk
 returns run after it, and a failed task nothing awaited is then a
 fatal error. A task's own `coroutine.yield` is an error; coroutines
-inside a task work as usual. Nothing a program can call waits on the
-outside world yet, so today every task runs to completion as it is
-called.
+inside a task work as usual. In the CLI nothing a program can call
+waits on the outside world yet, so every task runs to completion as it is
+called. An embedder's host functions can return operations to await
+(doc 59 §3.10); with no wait callback, `await` outside a task's own
+code then fails with "await would block".
 
 **Numerals** read as in Lua, hex floats (`0x1.8p+1`) and wrapping hex
 integers included, with one exception: `..` ends a numeral, so `1..2` is

@@ -157,6 +157,9 @@ pub const mh_status = enum(c_int) {
     err_api = 4,
     /// Doc 65 §7 (Q6): the guest called `os.exit`; not a fault.
     exit = 5,
+    /// Doc 73 §7.5: the entry's task waits on the host's operations, and the
+    /// host registered no wait callback; not a fault.
+    waiting = 6,
 };
 
 /// The public value *type* — a stable wire enum, deliberately decoupled from
@@ -234,6 +237,12 @@ pub const mh_host_fn = *const fn (
 
 pub const mh_host_fn_destroy = *const fn (userdata: ?*anyopaque) callconv(.c) void;
 
+/// Doc 73 §7.5: the host's wait for its operations, called when every task
+/// waits and some wait on the host. It returns once it has settled what it
+/// could (`mh_pending_settle`); any status but `MH_OK` raises a guest error
+/// carrying the `mh_error_set` message, as a host function's does.
+pub const mh_wait_fn = *const fn (vm: ?*VmBox, userdata: ?*anyopaque) callconv(.c) mh_status;
+
 // ---------------------------------------------------------------------------
 // handles
 // ---------------------------------------------------------------------------
@@ -263,13 +272,24 @@ pub const VmBox = struct {
     exit_pending: bool = false,
     /// The real OS behind the enabled `mh_config.system` groups (doc 65 §5.2).
     real_sys: host_system.RealSystem = undefined,
+    /// Doc 73 §7.5: `mh_set_wait_fn`'s callback; `vm.host_wait` reaches it
+    /// through `cWait`.
+    wait_fn: ?mh_wait_fn = null,
+    wait_userdata: ?*anyopaque = null,
+    host_wait: interp.HostWait = undefined,
 };
 
 /// The `mh_script` handle: a VM-owned program image (see file header). The
 /// box is just `{owner, root proto}` — freeing it frees nothing of the image.
 pub const ScriptBox = struct {
     owner: *VmBox,
+    image: Image,
+};
+
+/// A compiled root proto, and whether its code uses tasks (doc 73 §7.5).
+const Image = struct {
     proto: *const Proto,
+    uses_tasks: bool,
 };
 
 /// A table iterator (doc 59 §3.4): the deterministic key order materialized
@@ -658,7 +678,7 @@ pub export fn mh_collect(vm: ?*VmBox) mh_status {
 /// Parse + compile into a VM-owned program image (the `load()` recipe:
 /// VM-unique proto ids, VM-lifetime chunk + source ownership). On
 /// `error.Compile` the diagnostics are already rendered into `last_error`.
-fn compileImage(box: *VmBox, src: []const u8, name: []const u8) error{ Compile, OutOfMemory }!*const Proto {
+fn compileImage(box: *VmBox, src: []const u8, name: []const u8) error{ Compile, OutOfMemory }!Image {
     const vm = &box.vm;
     const owned = try vm.gpa.allocSentinel(u8, src.len, 0);
     @memcpy(owned, src);
@@ -712,7 +732,7 @@ fn compileImage(box: *VmBox, src: []const u8, name: []const u8) error{ Compile, 
         return error.OutOfMemory;
     };
     vm.next_proto_id += chunk.proto_count;
-    return chunk.proto;
+    return .{ .proto = chunk.proto, .uses_tasks = chunk.uses_tasks };
 }
 
 fn setErrorFromDiags(box: *VmBox, diags: *const diag.Diagnostics) void {
@@ -728,9 +748,71 @@ fn setErrorFromDiags(box: *VmBox, diags: *const diag.Diagnostics) void {
 /// Run a root proto: fresh closure + protected call. The closure is rooted
 /// by the frame the instant `callValue` pushes it; between `newClosure` and
 /// that push nothing allocates (straight-line), so no collect window exists.
-fn runProto(box: *VmBox, proto: *const Proto, results: []Value, nresults: *usize) mh_status {
-    const cl = box.vm.heap.newClosure(proto, 0) catch return oom(box);
-    return runProtected(box, Value.heap(&cl.header), &.{}, results, nresults);
+///
+/// Doc 73 §7.5: a chunk whose code uses tasks runs as one when the host has
+/// no wait callback, so its awaits can hand `MH_WAITING` back. Either way
+/// the ready tasks then run, as the CLI's drain runs them; tasks still
+/// waiting on the host stay for `mh_tasks_run`.
+fn runImage(box: *VmBox, img: Image, results: []Value, nresults: *usize) mh_status {
+    const cl = box.vm.heap.newClosure(img.proto, 0) catch return oom(box);
+    const f = Value.heap(&cl.header);
+    if (img.uses_tasks and box.vm.host_wait == null) return runTask(box, .enter, f, &.{}, results, nresults);
+    const st = runProtected(box, f, &.{}, results, nresults);
+    const lib = box.vm.task_lib orelse return st;
+    if (st != .ok) return st;
+    var n: usize = 0;
+    const tick = lib.get(Value.int(@intFromEnum(Vm.TaskFn.tick)));
+    const ts = runProtected(box, tick, &.{}, &.{}, &n);
+    if (ts != .ok) nresults.* = 0;
+    return ts;
+}
+
+/// Room for a task entry's arguments or results plus one: on the stack
+/// when they fit, else on the box's allocator.
+const TaskBuf = struct {
+    inline_buf: [16]Value = undefined,
+    heap: []Value = &.{},
+
+    fn get(self: *TaskBuf, box: *VmBox, n: usize) ?[]Value {
+        if (n <= self.inline_buf.len) return self.inline_buf[0..n];
+        self.heap = box.backing.alloc(Value, n) catch return null;
+        return self.heap;
+    }
+
+    fn deinit(self: *TaskBuf, box: *VmBox) void {
+        box.backing.free(self.heap);
+    }
+};
+
+/// Doc 73 §7.5: call the task library's `which` (`call`, `enter` or
+/// `result`) with `lead` and `args`, and hand back what it gives as an
+/// entry's outcome: `MH_OK` and the task's results, `MH_WAITING` and the
+/// task (in `results[0]`) while it waits, `MH_ERR_API` for no task. The
+/// caller has rooted `lead` and `args`.
+fn runTask(box: *VmBox, which: Vm.TaskFn, lead: Value, args: []const Value, results: []Value, nresults: *usize) mh_status {
+    const vm = &box.vm;
+    nresults.* = 0;
+    if (park(box, lead) != .ok) return .err_oom;
+    const callee = vm.taskFn(which) catch |e| return guestFault(box, vm.depth, vm.stack_top, e);
+    var in_buf: TaskBuf = .{};
+    defer in_buf.deinit(box);
+    var out_buf: TaskBuf = .{};
+    defer out_buf.deinit(box);
+    const in = in_buf.get(box, args.len + 1) orelse return oom(box);
+    const out = out_buf.get(box, results.len + 1) orelse return oom(box);
+    in[0] = lead;
+    @memcpy(in[1..], args);
+    var got: usize = 0;
+    const st = runProtected(box, callee, in, out, &got);
+    if (st != .ok) return st;
+    if (got == 0 or out[0].tag != .boolean) {
+        setLastError(box, "not a task");
+        return .err_api;
+    }
+    const n = @min(got - 1, results.len);
+    for (results[0..n], out[1 .. n + 1]) |*r, v| Value.storeWords(r, v);
+    nresults.* = n;
+    return if (out[0].payload.bits != 0) .ok else .waiting;
 }
 
 pub export fn mh_compile(vm: ?*VmBox, src: mh_str, name: mh_str, out: ?**ScriptBox) mh_status {
@@ -741,12 +823,12 @@ pub export fn mh_compile(vm: ?*VmBox, src: mh_str, name: mh_str, out: ?**ScriptB
     const src_bytes = strSlice(src) orelse return badStr(box);
     const name_bytes = strSlice(name) orelse return badStr(box);
     parkClearIfIdle(box);
-    const proto = compileImage(box, src_bytes, if (name_bytes.len > 0) name_bytes else "chunk") catch |e| switch (e) {
+    const image = compileImage(box, src_bytes, if (name_bytes.len > 0) name_bytes else "chunk") catch |e| switch (e) {
         error.Compile => return .err_compile,
         error.OutOfMemory => return oom(box),
     };
     const sb = box.backing.create(ScriptBox) catch return oom(box);
-    sb.* = .{ .owner = box, .proto = proto };
+    sb.* = .{ .owner = box, .image = image };
     o.* = sb;
     return .ok;
 }
@@ -770,7 +852,7 @@ pub export fn mh_run(vm: ?*VmBox, script: ?*ScriptBox, results: ?[*]mh_value, ma
         return .err_api;
     }
     parkClearIfIdle(box);
-    return runProto(box, sb.proto, resultsSlice(results, max_results), nres);
+    return runImage(box, sb.image, resultsSlice(results, max_results), nres);
 }
 
 pub export fn mh_eval(vm: ?*VmBox, src: mh_str, name: mh_str, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
@@ -782,11 +864,11 @@ pub export fn mh_eval(vm: ?*VmBox, src: mh_str, name: mh_str, results: ?[*]mh_va
     const src_bytes = strSlice(src) orelse return badStr(box);
     const name_bytes = strSlice(name) orelse return badStr(box);
     parkClearIfIdle(box);
-    const proto = compileImage(box, src_bytes, if (name_bytes.len > 0) name_bytes else "chunk") catch |e| switch (e) {
+    const image = compileImage(box, src_bytes, if (name_bytes.len > 0) name_bytes else "chunk") catch |e| switch (e) {
         error.Compile => return .err_compile,
         error.OutOfMemory => return oom(box),
     };
-    return runProto(box, proto, resultsSlice(results, max_results), nres);
+    return runImage(box, image, resultsSlice(results, max_results), nres);
 }
 
 fn badStr(box: *VmBox) mh_status {
@@ -822,9 +904,27 @@ pub export fn mh_call(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, n
     // A null buffer already meant "no results" (`resultsSlice`); normalizing
     // here means no inner layer sees a null `results` with a nonzero length.
     const max = if (results == null) 0 else max_results;
+    // Doc 73 §7.5: once the VM has the task library, a call may run as a task.
+    if (box.vm.task_lib != null)
+        return @call(.always_tail, hostcallTasks, .{ box, callee, args, nargs, results, max, nres });
     if (hostcall_asm)
         return @call(.always_tail, asm_entry.mahina_hostcall_entry, .{ box, callee, args, nargs, results, max, nres });
     return @call(.always_tail, hostcallSlow, .{ box, callee, args, nargs, results, max, nres });
+}
+
+/// Doc 73 §7.5: `mh_call` in a VM that loaded the task library. Without a
+/// wait callback the call runs as a task, so an await in it can hand
+/// `MH_WAITING` back; with one, an await waits there, and the call is H1's.
+/// `mh_call`'s narrow contract, as `hostcallSlow`'s.
+fn hostcallTasks(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) callconv(.c) mh_status {
+    const box = vm.?;
+    if (box.vm.host_wait != null) return hostcallSlow(vm, callee, args, nargs, results, max_results, nresults);
+    const cv = fromC(callee) orelse return badValue(box);
+    const cargs = argsSlice(box, args, nargs) orelse return badValue(box);
+    parkClearIfIdle(box);
+    if (park(box, cv) != .ok) return .err_oom;
+    for (cargs) |*a| if (park(box, Value.loadWords(a)) != .ok) return .err_oom;
+    return runTask(box, .call, cv, cargs, resultsSlice(results, max_results), nresults.?);
 }
 
 /// Doc 60 §6.1, for the differential tests: `mh_call` with H1 as its target
@@ -838,6 +938,7 @@ pub fn mhCallViaH1(vm: ?*VmBox, callee: mh_value, args: ?[*]const mh_value, narg
     nres.* = 0;
     if (checkFatal(box)) |s| return s;
     const max = if (results == null) 0 else max_results;
+    if (box.vm.task_lib != null) return hostcallTasks(box, callee, args, nargs, results, max, nres);
     return hostcallSlow(box, callee, args, nargs, results, max, nres);
 }
 
@@ -974,6 +1075,114 @@ fn argsSlice(box: *VmBox, args: ?[*]const mh_value, nargs: usize) ?[]const Value
 fn badValue(box: *VmBox) mh_status {
     setLastError(box, "invalid mh_value (bad tag, null heap pointer or non-0/1 boolean)");
     return .err_api;
+}
+
+// ---------------------------------------------------------------------------
+// tasks and the host's operations (doc 73 §7.5)
+// ---------------------------------------------------------------------------
+
+/// `Vm.host_wait` for a registered `mh_wait_fn`: a failing status raises
+/// as a host function's does (`cHostCall`).
+fn cWait(ctx: *anyopaque, vm: *Vm) anyerror!void {
+    const box: *VmBox = @ptrCast(@alignCast(ctx));
+    std.debug.assert(vm == &box.vm);
+    const st = box.wait_fn.?(box, box.wait_userdata);
+    if (box.exit_pending) return error.Exit;
+    if (st != .ok) {
+        const msg: []const u8 = if (box.host_error.items.len > 0) box.host_error.items else "host wait error";
+        const e = vm.raiseLocatedError(msg, 1);
+        box.host_error.clearRetainingCapacity();
+        return e;
+    }
+}
+
+/// Register (or, with a null `wait_fn`, clear) the host's wait. With one,
+/// an await with nothing ready calls it, and entries don't run as tasks.
+pub export fn mh_set_wait_fn(vm: ?*VmBox, wait_fn: ?mh_wait_fn, userdata: ?*anyopaque) mh_status {
+    const box = vm orelse return .err_api;
+    bumpEpoch(box);
+    box.wait_fn = wait_fn;
+    box.wait_userdata = userdata;
+    box.host_wait = .{ .ctx = box, .wait = &cWait };
+    box.vm.host_wait = if (wait_fn != null) &box.host_wait else null;
+    return .ok;
+}
+
+/// A new host operation in flight: a value the guest can await, finished
+/// by `mh_pending_settle`. Loads the task library if the VM hasn't yet.
+pub export fn mh_pending_new(vm: ?*VmBox, out: ?*mh_value) mh_status {
+    const box = vm orelse return .err_api;
+    bumpEpoch(box);
+    const o = out orelse return .err_api;
+    if (checkFatal(box)) |s| return s;
+    parkClearIfIdle(box);
+    const callee = box.vm.taskFn(.pending) catch |e| return guestFault(box, box.vm.depth, box.vm.stack_top, e);
+    var r: [1]Value = undefined;
+    var n: usize = 0;
+    const st = runProtected(box, callee, &.{}, &r, &n);
+    if (st != .ok) return st;
+    std.debug.assert(n == 1);
+    putC(o, r[0]);
+    return .ok;
+}
+
+/// Finish the operation `op`: with `ok`, its awaits give `values`;
+/// without, they raise `values[0]` (nil if `n` is 0). The tasks waiting on
+/// it become ready; they run in the wait callback's caller, or at the next
+/// `mh_tasks_run`.
+pub export fn mh_pending_settle(vm: ?*VmBox, op: mh_value, ok: c_int, values: ?[*]const mh_value, n: usize) mh_status {
+    const box = vm orelse return .err_api;
+    bumpEpoch(box);
+    if (checkFatal(box)) |s| return s;
+    const ov = fromC(op) orelse return badValue(box);
+    const vals = argsSlice(box, values, n) orelse return badValue(box);
+    parkClearIfIdle(box);
+    if (park(box, ov) != .ok) return .err_oom;
+    for (vals) |*a| if (park(box, Value.loadWords(a)) != .ok) return .err_oom;
+    const callee = box.vm.taskFn(.settle) catch |e| return guestFault(box, box.vm.depth, box.vm.stack_top, e);
+    var in_buf: TaskBuf = .{};
+    defer in_buf.deinit(box);
+    const in = in_buf.get(box, vals.len + 2) orelse return oom(box);
+    in[0] = ov;
+    in[1] = Value.boolean(ok != 0);
+    @memcpy(in[2..], vals);
+    var none: usize = 0;
+    return runProtected(box, callee, in, &.{}, &none);
+}
+
+/// Run the ready tasks, waiting on the host (with a wait callback) while
+/// its operations are in flight: `MH_OK` once nothing is left to run,
+/// `MH_WAITING` while tasks wait on operations and there is no callback.
+pub export fn mh_tasks_run(vm: ?*VmBox) mh_status {
+    const box = vm orelse return .err_api;
+    bumpEpoch(box);
+    if (checkFatal(box)) |s| return s;
+    const lib = box.vm.task_lib orelse return .ok;
+    parkClearIfIdle(box);
+    var r: [1]Value = undefined;
+    var n: usize = 0;
+    const st = runProtected(box, lib.get(Value.int(@intFromEnum(Vm.TaskFn.tick))), &.{}, &r, &n);
+    if (st != .ok) return st;
+    std.debug.assert(n == 1 and r[0].tag == .boolean);
+    return if (r[0].payload.bits != 0) .ok else .waiting;
+}
+
+/// The outcome of a task an entry handed back with `MH_WAITING`: `MH_OK`
+/// and its results once it is done, `MH_WAITING` (and the task) while it
+/// waits, `MH_ERR_RUNTIME` with its error once it failed.
+pub export fn mh_task_result(vm: ?*VmBox, task: mh_value, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
+    const box = vm orelse return .err_api;
+    bumpEpoch(box);
+    const nres = nresults orelse return .err_api;
+    nres.* = 0;
+    if (checkFatal(box)) |s| return s;
+    const tv = fromC(task) orelse return badValue(box);
+    if (box.vm.task_lib == null) {
+        setLastError(box, "not a task");
+        return .err_api;
+    }
+    parkClearIfIdle(box);
+    return runTask(box, .result, tv, &.{}, resultsSlice(results, max_results), nres);
 }
 
 // ---------------------------------------------------------------------------
@@ -1556,5 +1765,6 @@ test {
     _ = @import("capi_hostcall_test.zig");
     _ = @import("capi_epoch_test.zig");
     _ = @import("capi_suspend_test.zig");
+    _ = @import("capi_task_test.zig");
     if (hostcall_asm) _ = @import("asm/offsets_x64.zig");
 }

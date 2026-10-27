@@ -2,13 +2,13 @@
 -- (bytecode `intrinsic`). The VM compiles it the first time a program uses
 -- either and calls this chunk with the natives below, made fresh, so a
 -- program that rebinds `coroutine` or `error` can't reach into it. It
--- returns spawn, wait (`await`) and drain; the VM runs drain when the
--- main chunk finishes.
+-- returns spawn, wait (`await`) and drain, which the VM runs when the main
+-- chunk finishes, then the host's half (`interp.TaskFn` names the order).
 --
 -- A task is a table marked by TAG. It runs its function in a coroutine of
 -- its own, which yields only from `await`: (TAG, the awaited task). The
 -- ready queue holds the tasks the task they wait on has woken, in order.
-local create, resume, yield, running, status, close, error, select, unpack, type, rawget = ...
+local create, resume, yield, running, status, close, error, select, unpack, type, rawget, host_wait = ...
 
 local TAG = {}
 local queue, head, tail = {}, 1, 0
@@ -16,6 +16,9 @@ local queue, head, tail = {}, 1, 0
 local unobserved, nun = {}, 0
 -- The task whose coroutine is resumed innermost.
 local current = nil
+-- The host's operations not settled yet. While any are, an empty queue
+-- waits on the host (`host_wait`: false when it has no way to).
+local inflight = 0
 
 local function pack(...)
   return { n = select("#", ...), ... }
@@ -131,27 +134,53 @@ local function wait(x)
       if x == c then error("a task cannot await itself", 2) end
       yield(TAG, x)
     elseif not runReady() then
-      idle()
-      error("deadlock: the awaited task can never finish", 2)
+      if inflight == 0 then
+        idle()
+        error("deadlock: the awaited task can never finish", 2)
+      end
+      if not host_wait() then
+        error("await would block: the host has no way to wait outside a task", 2)
+      end
     end
   end
 end
 
--- The main chunk's results, once every ready task has run.
+-- Run the ready tasks, and wait on the host while its operations are in
+-- flight. True once nothing is left to run; false when tasks still wait
+-- on the host and it has no way to wait (doc 73 §7.5).
+local function tick()
+  while true do
+    if not runReady() then
+      if inflight == 0 then
+        idle()
+        return true
+      end
+      if not host_wait() then
+        idle()
+        return false
+      end
+    end
+  end
+end
+
+-- The main chunk's results, once the tasks have run.
 local function drain(r)
-  while runReady() do end
-  idle()
+  tick()
   return unpack(r, 1, r.n)
 end
 
 -- A host's operation in flight: a task with no coroutine, which `settle`
--- finishes. The host's, not a program's (doc 73 §7 P4b).
+-- finishes. The host's, not a program's (doc 73 §7.5).
 local function pending()
+  inflight = inflight + 1
   return { [TAG] = true, state = "waiting", observed = false }
 end
 
 local function settle(t, ok, ...)
-  if t.co ~= nil or t.state ~= "waiting" then error("not a pending operation", 2) end
+  if type(t) ~= "table" or rawget(t, TAG) == nil or t.co ~= nil or t.state ~= "waiting" then
+    error("not a pending operation", 2)
+  end
+  inflight = inflight - 1
   if ok then
     finish(t, true, pack(true, ...))
   else
@@ -159,4 +188,37 @@ local function settle(t, ok, ...)
   end
 end
 
-return { spawn, wait, drain, pending, settle }
+-- The host's look at task `t`: true and its results once it is done,
+-- false and `t` while it waits, its error raised once it failed; nothing
+-- when `t` is no task.
+local function result(t)
+  if type(t) ~= "table" or rawget(t, TAG) == nil then return end
+  local s = t.state
+  if s == "done" then
+    local r = t.results
+    return true, unpack(r, 2, r.n)
+  end
+  if s == "failed" then
+    t.observed = true
+    error(t.err, 0)
+  end
+  return false, t
+end
+
+-- A host entry run as a task, as `result` gives it back. The host
+-- observes it, so its failure is never an unobserved one.
+local function call(f, ...)
+  local t = spawn(f, ...)
+  t.observed = true
+  return result(t)
+end
+
+-- `call`, then the ready tasks, as the drain runs them.
+local function enter(f, ...)
+  local t = spawn(f, ...)
+  t.observed = true
+  tick()
+  return result(t)
+end
+
+return { spawn, wait, drain, pending, settle, tick, result, call, enter }

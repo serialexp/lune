@@ -4,7 +4,7 @@
 tests), E3/E4 (the Rust crates + `just embed-test` gate) and E5 (boundary
 benchmark) landed; E6–E9 deferred by design.
 **Owner:** claude (fable)
-**Last updated:** 2026-10-09
+**Last updated:** 2026-10-27
 
 ## Implementation status
 
@@ -219,6 +219,10 @@ land; move whole phases to Done once everything inside them is checked.
   on the same tag. First releases: v0.1.0, and v0.1.1, which fixes the
   trampoline building a slice from the null result buffer of a host fn called
   as a statement.
+- [x] **Tasks and host operations** (§3.10, doc 73 §7.5, 2026-10-27):
+  `MH_WAITING`, `mh_set_wait_fn`, `mh_pending_new`/`mh_pending_settle`,
+  `mh_tasks_run`, `mh_task_result`; `mahina-sys` mirrors them, the safe
+  crate has no task API yet (doc 73's Outstanding).
 ### Outstanding
 
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND
@@ -610,6 +614,31 @@ O(1)/step (§3.4), never `next`'s per-step re-sort. E5 pins: host→guest call
 iteration, ref churn under GC pressure, repeated compilation** (codex #14's
 additions) — cargo bench, informational, not a gating test (Rule #22).
 Bulk data stays out of v1; that's E7's lease design, not a per-item API.
+
+### 3.10 Tasks and host operations (doc 73 §7.5, added 2026-10-27)
+
+A host function starts an operation the guest awaits: `mh_pending_new`
+makes a value the guest can `await`, which the host keeps with a ref, and
+`mh_pending_settle(vm, op, ok, values, n)` finishes it, waking the tasks
+awaiting it. The task library counts the operations in flight. The host
+waits in one of two ways:
+
+- **A wait callback** (`mh_set_wait_fn`): an await with nothing ready
+  calls it; it blocks until it has settled what it can. Entries run as
+  plain code and finish synchronously.
+- **None:** entries run as tasks when they might have to stop — `mh_run`/
+  `mh_eval` of a chunk whose code uses `async`/`await` (`Chunk.uses_tasks`),
+  `mh_call` once the VM has loaded the task library — and return the new
+  status `MH_WAITING` with the task in `results[0]` while it waits. The
+  host settles, calls `mh_tasks_run` (`MH_OK` when nothing is left,
+  `MH_WAITING` while operations are in flight) and reads the outcome with
+  `mh_task_result`.
+
+`mh_run`/`mh_eval` run the ready tasks after the chunk, as the CLI's drain
+does; `mh_call` doesn't. The cost of the gate on an ordinary `mh_call` is
+one load and branch (`Vm.task_lib`) before its tail call; a task costs
+~10k instructions (doc 73 §7.5), paid only behind the gate. Nothing is
+logged: the C API has no record/replay surface (E6).
 
 ## 4. Non-goals (v1)
 

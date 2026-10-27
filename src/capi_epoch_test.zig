@@ -274,7 +274,7 @@ test "doc 63 epoch: guest execution, metamethods, collection and grid deflation 
     try testing.expectEqual(Status.ok, capi.mh_compile(box, s("return 1"), s("c"), &sb));
     defer capi.mh_script_free(sb);
     b = epoch(box);
-    try testing.expectEqual(@as(i64, 1), (try vm.run(sb.proto)).asInt());
+    try testing.expectEqual(@as(i64, 1), (try vm.run(sb.image.proto)).asInt());
     try expectDelta(box, "Vm.run of a call-free chunk", b, 1);
     // `mh_run`: the boundary bump, then `callValue` and `execWithEntry`.
     var n: usize = 0;

@@ -57,6 +57,9 @@ pub const Chunk = struct {
     /// dynamically-compiled chunk occupies a disjoint id range (serialization
     /// resolves a `proto_id` to exactly one proto across static + loaded chunks).
     proto_count: u32 = 0,
+    /// Doc 73 §7.5: some proto in the tree runs an `intrinsic` (`async`
+    /// or `await`), so the C API runs the chunk as a task.
+    uses_tasks: bool = false,
 
     pub fn deinit(self: *Chunk) void {
         self.arena.deinit();
@@ -175,7 +178,7 @@ pub fn compileWithOptions(
     // Moving `arena` is safe: code/constants/proto live in arena *heap* buffers,
     // not in the struct, so the pointers stay valid; only the `c.arena` handle
     // goes stale and we no longer use it.
-    return .{ .arena = arena, .proto = proto, .proto_count = next_id - opts.id_base };
+    return .{ .arena = arena, .proto = proto, .proto_count = next_id - opts.id_base, .uses_tasks = c.uses_tasks };
 }
 
 /// `Proto.global_slot_hints` for a proto with `n` constants: all slot 0,
@@ -327,6 +330,9 @@ const Compiler = struct {
     /// function body. Used to detect references to an outer function's locals
     /// (upvalue captures, which Phase 3d1 diagnoses rather than supports).
     parent: ?*Compiler = null,
+    /// The chunk's root compiler only: some function emitted an
+    /// `intrinsic` (`Chunk.uses_tasks`).
+    uses_tasks: bool = false,
 
     code: std.ArrayList(Instr) = .empty,
     /// Source span per emitted instruction, parallel to `code` (→ `Proto.spans`).
@@ -1742,7 +1748,12 @@ const Compiler = struct {
             .call => |c| try self.compileCall(c.callee, c.args, dest, 1),
             .method_call => |mc| try self.compileMethodCall(mc.obj, mc.name, mc.args, dest, 1),
             .function => |body| try self.compileFunction(body, "anonymous", dest),
-            .intrinsic => |k| _ = try self.emit(Instr.opAB(.intrinsic, dest, @intFromEnum(k))),
+            .intrinsic => |k| {
+                _ = try self.emit(Instr.opAB(.intrinsic, dest, @intFromEnum(k)));
+                var root = self;
+                while (root.parent) |up| root = up;
+                root.uses_tasks = true;
+            },
 
             // `...` in single-value position yields its *first* value (or nil).
             // Tail/expanding positions are handled by the spread sites below.

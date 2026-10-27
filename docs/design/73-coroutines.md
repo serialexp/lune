@@ -1,10 +1,11 @@
 # 73 — Coroutines, and async on top of them — Design
 
-Status: partial — P0, P1, P3 and P4a landed (resume/yield on separate
+Status: partial — P0, P1, P3, P4a and P4b landed (resume/yield on separate
 stacks, stops and keyframes inside coroutines, the whole library including
 `wrap` and native bodies, the stack pool and its GC weight, coroutines in
-the step debugger, `async function`/`await` over a task library); the JIT
-boundary and async's host pendings (P4b/P4c) outstanding.
+the step debugger, `async function`/`await` over a task library, the C
+API's host operations); the JIT boundary and the VM's own async functions
+(P4c) outstanding.
 Every open question decided 2026-10-26 (Q1: §4.2).
 Owner: claude (coral-marten)
 Last updated: 2026-10-27
@@ -148,6 +149,16 @@ land; move whole phases to Done once everything inside them is checked.
   the drain, a replay step in a drained task, and the parser's.
 - [x] **P5 (async, P4a part) — docs**: `docs/differences-from-lua.md`
   (the reserved words and the syntax), the viz editor's keywords.
+- [x] **P4b — host operations in the C API** (§7.5): `MH_WAITING`,
+  `mh_set_wait_fn`, `mh_pending_new`/`mh_pending_settle`, `mh_tasks_run`,
+  `mh_task_result`; the library counts operations in flight and waits on
+  the host (`task.host_wait`, `Vm.host_wait`) instead of dropping tasks;
+  entries run as tasks when the chunk uses async (`Chunk.uses_tasks`) or,
+  for `mh_call`, once the library is loaded, unless a wait callback is
+  registered; `mh_run`/`mh_eval` drain. Tests in `capi_task_test.zig` and
+  the C smoke test; `mahina-sys` mirrors it.
+- [x] **P5 (async, P4b part) — docs**: `include/mahina.h`'s TASKS block,
+  doc 59 §3.10.
 - [x] **P5 (coroutines) — docs and inventory**: the inventory rows and
   `docs/differences-from-lua.md` track the library; doc 00's Non-goal,
   its decision row and guiding principles, and doc 02's Non-goal and
@@ -162,17 +173,15 @@ land; move whole phases to Done once everything inside them is checked.
   coroutine body run as usual. Evidence from the first board: with the yield
   made 20 or 150 calls deep, `--jit-native` is 3.2–3.6× slower than t0
   (302.7 vs 95.7 ms, 2193.7 vs 610.4 ms) at ~41–46% residency.
-- [ ] **P4b — host pendings** (§7.2, §7.3): the C API over the library's
-  `pending`/`settle`, the completion as a logged effect (effect format 8),
-  and a drain that waits for the host while operations are in flight
-  (today tasks still waiting when the queue empties are dropped). The C
-  API needs its own way to run the drain: it enters guest code through
-  `callValue`, not `Vm.exec`, so an embedder's ready tasks don't run
-  yet.
-- [ ] **P4c — async copies of the blocking functions** (§7.2 A1): which
-  functions, and their names, to decide with Bart.
-- [ ] **P5 — docs for the async layer, remainder**: doc 59's C API section
-  for P4b's host pendings.
+- [ ] **P4c — async copies of the blocking functions** (§7.2 A1, §7.4): a
+  timer and file reads/writes in a module of their own, on a worker-thread
+  pool in the CLI, each completion a logged effect (effect format 8), and
+  the CLI's `Vm.host_wait`.
+- [ ] **The Rust crate's task API**: `mahina` maps `MH_WAITING` to an
+  `Error::Api` saying it can't continue the task; a safe surface over
+  §7.5's functions is its own design (TODO.md).
+- [ ] **P5 — docs for the async layer, remainder**: P4c's module in
+  `docs/differences-from-lua.md` and the inventory.
 - [ ] **Traces over `intrinsic`**: the recorder doesn't know the op
   (`nyi_opcode`), so a loop that calls an async function or awaits never
   traces in its own frame. Performance work, deferred with P2 (TODO.md).
@@ -605,6 +614,96 @@ the async copies of the blocking functions.
   P4a program runs synchronously. `pending()` / `settle(op, ok, ...)` are
   the host's half (P4b's foundation) and the tests' stand-in for a host,
   not reachable from a program.
+
+### 7.4 Decisions for P4b/P4c (Bart, 2026-10-27)
+
+- **Handing control to the embedder when every task waits on the host:
+  both.** A wait callback when the host registered one (the VM calls it,
+  blocking, and the host settles operations inside it); otherwise the
+  call returns to the host with a "waiting" status and the host continues
+  the tasks later.
+- **P4c's first async copies:** a timer (sleep) and file reads and
+  writes, run on a small pool of worker threads in the CLI, each
+  completion a logged effect.
+- **Their names:** a module of their own mirroring the blocking functions
+  (`aio.sleep(s)`, `aio.read(f, ...)`; the module name is a placeholder
+  until P4c lands).
+
+### 7.5 P4b design (2026-10-27), as built below
+
+What is settled by §7.2/§7.4 and the tree:
+
+- **A host operation is the library's `pending` task.** `mh_pending_new`
+  makes one and returns it as a value (the host function returns it to the
+  program, which awaits it) plus nothing else: the host keeps the value
+  with `mh_ref_create`, as any value it holds. `mh_pending_settle(vm,
+  op, ok, values, n)` finishes it (`settle`). The library counts the
+  operations in flight, so the count is in every keyframe.
+- **The C API logs nothing.** An embedder's host functions aren't logged
+  today (the C API has no record/replay surface), so their completions
+  aren't either; the logged completion is the VM's own operations' (P4c,
+  effect format 8).
+- **Waiting.** When `wait` or the drain finds no ready task and
+  operations are in flight, the library calls a fresh native,
+  `host_wait`. With a callback registered (`mh_set_wait_fn`), it calls
+  it and the library looks again. Without one, it depends on where the
+  wait is (next).
+
+Asked 2026-10-27, since decided:
+
+- **B1 — what can return "waiting" to the host.** Only a task's own
+  coroutine can stop and continue later, so the guest must be running in
+  a task. (a) Opt-in entry points: `mh_spawn(vm, callee, args, &op)` runs
+  a function as a task and returns it; `mh_tasks_run(vm)` runs the ready
+  tasks and returns `MH_WAITING` while operations are in flight;
+  `mh_run`/`mh_call` are unchanged, and an await in them with nothing
+  ready and no callback is an error ("await would block"). No cost for
+  ordinary calls. (b) `mh_run`/`mh_eval` run the chunk as a task, so a
+  script's top-level await can return `MH_WAITING`; `mh_call` as in (a).
+  The chunk then sees itself as a coroutine (`coroutine.running()`). (c)
+  Every top-level entry runs as a task: a coroutine per `mh_call`, a cost
+  on every embedder call.
+
+  **Decided (Bart, 2026-10-27): (c), gated.** After measuring a task's cost
+  (an awaited async call ~480 ns and ~10.2k instructions against 19.5 ns
+  for a plain call): `mh_run`/`mh_eval` run as a task when the chunk's code
+  uses `async` or `await` (known when it compiles), `mh_call` once the VM
+  has loaded the task library.
+- **B2 — the drain for embedders.** (a) `mh_run`/`mh_eval` drain as the
+  CLI does (ready tasks, then the callback while operations are in
+  flight; without a callback the waiting ones stay for `mh_tasks_run`),
+  so a script behaves the same embedded; `mh_call` doesn't drain. (b) No
+  drain in the C API: tasks run only when the host calls
+  `mh_tasks_run`.
+
+  **Decided (Bart, 2026-10-27): (a).**
+
+As built:
+
+- **The library.** `pending` counts an operation in flight and `settle`
+  uncounts it; it now checks it is given a pending operation. `tick` runs
+  the ready tasks and, while operations are in flight, calls `host_wait`
+  (a fresh copy of the manual registry native `task.host_wait`, which
+  calls `Vm.host_wait` or returns false): true once nothing is left to
+  run, false when tasks wait and the host can't wait. The drain is `tick`.
+  `await` outside a task's own coroutine with nothing ready waits on the
+  host too, and is "await would block" when it can't. `result(t)` is the
+  host's look at a task (true and its results, false and the task, or its
+  error raised), `call(f, ...)` runs `f` as a task the host observes, and
+  `enter` is `call` followed by `tick`. `interp.Vm.TaskFn` names the
+  indices.
+- **One refinement of B1:** with a wait callback registered, no entry runs
+  as a task. An await anywhere then waits through the callback and every
+  entry finishes synchronously, so the per-call task cost buys nothing;
+  the gate only applies when an entry might have to stop.
+- **`mh_call`** checks `task_lib` before its tail call (one load and
+  branch on the fast path) and goes to `hostcallTasks` when it is set.
+- **`mh_run`/`mh_eval`** after a chunk that ran as plain code call `tick`
+  when the library is loaded, so tasks it started run; ones still waiting
+  on the host stay for `mh_tasks_run`.
+- **A failing wait callback** raises its `mh_error_set` message where the
+  guest awaits, as a host function's failure does. Operations still in
+  flight are waited for again at the next drain.
 
 ## 8. Open questions for review
 

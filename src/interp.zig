@@ -217,6 +217,15 @@ pub const RandomSeedSource = struct {
     seed: *const fn (ctx: *anyopaque) u64,
 };
 
+/// Doc 73 §7.5: how the host waits for its operations. The task library
+/// calls it (`task.host_wait`) when every task waits and some wait on the
+/// host; it returns once the host has settled what it could, so the
+/// library looks again. Null: the host has no way to wait there.
+pub const HostWait = struct {
+    ctx: *anyopaque,
+    wait: *const fn (ctx: *anyopaque, vm: *Vm) anyerror!void,
+};
+
 /// The seed `math.random` starts from when the host supplies no entropy (doc 65
 /// Q4): an embedded VM is deterministic unless the host opts in.
 pub const default_random_seed: u64 = 0x6d61_6869_6e61_0001;
@@ -329,6 +338,8 @@ const core_natives = [_]BaseNative{
     // a heap string or nil, so the effect log carries inline bytes. The program's
     // arguments are the load-time `arg` table (doc 65 Q3: no `argc`/`argv`).
     .{ .name = "getenv", .func = &nativeGetenv, .effect = .getenv, .module = "os", .field = "getenv", .groups = .{ .env = true } },
+    // Doc 73 §7.5: the task library's own (`Vm.loadTaskLib`), no global.
+    .{ .name = "task.host_wait", .func = &nativeHostWait, .manual = true },
     // (`io.write`/`io.flush` moved to `stdlib/io.zig` with the rest of `io`,
     // keeping their serialized names; `tonumber` and `string.format` to
     // `stdlib/basic.zig` and `stdlib/string.zig`.)
@@ -1106,11 +1117,14 @@ pub const Vm = struct {
     /// (`coroutine.native_body_source`), compiled the first time one starts
     /// (`nativeBodyProto`). No constants, so compiling it touches no heap.
     native_body_chunk: ?compiler.Chunk = null,
-    /// Doc 73 §7: the task library's functions, `{spawn, await, drain}`
-    /// (`ast.Intrinsic` order, then drain), from `stdlib/task.lua`, which
-    /// the first `intrinsic` compiles (`taskLib`) into `loaded_chunks`.
+    /// Doc 73 §7: the task library's functions (`TaskFn`), from
+    /// `stdlib/task.lua`, which the first `intrinsic` compiles (`taskLib`)
+    /// into `loaded_chunks`.
     /// Null in a VM that never ran async code. A VM-level root.
     task_lib: ?*table.Table = null,
+    /// Doc 73 §7.5: the host's way to wait for its operations, if it has
+    /// one (the C API's `mh_set_wait_fn`). The host owns it.
+    host_wait: ?*const HostWait = null,
     /// Next proto id to hand out. Seeded to the static chunk's proto count in
     /// `run`/`start` so every dynamically-`load`ed proto gets a globally-unique id
     /// across the static + dynamic trees — purely so snapshot serialization can
@@ -1317,8 +1331,22 @@ pub const Vm = struct {
     /// The task library's chunk name: how its rows and messages name it.
     pub const task_chunk_name = "=[task]";
     const task_source = @embedFile("stdlib/task.lua");
-    /// `task_lib`'s index of the drain function, after the intrinsics'.
-    const task_drain_index = @typeInfo(ast.Intrinsic).@"enum".field_names.len + 1;
+    /// `task_lib`'s functions by index (`stdlib/task.lua`'s return):
+    /// the intrinsics' first, in `ast.Intrinsic` order, then the drain,
+    /// then the host's.
+    pub const TaskFn = enum(u8) { spawn = 1, wait, drain, pending, settle, tick, result, call, enter };
+    comptime {
+        std.debug.assert(@intFromEnum(TaskFn.spawn) == @intFromEnum(ast.Intrinsic.task_spawn) + 1);
+        std.debug.assert(@intFromEnum(TaskFn.wait) == @intFromEnum(ast.Intrinsic.task_await) + 1);
+        std.debug.assert(@intFromEnum(TaskFn.drain) == @typeInfo(ast.Intrinsic).@"enum".field_names.len + 1);
+    }
+    const task_drain_index = @intFromEnum(TaskFn.drain);
+
+    /// The task library's function `f`, loading the library if need be.
+    pub fn taskFn(self: *Vm, f: TaskFn) Error!Value {
+        const lib = try self.taskLib();
+        return lib.get(Value.int(@intFromEnum(f)));
+    }
 
     /// Doc 73 §7: the task library, compiled and run the first time a
     /// program uses it. The chunk gets fresh copies of the natives it
@@ -1339,7 +1367,7 @@ pub const Vm = struct {
         std.debug.assert(n == 1);
         const last = self.loaded_chunks.items.len - 1;
         markSystem(@constCast(self.loaded_chunks.items[last].chunk.proto));
-        const names = .{ "coroutine.create", "coroutine.resume", "coroutine.yield", "coroutine.running", "coroutine.status", "coroutine.close", "error", "select", "table.unpack", "type", "rawget" };
+        const names = .{ "coroutine.create", "coroutine.resume", "coroutine.yield", "coroutine.running", "coroutine.status", "coroutine.close", "error", "select", "table.unpack", "type", "rawget", "task.host_wait" };
         var args: [names.len]Value = undefined;
         // No safepoint until `callValue` has them in its window.
         inline for (names, &args) |name, *arg| arg.* = Value.heap(&(try self.heap.newNativeFrom(templateOf(name))).header);
@@ -12014,6 +12042,16 @@ fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// and emitted as one line, prefixed `mahina warning: `, to stderr (`Vm.err`, or the
 /// process stderr). Pure output, NOT a recorded effect (like `print`): the call is
 /// a trace barrier and is never replayed, so it carries no `EffectKind`.
+/// Doc 73 §7.5 `task.host_wait()`: wait on the host (`Vm.host_wait`) and
+/// return true, or false at once when it has no way to wait.
+fn nativeHostWait(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = args;
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    const hw = vm.host_wait orelse return Value.boolean(false);
+    try hw.wait(hw.ctx, vm);
+    return Value.boolean(true);
+}
+
 fn nativeWarn(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm: *Vm = @ptrCast(@alignCast(ctx));
     // At least one argument, and every argument must be a string — Lua checks all

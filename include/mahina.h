@@ -65,7 +65,9 @@ typedef enum mh_status {
     MH_ERR_RUNTIME = 2, /* guest fault; located message in mh_last_error   */
     MH_ERR_OOM = 3,     /* allocation failure                              */
     MH_ERR_API = 4,     /* misuse: bad value/ref/handle, collision, fatal  */
-    MH_EXIT = 5         /* the guest called os.exit; see mh_exit_status    */
+    MH_EXIT = 5,        /* the guest called os.exit; see mh_exit_status    */
+    MH_WAITING = 6      /* the entry's task waits on host operations; see
+                           TASKS below. Not a fault. */
 } mh_status;
 
 /* The public value type. Stable; deliberately decoupled from the VM's
@@ -177,6 +179,43 @@ mh_status mh_eval(mh_vm *vm, mh_str src, mh_str name, mh_value *results, size_t 
 
 mh_status mh_call(mh_vm *vm, mh_value callee, const mh_value *args, size_t nargs,
                   mh_value *results, size_t max_results, size_t *nresults);
+
+/* ---- tasks and host operations (doc 73 §7.5) ----------------------------
+ * A host function can start an operation the guest awaits: mh_pending_new
+ * makes one (return it to the guest; keep it with mh_ref_create) and
+ * mh_pending_settle finishes it, waking the tasks that await it.
+ *
+ * With a wait callback (mh_set_wait_fn), an await with nothing ready calls
+ * it; it blocks until it has settled what it can and returns MH_OK (any
+ * other status raises, with the mh_error_set message, where the guest
+ * awaits). Entries then run as plain code and finish synchronously.
+ *
+ * Without one, entries run as tasks so they can stop: mh_run/mh_eval of a
+ * chunk whose code uses async or await, and mh_call once the VM has loaded
+ * the task library (an async function ran, or mh_pending_new was called).
+ * Such an entry returns MH_WAITING while its task waits on the host, with
+ * the task in results[0] if max_results >= 1 (borrowed like any result).
+ * Settle the operations, call mh_tasks_run, then mh_task_result.
+ *
+ * mh_run/mh_eval also run the ready tasks after the chunk, as the CLI
+ * does, waiting through the callback while operations are in flight;
+ * mh_call does not. An await outside a task's own coroutine (in a
+ * coroutine.wrap inside a task, say) with no callback is an error. */
+
+typedef mh_status (*mh_wait_fn)(mh_vm *vm, void *userdata);
+/* NULL clears it. */
+mh_status mh_set_wait_fn(mh_vm *vm, mh_wait_fn fn, void *userdata);
+mh_status mh_pending_new(mh_vm *vm, mh_value *out);
+/* ok nonzero: the awaits give values[0..n]; zero: they raise values[0]
+ * (nil when n is 0). An operation settles once. */
+mh_status mh_pending_settle(mh_vm *vm, mh_value op, int ok, const mh_value *values, size_t n);
+/* Run the ready tasks: MH_OK once nothing is left to run, MH_WAITING while
+ * tasks wait on unsettled operations and there is no wait callback. */
+mh_status mh_tasks_run(mh_vm *vm);
+/* A task's outcome: MH_OK and its results once done, MH_WAITING while it
+ * waits, MH_ERR_RUNTIME with its error once it failed; MH_ERR_API for a
+ * value that is no task. */
+mh_status mh_task_result(mh_vm *vm, mh_value task, mh_value *results, size_t max_results, size_t *nresults);
 
 /* ---- values ------------------------------------------------------------ */
 

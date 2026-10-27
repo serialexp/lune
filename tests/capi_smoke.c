@@ -39,6 +39,22 @@ static mh_status host_add(mh_vm *vm, void *userdata, const mh_value *args,
     return MH_OK;
 }
 
+/* Doc 73 §7.5: a host operation the guest awaits, settled later. */
+static mh_ref op_ref = 0;
+
+static mh_status host_start_op(mh_vm *vm, void *userdata, const mh_value *args,
+                               size_t nargs, mh_value *results, size_t max_results,
+                               size_t *nresults) {
+    (void)userdata;
+    (void)args;
+    (void)nargs;
+    if (max_results < 1) return MH_ERR_API;
+    if (mh_pending_new(vm, &results[0]) != MH_OK) return MH_ERR_API;
+    if (mh_ref_create(vm, results[0], &op_ref) != MH_OK) return MH_ERR_API;
+    *nresults = 1;
+    return MH_OK;
+}
+
 int main(void) {
     mh_vm *vm = NULL;
     mh_value out[2];
@@ -112,6 +128,21 @@ int main(void) {
     assert(mh_eval(vm, MH_STR("print('hi')"), MH_STR("smoke"), out, 0, &n) == MH_OK);
     mh_str o = mh_output(vm);
     assert(o.len >= 2 && memmem(o.ptr, o.len, "hi", 2) != NULL);
+
+    /* tasks: an await on a host operation hands MH_WAITING back */
+    assert(mh_register_fn(vm, MH_STR("start_op"), host_start_op, NULL, NULL) == MH_OK);
+    assert(mh_eval(vm, MH_STR("return (await start_op()) + 1"), MH_STR("smoke"), out, 1, &n) == MH_WAITING);
+    assert(n == 1);
+    mh_ref task_ref;
+    assert(mh_ref_create(vm, out[0], &task_ref) == MH_OK);
+    mh_value op, task, val = mh_int(41);
+    assert(mh_ref_get(vm, op_ref, &op) == MH_OK);
+    assert(mh_pending_settle(vm, op, 1, &val, 1) == MH_OK);
+    assert(mh_tasks_run(vm) == MH_OK);
+    assert(mh_ref_get(vm, task_ref, &task) == MH_OK);
+    assert(mh_task_result(vm, task, out, 1, &n) == MH_OK);
+    assert(n == 1 && mh_value_int(out[0], &x) == MH_OK && x == 42);
+    assert(mh_ref_free(vm, task_ref) == MH_OK && mh_ref_free(vm, op_ref) == MH_OK);
 
     assert(mh_vm_free(vm) == MH_OK);
     printf("capi smoke: OK\n");

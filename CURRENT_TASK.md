@@ -1,4 +1,4 @@
-DOC 73 COROUTINES: P0 + P1 + P3 + P4a DONE (2026-10-27, coral-marten); next P4b.
+DOC 73 COROUTINES: P0 + P1 + P3 + P4a + P4b DONE (2026-10-27, coral-marten); next P4c.
 - All questions decided. Bart accepted the frames-pointer cost; P0a landed
   (4e37dfd). The P0 runtime design is doc 73 §5.1 (stack = one allocation
   of tags+payloads+scratch+frames; active fields stay in Vm and are
@@ -70,10 +70,21 @@ DOC 73 COROUTINES: P0 + P1 + P3 + P4a DONE (2026-10-27, coral-marten); next P4b.
   (task_lib_id). Tests: interp_task_test.zig (pending/settle natives as a
   stand-in host), every-cut keyframe test, replay step test, parser tests.
   The library's `await` local is `wait` (await is reserved).
-- Next, P4b: C API over lib[4] pending / lib[5] settle, the completion as
-  a logged effect (effect format 8), drain waiting on the host while
-  operations are in flight. Then P4c: ask Bart which blocking functions
-  get async copies and how they are named.
+- P4b landed (doc 73 §7.5, doc 59 §3.10): MH_WAITING, mh_set_wait_fn,
+  mh_pending_new/settle, mh_tasks_run, mh_task_result. Library: inflight
+  count, tick/result/call/enter, `task.host_wait` manual native over
+  Vm.host_wait (?*const HostWait, the box owns it). Gate (Bart): entries
+  run as tasks when the chunk uses async (Chunk.uses_tasks) / for mh_call
+  once task_lib is loaded — and (my refinement, tell Bart) never when a
+  wait callback is registered. mh_call's gate costs +4 instr/call (~1%,
+  hostcall_probe a1 388 → 392). Tests: capi_task_test.zig + C smoke. The
+  Rust safe crate has no task API (TODO.md).
+- The P4a commit (cfc70ab) broke `zig build lib -Doptimize=ReleaseFast`:
+  only the safety block of offsets_x64.inc was updated. Fixed with P4b.
+  Nothing in `just test` builds the release lib; bundle-smoke would.
+- Next, P4c (decided, doc 73 §7.4): sleep + file read/write in their own
+  module on a CLI worker-thread pool, completions as a logged effect
+  (effect format 8), the CLI's Vm.host_wait.
   P2 lead (deferred): co_pingpong_d20/_d150 run 3.2–3.6× slower on --jit-native than
   t0 (yield made deep in recursion) — start with --jit-stats/--dump-aborts.
 - gmatch/codes lone iterators can now use bound natives (TODO.md).

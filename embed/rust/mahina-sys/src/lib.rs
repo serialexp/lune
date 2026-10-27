@@ -20,6 +20,7 @@ pub const MH_ERR_RUNTIME: mh_status = 2;
 pub const MH_ERR_OOM: mh_status = 3;
 pub const MH_ERR_API: mh_status = 4;
 pub const MH_EXIT: mh_status = 5;
+pub const MH_WAITING: mh_status = 6;
 
 pub type mh_type = c_int;
 pub const MH_NIL: mh_type = 0;
@@ -132,6 +133,8 @@ pub type mh_host_fn = unsafe extern "C" fn(
 
 pub type mh_host_fn_destroy = unsafe extern "C" fn(userdata: *mut c_void);
 
+pub type mh_wait_fn = unsafe extern "C" fn(vm: *mut mh_vm, userdata: *mut c_void) -> mh_status;
+
 // ---- functions --------------------------------------------------------------
 
 extern "C" {
@@ -170,6 +173,24 @@ extern "C" {
         callee: mh_value,
         args: *const mh_value,
         nargs: usize,
+        results: *mut mh_value,
+        max_results: usize,
+        nresults: *mut usize,
+    ) -> mh_status;
+
+    pub fn mh_set_wait_fn(vm: *mut mh_vm, f: Option<mh_wait_fn>, userdata: *mut c_void) -> mh_status;
+    pub fn mh_pending_new(vm: *mut mh_vm, out: *mut mh_value) -> mh_status;
+    pub fn mh_pending_settle(
+        vm: *mut mh_vm,
+        op: mh_value,
+        ok: c_int,
+        values: *const mh_value,
+        n: usize,
+    ) -> mh_status;
+    pub fn mh_tasks_run(vm: *mut mh_vm) -> mh_status;
+    pub fn mh_task_result(
+        vm: *mut mh_vm,
+        task: mh_value,
         results: *mut mh_value,
         max_results: usize,
         nresults: *mut usize,
