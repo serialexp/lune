@@ -206,6 +206,12 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     if (n == 0 or n > 0xFFFF) return null;
     const terminal = t.instrs[n - 1].op;
     if (terminal != .loop and terminal != .link and terminal != .terminal) return null;
+    // A terminal that resumes tier-0 at a dynamic-window `ret`/call (`b != 0`,
+    // doc 44 D4) publishes `reg_top` from the emitted exit, which needs the
+    // episode ctx and the Vm field offsets; without them the IR interpreter
+    // (whose consumer publishes) runs the trace instead.
+    if (terminal == .terminal and t.instrs[n - 1].b != 0 and
+        (seed_ctx == null or seed_ctx.?.frame_abi == null)) return null;
 
     // Doc 45 D6 acceptance checklist for PRECISE traces (codex point 1), all
     // fail-closed — never trust the IR (`assertWellFormed` is compiled out in
@@ -2283,12 +2289,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // (the old callout declined on every single push — pure
                 // waste), and an eligible one bakes `instr.a/b/c` as
                 // immediates.
+                // A dynamic argument window (`b == all_results`) pushes with the
+                // count the recorder resolved (`term.b` = the window's end + 1).
                 const push_static: ?bytecode.Instr = blk: {
                     const proto_ = t.anchor.proto;
                     if (term.aux < 0 or term.aux >= proto_.code.len) break :blk null;
-                    const ci = proto_.code[@intCast(term.aux)];
+                    var ci = proto_.code[@intCast(term.aux)];
                     if (ci.op != .call) break :blk null;
-                    if (ci.b == bytecode.all_results) break :blk null;
+                    if (ci.b == bytecode.all_results) {
+                        if (term.b == 0 or term.b - 1 <= ci.a) break :blk null;
+                        ci.b = @intCast(term.b - 1 - ci.a - 1);
+                    }
                     if (proto_.is_vararg) break :blk null;
                     break :blk ci;
                 };
@@ -2409,21 +2420,29 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // the plain `head_terminal` exit, byte-identical to pre-D12c
                 // (tier-0 re-executes the `ret` generically).
                 if (@as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .return_interp) {
-                    const pop_static: ?bytecode.Instr = blk: {
+                    // A dynamic `ret a, all_results` pops with the count the
+                    // recorder resolved (`term.b` = the window's end + 1): the
+                    // values the trace wrote back are exactly `[a, end)`, and
+                    // a caller that itself wants `all_results` still declines
+                    // at run time (step 5), leaving tier-0 the published top.
+                    const pop_static: ?struct { ci: bytecode.Instr, count: u32 } = blk: {
                         const proto_ = t.anchor.proto;
                         if (proto_.is_vararg) break :blk null;
                         if (term.aux < 0 or term.aux >= proto_.code.len) break :blk null;
                         const ci = proto_.code[@intCast(term.aux)];
                         if (ci.op != .ret) break :blk null;
-                        if (ci.b == bytecode.all_results) break :blk null;
-                        if (@as(u32, ci.a) + ci.b > proto_.num_registers) break :blk null;
-                        break :blk ci;
+                        const count: u32 = if (ci.b == bytecode.all_results) dyn: {
+                            if (term.b == 0 or term.b - 1 < ci.a) break :blk null;
+                            break :dyn @as(u32, term.b - 1) - ci.a;
+                        } else ci.b;
+                        if (@as(u32, ci.a) + count > proto_.num_registers) break :blk null;
+                        break :blk .{ .ci = ci, .count = count };
                     };
-                    if (pop_static) |ci| if (seed_ctx) |ctx| if (ctx.frame_abi) |abi| {
+                    if (pop_static) |ps| if (seed_ctx) |ctx| if (ctx.frame_abi) |abi| {
                         const no_pop = try a.label();
                         try emit.emitInlineSelfRetPop(a, ctx, abi, .{
-                            .a_reg = ci.a,
-                            .count = ci.b,
+                            .a_reg = ps.ci.a,
+                            .count = @intCast(ps.count),
                             .nreg = t.anchor.proto.num_registers,
                         }, no_pop);
                         try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "popped_frames"));
@@ -2508,6 +2527,23 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     };
                 }
                 if (no_push) |l| a.bind(l);
+                // The plain terminal exit hands tier-0 an unexecuted `ret`/call.
+                // When it reads a dynamic window the recorder resolved
+                // (`term.b` = end + 1, in the leaf's registers), publish it as
+                // `reg_top` first: the trace never maintained it, and every
+                // value of the window was just written back. Reached only by a
+                // declined or absent push/pop, so no callee is running. The
+                // gate above guarantees the ctx and ABI exist.
+                if (term.b != 0) {
+                    const ctx = seed_ctx.?;
+                    const abi = ctx.frame_abi.?;
+                    try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(ctx))));
+                    try a.movRegMem(.rax, .r9, @offsetOf(trace_code.NativeSeedCtx, "base"));
+                    try a.addRegImm32(.rax, @as(i32, term.b) - 1);
+                    try a.movRegMem(.r8, .r9, @offsetOf(trace_code.NativeSeedCtx, "vm"));
+                    try a.movMemReg(.r8, abi.vm_reg_top_off, .rax);
+                    try a.movByteMemImm(.r8, abi.vm_reg_top_pending_off, 1);
+                }
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
                 try emitLedgerAppend(a, trace_id, .head_terminal);

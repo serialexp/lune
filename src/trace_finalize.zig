@@ -171,8 +171,9 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
     }
     if (rec.terminal_close) |tc| {
         // Doc 44: the one-shot head-trace close — kind tag in `a`, the real
-        // resume pc in `aux`.
-        try rec.instrs.append(gpa, .{ .op = .terminal, .a = @intFromEnum(tc.kind), .aux = @intCast(tc.resume_pc) });
+        // resume pc in `aux`, and in `b` the resolved dynamic window's end + 1
+        // (0 = none; the consumers publish it as `reg_top`).
+        try rec.instrs.append(gpa, .{ .op = .terminal, .a = @intFromEnum(tc.kind), .b = tc.top, .aux = @intCast(tc.resume_pc) });
     } else if (rec.link_target) |lt| {
         try rec.instrs.append(gpa, .{ .op = .link, .a = @intFromEnum(rec.link_kind), .aux = @intCast(lt) });
     } else {

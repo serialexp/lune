@@ -12,7 +12,7 @@ Remaining P1/P2/P4 work below is not claimed complete.
 Codex-reviewed ×6 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
-Last updated: 2026-10-23
+Last updated: 2026-10-27
 
 Prerequisite reading: doc 10 (cross-frame tracing, inline frames, `guard_func`),
 doc 16 (coherent state chaining — the seam-cost lesson that shapes this arc's
@@ -286,7 +286,43 @@ to Done once everything inside a phase is checked.
       path), and the recorder aborts `.self_terminal` as the backstop for
       every other arming path. Board unchanged.
 
+- [x] **D4 follow-up — `all_results` terminals (2026-10-27).** A depth-0
+      `ret a, all_results` (`return f(x)`) or a self-call with a dynamic
+      argument window no longer aborts a one-shot recording. The recorder
+      resolves the window from the multret shadow (as `recReturn` does) and
+      carries its end + 1 in `terminal.b` (0 = none); the window must fit the
+      anchor proto's register file, since its values are written back with
+      the φ rows. A terminal exit that falls back to tier-0 publishes it as
+      `reg_top`: native code stores it from the emitted plain terminal exit
+      (`FrameMotionAbi.vm_reg_top_off`/`vm_reg_top_pending_off`), and the
+      native inline pop/push take the resolved count as `count`/`nargs`. The
+      IR interpreter declines such a trace (zero iterations, like a failed
+      prologue) rather than teach the shared consumer: any code added to
+      `enterSelectedTrace` moved its hot entry path by 0.3–0.6% on call-free
+      loops and binary-trees, and the decline costs the non-production tier
+      only. This was the cause of the co_pingpong d20/d150 slowdown in doc
+      73's first board, in its recursion half: `deep`'s base case
+      `return leaf(i)` never recorded, so no ret-cont link armed and each
+      return paid a dispatcher entry (297 → 83 ms on the coroutine-free
+      repro; instruction counts of 15 other benchmarks within ±0.001%).
+      Tests: `interp_trace_test.zig` ("doc 44 D4": window on the terminal for
+      0/1/2 results, a fixed return carries none, an oversized window stays
+      refused, matrix legs for recursion, 0/1/many forwarded results,
+      prefix + forwarded window, and a window feeding a self-call).
+
 ### Outstanding
+- [ ] **`all_results` windows past the register file.** `return g()` where
+      `g` returns more values than the caller has registers (a one-register
+      `f`) still aborts `nyi_opcode`: the extra results exist only in tier-0's
+      slab scratch. Needs terminal-only outputs through finalize, the
+      allocator and both writeback paths (Codex, 2026-10-27).
+- [ ] **Head/cont recordings that reach a depth-0 barrier call.** A native
+      call the recorder can't inline (`coroutine.yield`, `print`) aborts the
+      recording `host_barrier`, so a base case like `return yield(i)` still
+      never records a sibling; co_pingpong d20/d150 stay 3.2–3.6× slower than
+      t0 for that reason. Also: frames the episode didn't push can't be
+      popped natively (cont pages enter with net 0), so a closing terminal at
+      the barrier alone may not recover the returns.
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
       (want-during-recording, sibling abort/cooldown retry,
       `max_traces_per_anchor == trial_visited_cap` truncation, unpatch

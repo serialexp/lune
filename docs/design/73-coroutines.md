@@ -202,8 +202,14 @@ land; move whole phases to Done once everything inside them is checked.
   links 0, `self-ret pops` 0), and each of the 19 returns pays a
   dispatcher entry (`enterSelectedTrace` 28%, `driveDispatcherSilentResult`
   10%). Writing the base case as `local r = leaf(i); return r` gives 85 ms
-  with 3.8M native descents and pops. What remains coroutine-specific:
-  a loop containing `resume` never traces (d1: 100% tier-0, no trace).
+  with 3.8M native descents and pops. **The recursion half is fixed**
+  (doc 44 §D4 follow-up: `all_results` terminals; the no-coroutine case
+  297 → 83 ms). What remains coroutine-specific: `co_pingpong` d20/d150 is
+  unchanged, because its base case `return yield(i)` is a native barrier
+  call (the head sibling aborts `host_barrier` at the `call`) and cont
+  pages enter with net 0, so they cannot natively pop frames the episode
+  didn't push; and a loop containing `resume` never traces (d1: 100%
+  tier-0, no trace).
 - [ ] **The Rust crate's task API**: `mahina` maps `MH_WAITING` to an
   `Error::Api` saying it can't continue the task; a safe surface over
   §7.5's functions is its own design (TODO.md).

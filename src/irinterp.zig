@@ -334,6 +334,16 @@ pub fn executeTracedValues(rec: *execlog.ExecLogRecorder, t: *const Trace, regs:
 /// byte-identical to the uninstrumented run (the parity canary test asserts this).
 fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
     std.debug.assert(values.len >= t.instrs.len);
+    // A head/cont terminal that resumes tier-0 at a dynamic-window `ret`/call
+    // (`terminal.b != 0`, doc 44 D4) needs `reg_top` published on the way out.
+    // Native code does that from its emitted exit; this executor has no Vm to
+    // write it to, and teaching the dispatcher's shared consumer would tax every
+    // trace entry. So the trace is native-only: decline like a failed prologue
+    // (zero iterations, registers untouched) and tier-0 runs the body.
+    if (t.instrs.len != 0) {
+        const last = t.instrs[t.instrs.len - 1];
+        if (last.op == .terminal and last.b != 0) return .{ .completed = 0, .exit_instr = std.math.maxInt(u32) };
+    }
     if (record) rec.begin();
     var completed: usize = 0;
     // Doc 45 D5: nonzero iff a PRECISE effect shim (`tnew` today) raised a

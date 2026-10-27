@@ -391,6 +391,11 @@ pub const FrameMotionAbi = struct {
     /// open-upvalue check (`ceiling <= popped base` ⇒ no open cell at or
     /// above the popped window). Doc 54 P1.
     vm_open_upvalue_ceiling_off: i32,
+    /// `Vm.reg_top` (usize) and `Vm.reg_top_pending` (bool, 1 byte) — the
+    /// dynamic-window handoff a `.terminal` with `b != 0` publishes for the
+    /// tier-0 `ret`/call it resumes at (doc 44 D4).
+    vm_reg_top_off: i32,
+    vm_reg_top_pending_off: i32,
     /// `@sizeOf(CallFrame)` — the `frames[]` stride.
     frame_size: i32,
     frame_closure_off: i32,

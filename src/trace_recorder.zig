@@ -767,8 +767,13 @@ pub const RecordingSession = struct {
     /// instead of `.loop`/`.link`, keeps EVERY defined depth-0 register in
     /// the writeback φ rows (a ret/call may read temporaries the dead-φ
     /// filter would drop), and caches the trace unoptimized (the link-trace
-    /// precedent). Reset to `null` by `reset`.
-    terminal_close: ?struct { kind: trace_ir.TerminalKind, resume_pc: u32 } = null,
+    /// precedent. `top` is the pending `all_results` window's end + 1 in
+    /// anchor-frame registers (0 = the terminal instruction reads no dynamic
+    /// window): a `ret`/self-call whose window the multret shadow resolved at
+    /// record time, which tier-0 must find in `reg_top` when it executes the
+    /// instruction (`.terminal.b`, published by the terminal consumers).
+    /// Reset to `null` by `reset`.
+    terminal_close: ?struct { kind: trace_ir.TerminalKind, resume_pc: u32, top: u16 = 0 } = null,
     /// Nested-loop trace linking (doc 15, Phase 2): true iff this recording is a
     /// *continuation* — armed at a non-header exit pc by `maybeStartContinuation`,
     /// recording the outer body after an inner loop's loop-done exit. Only a
@@ -1644,9 +1649,9 @@ pub const RecordingSession = struct {
                 // loop root still aborts (LLEAVE): it must not leave the loop.
                 (if (isOneShotKind(self.kind))
                     (if (instr.b == bytecode.all_results)
-                        self.abort(.nyi_opcode)
+                        self.closeDynamicTerminal(.return_interp, instr.a, multret)
                     else
-                        self.closeHeadTerminal(.return_interp))
+                        self.closeHeadTerminal(.return_interp, 0))
                 else
                     self.abort(.cross_frame))
             else
@@ -4353,15 +4358,16 @@ pub const RecordingSession = struct {
         // guard is emitted: on the terminal exit tier-0 re-executes the call
         // generically, so no callee pin is needed (a different callee at this
         // pc at run time simply gets called normally — correct either way).
-        // A dynamic argument window is refused: the re-executed call would
-        // read `reg_top` state that trace execution never maintains (the
-        // multret shadow is a RECORD-time resolution only).
+        // A dynamic argument window is resolved from the multret shadow and
+        // carried on the terminal (`closeDynamicTerminal`): the re-executed
+        // call reads `reg_top`, which the terminal consumers publish.
         // (Doc 44 D12b: `.cont` inherits the same close — a depth-0 direct
         // call of the anchor proto, i.e. the caller recursing, terminates
         // the continuation one-shot exactly like the head's.)
         if (isOneShotKind(self.kind) and self.inline_depth == 0 and cp == self.anchor.proto) {
-            if (instr.b == bytecode.all_results) return self.abort(.nyi_opcode);
-            return self.closeHeadTerminal(.self_call_interp);
+            if (instr.b == bytecode.all_results)
+                return self.closeDynamicTerminal(.self_call_interp, @as(u32, instr.a) + 1, multret);
+            return self.closeHeadTerminal(.self_call_interp, 0);
         }
         // Doc 45 D1/D3: precise mode records NO inlined frames — snapshots
         // describe the anchor activation only, and no call may be inlined once
@@ -5484,11 +5490,31 @@ pub const RecordingSession = struct {
     /// `cur_pc` is post-increment, so the terminating instruction's own pc —
     /// where tier-0 resumes on a successful terminal exit and executes it
     /// exactly once — is `cur_pc - 1`.
-    fn closeHeadTerminal(self: *RecordingSession, kind: trace_ir.TerminalKind) void {
+    fn closeHeadTerminal(self: *RecordingSession, kind: trace_ir.TerminalKind, top: u16) void {
         std.debug.assert(isOneShotKind(self.kind) and self.inline_depth == 0);
         if (self.cur_pc - 1 == trace_code.entryPc(self.anchor.pc)) return self.abort(.self_terminal);
-        self.terminal_close = .{ .kind = kind, .resume_pc = self.cur_pc - 1 };
+        self.terminal_close = .{ .kind = kind, .resume_pc = self.cur_pc - 1, .top = top };
         self.close_requested = true;
+    }
+
+    /// `closeHeadTerminal` for a terminal instruction whose operand window is
+    /// dynamic (`ret a, all_results`, or a self-call with `b = all_results`):
+    /// the window's first register is `first`, its end the multret shadow's
+    /// `top` (doc 27, in anchor-frame space, resolved exactly as `recReturn`
+    /// does: a `null` shadow, a `top` below `first`, or a count at the
+    /// sentinel fails closed). The producer's values are recorded in the
+    /// anchor registers `[first, top)`, so a window past the anchor proto's
+    /// register file has nowhere to be written back and is refused. The count
+    /// is invariant on this trace — the producer's identity and every branch
+    /// that selected it are guarded — so it rides the terminal (`top + 1`;
+    /// the consumers publish it as `reg_top` before tier-0 runs the
+    /// instruction), never read from VM state the trace doesn't maintain.
+    fn closeDynamicTerminal(self: *RecordingSession, kind: trace_ir.TerminalKind, first: u32, multret: ?u32) void {
+        const top = multret orelse return self.abort(.cross_frame);
+        if (top < first) return self.abort(.cross_frame);
+        if (top - first >= bytecode.all_results) return self.abort(.cross_frame);
+        if (top > self.anchor_num_registers or top >= std.math.maxInt(u16)) return self.abort(.nyi_opcode);
+        self.closeHeadTerminal(kind, @intCast(top + 1));
     }
 
     pub fn recReturn(self: *RecordingSession, instr: Instr, multret: ?u32) !void {

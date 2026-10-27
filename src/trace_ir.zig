@@ -691,7 +691,10 @@ pub const IrOp = enum(u8) {
     /// which resumes AT that instruction and executes it exactly once.
     /// `a` = `TerminalKind` ordinal (`trace_code.TerminalKind`:
     /// return_interp / self_call_interp); `aux` = the real resume bytecode
-    /// pc. No operands; like `.loop`/`.link` it must be the last
+    /// pc; `b` = the dynamic `all_results` window's end + 1 in anchor
+    /// registers when the terminal instruction reads one (resolved at
+    /// record time from the multret shadow; the consumers publish it as
+    /// `reg_top`), else 0. No IR operands; like `.loop`/`.link` it must be the last
     /// instruction, and only kind-`.head` traces may carry it
     /// (`assertWellFormed`). A SUCCESSFUL terminal exit is NOT a side
     /// exit: it publishes end-of-trace state (sunk stores flushed exactly
@@ -1143,7 +1146,10 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
             .enclosing_iteration => try w.print("-> {d} (iteration)", .{ins.aux}),
         },
         // `.terminal` (doc 44): one-shot close; kind tag + resume pc.
-        .terminal => try w.print("{s} @ {d}", .{ @tagName(@as(TerminalKind, @enumFromInt(ins.a))), ins.aux }),
+        .terminal => {
+            try w.print("{s} @ {d}", .{ @tagName(@as(TerminalKind, @enumFromInt(ins.a))), ins.aux });
+            if (ins.b != 0) try w.print(" window end r{d}", .{ins.b - 1});
+        },
         // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit
         // `regs[slot]`); an internal φ prints `init=%a update=%b → internal`.
         // Doc 39: a peeled trace's slot-bound φ may carry `a` = the slot's

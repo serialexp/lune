@@ -1111,7 +1111,8 @@ pub const InlineSelfRetPop = struct {
 ///
 /// The helper's per-pop preflight maps to:
 /// - emit-time statics (caller's job): aux in bounds, `.ret`,
-///   `b != all_results`, `!is_vararg`, `a + b <= nreg`;
+///   `!is_vararg`, `a + count <= nreg` (`count` = `b`, or for
+///   `b == all_results` the window the terminal carries);
 /// - the per-episode `descent_ok` byte (receipts inert ∧ no pending
 ///   reg-top ∧ no final cut);
 /// - inline runtime checks: the net-pushed floor, the open-upvalue

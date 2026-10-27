@@ -19,7 +19,7 @@ DOC 74 LANGUAGE SERVER: P0 DONE (2026-10-27, coral-raven); P0 wasm host and P1a�
   has uncommitted (src/trace_recorder.zig, src/interp_trace_test.zig); the LSP
   commits do not touch the recorder. Everything else passed (2040 pass, 2 skip).
 
-DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT) diagnosed, fix awaits Bart.
+DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT): recursion half FIXED, coroutine barrier remainder open.
 - P2 DIAGNOSIS (2026-10-27): the co_pingpong_d20/_d150 jit slowdown is NOT a
   coroutine cost. /tmp/nb/rec_plain.lua (the same `deep` recursion, no
   coroutine) is 297 ms jit vs 90 ms t0; with the base case written
@@ -29,8 +29,20 @@ DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT) d
   the terminal snapshot doesn't carry the dynamic result top), so the
   base-case head sibling aborts (nyi_opcode), deep's ret-cont/call-head
   links never arm, and each return pays a dispatcher entry. Doc 73's P2
-  bullet is corrected. Fix = doc 44's deferred all_results terminal; needs
-  Bart's go-ahead on the approach (soundness: multret_top at the terminal).
+  bullet is corrected.
+- P2 FIX LANDED (2026-10-27): doc 44 §D4 follow-up, `all_results` terminals.
+  The recorder resolves the window from the multret shadow and carries
+  terminal.b = top+1; native code publishes reg_top/reg_top_pending at the
+  plain terminal exit; inline push/pop derive counts from it; irinterp
+  declines such traces. rec_plain 297 -> 83 ms. Instruction counts on the
+  guard benches within +-0.001% (publication is emitted code, NOT in
+  enterSelectedTrace/consumers: those are layout-sensitive).
+- P2 REMAINDER: real co_pingpong d20/d150 unchanged. Base case is
+  `return yield(i)`, a native barrier call -> head sibling aborts
+  host_barrier at the call; cont pages enter with net 0 so cannot natively
+  pop frames they didn't push. Needs a design choice (e.g. a call_interp
+  terminal for depth-0 barrier calls). Windows past the anchor's register
+  file stay nyi_opcode (doc 44 Outstanding).
 - All questions decided. Bart accepted the frames-pointer cost; P0a landed
   (4e37dfd). The P0 runtime design is doc 73 §5.1 (stack = one allocation
   of tags+payloads+scratch+frames; active fields stay in Vm and are

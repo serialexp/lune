@@ -6183,14 +6183,78 @@ test "inline pop ceiling (doc 54 P1): escaping closures over recursion frames st
     });
 }
 
-test "recorder (head, doc 44 P0): a depth-0 multret-forwarding return aborts — no head trace" {
+test "recorder (head, doc 44 D4): a depth-0 multret-forwarding return closes with its resolved window on the terminal" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // `return g()` forwards ALL results: `multret_top` is dynamic VM state the
-    // trace never maintains, so the head close refuses it (abort, gate strike).
-    // Only four `f` entries, so `g`'s own counter (3 counted entries — the one
-    // during recording is skipped) never goes hot and can't pollute the cache.
+    // `return g(a)` forwards ALL of g's results. The trace never maintains
+    // `reg_top`, so the recorder resolves the window from the multret shadow
+    // (here g's two results in r2, r3) and carries its end + 1 on the
+    // terminal for the consumers to publish. Only four `f` entries, so
+    // `g`'s own counter (3 counted entries — the one during recording is
+    // skipped) never goes hot and can't pollute the cache.
+    var chunk = try runForHeadTrace(&vm, gpa,
+        \\local function g(x) return x, 2 end
+        \\local function f(a, b) return g(a) end
+        \\f(1, 0) f(1, 0) f(1, 0) f(1, 0)
+        \\print("done")
+    );
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expectEqual(@as(u32, 0), vm.trace.record_gate.count());
+    const t = vm.trace.registry.cache.items[0];
+    const last = t.code.instrs[t.code.instrs.len - 1];
+    try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
+    try testing.expectEqual(@intFromEnum(trace.trace_ir.TerminalKind.return_interp), last.a);
+    // Window [r2, r4): end + 1 = 5.
+    try testing.expectEqual(@as(u16, 5), last.b);
+}
+
+test "recorder (head, doc 44 D4): a window with no results records an empty window; a fixed return carries none" {
+    const gpa = testing.allocator;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var chunk = try runForHeadTrace(&vm, gpa,
+            \\local function g(x) end
+            \\local function f(a, b) local c = a + b; return g(c) end
+            \\f(1, 0) f(1, 0) f(1, 0) f(1, 0)
+            \\print("done")
+        );
+        defer chunk.deinit();
+        try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+        const t = vm.trace.registry.cache.items[0];
+        const last = t.code.instrs[t.code.instrs.len - 1];
+        try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
+        // The window is empty at r3 (`c` is r2): end + 1 = 4 (never 0, which
+        // means "none").
+        try testing.expectEqual(@as(u16, 4), last.b);
+    }
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var chunk = try runForHeadTrace(&vm, gpa,
+            \\local function f(a) local c = a + 1; return c end
+            \\f(1) f(2) f(3) f(4) f(5)
+            \\print("done")
+        );
+        defer chunk.deinit();
+        try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+        const t = vm.trace.registry.cache.items[0];
+        const last = t.code.instrs[t.code.instrs.len - 1];
+        try testing.expectEqual(trace.trace_ir.IrOp.terminal, last.op);
+        try testing.expectEqual(@as(u16, 0), last.b);
+    }
+}
+
+test "recorder (head, doc 44 D4): a window past the frame's register file stays refused" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `f` has one register, `g` returns two: the second result has no anchor
+    // register to be written back to, so the head close refuses (the values
+    // would only exist in tier-0's slab scratch).
     var chunk = try runForHeadTrace(&vm, gpa,
         \\local function g() return 1, 2 end
         \\local function f() return g() end
@@ -6198,10 +6262,76 @@ test "recorder (head, doc 44 P0): a depth-0 multret-forwarding return aborts —
         \\print("done")
     );
     defer chunk.deinit();
-
     try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1);
     try testing.expect(!vm.trace.isRecording());
+}
+
+test "doc 44 D4: a recursive base case that forwards a call's results is correct and (native) pops" {
+    try util.expectProgramTuned(
+        \\local function leaf(i) return i end
+        \\local function deep(d, i)
+        \\  if d <= 1 then return leaf(i) end
+        \\  return deep(d - 1, i) + 0
+        \\end
+        \\local acc = 0
+        \\for i = 1, 200 do acc = acc + deep(8, i) end
+        \\print(acc)
+    , "20100\n", .{
+        .hotguard = 2,
+        .inspect = &struct {
+            fn inspect(vm: *Vm, mode: util.TraceMode) !void {
+                if (mode != .record_execute_native or vm.heap.gc_stress or
+                    !@import("nativegen.zig").is_x64_linux) return;
+                // The base case's `ret a, all_results` pops natively with the
+                // recorded count — before the fix its sibling never recorded
+                // and no frame ever unwound natively.
+                try testing.expect(vm.trace.self_call_pushes > 0);
+                try testing.expect(vm.trace.self_ret_pops > 0);
+            }
+        }.inspect,
+    });
+}
+
+test "doc 44 D4: forwarded result counts of zero, one and many reach the caller exactly" {
+    try util.expectProgramTuned(
+        \\local function none() end
+        \\local function two(i) return i, i * 2 end
+        \\local function pick(k, i)
+        \\  if k == 0 then return none() elseif k == 1 then return i else return two(i) end
+        \\end
+        \\local function rec(d, k, i)
+        \\  if d <= 0 then return pick(k, i) end
+        \\  return rec(d - 1, k, i)
+        \\end
+        \\local cnt, total = 0, 0
+        \\for i = 1, 300 do
+        \\  local r = table.pack(rec(6, i % 3, i))
+        \\  cnt = cnt + r.n
+        \\  for j = 1, r.n do total = total + r[j] end
+        \\end
+        \\print(cnt, total)
+    , "300\t60100\n", .{ .hotguard = 2 });
+}
+
+test "doc 44 D4: a prefix before a forwarded call's results, and a forwarded window feeding a self-call" {
+    try util.expectProgramTuned(
+        \\local function two(i) return i, 1 end
+        \\local function f(n, m)
+        \\  if n <= 0 then return m end
+        \\  return f(two(n - 1))
+        \\end
+        \\local function pre(n)
+        \\  return n, two(n)
+        \\end
+        \\local a, b = 0, 0
+        \\for i = 1, 200 do
+        \\  a = a + f(i % 7, 0)
+        \\  local x, y, z = pre(i)
+        \\  b = b + x + y + z
+        \\end
+        \\print(a, b)
+    , "172\t40400\n", .{ .hotguard = 2 });
 }
 
 // ---------------------------------------------------------------------------

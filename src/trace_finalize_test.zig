@@ -23,7 +23,7 @@ const Scratch = struct {
     anchor_num_registers: u16 = 1,
     link_target: ?u32 = null,
     link_kind: ir.LinkKind = .inner_root,
-    terminal_close: ?struct { kind: ir.TerminalKind, resume_pc: u32 } = null,
+    terminal_close: ?struct { kind: ir.TerminalKind, resume_pc: u32, top: u16 = 0 } = null,
     pending_link_provenance: ?types.ExitProvenance = null,
     rec_path_ok: bool = true,
     // Not maskable, so the dead-φ filter keeps every φ unless a test says
