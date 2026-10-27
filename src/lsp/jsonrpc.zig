@@ -229,6 +229,22 @@ pub fn parse(arena: std.mem.Allocator, body: []const u8, id_out: *?Id) ParseErro
     return msg;
 }
 
+/// The id a `$/cancelRequest` notification names, if `msg` is one. The host
+/// reads this on its input thread so a cancellation is seen while the worker
+/// is busy; the id's string borrows the message's arena.
+pub fn cancelTarget(msg: Incoming) ?Id {
+    const method = msg.method orelse return null;
+    if (!std.mem.eql(u8, method, "$/cancelRequest")) return null;
+    const params = msg.params orelse return null;
+    if (params != .object) return null;
+    const idv = params.object.get("id") orelse return null;
+    return switch (idv) {
+        .integer => |i| .{ .int = i },
+        .string => |s| .{ .string = s },
+        else => null,
+    };
+}
+
 /// Decode `params` (or any value) into `T`, ignoring unknown fields.
 pub fn decode(comptime T: type, arena: std.mem.Allocator, value: json.Value) error{ InvalidParams, OutOfMemory }!T {
     return json.parseFromValueLeaky(T, arena, value, .{ .ignore_unknown_fields = true }) catch |e| switch (e) {
@@ -504,4 +520,19 @@ test "decode: ignores unknown fields, rejects wrong types" {
     try testing.expect(p.version == null);
     const bad = try json.parseFromSliceLeaky(json.Value, a, "{\"uri\":5}", .{});
     try testing.expectError(error.InvalidParams, decode(P, a, bad));
+}
+
+test "cancelTarget: integer and string ids; anything else is not a cancel" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var id: ?Id = null;
+    const n = try parse(a, "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{\"id\":12}}", &id);
+    try testing.expectEqual(@as(i64, 12), cancelTarget(n).?.int);
+    const s = try parse(a, "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{\"id\":\"r1\"}}", &id);
+    try testing.expectEqualStrings("r1", cancelTarget(s).?.string);
+    const other = try parse(a, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}", &id);
+    try testing.expect(cancelTarget(other) == null);
+    const bad = try parse(a, "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{\"id\":true}}", &id);
+    try testing.expect(cancelTarget(bad) == null);
 }

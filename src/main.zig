@@ -55,6 +55,9 @@ const usage =
     \\                                  serve the trace visualiser on localhost
     \\                                  (`mahina viz --help`; a script named
     \\                                  `viz` runs as `./viz`)
+    \\  mahina lsp                      run the language server on stdin/stdout
+    \\                                  (`mahina lsp --help`; a script named
+    \\                                  `lsp` runs as `./lsp`)
     \\
     \\options:
     \\  --trace              enable the tracing JIT: detect hot loops, record them
@@ -258,6 +261,7 @@ pub fn main(init: std.process.Init) u8 {
     // flag loop below starts from `pending` before pulling from `it`.
     var pending = it.next();
     if (pending) |arg| if (std.mem.eql(u8, arg, "viz")) return vizMain(init, &it);
+    if (pending) |arg| if (std.mem.eql(u8, arg, "lsp")) return lspMain(init, &it);
 
     // Leading options precede the script / `-e`; the first non-option argument
     // ends flag parsing.
@@ -461,6 +465,41 @@ const viz_usage =
     \\  -h, --help   show this help
     \\
 ;
+
+const lsp_usage =
+    \\usage: mahina lsp [--stdio]
+    \\
+    \\Run the mahina language server (LSP 3.17) on stdin and stdout, until the
+    \\client sends `exit` or closes the pipe. Configure an editor to start this
+    \\command for mahina files. Diagnostics for the operator go to stderr; stdout
+    \\carries protocol messages only.
+    \\
+    \\options:
+    \\  --stdio      accepted for clients that always pass it (the only transport)
+    \\  -h, --help   show this help
+    \\
+;
+
+/// `mahina lsp`: serve the language server over stdio.
+fn lspMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            mahina.io.print("{s}", .{lsp_usage});
+            return 0;
+        } else if (std.mem.eql(u8, arg, "--stdio")) {
+            // The only transport; accepted because many clients always pass it.
+        } else {
+            mahina.io.eprint("mahina lsp: error: unknown argument '{s}'\n{s}", .{ arg, lsp_usage });
+            return 2;
+        }
+    }
+    // `init.gpa` is the thread-safe process allocator: the reader thread
+    // allocates message bodies the worker frees.
+    return mahina.lsp.host_stdio.run(init.gpa, mahina.lsp.host_stdio.stdioTransport(), .{}) catch |err| {
+        mahina.io.eprint("mahina lsp: error: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+}
 
 /// `mahina viz`: parse its options and serve until interrupted.
 fn vizMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {

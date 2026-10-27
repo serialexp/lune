@@ -2,6 +2,7 @@
 # Smoke-check the CLI release (tools/mahina-cli.sh) the way a user runs it:
 # unpack a platform's archive, then
 #   - run scripts (tier-0, and --jit-native, which falls back off x86-64 Linux);
+#   - round-trip initialize / shutdown / exit through `mahina lsp`;
 #   - emit a .mahinatrace and serve it with `mahina viz --no-open`;
 #   - fetch the page, the wasm VM and the trace over HTTP;
 #   - POST /run (the differential validator's native side) and check the
@@ -136,6 +137,17 @@ EOF
             fail "--jit-native did not warn: $(cat jit.err)"
     fi
     "$exe" viz --help >/dev/null || fail "mahina viz --help exited $?"
+
+    # The language server: one initialize / shutdown / exit round trip on stdio.
+    "$exe" lsp --help >/dev/null || fail "mahina lsp --help exited $?"
+    local init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
+    local down='{"jsonrpc":"2.0","id":2,"method":"shutdown"}'
+    local bye='{"jsonrpc":"2.0","method":"exit"}'
+    local lsp_out
+    lsp_out=$(printf 'Content-Length: %d\r\n\r\n%s' "${#init}" "$init" "${#down}" "$down" "${#bye}" "$bye" |
+        "$exe" lsp) || fail "mahina lsp exited $? after a clean shutdown"
+    [[ $lsp_out == *'"capabilities"'* ]] || fail "mahina lsp did not answer initialize: $lsp_out"
+    [[ $lsp_out == *'"id":2,"result":null'* ]] || fail "mahina lsp did not answer shutdown: $lsp_out"
 
     "$exe" --emit-traces t.mahinatrace loop.mahina >/dev/null
     [[ -s t.mahinatrace ]] || fail "--emit-traces wrote no trace"
