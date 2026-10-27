@@ -138,6 +138,14 @@ land; move whole phases to Done once everything inside them is checked.
     document stays dirty); the server publishes versioned diagnostics with
     code, source, severity, `relatedInformation`, ranges in the negotiated
     encoding, and empty sets on clear.
+  - [x] P2 Zed client + grammar (§13.2): `editors/tree-sitter-mahina/`
+    (grammar with an external scanner for long brackets and block comments,
+    highlights/brackets/outline/indents queries, a corpus test) and
+    `editors/zed/` (manifest, language config, a launcher crate that runs
+    `mahina lsp`; queries symlinked from the grammar). The drift check
+    (`test/drift.test.ts`) parses every tracked `.lua`/`.mah` source with
+    the grammar and fails on any ERROR node. Not yet tried inside Zed
+    itself: installing the dev extension is a manual step.
   - [x] P2 viz client (§13.1): `@codemirror/lsp-client` over postMessage to a
     dedicated worker (`mahina.lsp.worker.ts`, its own wasm instance, so a run
     never stalls diagnostics and `stop()` never kills the session; the
@@ -158,14 +166,6 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Bench follow-ups:** the 100k-line budget miss (check dominates); the
   recursive-descent parser has no nesting limit, so the wasm stack (much
   smaller than native) needs a depth test or a limit.
-- [ ] **P2 Zed client** (§13.2): `editors/zed/` (extension manifest, the
-  `language_server_command` launching `mahina lsp`, language config for
-  `.mah`) and `editors/tree-sitter-mahina/` (grammar plus highlights,
-  brackets, outline and indents queries), dev-installed into Zed.
-- [ ] **P2 grammar drift check** (§13.2): a test parsing every mahina
-  source in the repo (today 59 `.lua` files outside `vendor/`; there are
-  no `.mah` files yet) with the Tree-sitter grammar, failing on any
-  `ERROR` node in a file mahina's parser accepts.
 - [ ] **P3 — navigation and basic completion** (§7.2): definition,
   references, document highlight, prepareRename/rename with capture
   checks; completion of keywords and in-scope names.

@@ -1,0 +1,14 @@
+name = "Mahina"
+grammar = "mahina"
+path_suffixes = ["mah"]
+line_comments = ["-- "]
+block_comment = { start = "--[[ ", prefix = "", end = "]]", tab_size = 0 }
+autoclose_before = ";:.,=}])>"
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["string", "comment"] },
+    { start = "'", end = "'", close = true, newline = false, not_in = ["string", "comment"] },
+]
+tab_size = 2

@@ -1,0 +1,17 @@
+[package]
+name = "zed_mahina"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+path = "src/mahina.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
+
+# Not part of the mahina build: Zed compiles this crate itself on
+# "zed: install dev extension".
+[workspace]

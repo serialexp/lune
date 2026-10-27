@@ -1,0 +1,1 @@
+../../../tree-sitter-mahina/queries/brackets.scm
