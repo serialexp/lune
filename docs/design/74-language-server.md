@@ -4,6 +4,8 @@ Status: draft, not yet implemented. Direction decided 2026-10-27 (server in
 Zig as a CLI subcommand; design before code). Review round 1 (Codex,
 Antigravity) folded in 2026-10-27; Bart delegated the picks where the
 reviewers disagreed (§12). Every open question decided 2026-10-27.
+Clients decided 2026-10-27 (§13): the viz web UI and Zed; no VS Code or
+Neovim client.
 Owner: claude (coral-raven)
 Last updated: 2026-10-27
 
@@ -46,7 +48,12 @@ land; move whole phases to Done once everything inside them is checked.
   default (doc 00 §"Two source extensions"), `.lua` opt-in; the VS Code
   extension lives in-repo under `editors/vscode/` and is not published to
   any marketplace (Bart, 2026-10-27: no publisher account, doesn't use VS
-  Code); it installs from a locally built `.vsix`.
+  Code); it installs from a locally built `.vsix`. **Superseded the same
+  day by D3:** there is no VS Code extension; the `.mah` default stands.
+- [x] **D3 — clients** (§13): decided by Bart 2026-10-27. The viz web UI
+  (the server compiled to wasm, in the existing worker, behind
+  `@codemirror/lsp-client`) and Zed (a dev-installed extension plus a
+  Tree-sitter grammar). Bart uses neither VS Code nor Neovim.
 - [x] **Q5 — workspace configuration file** (§7.4): `mahina.toml` at the
   project root (Bart, 2026-10-27). The Zig stdlib has no TOML reader, so
   P6 includes a small one for the subset the config uses.
@@ -59,11 +66,16 @@ land; move whole phases to Done once everything inside them is checked.
   `Compiler.addConstant` (`src/compiler.zig:454`) scans the pool per
   constant. Fix with an identity-keyed map before the P2 benchmark can
   meet budget.
-- [ ] **P0 — transport, lifecycle, snapshots** (§5): `src/lsp/jsonrpc.zig`
-  framing with limits, the reader thread + analysis worker, cancellation
-  with responses, the handshake and shutdown/exit state machine,
+- [ ] **P0 — transport, lifecycle, snapshots** (§5): the sans-IO server
+  core (`src/lsp/server.zig`: message in, messages out, host-driven timers
+  and cancellation), `src/lsp/jsonrpc.zig` framing with limits, the stdio
+  host (reader thread + core on a worker thread), cancellation with
+  responses, the handshake and shutdown/exit state machine,
   position-encoding negotiation, the incremental document store, a
   headless smoke client; protocol tests over in-memory streams.
+- [ ] **P0 wasm host** (§13.1): `mahina_lsp_*` exports in
+  `src/wasm_entry.zig` driving the same core on wasm32-freestanding; the
+  core builds for wasm in CI (`zig build wasm`).
 - [ ] **P1a — AST name spans** (§6.3): `name_span` on `local_function`,
   numeric/generic `for` variables, `FuncName` components, named table
   fields; implicit `self` gets a synthetic, zero-width span instead of the
@@ -83,8 +95,18 @@ land; move whole phases to Done once everything inside them is checked.
   versions, empty sets on clear; the same frontend path for the LSP and
   `mahina_check` (the wasm check gets the recovery work too).
 - [ ] **P2 bench** (§9): `bench_lsp.zig` with the adversarial corpus.
-- [ ] **P2 clients** (§8): the minimal VS Code extension and a Neovim
-  snippet, enough to use P2 in a real editor.
+- [ ] **P2 viz client** (§13.1): `@codemirror/lsp-client` in the viz with
+  a postMessage transport to the worker; its diagnostics replace
+  `mahinaLinter.ts`'s direct `mahina_check` path, so the browser has one
+  checking path. `mahina_check` is removed once nothing calls it.
+- [ ] **P2 Zed client** (§13.2): `editors/zed/` (extension manifest, the
+  `language_server_command` launching `mahina lsp`, language config for
+  `.mah`) and `editors/tree-sitter-mahina/` (grammar plus highlights,
+  brackets, outline and indents queries), dev-installed into Zed.
+- [ ] **P2 grammar drift check** (§13.2): a test parsing every mahina
+  source in the repo (today 59 `.lua` files outside `vendor/`; there are
+  no `.mah` files yet) with the Tree-sitter grammar, failing on any
+  `ERROR` node in a file mahina's parser accepts.
 - [ ] **P3 — navigation and basic completion** (§7.2): definition,
   references, document highlight, prepareRename/rename with capture
   checks; completion of keywords and in-scope names.
@@ -98,8 +120,10 @@ land; move whole phases to Done once everything inside them is checked.
   `src/lsp/config.zig`), open-document overlays,
   module exports for `local M = {} … return M`, workspace symbols.
 - [ ] **P7 — JIT lenses** (§7.6): extend the `--emit-coverage` artifact
-  with source spans and structured abort records; the editor command,
-  panel and inlay hints.
+  with source spans and structured abort records; in Zed, a code action
+  running the file and inlay hints from the result. The viz already shades
+  loop headers from its own run's coverage (`MahinaEditor.tsx`
+  `coverageField`); P7 adds abort reasons there.
 - [ ] **Doc 75 — time-travel debugging over DAP** (§7.7): write the
   design doc.
 - [ ] **Defer — inference (tier 5)** (§7.5): table shapes and
@@ -129,8 +153,12 @@ gets its own doc (§7.7).
   already makes for the browser. No second grammar and no second scoping
   model that can drift (§6.3). Recovery improvements go into the shared
   frontend, so the LSP and the browser check never disagree.
-- **Every LSP editor.** Plain LSP 3.17 over stdio; nothing editor-specific
-  in the server.
+- **Every LSP editor, two first-class clients.** Plain LSP 3.17; nothing
+  editor-specific in the server. The clients we build and test are the
+  viz web UI and Zed (§13).
+- **One core, two hosts.** The server core is sans-IO and single-threaded,
+  so the same code runs over stdio in the CLI and in the browser's wasm
+  worker (§5.2, §13.1).
 - **Fast on large and hostile files** (Rule 20, §9). Nothing quadratic in
   document size, line length, constant count or workspace size.
 - **Allocation discipline** (Rule Z-4). The server takes an allocator;
@@ -158,13 +186,17 @@ src/resolve.zig     the shared resolver (P1c): used by the compiler AND the LSP
 src/lsp/
   jsonrpc.zig       framing + std.json; the only churny file of the LSP
   protocol.zig      the LSP structs we use, plain Zig types, no JSON
-  server.zig        reader thread, worker, dispatch, lifecycle, capabilities
+  server.zig        sans-IO core: dispatch, lifecycle, capabilities, timers
+  host_stdio.zig    the CLI host: reader thread, worker thread, clock
   documents.zig     document store: text, version, line index, latest analysis
   position.zig      byte offset <-> (line, character) in the negotiated encoding
   analysis.zig      parse + resolve + compile for one document version
   stdlib_db.zig     generated builtin table (P5)
   config.zig        mahina.toml reader, a TOML subset (P6)
 src/main.zig        `lsp` subcommand, next to `viz`
+src/wasm_entry.zig  `mahina_lsp_*` exports: the browser host (§13.1)
+editors/zed/                 the Zed extension (§13.2)
+editors/tree-sitter-mahina/  the Tree-sitter grammar Zed requires (§13.2)
 ```
 
 `main.zig` dispatches `viz` before the flag loop (`src/main.zig:260`);
@@ -195,7 +227,16 @@ or the queue owns.
 
 ### 5.2 Threads and cancellation
 
-Two threads:
+*Amended 2026-10-27 by D3 (§13.1):* the browser host runs on
+wasm32-freestanding, which has no threads. The server core in
+`server.zig` is therefore **sans-IO**: it takes one decoded message,
+returns the messages to send, and exposes `nextDeadline()`/`tick(now)` so
+the host owns the clock and the debounce timer, plus a host-supplied
+`isCancelled(request)`/`isStale(document, version)` callback polled at
+analysis phase boundaries. The thread design below is now the **stdio
+host's** (`host_stdio.zig`); the browser host is in §13.1.
+
+The stdio host has two threads:
 
 - **The reader** frames messages, parses them, and pushes them onto a
   bounded queue in arrival order. It does two things itself:
@@ -466,6 +507,9 @@ its own design questions; doc 75 owns them.
 
 ## 8. Editor clients
 
+*Superseded 2026-10-27 by D3:* the clients are the viz web UI and Zed,
+specified in §13. The original plan below is kept for the record.
+
 - **VS Code** (in-repo, `editors/vscode/`, versioned with the server):
   `vscode-languageclient` starting `mahina lsp` from `PATH` or a setting,
   a TextMate grammar for first paint, `.mah` associated by default and
@@ -522,8 +566,8 @@ budget is explicit and benchmarked.
 
 ## 11. Open questions
 
-None. Q5, Q10 and Q12 were decided by Bart on 2026-10-27; the rest in
-review round 1 (§12).
+None. Q5, Q10 and Q12 were decided by Bart on 2026-10-27, D3 the same day
+(§13); the rest in review round 1 (§12).
 
 ## 12. Review round 1 (2026-10-27)
 
@@ -558,6 +602,94 @@ pick; these are the picks and why:
 | Q8 timeout | configurable | strict 2000 ms | configurable, 10 s default | JIT residency only means something on a run long enough to warm up. |
 | Threads | reader + worker, or cooperative slices | a buffered reader loop | reader + worker | Slices would make the parser and compiler resumable; phase-boundary checks give the same responsiveness. |
 
+## 13. Clients: the viz web UI and Zed (D3, 2026-10-27)
+
+Bart uses neither VS Code nor Neovim; the clients that matter are the
+viz web UI and Zed. Both are first-class: built in-repo, tested, and
+landing with P2.
+
+### 13.1 The viz web UI
+
+The viz already runs the VM in a wasm worker (`viz/src/wasm/mahina.worker.ts`),
+validates live through `mahina_check` (`viz/src/editor/mahinaLinter.ts`)
+and shades loop headers from its run's coverage (`MahinaEditor.tsx`,
+`coverageField`). The LSP takes over the checking:
+
+- **The browser host.** `src/wasm_entry.zig` gains `mahina_lsp_init`,
+  `mahina_lsp_send(msg_ptr, msg_len)` (one JSON message in; returns a
+  buffer of zero or more JSON messages out), `mahina_lsp_next_deadline()`
+  and `mahina_lsp_tick(now_ms)`. These wrap the same sans-IO core as the
+  stdio host (§5.2); no framing is needed because postMessage already
+  delimits messages. The core, `std.json` and the analysis all have to
+  build for wasm32-freestanding; the analysis already does (it is what
+  `mahina_check` runs).
+- **The client.** `@codemirror/lsp-client` (CodeMirror's own LSP client,
+  MIT) with a `Transport` whose `send` posts to the worker and whose
+  `subscribe` receives the worker's replies. The worker runs debounce
+  timers with `setTimeout` against `mahina_lsp_next_deadline`. The client
+  implements diagnostics, completion, hover, signature help, definition,
+  references and rename, which covers P2, P3 and P5; highlighting stays
+  with the existing CodeMirror mode (`mahinaLanguage.ts`), since the
+  client has no semantic tokens.
+- **Positions.** CodeMirror documents are UTF-16, so this host negotiates
+  `utf-16` (§5.3).
+- **One checking path.** `mahinaLinter.ts` is replaced by the LSP's
+  diagnostics, and `mahina_check` is deleted when nothing calls it: the
+  browser and the CLI then check through exactly the same core.
+- **Cancellation.** A single wasm call can't see a message that arrives
+  during it; the worker queues messages while a call runs and drops
+  superseded `didChange`-triggered analyses before calling in. With the
+  §9 budget, that's sufficient.
+- **Cross-file (P6).** The browser has no filesystem; the viz's open tabs
+  (the files it passes to `mahina_run`) are the workspace, given to the
+  server as open documents. There is no `mahina.toml` in the browser;
+  the viz passes its settings as `initializationOptions`.
+- **JIT lenses (P7).** The viz doesn't need the child-process path: it
+  already has its run's coverage artifact. Wasm has no native tier and no
+  TSC, so the shading reports traced vs tier-0 iterations, not native
+  residency, and labels it that way. P7 adds abort reasons to the same
+  decorations.
+- **Performance.** The §9 budget is for the native CLI. The benchmark
+  also runs the wasm build (it is what the viz uses) and reports its
+  numbers; the worker keeps analysis off the UI thread, so a slower
+  analysis delays diagnostics, not typing.
+
+### 13.2 Zed
+
+A Zed language extension has four parts (Zed docs,
+`docs/src/extensions/languages.md`): language metadata, a **required**
+Tree-sitter grammar, Tree-sitter queries, and optional language servers.
+
+- **`editors/zed/`**: `extension.toml` naming the grammar and the
+  `mahina` language server; `languages/mahina/config.toml` (`.mah` suffix,
+  `--` line comments, brackets); and the small Rust extension (compiled
+  to wasm by Zed) whose `language_server_command` returns `mahina lsp`
+  found on `PATH`. Installed with Zed's "install dev extension"; not
+  published (Q10's spirit).
+- **`editors/tree-sitter-mahina/`**: the grammar, referenced from
+  `extension.toml` by this repository, a pinned rev and `path =
+  "editors/tree-sitter-mahina"` (Zed's grammar manifest supports a
+  subdirectory, `crates/extension/src/extension_manifest.rs`
+  `GrammarManifestEntry.path`). Queries: `highlights.scm`,
+  `brackets.scm`, `outline.scm`, `indents.scm`.
+- **A second grammar, on purpose and bounded.** Zed builds highlighting,
+  bracket matching, outline and indentation on Tree-sitter, so it needs
+  one regardless of the LSP. That is a second grammar, which §2 rules out
+  for *diagnostics and scoping*; it is acceptable here because it only
+  drives presentation. Every error, warning, definition and rename still
+  comes from the server. The drift check (Outstanding) keeps it honest:
+  the Tree-sitter grammar must parse every mahina source in the repo that
+  mahina's parser accepts without an `ERROR` node. Zed can also layer the
+  server's semantic tokens over Tree-sitter highlighting (its
+  `semantic_tokens` setting), which is where P4's locals-vs-globals
+  colouring shows up.
+- **Positions.** Zed negotiates its own encoding; the server picks
+  `utf-8` if offered, else `utf-16` (§5.3).
+- **JIT lenses (P7).** A code action ("Show JIT residency") runs
+  `workspace/executeCommand`; the server spawns the child run (§7.6) and
+  then serves the results as `textDocument/inlayHint` until the next
+  edit.
+
 ## References
 
 - LSP 3.17 specification —
@@ -571,3 +703,6 @@ pick; these are the picks and why:
 - `src/stdlib/package.zig` — `package.searchpath` semantics P6 mirrors
 - Codex review thread `01a17a97-e280-7cc1-9c5c-9334d3c5a39c`
 - lua-language-server (sumneko) — the reference for tier 5 inference
+- `@codemirror/lsp-client` — https://code.haverbeke.berlin/codemirror/lsp-client
+- Zed language extensions — `docs/src/extensions/languages.md` in
+  zed-industries/zed
