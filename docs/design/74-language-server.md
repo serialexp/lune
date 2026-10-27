@@ -100,6 +100,16 @@ land; move whole phases to Done once everything inside them is checked.
     and `function a.b:m` components; `name_span` on `local_function`,
     `numeric_for`, `field`, `method_call` and named table fields; the
     implicit `self` is a zero-width span at the method name.
+  - [x] P1b recovery regions (§6.2, parser half): `Stmt.err` / `Expr.err`
+    nodes carry the span a failed statement dropped; `synchronize` returns
+    that span and no longer swallows a boundary keyword it is already at
+    (`local x =` then `local y = 1` keeps `y`); a `local` whose value is
+    broken keeps its names with an error value; an identifier on a later
+    line ends the skip; a stray block-closing token after an earlier error
+    is an error node without a second diagnostic, and the rest of the file
+    still parses. The compiler treats error nodes as nothing / nil. The
+    damaged-scope marking and the compile-after-error steps wait for the
+    resolver (P1c) and P2.
   - [x] Wasm host: `mahina_lsp_open/send/tick/next_deadline/message_ptr/
     message_len/is_done/close` in `src/wasm_entry.zig` (message bodies, no
     framing; JS owns the debounce timer). `viz/test/lsp-wasm.test.ts`.
@@ -110,9 +120,6 @@ land; move whole phases to Done once everything inside them is checked.
   host's `cancelled` hook once per request; the phase-boundary checks
   (after parse, resolve, compile) and the newest-version atomic arrive with
   the analysis in P2, since there is nothing long-running to abandon yet.
-- [ ] **P1b — parser recovery regions** (§6.2): `synchronize` records the
-  skipped span; error nodes where a statement was dropped; recovered
-  declarations kept where they are trustworthy.
 - [ ] **P1c — the shared resolver** (§6.3): `src/resolve.zig`, a pass over
   the AST producing bindings and occurrences; the compiler reads its
   results instead of resolving names itself; equivalence tests on the

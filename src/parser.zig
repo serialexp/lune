@@ -51,6 +51,9 @@ const Parser = struct {
     source: [:0]const u8,
     arena: std.mem.Allocator,
     diags: *Diagnostics,
+    /// A syntax error has been reported: stray tokens after it are probably
+    /// its aftermath, not new mistakes.
+    had_error: bool = false,
 
     // -- token cursor --
 
@@ -89,6 +92,7 @@ const Parser = struct {
     fn fail(self: *Parser, message: []const u8) Error {
         const t = self.current();
         self.diags.err(message, t.start, t.end, t.line);
+        self.had_error = true;
         return Error.ParseError;
     }
 
@@ -119,12 +123,20 @@ const Parser = struct {
     // =====================================================================
 
     fn parseChunk(self: *Parser) Error!ast.Block {
-        const block = try self.parseBlock();
-        if (!self.check(.eof)) {
-            // Trailing junk after a complete chunk.
-            _ = self.fail("expected end of input") catch {};
+        var stmts: std.ArrayList(Stmt) = .empty;
+        while (true) {
+            try stmts.appendSlice(self.arena, try self.parseBlock());
+            if (self.check(.eof)) break;
+            // A block-closing token with nothing to close. After an earlier
+            // error it is usually that error's aftermath (a statement whose
+            // header was dropped but whose `end` was not), so it is skipped
+            // without a second diagnostic; the rest of the file still parses.
+            const t = self.current();
+            if (!self.had_error) _ = self.fail("expected end of input") catch {};
+            _ = self.advance();
+            try stmts.append(self.arena, .{ .span = tokSpan(t), .data = .err });
         }
-        return block;
+        return try stmts.toOwnedSlice(self.arena);
     }
 
     fn atBlockEnd(self: *const Parser) bool {
@@ -141,10 +153,12 @@ const Parser = struct {
                 _ = self.advance();
                 continue;
             }
+            const start_pos = self.pos;
+            const start = self.current().start;
             if (self.check(.keyword_return)) {
                 const ret = self.parseReturn() catch |e| switch (e) {
                     Error.ParseError => {
-                        self.synchronize();
+                        try stmts.append(self.arena, try self.dropped(start_pos, start));
                         continue;
                     },
                     else => return e,
@@ -154,7 +168,7 @@ const Parser = struct {
             }
             const stmt = self.parseStatement() catch |e| switch (e) {
                 Error.ParseError => {
-                    self.synchronize();
+                    try stmts.append(self.arena, try self.dropped(start_pos, start));
                     continue;
                 },
                 else => return e,
@@ -164,15 +178,38 @@ const Parser = struct {
         return try stmts.toOwnedSlice(self.arena);
     }
 
+    /// The statement that began at token `start_pos` (source offset `start`)
+    /// failed: skip to a boundary and stand an error node over what was lost.
+    fn dropped(self: *Parser, start_pos: u32, start: u32) Error!Stmt {
+        return .{ .span = self.synchronize(start_pos, start), .data = .err };
+    }
+
     /// Skip tokens until a plausible statement boundary so parsing can resume
-    /// after an error. Always makes progress.
-    fn synchronize(self: *Parser) void {
-        // Ensure forward progress even if the current token is itself a sync
-        // point we got stuck on.
-        if (!self.check(.eof)) _ = self.advance();
+    /// after an error, and return the span skipped, from `start`. Always makes
+    /// progress: if nothing was consumed since `floor_pos` (the token the
+    /// failed construct began at) the current token is skipped even if it
+    /// would be a boundary; otherwise a boundary token is left for the next
+    /// statement, so `local x =` followed by `local y = 1` keeps the second.
+    fn synchronize(self: *Parser, floor_pos: u32, start: u32) Span {
+        const error_line = self.current().line;
+        if (self.pos == floor_pos and !self.check(.eof)) _ = self.advance();
+        self.skipToBoundary(error_line);
+        return .{ .start = start, .end = @max(start, self.lastEnd()) };
+    }
+
+    /// `error_line` is the line the error was found on: an identifier on a
+    /// later line is taken to begin the next statement (`print(2)` after a
+    /// broken line), which no keyword announces. A statement continued over
+    /// several lines can make this stop early; the extra node is an error
+    /// node, not a changed meaning.
+    fn skipToBoundary(self: *Parser, error_line: u32) void {
         while (!self.check(.eof)) {
             // Stop *before* a token that can begin (or end) a statement.
             switch (self.currentTag()) {
+                .identifier => {
+                    if (self.current().line > error_line) return;
+                    _ = self.advance();
+                },
                 .semicolon => {
                     _ = self.advance();
                     return;
@@ -230,6 +267,7 @@ const Parser = struct {
     }
 
     fn parseLocal(self: *Parser) Error!Stmt {
+        const local_pos = self.pos;
         const start = self.advance().start; // 'local'
 
         const is_async = self.match(.keyword_async);
@@ -257,7 +295,21 @@ const Parser = struct {
         }
 
         var values: []const *Expr = &.{};
-        if (self.match(.assign)) values = try self.parseExprList();
+        if (self.match(.assign)) {
+            const value_start = self.current().start;
+            values = self.parseExprList() catch |e| switch (e) {
+                Error.ParseError => blk: {
+                    // The names parsed, so keep the declaration: dropping it
+                    // would turn every later use of them into a global.
+                    const skipped = self.synchronize(local_pos, value_start);
+                    const lost = try self.newExpr(skipped, .err);
+                    const one = try self.arena.alloc(*Expr, 1);
+                    one[0] = lost;
+                    break :blk one;
+                },
+                else => return e,
+            };
+        }
 
         return .{
             .span = self.spanFrom(start),
@@ -1063,4 +1115,83 @@ test "doc 74 P1a: the implicit self of a method is a zero-width span at the meth
     try testing.expectEqual(ast.Span{ .start = @intCast(at), .end = @intCast(at) }, params[0].name_span);
     // The declared parameter keeps its own span.
     try testing.expectEqualStrings("name", spanText(src, params[1].name_span));
+}
+
+/// Parse source that has errors; the caller checks `diags` and frees the tree.
+fn parseBroken(src: [:0]const u8, diags: *Diagnostics) !ast.Ast {
+    return parse(testing.allocator, src, diags);
+}
+
+test "doc 74 P1b: a dropped statement becomes an error node over the skipped text" {
+    const src = "x = = 1\nprint(2)";
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parseBroken(src, &diags);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 1), diags.count());
+    try testing.expectEqual(@as(usize, 2), tree.root.len);
+    try testing.expect(tree.root[0].data == .err);
+    try testing.expectEqualStrings("x = = 1", spanText(src, tree.root[0].span));
+    try testing.expect(tree.root[1].data == .call);
+}
+
+test "doc 74 P1b: a local with a broken value keeps its declaration" {
+    const src = "local x =\nlocal y = 1\nprint(x, y)";
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parseBroken(src, &diags);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 1), diags.count());
+    try testing.expectEqual(@as(usize, 3), tree.root.len);
+    const x = tree.root[0].data.local;
+    try testing.expectEqualStrings("x", x.names[0].name);
+    try testing.expectEqual(@as(usize, 1), x.values.len);
+    try testing.expect(x.values[0].data == .err);
+    // The next statement's `local` was not swallowed by the recovery.
+    try testing.expectEqualStrings("y", tree.root[1].data.local.names[0].name);
+    try testing.expect(tree.root[2].data == .call);
+}
+
+test "doc 74 P1b: the `end` left over by a dropped header costs no second diagnostic" {
+    const src = "if ( then local a = 1 end\nprint(a)";
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parseBroken(src, &diags);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 1), diags.count());
+    // if-header (dropped), local a, stray end, print(a): parsing went on to the end.
+    try testing.expectEqual(@as(usize, 4), tree.root.len);
+    try testing.expect(tree.root[0].data == .err);
+    try testing.expect(tree.root[1].data == .local);
+    try testing.expect(tree.root[2].data == .err);
+    try testing.expect(tree.root[3].data == .call);
+}
+
+test "doc 74 P1b: a stray `end` with no earlier error is reported once and parsing goes on" {
+    const src = "end\nprint(1)";
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parseBroken(src, &diags);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 1), diags.count());
+    try testing.expect(tree.root[0].data == .err);
+    try testing.expect(tree.root[1].data == .call);
+}
+
+test "doc 74 P1b: every error node's span is well formed and inside the source" {
+    const sources = [_][:0]const u8{
+        "local", "local x =", "x =", "if", "if x then", "for", "function", "a.b.", "f(", "{", "return return",
+        "local function", "while true do local = end", "end end end", "(((", "x = = = =",
+    };
+    for (sources) |src| {
+        var diags = Diagnostics.init(testing.allocator);
+        defer diags.deinit();
+        var tree = try parseBroken(src, &diags);
+        defer tree.deinit();
+        try testing.expect(diags.hasErrors());
+        for (tree.root) |s| {
+            try testing.expect(s.span.start <= s.span.end);
+            try testing.expect(s.span.end <= src.len);
+        }
+    }
 }

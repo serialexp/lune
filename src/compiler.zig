@@ -842,7 +842,7 @@ const Compiler = struct {
             .call => |call_expr| try self.compileCallStmt(call_expr),
             .function_decl => |fd| try self.compileFunctionDecl(fd),
             .local_function => |lf| try self.compileLocalFunction(lf),
-
+            .err => {}, // dropped by the parser's recovery; already reported
             .generic_for => |gf| try self.compileGenericFor(gf),
         }
     }
@@ -1333,7 +1333,7 @@ const Compiler = struct {
     /// the scope of.)
     fn hasFunction(e: *const ast.Expr) bool {
         return switch (e.data) {
-            .nil, .bool, .int, .float, .string_raw, .name, .vararg, .intrinsic => false,
+            .nil, .bool, .int, .float, .string_raw, .name, .vararg, .intrinsic, .err => false,
             .function => true,
             .paren => |inner| hasFunction(inner),
             .unary => |u| hasFunction(u.operand),
@@ -1696,7 +1696,9 @@ const Compiler = struct {
     fn compileExprTo(self: *Compiler, e: *const ast.Expr, dest: u16) Error!void {
         self.cur_span = e.span;
         switch (e.data) {
-            .nil => _ = try self.emit(Instr.opA(.load_nil, dest)),
+            // Recovered source (doc 74 §6.2) never runs; nil keeps the register
+            // stream well-formed for the checks that compile a damaged tree.
+            .nil, .err => _ = try self.emit(Instr.opA(.load_nil, dest)),
             .bool => |b| _ = try self.emit(Instr.opAB(.load_bool, dest, @intFromBool(b))),
             .int => |i| {
                 if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32)) {

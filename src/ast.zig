@@ -150,6 +150,10 @@ pub const Expr = struct {
         intrinsic: Intrinsic,
         /// `{ ... }`
         table: []const TableField,
+        /// Source the parser could not read (error recovery, doc 74 §6.2).
+        /// The span covers the text it dropped; a diagnostic already
+        /// reported it. Never compiled into anything that runs.
+        err,
     };
 
     /// Is this expression a valid assignment target (lvalue)?
@@ -226,6 +230,9 @@ pub const Stmt = struct {
         return_: []const *Expr,
         /// `break`
         break_,
+        /// A statement the parser dropped (error recovery, doc 74 §6.2); the
+        /// span covers the skipped text and a diagnostic already reported it.
+        err,
     };
 
     pub const Branch = struct { cond: *Expr, body: Block };
