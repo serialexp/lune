@@ -105,7 +105,7 @@ pub const Lexer = struct {
                 while (true) {
                     const c = self.peek();
                     if (c == 0) {
-                        self.diags.err("unterminated block comment", open_start, self.index, open_line);
+                        self.diags.report(.unterminated_block_comment, open_start, self.index, open_line);
                         return;
                     }
                     if (c == ']') {
@@ -153,7 +153,7 @@ pub const Lexer = struct {
         while (true) {
             const c = self.peek();
             if (c == 0) {
-                self.diags.err("unterminated long string", start, self.index, line);
+                self.diags.report(.unterminated_long_string, start, self.index, line);
                 return self.make(.invalid, start, line);
             }
             if (c == ']') {
@@ -195,7 +195,7 @@ pub const Lexer = struct {
         }
         if (isAlpha(self.peek())) self.index += 1;
         const n = numeral.parse(self.source[start..self.index]) orelse {
-            self.diags.err("malformed number", start, self.index, line);
+            self.diags.report(.malformed_number, start, self.index, line);
             return self.make(.invalid, start, line);
         };
         return self.make(if (n == .int) .int_literal else .float_literal, start, line);
@@ -219,7 +219,7 @@ pub const Lexer = struct {
             const c = self.peek();
             switch (c) {
                 0, '\n', '\r' => {
-                    self.diags.err("unterminated string", start, self.index, line);
+                    self.diags.report(.unterminated_string, start, self.index, line);
                     return self.make(.invalid, start, line);
                 },
                 '\\' => {
@@ -289,7 +289,7 @@ pub const Lexer = struct {
             '>' => self.gtOp(),
             '.' => self.dots(),
             else => {
-                self.diags.err("unexpected character", start, self.index, line);
+                self.diags.report(.unexpected_character, start, self.index, line);
                 return self.make(.invalid, start, line);
             },
         };

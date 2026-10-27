@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const position = @import("position.zig");
+const analysis_mod = @import("analysis.zig");
 
 pub const Document = struct {
     /// Owned.
@@ -22,12 +23,32 @@ pub const Document = struct {
     dirty_since: ?u64 = null,
     last_change: u64 = 0,
 
+    /// The latest finished analysis and the document version it was made
+    /// from. Features read it only while `analysed_version == version`; an
+    /// edit leaves it in place (stale) until the next analysis replaces it.
+    analysis: ?analysis_mod.Analysis = null,
+    analysed_version: i64 = -1,
+
     pub const Error = std.mem.Allocator.Error || error{TextTooLong};
 
     pub fn deinit(self: *Document, gpa: std.mem.Allocator) void {
+        if (self.analysis) |*a| a.deinit();
         if (self.index) |ix| ix.deinit(gpa);
         self.text.deinit(gpa);
         gpa.free(self.uri);
+    }
+
+    /// Keep `result`, made from the current text, in place of the previous one.
+    pub fn setAnalysis(self: *Document, result: analysis_mod.Analysis) void {
+        if (self.analysis) |*old| old.deinit();
+        self.analysis = result;
+        self.analysed_version = self.version;
+    }
+
+    /// The analysis, if it is of the text as it is now.
+    pub fn currentAnalysis(self: *const Document) ?*const analysis_mod.Analysis {
+        if (self.analysed_version != self.version) return null;
+        return if (self.analysis) |*a| a else null;
     }
 
     pub fn source(self: *const Document) []const u8 {

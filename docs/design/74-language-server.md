@@ -120,24 +120,37 @@ land; move whole phases to Done once everything inside them is checked.
     and `unresolved` binding kinds are not produced yet (P5 and P1d), and
     `scope_end` is the end of the owning construct, since the AST does not
     record a block's closing keyword.
+  - [x] P1d diagnostics model (§6.4, sink half): `diag.Code` (stable
+    number per message, `E0109`-style `id()`, `W0001` for lints; 65 call
+    sites in the lexer, parser and compiler now name a code and the message
+    lives once, in `Code.message`); `Diagnostic.related` (span + static
+    label) set for every unclosed `if`/`while`/`for`/`do`/`repeat`/
+    `function`/call/paren/table; `Diagnostics.incomplete` set when an
+    allocation failure drops a diagnostic.
   - [x] Wasm host: `mahina_lsp_open/send/tick/next_deadline/message_ptr/
     message_len/is_done/close` in `src/wasm_entry.zig` (message bodies, no
     framing; JS owns the debounce timer). `viz/test/lsp-wasm.test.ts`.
 
+  - [x] P1d (rest) + P2 core: `compiler.checkChunk` recovers per statement
+    and assembles no bytecode, with the unknown-global lint hiding names
+    found in damaged text; `lsp/analysis.zig` runs parse → resolve → check
+    with phase-boundary abandonment (`Hooks.input_pending`; an abandoned
+    document stays dirty); the server publishes versioned diagnostics with
+    code, source, severity, `relatedInformation`, ranges in the negotiated
+    encoding, and empty sets on clear.
+  - [x] P2 bench (§9): `zig build bench-lsp` (`src/bench_lsp.zig`). First
+    numbers (ReleaseFast, end to end): 10k lines 8.5 ms, 100k lines 108 ms
+    (budget 100 ms, about 8% over: check is 63 ms of it), 1 MB astral line
+    9 ms, 60k constants 28 ms, 50k-deep nesting 136 ms with no crash on the
+    native stack, 200-edit burst 23 ms, 49 documents in one tick 39 ms.
+
 ### Outstanding
 
-- [ ] **P0 follow-up — stale-work abandonment** (§5.2): the core checks the
-  host's `cancelled` hook once per request; the phase-boundary checks
-  (after parse, resolve, compile) and the newest-version atomic arrive with
-  the analysis in P2, since there is nothing long-running to abandon yet.
-- [ ] **P1d — diagnostics model** (§6.4): codes and related spans on
-  `Diagnostic`; message ownership (copied out of the compile arena);
-  OOM reported as "analysis incomplete", not silently dropped; the
-  compiler keeps going after a `CompileError` where it can.
-- [ ] **P2 — diagnostics end to end** (§6): `publishDiagnostics` with
-  versions, empty sets on clear; the same frontend path for the LSP and
-  `mahina_check` (the wasm check gets the recovery work too).
-- [ ] **P2 bench** (§9): `bench_lsp.zig` with the adversarial corpus.
+- [ ] **Bench follow-ups:** the 100k-line budget miss (check dominates); the
+  recursive-descent parser has no nesting limit, so the wasm stack (much
+  smaller than native) needs a depth test or a limit.
+- [ ] **P2 — `mahina_check`** (§6): the wasm check takes the same
+  `checkChunk` path as the LSP.
 - [ ] **P2 viz client** (§13.1): `@codemirror/lsp-client` in the viz with
   a postMessage transport to the worker; its diagnostics replace
   `mahinaLinter.ts`'s direct `mahina_check` path, so the browser has one

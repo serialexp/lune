@@ -115,25 +115,12 @@ pub fn compileWithOptions(
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
 
-    var usage = GlobalUsage{ .writes = std.StringHashMap(void).init(gpa), .known = opts.known_globals };
-    defer usage.deinit(gpa);
-    const lines = try LineTable.build(gpa, source);
-    defer lines.deinit(gpa);
+    var session: Session = undefined;
+    try session.init(gpa, source, root, opts.known_globals, null);
+    defer session.deinit(gpa);
 
-    var res = try resolve.resolve(gpa, root, @intCast(source.len));
-    defer res.deinit();
-
-    var c = Compiler{
-        .arena = arena.allocator(),
-        .scratch = gpa,
-        .heap = heap,
-        .source = source,
-        .lines = &lines,
-        .diags = diags,
-        .globals_usage = &usage,
-        .res = &res,
-        .is_vararg = opts.vararg_root,
-    };
+    var c = session.compiler(arena.allocator(), arena.allocator(), gpa, heap, source, diags);
+    c.is_vararg = opts.vararg_root;
     defer c.deinitScratch();
 
     try c.compileBlock(root);
@@ -185,6 +172,104 @@ pub fn compileWithOptions(
     // goes stale and we no longer use it.
     return .{ .arena = arena, .proto = proto, .proto_count = next_id - opts.id_base, .uses_tasks = c.uses_tasks };
 }
+
+/// Check a parsed chunk for a tool (doc 74): everything `compileWithOptions`
+/// reports, and as much of it as the damage allows. A statement that fails to
+/// compile is skipped and compilation goes on, so a tool gets every diagnostic
+/// of a chunk and not only the first; the unknown-global lint runs even when
+/// there are errors, quiet about any name mentioned in text the parser dropped
+/// or a statement that failed (a definition could be hiding there). No
+/// bytecode is assembled: a chunk compiled this way would be meaningless.
+pub fn checkChunk(
+    gpa: std.mem.Allocator,
+    /// Owns the text of the diagnostics that name something; it must outlive
+    /// `diags`.
+    messages: std.mem.Allocator,
+    heap: *gc.Heap,
+    source: [:0]const u8,
+    root: ast.Block,
+    /// The chunk's name resolution, when the caller has it; else made here.
+    resolved: ?*const resolve.Resolution,
+    diags: *Diagnostics,
+    opts: Options,
+) Error!void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var session: Session = undefined;
+    try session.init(gpa, source, root, opts.known_globals, resolved);
+    defer session.deinit(gpa);
+
+    var c = session.compiler(arena.allocator(), messages, gpa, heap, source, diags);
+    c.is_vararg = opts.vararg_root;
+    c.recover = true;
+    defer c.deinitScratch();
+
+    try c.compileBlock(root);
+    try c.warnUnknownGlobals();
+}
+
+/// What one compile of a chunk shares across its functions: the global-usage
+/// tables, the line table and the name resolution. Lives on the caller's
+/// stack (the compiler points into it).
+const Session = struct {
+    usage: GlobalUsage,
+    lines: LineTable,
+    /// The name resolution in use: `owned` unless the caller already had one.
+    res: *const resolve.Resolution,
+    owned: ?resolve.Resolution,
+
+    /// `resolved` is the chunk's resolution if the caller made it already (the
+    /// language server keeps it); otherwise this makes and owns one.
+    fn init(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        source: [:0]const u8,
+        root: ast.Block,
+        known: []const []const u8,
+        resolved: ?*const resolve.Resolution,
+    ) Error!void {
+        self.usage = .{ .writes = std.StringHashMap(void).init(gpa), .known = known };
+        errdefer self.usage.deinit(gpa);
+        self.lines = try LineTable.build(gpa, source);
+        errdefer self.lines.deinit(gpa);
+        if (resolved) |r| {
+            self.owned = null;
+            self.res = r;
+        } else {
+            self.owned = try resolve.resolve(gpa, root, @intCast(source.len));
+            self.res = &self.owned.?;
+        }
+    }
+
+    fn deinit(self: *Session, gpa: std.mem.Allocator) void {
+        if (self.owned) |*r| r.deinit();
+        self.lines.deinit(gpa);
+        self.usage.deinit(gpa);
+    }
+
+    fn compiler(
+        self: *Session,
+        arena: std.mem.Allocator,
+        messages: std.mem.Allocator,
+        scratch: std.mem.Allocator,
+        heap: *gc.Heap,
+        source: [:0]const u8,
+        diags: *Diagnostics,
+    ) Compiler {
+        return .{
+            .arena = arena,
+            .messages = messages,
+            .scratch = scratch,
+            .heap = heap,
+            .source = source,
+            .lines = &self.lines,
+            .diags = diags,
+            .globals_usage = &self.usage,
+            .res = self.res,
+        };
+    }
+};
 
 /// `Proto.global_slot_hints` for a proto with `n` constants: all slot 0,
 /// which every lookup re-checks like any other hint.
@@ -282,9 +367,13 @@ const GlobalUsage = struct {
     /// Builtin globals the host installs before the chunk runs (e.g. `print`,
     /// `clock`); treated as defined. Empty unless the caller supplies them.
     known: []const []const u8 = &.{},
+    /// Statements that failed to compile under `Options.recover`: what they
+    /// read or assigned was only partly recorded above.
+    failed: std.ArrayList(ast.Span) = .empty,
 
     fn deinit(self: *GlobalUsage, gpa: std.mem.Allocator) void {
         self.reads.deinit(gpa);
+        self.failed.deinit(gpa);
         self.writes.deinit();
     }
 
@@ -333,6 +422,12 @@ const Compiler = struct {
     /// Which declaration every name in the chunk refers to (`resolve.zig`).
     /// Shared like `globals_usage`: the root owns it.
     res: *const resolve.Resolution,
+    /// `checkChunk`: a statement that fails to compile is skipped.
+    recover: bool = false,
+    /// Where messages that must be formatted (the unknown-global lint) live:
+    /// the chunk's arena when compiling, the caller's when checking, so they
+    /// outlive the compile.
+    messages: std.mem.Allocator,
 
     /// The lexically-enclosing function being compiled, if this is a nested
     /// function body. Used to detect references to an outer function's locals
@@ -396,7 +491,7 @@ const Compiler = struct {
         // encoding would alias `FUNC_HEAD_PC`. Hard-fail, not clamp: a
         // 2-billion-instruction proto is corrupt input, not a program.
         if (self.code.items.len >= 1 << 31)
-            return self.fail(self.cur_span, "function too large (2^31 instruction limit)");
+            return self.fail(self.cur_span, .function_too_large);
         try self.code.append(self.arena, instr);
         if (self.cur_span.start != self.line_memo_start) {
             self.line_memo_start = self.cur_span.start;
@@ -437,7 +532,7 @@ const Compiler = struct {
 
     fn reserve(self: *Compiler, n: u16) Error!u16 {
         if (self.next_reg > std.math.maxInt(u16) - n) {
-            self.diags.err("function needs too many registers", 0, 0, 0);
+            self.diags.report(.too_many_registers, 0, 0, 0);
             return Error.CompileError;
         }
         const base = self.next_reg;
@@ -476,7 +571,7 @@ const Compiler = struct {
         const idx = self.constants.items.len;
         if (idx > std.math.maxInt(u16)) {
             _ = self.const_index.remove(slot.key_ptr.*);
-            self.diags.err("too many constants", 0, 0, 0);
+            self.diags.report(.too_many_constants, 0, 0, 0);
             return Error.CompileError;
         }
         try self.constants.append(self.arena, v);
@@ -609,7 +704,9 @@ const Compiler = struct {
             const local = self.locals.items[n];
             // The resolver's whole-chunk answer and the capture marking done
             // while compiling closures must agree: one scoping model.
-            std.debug.assert(local.captured == self.res.binding(local.binding).captured);
+            // (A tool's recovering compile skips statements, so a closure that
+            // would have captured it may never have been compiled.)
+            std.debug.assert(self.recover or local.captured == self.res.binding(local.binding).captured);
             if (local.captured) any_captured = true;
             self.next_reg -= 1; // local registers are contiguous at the top
         }
@@ -679,7 +776,7 @@ const Compiler = struct {
         }
         const idx = self.upvalues.items.len;
         if (idx > std.math.maxInt(u16)) {
-            self.diags.err("function needs too many upvalues", 0, 0, 0);
+            self.diags.report(.too_many_upvalues, 0, 0, 0);
             return Error.CompileError;
         }
         try self.upvalues.append(self.arena, desc);
@@ -817,12 +914,20 @@ const Compiler = struct {
     /// the chunk is freed).
     fn warnUnknownGlobals(self: *Compiler) Error!void {
         const u = self.globals_usage;
+        // Names mentioned in text the compiler never saw whole: a global that
+        // looks unassigned may be assigned there.
+        var hidden: std.StringHashMapUnmanaged(void) = .empty;
+        defer hidden.deinit(self.scratch);
+        try self.collectWords(&hidden, self.res.damaged.items);
+        try self.collectWords(&hidden, u.failed.items);
         for (u.reads.items) |r| {
             if (u.writes.contains(r.name)) continue;
             if (u.isKnown(r.name)) continue;
-            const msg = try std.fmt.allocPrint(self.arena, "undefined global '{s}' (never assigned; reads as nil)", .{r.name});
+            if (hidden.contains(r.name)) continue;
+            const msg = try std.fmt.allocPrint(self.messages, "undefined global '{s}' (never assigned; reads as nil)", .{r.name});
             self.diags.add(.{
                 .severity = .warning,
+                .code = .undefined_global,
                 .message = msg,
                 .start = r.start,
                 .end = r.end,
@@ -831,10 +936,53 @@ const Compiler = struct {
         }
     }
 
+    /// Add every identifier-shaped word of the source under `spans` to `set`.
+    /// The words borrow the source buffer.
+    fn collectWords(self: *Compiler, set: *std.StringHashMapUnmanaged(void), spans: []const ast.Span) Error!void {
+        for (spans) |sp| {
+            const text = self.source[sp.start..@min(sp.end, self.source.len)];
+            var i: usize = 0;
+            while (i < text.len) {
+                if (!isWordStart(text[i])) {
+                    i += 1;
+                    continue;
+                }
+                const begin = i;
+                while (i < text.len and (isWordStart(text[i]) or std.ascii.isDigit(text[i]))) i += 1;
+                try set.put(self.scratch, text[begin..i], {});
+            }
+        }
+    }
+
+    fn isWordStart(ch: u8) bool {
+        return std.ascii.isAlphabetic(ch) or ch == '_';
+    }
+
     // ---- statements ----
 
     fn compileBlock(self: *Compiler, block: ast.Block) Error!void {
-        for (block) |*stmt| try self.compileStmt(stmt);
+        for (block) |*stmt| {
+            if (!self.recover) {
+                try self.compileStmt(stmt);
+                continue;
+            }
+            // Keep going past a failed statement: put the register, scope
+            // and loop bookkeeping back where the statement found it.
+            const next_reg = self.next_reg;
+            const depth = self.scope_depth;
+            const n_locals = self.locals.items.len;
+            const n_loops = self.loops.items.len;
+            self.compileStmt(stmt) catch |e| switch (e) {
+                Error.CompileError => {
+                    self.next_reg = next_reg;
+                    self.scope_depth = depth;
+                    self.locals.items.len = n_locals;
+                    self.loops.items.len = n_loops;
+                    try self.globals_usage.failed.append(self.scratch, stmt.span);
+                },
+                else => return e,
+            };
+        }
     }
 
     fn compileStmt(self: *Compiler, s: *const ast.Stmt) Error!void {
@@ -1207,7 +1355,7 @@ const Compiler = struct {
     /// Fail unless the function being compiled is variadic. Gate for every use
     /// of `...` (bare or named).
     fn requireVararg(self: *Compiler, span: ast.Span) Error!void {
-        if (!self.is_vararg) return self.fail(span, "cannot use '...' outside a vararg function");
+        if (!self.is_vararg) return self.fail(span, .vararg_outside_vararg_function);
     }
 
     /// Emit a `vararg_spread` whose values land at the current `next_reg`, the
@@ -1688,7 +1836,7 @@ const Compiler = struct {
     }
 
     fn compileBreak(self: *Compiler, span: ast.Span) Error!void {
-        if (self.loops.items.len == 0) return self.fail(span, "break outside a loop");
+        if (self.loops.items.len == 0) return self.fail(span, .break_outside_loop);
         const loop_idx = self.loops.items.len - 1;
         // The fall-through scope-exit close does not run on the break path, so
         // close the loop scope's upvalues here before jumping out. (A no-op at
@@ -1980,7 +2128,7 @@ const Compiler = struct {
     /// disassembly only.
     fn compileFunction(self: *Compiler, body: *const ast.FunctionBody, name: []const u8, dest: u16) Error!void {
         if (body.is_async) return self.compileAsyncFunction(body, name, dest);
-        if (body.params.len > std.math.maxInt(u8)) return self.fail(body.span, "too many parameters");
+        if (body.params.len > std.math.maxInt(u8)) return self.fail(body.span, .too_many_parameters);
 
         var child = Compiler{
             .arena = self.arena,
@@ -1991,6 +2139,8 @@ const Compiler = struct {
             .diags = self.diags,
             .globals_usage = self.globals_usage,
             .res = self.res,
+            .recover = self.recover,
+            .messages = self.messages,
             .parent = self,
         };
         defer child.deinitScratch();
@@ -2032,7 +2182,7 @@ const Compiler = struct {
         proto.maskable = try bc_liveness.maskable(self.scratch, proto.code, proto.reg_live, proto.num_registers, proto.protos);
         std.debug.assert(proto.maskable or !proto.reg_live.available());
 
-        if (self.protos.items.len > std.math.maxInt(u16)) return self.fail(body.span, "too many nested functions");
+        if (self.protos.items.len > std.math.maxInt(u16)) return self.fail(body.span, .too_many_nested_functions);
         const idx: u16 = @intCast(self.protos.items.len);
         try self.protos.append(self.arena, proto);
         _ = try self.emit(Instr.opAB(.closure, dest, idx));
@@ -2127,7 +2277,7 @@ const Compiler = struct {
                 const r = try self.alloc1();
                 try self.compileExprTo(arg, r);
             }
-            if (n > std.math.maxInt(u16)) return self.fail(span, "too many arguments");
+            if (n > std.math.maxInt(u16)) return self.fail(span, .too_many_arguments);
             _ = try self.emit(Instr.opABC(.call, base, @intCast(n), nwanted));
         }
     }
@@ -2178,7 +2328,7 @@ const Compiler = struct {
                 try self.compileExprTo(arg, r);
             }
             const total = n + 1; // implicit self
-            if (total > std.math.maxInt(u16)) return self.fail(span, "too many arguments");
+            if (total > std.math.maxInt(u16)) return self.fail(span, .too_many_arguments);
             _ = try self.emit(Instr.opABC(.call, base, @intCast(total), nwanted));
         }
     }
@@ -2281,8 +2431,8 @@ const Compiler = struct {
                         val = val * 16 + hexValue(inner[i]);
                         i += 1;
                     }
-                    if (digits != 2) return self.fail(span, "\\x escape needs exactly two hex digits");
-                    if (val > 0x7F) return self.fail(span, "\\x escape must be ASCII (<= 0x7F); use \\u{...} for a code point or a byte array for a raw byte");
+                    if (digits != 2) return self.fail(span, .hex_escape_digits);
+                    if (val > 0x7F) return self.fail(span, .hex_escape_not_ascii);
                     try buf.append(self.arena, @intCast(val));
                 },
                 '0'...'9' => {
@@ -2292,32 +2442,32 @@ const Compiler = struct {
                         val = val * 10 + (inner[i] - '0');
                         i += 1;
                     }
-                    if (val > 0x7F) return self.fail(span, "\\ddd escape must be ASCII (<= 127); use \\u{...} for a code point or a byte array for a raw byte");
+                    if (val > 0x7F) return self.fail(span, .decimal_escape_not_ascii);
                     try buf.append(self.arena, @intCast(val));
                 },
                 'u' => {
                     // `\u{XXXX}` — a Unicode code point encoded to UTF-8.
-                    if (i >= inner.len or inner[i] != '{') return self.fail(span, "\\u must be followed by '{'");
+                    if (i >= inner.len or inner[i] != '{') return self.fail(span, .unicode_escape_open_brace);
                     i += 1;
                     var cp: u32 = 0;
                     var digits: usize = 0;
                     while (i < inner.len and isHex(inner[i])) : (digits += 1) {
                         cp = cp * 16 + hexValue(inner[i]);
                         i += 1;
-                        if (cp > 0x10FFFF) return self.fail(span, "\\u{...} code point out of range (> 0x10FFFF)");
+                        if (cp > 0x10FFFF) return self.fail(span, .unicode_escape_out_of_range);
                     }
-                    if (digits == 0) return self.fail(span, "\\u{...} needs at least one hex digit");
-                    if (i >= inner.len or inner[i] != '}') return self.fail(span, "\\u{...} missing closing '}'");
+                    if (digits == 0) return self.fail(span, .unicode_escape_no_digits);
+                    if (i >= inner.len or inner[i] != '}') return self.fail(span, .unicode_escape_close_brace);
                     i += 1;
                     var tmp: [4]u8 = undefined;
                     const n = std.unicode.utf8Encode(@intCast(cp), &tmp) catch
-                        return self.fail(span, "\\u{...} is not a valid code point (surrogate or out of range)");
+                        return self.fail(span, .unicode_escape_invalid);
                     try buf.appendSlice(self.arena, tmp[0..n]);
                 },
-                else => return self.fail(span, "invalid escape sequence"),
+                else => return self.fail(span, .invalid_escape),
             }
         }
-        if (!std.unicode.utf8ValidateSlice(buf.items)) return self.fail(span, "string literal is not valid UTF-8");
+        if (!std.unicode.utf8ValidateSlice(buf.items)) return self.fail(span, .invalid_utf8);
         return buf.items;
     }
 
@@ -2344,7 +2494,7 @@ const Compiler = struct {
                 inner = inner[1..];
             }
         }
-        if (!std.unicode.utf8ValidateSlice(inner)) return self.fail(span, "string literal is not valid UTF-8");
+        if (!std.unicode.utf8ValidateSlice(inner)) return self.fail(span, .invalid_utf8);
         if (std.mem.indexOfScalar(u8, inner, '\r') == null) return inner;
         var buf: std.ArrayList(u8) = .empty;
         try buf.ensureTotalCapacity(self.arena, inner.len);
@@ -2365,8 +2515,8 @@ const Compiler = struct {
         return self.lines.lineOf(offset);
     }
 
-    fn fail(self: *Compiler, span: ast.Span, comptime message: []const u8) Error {
-        self.diags.err(message, span.start, span.end, self.lineOf(span.start));
+    fn fail(self: *Compiler, span: ast.Span, code: diag.Code) Error {
+        self.diags.report(code, span.start, span.end, self.lineOf(span.start));
         return Error.CompileError;
     }
 };
@@ -3577,6 +3727,7 @@ test "unknown global: a read that is never assigned warns" {
             try testing.expect(!diags.hasErrors());
             const d = diags.list.items[0];
             try testing.expectEqual(diag.Severity.warning, d.severity);
+            try testing.expectEqual(diag.Code.undefined_global, d.code);
             // Span covers exactly the single-character `d` read.
             try testing.expectEqual(@as(u32, 1), d.end - d.start);
             try testing.expect(std.mem.indexOf(u8, d.message, "undefined global") != null);
@@ -3725,4 +3876,70 @@ test "constant pool: many distinct constants fill the pool exactly, the next is 
     defer tree2.deinit();
     try testing.expectError(Error.CompileError, compile(testing.allocator, vm.heap, z2, tree2.root, &diags2));
     try testing.expect(diags2.hasErrors());
+}
+
+/// `checkChunk` over `src`, which may be damaged, with a bare heap as the
+/// language server has it. Returns nothing: callers read `diags`.
+fn checkSource(src: [:0]const u8, messages: std.mem.Allocator, diags: *Diagnostics) !void {
+    var tree = try parser.parse(testing.allocator, src, diags);
+    defer tree.deinit();
+    var heap = gc.Heap.init(testing.allocator);
+    defer heap.deinit();
+    try checkChunk(testing.allocator, messages, &heap, src, tree.root, null, diags, .{ .known_globals = &.{"print"} });
+}
+
+fn countCode(diags: *const Diagnostics, code: diag.Code) usize {
+    var n: usize = 0;
+    for (diags.list.items) |d| {
+        if (d.code == code) n += 1;
+    }
+    return n;
+}
+
+test "doc 74 P2: checkChunk goes on after a statement that fails to compile" {
+    const src =
+        \\break
+        \\local s = "\q"
+        \\print(s)
+        \\break
+    ;
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var text_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer text_arena.deinit();
+    try checkSource(src, text_arena.allocator(), &diags);
+    // Both `break`s and the bad escape, not only the first.
+    try testing.expectEqual(@as(usize, 2), countCode(&diags, .break_outside_loop));
+    try testing.expectEqual(@as(usize, 1), countCode(&diags, .invalid_escape));
+}
+
+test "doc 74 P2: the unknown-global lint runs on a damaged chunk and stays quiet about hidden names" {
+    const src =
+        \\print(never_defined)
+        \\hidden = = 1
+        \\print(hidden)
+        \\local t = "\q"
+        \\failed_name = t
+        \\print(failed_name)
+    ;
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var text_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer text_arena.deinit();
+    try checkSource(src, text_arena.allocator(), &diags);
+    // `never_defined` is flagged; `hidden` may be defined in the dropped text;
+    // `failed_name`'s statement is the one the bad escape cut short.
+    try testing.expectEqual(@as(usize, 1), countCode(&diags, .undefined_global));
+    for (diags.list.items) |d| {
+        if (d.code == .undefined_global) try testing.expect(std.mem.indexOf(u8, d.message, "never_defined") != null);
+    }
+}
+
+test "doc 74 P2: a clean chunk checks clean, as it compiles clean" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var text_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer text_arena.deinit();
+    try checkSource("local function f(n) if n < 2 then return n end return f(n - 1) + f(n - 2) end\nreturn f(10)", text_arena.allocator(), &diags);
+    try testing.expectEqual(@as(usize, 0), diags.count());
 }

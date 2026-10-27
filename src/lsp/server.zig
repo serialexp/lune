@@ -15,6 +15,7 @@ const std = @import("std");
 const jsonrpc = @import("jsonrpc.zig");
 const protocol = @import("protocol.zig");
 const documents = @import("documents.zig");
+const analysis_mod = @import("analysis.zig");
 const position = @import("position.zig");
 
 /// Analysis runs this long after the last change...
@@ -31,8 +32,17 @@ pub const Hooks = struct {
     /// Whether the client has cancelled request `id` (`$/cancelRequest`).
     /// Asked once, just before a request is dispatched.
     cancelled: *const fn (ctx: ?*anyopaque, id: jsonrpc.Id) bool = neverCancelled,
+    /// Whether more input is already waiting. An analysis that is under way
+    /// when this turns true is abandoned between its phases: what it would
+    /// publish is about to be out of date, and the document stays dirty so it
+    /// is analysed again once the waiting messages are in.
+    input_pending: *const fn (ctx: ?*anyopaque) bool = nothingPending,
 
     fn neverCancelled(_: ?*anyopaque, _: jsonrpc.Id) bool {
+        return false;
+    }
+
+    fn nothingPending(_: ?*anyopaque) bool {
         return false;
     }
 };
@@ -92,6 +102,9 @@ pub const Server = struct {
     /// The unit of `character` in every position (negotiated at `initialize`).
     encoding: position.Encoding = .utf16,
     docs: documents.Store,
+    /// The global names the host installs, so they are not flagged as
+    /// undefined. Set by the host after `init`.
+    known_globals: []const []const u8 = &.{},
 
     pub const Error = error{OutOfMemory};
 
@@ -297,19 +310,57 @@ pub const Server = struct {
         }
     }
 
-    /// Analyse one document now and publish what it found. The frontend is not
-    /// wired in yet (doc 74 P1/P2), so this publishes a clean bill for the
-    /// current version — which exercises the version/debounce plumbing the real
-    /// diagnostics will ride on.
+    /// Analyse one document now and publish what it found. A newer edit already
+    /// waiting makes the work pointless, so the host's `input_pending` is asked
+    /// between phases and the document stays dirty if it says yes.
     fn analyse(self: *Server, doc: *documents.Document, out: *Outbox) Error!void {
-        _ = self;
+        const abandon: analysis_mod.Abandon = .{ .ctx = self.hooks.ctx, .stale = self.hooks.input_pending };
+        const result = analysis_mod.analyse(self.gpa, doc.source(), self.known_globals, abandon) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Abandoned => return, // stays dirty: `tick` comes round again
+            error.Unparseable => {
+                doc.dirty_since = null;
+                try out.log(protocol.MessageType.warning, "analysis incomplete: the parser produced no tree");
+                return;
+            },
+        };
+        doc.setAnalysis(result);
         doc.dirty_since = null;
+        const an = &doc.analysis.?;
+        if (an.incomplete) try out.log(protocol.MessageType.warning, "analysis incomplete: out of memory while collecting diagnostics");
+
+        const index = doc.lineIndex(self.gpa) catch return error.OutOfMemory;
+        const a = out.arena.allocator();
+        const list = try a.alloc(protocol.Diagnostic, an.diagnostics.len);
+        for (an.diagnostics, list) |d, *slot| {
+            var related: ?[]const protocol.DiagnosticRelatedInformation = null;
+            if (d.related) |r| {
+                const one = try a.alloc(protocol.DiagnosticRelatedInformation, 1);
+                one[0] = .{
+                    .location = .{ .uri = doc.uri, .range = index.toRange(an.source, r.start, r.end, self.encoding) },
+                    .message = r.label,
+                };
+                related = one;
+            }
+            slot.* = .{
+                .range = index.toRange(an.source, d.start, d.end, self.encoding),
+                .severity = switch (d.severity) {
+                    .@"error" => protocol.DiagnosticSeverity.@"error",
+                    .warning => protocol.DiagnosticSeverity.warning,
+                },
+                .code = d.code.id(),
+                .source = server_name,
+                .message = d.message,
+                .relatedInformation = related,
+            };
+        }
         try out.notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
             .uri = doc.uri,
             .version = doc.version,
-            .diagnostics = &.{},
+            .diagnostics = list,
         });
     }
+
 };
 
 // ---------------------------------------------------------------------------
@@ -603,4 +654,112 @@ test "debounce: documents are independent" {
     try testing.expectEqual(@as(?u64, 80), h.server.nextDeadline());
     r = try h.tick(80);
     try testing.expectEqualStrings("b", r[0].object.get("params").?.object.get("uri").?.string);
+}
+
+/// Open `text` as document `u` at version 1 and run its analysis.
+fn analyseText(h: *Harness, text: []const u8) !json.Value {
+    var buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(&buf,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"u","version":1,"text":{f}}}}}}}
+    , .{std.json.fmt(text, .{})});
+    _ = try h.send(0, body);
+    const r = try h.tick(50);
+    try testing.expectEqual(@as(usize, 1), r.len);
+    return r[0].object.get("params").?;
+}
+
+test "diagnostics: a syntax error is published with its code, range and the opener it names" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const params = try analyseText(&h, "if x then");
+    const diags = params.object.get("diagnostics").?.array.items;
+    try testing.expectEqual(@as(usize, 1), diags.len);
+    const d = diags[0].object;
+    try testing.expectEqualStrings("E0109", d.get("code").?.string);
+    try testing.expectEqualStrings("mahina", d.get("source").?.string);
+    try testing.expectEqual(@as(i64, 1), d.get("severity").?.integer);
+    const start = d.get("range").?.object.get("start").?.object;
+    try testing.expectEqual(@as(i64, 9), start.get("character").?.integer); // the end of input
+    const rel = d.get("relatedInformation").?.array.items[0].object;
+    try testing.expectEqualStrings("'if' opened here", rel.get("message").?.string);
+    const loc = rel.get("location").?.object;
+    try testing.expectEqualStrings("u", loc.get("uri").?.string);
+    try testing.expectEqual(@as(i64, 2), loc.get("range").?.object.get("end").?.object.get("character").?.integer);
+}
+
+test "diagnostics: a lint is a warning, and the names the host installs are not flagged" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.known_globals = &.{"print"};
+    try h.open();
+    const params = try analyseText(&h, "print(nope)");
+    const diags = params.object.get("diagnostics").?.array.items;
+    try testing.expectEqual(@as(usize, 1), diags.len);
+    try testing.expectEqual(@as(i64, 2), diags[0].object.get("severity").?.integer);
+    try testing.expectEqualStrings("W0001", diags[0].object.get("code").?.string);
+    try testing.expect(std.mem.indexOf(u8, diags[0].object.get("message").?.string, "nope") != null);
+}
+
+test "diagnostics: columns follow the negotiated encoding" {
+    const src = "local s = \"\u{1F600}\" +";
+    // UTF-16 (the default): the emoji is two code units.
+    {
+        var h = Harness.init(.{});
+        defer h.deinit();
+        try h.open();
+        const params = try analyseText(&h, src);
+        const start = params.object.get("diagnostics").?.array.items[0].object.get("range").?.object.get("start").?.object;
+        try testing.expectEqual(@as(i64, 16), start.get("character").?.integer);
+    }
+    // UTF-8, when the client offers it: four bytes.
+    {
+        var h = Harness.init(.{});
+        defer h.deinit();
+        _ = try h.send(0,
+            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-8"]}}}}
+        );
+        const params = try analyseText(&h, src);
+        const start = params.object.get("diagnostics").?.array.items[0].object.get("range").?.object.get("start").?.object;
+        try testing.expectEqual(@as(i64, 18), start.get("character").?.integer);
+    }
+}
+
+test "diagnostics: fixing the text clears them, and the version travels with the set" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    _ = try analyseText(&h, "x = =");
+    _ = try h.send(100,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"u","version":2},"contentChanges":[{"text":"local x = 1"}]}}
+    );
+    const r = try h.tick(150);
+    try testing.expectEqual(@as(usize, 1), r.len);
+    const p = r[0].object.get("params").?.object;
+    try testing.expectEqual(@as(i64, 2), p.get("version").?.integer);
+    try testing.expectEqual(@as(usize, 0), p.get("diagnostics").?.array.items.len);
+}
+
+test "diagnostics: input already waiting abandons the analysis, which runs again later" {
+    const Pending = struct {
+        waiting: bool = true,
+        fn check(ctx: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            return self.waiting;
+        }
+    };
+    var pending = Pending{};
+    var h = Harness.init(.{ .ctx = &pending, .input_pending = Pending.check });
+    defer h.deinit();
+    try h.open();
+    _ = try h.send(0,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"u","version":1,"text":"local x = 1"}}}
+    );
+    try testing.expectEqual(@as(usize, 0), (try h.tick(50)).len);
+    // Still dirty, so the host's timer fires again.
+    try testing.expect(h.server.nextDeadline() != null);
+    pending.waiting = false;
+    const r = try h.tick(60);
+    try testing.expectEqual(@as(usize, 1), r.len);
+    try testing.expect(h.server.nextDeadline() == null);
 }

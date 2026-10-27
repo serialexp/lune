@@ -16,7 +16,8 @@ const lexer = @import("lexer.zig");
 const numeral = @import("numeral.zig");
 const Token = token.Token;
 const Tag = Token.Tag;
-const Diagnostics = @import("diag.zig").Diagnostics;
+const diag = @import("diag.zig");
+const Diagnostics = diag.Diagnostics;
 const Expr = ast.Expr;
 const Stmt = ast.Stmt;
 const Span = ast.Span;
@@ -89,16 +90,28 @@ const Parser = struct {
 
     // -- diagnostics --
 
-    fn fail(self: *Parser, message: []const u8) Error {
+    fn fail(self: *Parser, code: diag.Code) Error {
+        return self.failRelated(code, null);
+    }
+
+    /// `fail`, also pointing at `related` (the construct that is unclosed).
+    fn failRelated(self: *Parser, code: diag.Code, related: ?diag.Related) Error {
         const t = self.current();
-        self.diags.err(message, t.start, t.end, t.line);
+        self.diags.reportRelated(code, t.start, t.end, t.line, related);
         self.had_error = true;
         return Error.ParseError;
     }
 
-    fn expect(self: *Parser, tag: Tag, message: []const u8) Error!Token {
+    fn expect(self: *Parser, tag: Tag, code: diag.Code) Error!Token {
         if (self.check(tag)) return self.advance();
-        return self.fail(message);
+        return self.fail(code);
+    }
+
+    /// `expect` for the token that closes something `open` opened: a failure
+    /// also points back at the opener, labelled `label` (static text).
+    fn expectClosing(self: *Parser, tag: Tag, code: diag.Code, open: Token, label: []const u8) Error!Token {
+        if (self.check(tag)) return self.advance();
+        return self.failRelated(code, .{ .start = open.start, .end = open.end, .label = label });
     }
 
     // -- allocation helpers --
@@ -132,7 +145,7 @@ const Parser = struct {
             // header was dropped but whose `end` was not), so it is skipped
             // without a second diagnostic; the rest of the file still parses.
             const t = self.current();
-            if (!self.had_error) _ = self.fail("expected end of input") catch {};
+            if (!self.had_error) _ = self.fail(.expected_end_of_input) catch {};
             _ = self.advance();
             try stmts.append(self.arena, .{ .span = tokSpan(t), .data = .err });
         }
@@ -246,7 +259,7 @@ const Parser = struct {
             .keyword_async => blk: {
                 // Doc 73 §7: `async function a.b:c(...) ... end`.
                 const start = self.advance().start;
-                if (!self.check(.keyword_function)) break :blk self.fail("expected 'function' after 'async'");
+                if (!self.check(.keyword_function)) break :blk self.fail(.expected_function_after_async);
                 var s = try self.parseFunctionDecl(true);
                 s.span.start = start;
                 break :blk s;
@@ -255,7 +268,7 @@ const Parser = struct {
             .keyword_await => blk: {
                 const start = self.current().start;
                 const e = try self.parseExpr(0);
-                if (!e.isCall()) break :blk self.fail("expected a statement (assignment or call)");
+                if (!e.isCall()) break :blk self.fail(.expected_statement);
                 break :blk Stmt{ .span = self.spanFrom(start), .data = .{ .call = e } };
             },
             .keyword_break => blk: {
@@ -271,10 +284,11 @@ const Parser = struct {
         const start = self.advance().start; // 'local'
 
         const is_async = self.match(.keyword_async);
-        if (is_async and !self.check(.keyword_function)) return self.fail("expected 'function' after 'async'");
+        if (is_async and !self.check(.keyword_function)) return self.fail(.expected_function_after_async);
+        const fn_tok = self.current();
         if (self.match(.keyword_function)) {
-            const name_tok = try self.expect(.identifier, "expected function name");
-            const body = try self.parseFunctionBody();
+            const name_tok = try self.expect(.identifier, .expected_function_name);
+            const body = try self.parseFunctionBody(fn_tok);
             body.is_async = is_async;
             return .{
                 .span = self.spanFrom(start),
@@ -284,7 +298,7 @@ const Parser = struct {
 
         var names: std.ArrayList(ast.TypedName) = .empty;
         while (true) {
-            const name_tok = try self.expect(.identifier, "expected variable name");
+            const name_tok = try self.expect(.identifier, .expected_variable_name);
             const ty = try self.parseOptionalType();
             try names.append(self.arena, .{
                 .name = name_tok.lexeme(self.source),
@@ -350,7 +364,7 @@ const Parser = struct {
         // token with inequality — here, right after an lvalue, it is xor-assign.
         if (compoundAssignOp(self.current().tag)) |op| {
             if (!first.isAssignable()) {
-                self.diags.err("cannot assign to this expression", first.span.start, first.span.end, 0);
+                self.diags.report(.cannot_assign, first.span.start, first.span.end, 0);
                 return Error.ParseError;
             }
             _ = self.advance(); // the compound-assign operator
@@ -367,11 +381,11 @@ const Parser = struct {
             while (self.match(.comma)) {
                 try targets.append(self.arena, try self.parseSuffixed());
             }
-            _ = try self.expect(.assign, "expected '=' in assignment");
+            _ = try self.expect(.assign, .expected_assign);
             const values = try self.parseExprList();
             for (targets.items) |t| {
                 if (!t.isAssignable()) {
-                    self.diags.err("cannot assign to this expression", t.span.start, t.span.end, 0);
+                    self.diags.report(.cannot_assign, t.span.start, t.span.end, 0);
                     return Error.ParseError;
                 }
             }
@@ -381,28 +395,29 @@ const Parser = struct {
             };
         }
 
-        if (!first.isCall()) return self.fail("expected a statement (assignment or call)");
+        if (!first.isCall()) return self.fail(.expected_statement);
         return .{ .span = self.spanFrom(start), .data = .{ .call = first } };
     }
 
     fn parseIf(self: *Parser) Error!Stmt {
-        const start = self.advance().start; // 'if'
+        const open = self.advance(); // 'if'
+        const start = open.start;
         var branches: std.ArrayList(Stmt.Branch) = .empty;
 
         const cond = try self.parseExpr(0);
-        _ = try self.expect(.keyword_then, "expected 'then'");
+        _ = try self.expect(.keyword_then, .expected_then);
         try branches.append(self.arena, .{ .cond = cond, .body = try self.parseBlock() });
 
         while (self.match(.keyword_elseif)) {
             const c = try self.parseExpr(0);
-            _ = try self.expect(.keyword_then, "expected 'then'");
+            _ = try self.expect(.keyword_then, .expected_then);
             try branches.append(self.arena, .{ .cond = c, .body = try self.parseBlock() });
         }
 
         var else_body: ?ast.Block = null;
         if (self.match(.keyword_else)) else_body = try self.parseBlock();
 
-        _ = try self.expect(.keyword_end, "expected 'end' to close 'if'");
+        _ = try self.expectClosing(.keyword_end, .expected_end_if, open, "'if' opened here");
         return .{
             .span = self.spanFrom(start),
             .data = .{ .if_ = .{ .branches = try branches.toOwnedSlice(self.arena), .else_body = else_body } },
@@ -410,18 +425,20 @@ const Parser = struct {
     }
 
     fn parseWhile(self: *Parser) Error!Stmt {
-        const start = self.advance().start; // 'while'
+        const open = self.advance(); // 'while'
+        const start = open.start;
         const cond = try self.parseExpr(0);
-        _ = try self.expect(.keyword_do, "expected 'do'");
+        _ = try self.expect(.keyword_do, .expected_do);
         const body = try self.parseBlock();
-        _ = try self.expect(.keyword_end, "expected 'end' to close 'while'");
+        _ = try self.expectClosing(.keyword_end, .expected_end_while, open, "'while' opened here");
         return .{ .span = self.spanFrom(start), .data = .{ .while_ = .{ .cond = cond, .body = body } } };
     }
 
     fn parseRepeat(self: *Parser) Error!Stmt {
-        const start = self.advance().start; // 'repeat'
+        const open = self.advance(); // 'repeat'
+        const start = open.start;
         const body = try self.parseBlock();
-        _ = try self.expect(.keyword_until, "expected 'until' to close 'repeat'");
+        _ = try self.expectClosing(.keyword_until, .expected_until, open, "'repeat' opened here");
         // The condition is parsed (and later compiled) in the body's scope: Lua
         // permits `until` to reference locals declared inside the loop body.
         const cond = try self.parseExpr(0);
@@ -429,19 +446,20 @@ const Parser = struct {
     }
 
     fn parseFor(self: *Parser) Error!Stmt {
-        const start = self.advance().start; // 'for'
-        const first_name = try self.expect(.identifier, "expected loop variable");
+        const open = self.advance(); // 'for'
+        const start = open.start;
+        const first_name = try self.expect(.identifier, .expected_loop_variable);
 
         if (self.match(.assign)) {
             // numeric for: for i = start, stop [, step] do ... end
             const start_expr = try self.parseExpr(0);
-            _ = try self.expect(.comma, "expected ',' after numeric-for start");
+            _ = try self.expect(.comma, .expected_comma_after_for_start);
             const stop_expr = try self.parseExpr(0);
             var step: ?*Expr = null;
             if (self.match(.comma)) step = try self.parseExpr(0);
-            _ = try self.expect(.keyword_do, "expected 'do'");
+            _ = try self.expect(.keyword_do, .expected_do);
             const body = try self.parseBlock();
-            _ = try self.expect(.keyword_end, "expected 'end' to close 'for'");
+            _ = try self.expectClosing(.keyword_end, .expected_end_for, open, "'for' opened here");
             return .{ .span = self.spanFrom(start), .data = .{ .numeric_for = .{
                 .name = first_name.lexeme(self.source),
                 .name_span = tokSpan(first_name),
@@ -456,14 +474,14 @@ const Parser = struct {
         var names: std.ArrayList(ast.Ident) = .empty;
         try names.append(self.arena, self.ident(first_name));
         while (self.match(.comma)) {
-            const n = try self.expect(.identifier, "expected loop variable");
+            const n = try self.expect(.identifier, .expected_loop_variable);
             try names.append(self.arena, self.ident(n));
         }
-        _ = try self.expect(.keyword_in, "expected '=' or 'in' in for-loop");
+        _ = try self.expect(.keyword_in, .expected_in);
         const exprs = try self.parseExprList();
-        _ = try self.expect(.keyword_do, "expected 'do'");
+        _ = try self.expect(.keyword_do, .expected_do);
         const body = try self.parseBlock();
-        _ = try self.expect(.keyword_end, "expected 'end' to close 'for'");
+        _ = try self.expectClosing(.keyword_end, .expected_end_for, open, "'for' opened here");
         return .{ .span = self.spanFrom(start), .data = .{ .generic_for = .{
             .names = try names.toOwnedSlice(self.arena),
             .exprs = exprs,
@@ -472,28 +490,30 @@ const Parser = struct {
     }
 
     fn parseDo(self: *Parser) Error!Stmt {
-        const start = self.advance().start; // 'do'
+        const open = self.advance(); // 'do'
+        const start = open.start;
         const body = try self.parseBlock();
-        _ = try self.expect(.keyword_end, "expected 'end' to close 'do'");
+        _ = try self.expectClosing(.keyword_end, .expected_end_do, open, "'do' opened here");
         return .{ .span = self.spanFrom(start), .data = .{ .do = body } };
     }
 
     fn parseFunctionDecl(self: *Parser, is_async: bool) Error!Stmt {
-        const start = self.advance().start; // 'function'
+        const fn_tok = self.advance(); // 'function'
+        const start = fn_tok.start;
         var path: std.ArrayList(ast.Ident) = .empty;
-        const first = try self.expect(.identifier, "expected function name");
+        const first = try self.expect(.identifier, .expected_function_name);
         try path.append(self.arena, self.ident(first));
         while (self.match(.dot)) {
-            const n = try self.expect(.identifier, "expected name after '.'");
+            const n = try self.expect(.identifier, .expected_name_after_dot);
             try path.append(self.arena, self.ident(n));
         }
         var method: ?ast.Ident = null;
         if (self.match(.colon)) {
-            const m = try self.expect(.identifier, "expected method name after ':'");
+            const m = try self.expect(.identifier, .expected_method_name);
             method = self.ident(m);
         }
 
-        const body = try self.parseFunctionBody();
+        const body = try self.parseFunctionBody(fn_tok);
         body.is_async = is_async;
         // A method `a:m` gets an implicit leading `self` parameter.
         const final_body = if (method) |m| try self.prependSelf(body, m.span.start) else body;
@@ -530,9 +550,9 @@ const Parser = struct {
 
     /// Parse `( params ) [: rettype] block end`. Assumes the name/keyword before
     /// the `(` was already consumed.
-    fn parseFunctionBody(self: *Parser) Error!*ast.FunctionBody {
+    fn parseFunctionBody(self: *Parser, open: Token) Error!*ast.FunctionBody {
         const start = self.current().start;
-        _ = try self.expect(.lparen, "expected '(' for parameter list");
+        _ = try self.expect(.lparen, .expected_lparen_params);
 
         var params: std.ArrayList(ast.Param) = .empty;
         var is_vararg = false;
@@ -542,7 +562,7 @@ const Parser = struct {
                     is_vararg = true;
                     break;
                 }
-                const name_tok = try self.expect(.identifier, "expected parameter name");
+                const name_tok = try self.expect(.identifier, .expected_param_name);
                 const ty = try self.parseOptionalType();
                 try params.append(self.arena, .{
                     .name = name_tok.lexeme(self.source),
@@ -552,11 +572,11 @@ const Parser = struct {
                 if (!self.match(.comma)) break;
             }
         }
-        _ = try self.expect(.rparen, "expected ')' after parameters");
+        _ = try self.expect(.rparen, .expected_rparen_params);
 
         const ret_type = try self.parseOptionalType();
         const body = try self.parseBlock();
-        _ = try self.expect(.keyword_end, "expected 'end' to close function");
+        _ = try self.expectClosing(.keyword_end, .expected_end_function, open, "'function' opened here");
 
         const fb = try self.arena.create(ast.FunctionBody);
         fb.* = .{
@@ -575,10 +595,10 @@ const Parser = struct {
         if (!self.match(.colon)) return null;
         const start = self.current().start;
         var path: std.ArrayList([]const u8) = .empty;
-        const first = try self.expect(.identifier, "expected type name");
+        const first = try self.expect(.identifier, .expected_type_name);
         try path.append(self.arena, first.lexeme(self.source));
         while (self.match(.dot)) {
-            const n = try self.expect(.identifier, "expected type name after '.'");
+            const n = try self.expect(.identifier, .expected_type_name_after_dot);
             try path.append(self.arena, n.lexeme(self.source));
         }
         const is_opt = self.matchOptionalMarker();
@@ -692,7 +712,7 @@ const Parser = struct {
             switch (self.currentTag()) {
                 .dot => {
                     _ = self.advance();
-                    const name_tok = try self.expect(.identifier, "expected field name after '.'");
+                    const name_tok = try self.expect(.identifier, .expected_field_name);
                     e = try self.newExpr(
                         .{ .start = e.span.start, .end = name_tok.end },
                         .{ .field = .{ .obj = e, .name = name_tok.lexeme(self.source), .name_span = tokSpan(name_tok) } },
@@ -701,7 +721,7 @@ const Parser = struct {
                 .lbracket => {
                     _ = self.advance();
                     const key = try self.parseExpr(0);
-                    const close = try self.expect(.rbracket, "expected ']'");
+                    const close = try self.expect(.rbracket, .expected_rbracket);
                     e = try self.newExpr(
                         .{ .start = e.span.start, .end = close.end },
                         .{ .index = .{ .obj = e, .key = key } },
@@ -716,7 +736,7 @@ const Parser = struct {
                 },
                 .colon => {
                     _ = self.advance();
-                    const name_tok = try self.expect(.identifier, "expected method name after ':'");
+                    const name_tok = try self.expect(.identifier, .expected_method_name);
                     const args = try self.parseCallArgs();
                     e = try self.newExpr(
                         .{ .start = e.span.start, .end = self.lastEnd() },
@@ -732,10 +752,10 @@ const Parser = struct {
     /// `( args )` — consumes the parentheses. Call sugar (`f"s"`, `f{...}`) is
     /// deferred.
     fn parseCallArgs(self: *Parser) Error![]const *Expr {
-        _ = try self.expect(.lparen, "expected '(' to start call arguments");
+        const open = try self.expect(.lparen, .expected_lparen_args);
         if (self.match(.rparen)) return &.{};
         const args = try self.parseExprList();
-        _ = try self.expect(.rparen, "expected ')' to close call arguments");
+        _ = try self.expectClosing(.rparen, .expected_rparen_args, open, "'(' opened here");
         return args;
     }
 
@@ -782,29 +802,29 @@ const Parser = struct {
             .lparen => {
                 _ = self.advance();
                 const inner = try self.parseExpr(0);
-                const close = try self.expect(.rparen, "expected ')'");
+                const close = try self.expectClosing(.rparen, .expected_rparen, t, "'(' opened here");
                 return self.newExpr(.{ .start = t.start, .end = close.end }, .{ .paren = inner });
             },
             .lbrace => return self.parseTable(),
             .keyword_function => {
-                _ = self.advance();
-                const body = try self.parseFunctionBody();
+                const fn_tok = self.advance();
+                const body = try self.parseFunctionBody(fn_tok);
                 return self.newExpr(body.span, .{ .function = body });
             },
             .keyword_async => {
                 _ = self.advance();
-                if (!self.check(.keyword_function)) return self.fail("expected 'function' after 'async'");
-                _ = self.advance();
-                const body = try self.parseFunctionBody();
+                if (!self.check(.keyword_function)) return self.fail(.expected_function_after_async);
+                const fn_tok = self.advance();
+                const body = try self.parseFunctionBody(fn_tok);
                 body.is_async = true;
                 return self.newExpr(.{ .start = t.start, .end = body.span.end }, .{ .function = body });
             },
-            else => return self.fail("expected an expression"),
+            else => return self.fail(.expected_expression),
         }
     }
 
-    fn failAtToken(self: *Parser, t: Token, message: []const u8) Error {
-        self.diags.err(message, t.start, t.end, t.line);
+    fn failAtToken(self: *Parser, t: Token, code: diag.Code) Error {
+        self.diags.report(code, t.start, t.end, t.line);
         return Error.ParseError;
     }
 
@@ -812,21 +832,22 @@ const Parser = struct {
     /// lexer's classifier): hex integers wrap, a decimal integer too big for
     /// `i64` is a float, and floats may be hex (`0x1.8p+1`).
     fn parseNumber(self: *Parser, t: Token) Error!Expr.Data {
-        return switch (numeral.parse(t.lexeme(self.source)) orelse return self.failAtToken(t, "malformed number")) {
+        return switch (numeral.parse(t.lexeme(self.source)) orelse return self.failAtToken(t, .malformed_number)) {
             .int => |i| .{ .int = i },
             .float => |f| .{ .float = f },
         };
     }
 
     fn parseTable(self: *Parser) Error!*Expr {
-        const start = self.advance().start; // '{'
+        const open = self.advance(); // '{'
+        const start = open.start;
         var fields: std.ArrayList(ast.TableField) = .empty;
         while (!self.check(.rbrace)) {
             if (self.check(.lbracket)) {
                 _ = self.advance();
                 const key = try self.parseExpr(0);
-                _ = try self.expect(.rbracket, "expected ']' in table key");
-                _ = try self.expect(.assign, "expected '=' after table key");
+                _ = try self.expect(.rbracket, .expected_rbracket_key);
+                _ = try self.expect(.assign, .expected_assign_after_key);
                 const value = try self.parseExpr(0);
                 try fields.append(self.arena, .{ .keyed = .{ .key = key, .value = value } });
             } else if (self.check(.identifier) and self.peekAt(1).tag == .assign) {
@@ -840,7 +861,7 @@ const Parser = struct {
             }
             if (!self.match(.comma) and !self.match(.semicolon)) break;
         }
-        const close = try self.expect(.rbrace, "expected '}' to close table");
+        const close = try self.expectClosing(.rbrace, .expected_rbrace, open, "'{' opened here");
         return self.newExpr(.{ .start = start, .end = close.end }, .{ .table = try fields.toOwnedSlice(self.arena) });
     }
 };
@@ -1194,4 +1215,39 @@ test "doc 74 P1b: every error node's span is well formed and inside the source" 
             try testing.expect(s.span.end <= src.len);
         }
     }
+}
+
+test "doc 74 P1d: an unclosed construct points back at its opener" {
+    const cases = [_]struct { src: [:0]const u8, code: diag.Code, open: []const u8, label: []const u8 }{
+        .{ .src = "if x then", .code = .expected_end_if, .open = "if", .label = "'if' opened here" },
+        .{ .src = "while x do", .code = .expected_end_while, .open = "while", .label = "'while' opened here" },
+        .{ .src = "for i = 1, 2 do", .code = .expected_end_for, .open = "for", .label = "'for' opened here" },
+        .{ .src = "do", .code = .expected_end_do, .open = "do", .label = "'do' opened here" },
+        .{ .src = "repeat", .code = .expected_until, .open = "repeat", .label = "'repeat' opened here" },
+        .{ .src = "local function f()", .code = .expected_end_function, .open = "function", .label = "'function' opened here" },
+        .{ .src = "f(1", .code = .expected_rparen_args, .open = "(", .label = "'(' opened here" },
+        .{ .src = "local t = {1", .code = .expected_rbrace, .open = "{", .label = "'{' opened here" },
+        .{ .src = "local a = (1", .code = .expected_rparen, .open = "(", .label = "'(' opened here" },
+    };
+    for (cases) |c| {
+        var diags = Diagnostics.init(testing.allocator);
+        defer diags.deinit();
+        var tree = try parseBroken(c.src, &diags);
+        defer tree.deinit();
+        const d = diags.list.items[0];
+        try testing.expectEqual(c.code, d.code);
+        try testing.expectEqualStrings(c.code.message(), d.message);
+        const r = d.related.?;
+        try testing.expectEqualStrings(c.label, r.label);
+        try testing.expectEqualStrings(c.open, c.src[r.start..r.end]);
+    }
+}
+
+test "doc 74 P1d: a plain syntax error carries its code and no related span" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parseBroken("local x = )", &diags);
+    defer tree.deinit();
+    try testing.expectEqual(diag.Code.expected_expression, diags.list.items[0].code);
+    try testing.expect(diags.list.items[0].related == null);
 }

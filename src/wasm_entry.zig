@@ -1168,6 +1168,7 @@ export fn mahina_lsp_open() u32 {
         .server = lsp_server.Server.init(gpa, .{}),
         .out = lsp_server.Outbox.init(gpa),
     };
+    lsp_state.?.server.known_globals = &mahina.interp.builtin_global_names;
     return 0;
 }
 

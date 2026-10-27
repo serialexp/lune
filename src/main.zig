@@ -495,7 +495,9 @@ fn lspMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
     }
     // `init.gpa` is the thread-safe process allocator: the reader thread
     // allocates message bodies the worker frees.
-    return mahina.lsp.host_stdio.run(init.gpa, mahina.lsp.host_stdio.stdioTransport(), .{}) catch |err| {
+    return mahina.lsp.host_stdio.run(init.gpa, mahina.lsp.host_stdio.stdioTransport(), .{
+        .known_globals = &mahina.interp.builtin_global_names,
+    }) catch |err| {
         mahina.io.eprint("mahina lsp: error: {s}\n", .{@errorName(err)});
         return 1;
     };

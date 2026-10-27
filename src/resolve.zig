@@ -80,10 +80,16 @@ pub const Resolution = struct {
     bindings: std.ArrayList(Binding) = .empty,
     /// Sorted by `span.start`; a name token yields at most one.
     occurrences: std.ArrayList(Occurrence) = .empty,
+    /// The source the parser's recovery dropped (error nodes), in tree order.
+    /// Names written there are unknown to this pass: a global that looks
+    /// undefined may be defined in that text, so lints that rely on "never
+    /// assigned" must stay quiet about any name it mentions.
+    damaged: std.ArrayList(Span) = .empty,
 
     pub fn deinit(self: *Resolution) void {
         self.bindings.deinit(self.gpa);
         self.occurrences.deinit(self.gpa);
+        self.damaged.deinit(self.gpa);
     }
 
     pub fn binding(self: *const Resolution, id: BindingId) *const Binding {
@@ -322,7 +328,8 @@ const Walker = struct {
                 try self.function(fd.body, fd.name.method != null);
             },
             .return_ => |values| try self.exprList(values),
-            .break_, .err => {},
+            .break_ => {},
+            .err => try self.res.damaged.append(self.gpa, s.span),
         }
     }
 
@@ -337,7 +344,8 @@ const Walker = struct {
 
     fn expr(self: *Walker, e: *const ast.Expr) std.mem.Allocator.Error!void {
         switch (e.data) {
-            .nil, .bool, .int, .float, .string_raw, .vararg, .intrinsic, .err => {},
+            .nil, .bool, .int, .float, .string_raw, .vararg, .intrinsic => {},
+            .err => try self.res.damaged.append(self.gpa, e.span),
             .name => |n| try self.use(n, e.span, .read),
             .paren => |inner| try self.expr(inner),
             .unary => |u| try self.expr(u.operand),
@@ -602,4 +610,16 @@ test "resolve: an AST with error nodes resolves what is left" {
     defer res.deinit();
     const x_use = res.bindingAt(@intCast(std.mem.find(u8, src, "x, y").?)).?;
     try testing.expectEqual(Kind.local, res.binding(x_use).kind);
+}
+
+test "resolve: dropped source is recorded as damaged" {
+    const src = "local x =\nlocal y = 1\nz = = 2\nprint(x, y)";
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, src, &diags);
+    defer tree.deinit();
+    var res = try resolve(testing.allocator, tree.root, src.len);
+    defer res.deinit();
+    try testing.expectEqual(@as(usize, 2), res.damaged.items.len);
+    try testing.expectEqualStrings("z = = 2", src[res.damaged.items[1].start..res.damaged.items[1].end]);
 }

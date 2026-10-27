@@ -36,6 +36,8 @@ pub const Config = struct {
     log: *const fn ([]const u8) void = logStderr,
     /// Monotonic milliseconds.
     clock: *const fn () u64 = monotonicMs,
+    /// The global names the host installs, which are not flagged as undefined.
+    known_globals: []const []const u8 = &.{},
 };
 
 fn logStderr(msg: []const u8) void {
@@ -243,6 +245,14 @@ fn cancelledHook(ctx: ?*anyopaque, id: jsonrpc.Id) bool {
     return sh.takeCancel(id);
 }
 
+/// Another message is already queued: an analysis under way is out of date.
+fn inputPendingHook(ctx: ?*anyopaque) bool {
+    const sh: *Shared = @ptrCast(@alignCast(ctx.?));
+    sh.lock();
+    defer sh.unlock();
+    return sh.head < sh.queue.items.len;
+}
+
 /// Run the server until `exit` or end of input. Returns the process exit code.
 pub fn run(gpa: std.mem.Allocator, transport: Transport, cfg: Config) !u8 {
     const sh = try gpa.create(Shared);
@@ -257,8 +267,9 @@ pub fn run(gpa: std.mem.Allocator, transport: Transport, cfg: Config) !u8 {
     reader.detach(); // it may be blocked in `read`; `Shared` is ref-counted for that
     defer sh.stop();
 
-    var core = server_mod.Server.init(gpa, .{ .ctx = sh, .cancelled = cancelledHook });
+    var core = server_mod.Server.init(gpa, .{ .ctx = sh, .cancelled = cancelledHook, .input_pending = inputPendingHook });
     defer core.deinit();
+    core.known_globals = cfg.known_globals;
     var out = server_mod.Outbox.init(gpa);
     defer out.deinit();
     var wire: std.ArrayList(u8) = .empty;

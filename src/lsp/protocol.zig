@@ -98,12 +98,23 @@ pub const DiagnosticSeverity = struct {
     pub const hint: u8 = 4;
 };
 
+pub const Location = struct {
+    uri: []const u8,
+    range: Range,
+};
+
+pub const DiagnosticRelatedInformation = struct {
+    location: Location,
+    message: []const u8,
+};
+
 pub const Diagnostic = struct {
     range: Range,
     severity: ?u8 = null,
     code: ?[]const u8 = null,
     source: ?[]const u8 = null,
     message: []const u8,
+    relatedInformation: ?[]const DiagnosticRelatedInformation = null,
 };
 
 pub const PublishDiagnosticsParams = struct {

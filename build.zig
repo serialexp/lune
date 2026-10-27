@@ -302,6 +302,25 @@ pub fn build(b: *std.Build) void {
     const bench_topo_step = b.step("bench-topology", "Run the region-topology rebuild benchmark (ReleaseFast)");
     bench_topo_step.dependOn(&run_bench_topo.step);
 
+    // `zig build bench-lsp` — doc 74 §9: the language server's stages and
+    // end-to-end latency over realistic and adversarial files. ReleaseFast,
+    // informational, not a test (global Rule #22).
+    const bench_lsp_exe = b.addExecutable(.{
+        .name = "bench-lsp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_lsp.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{
+                .{ .name = "mahina", .module = mod },
+            },
+        }),
+    });
+    bench_lsp_exe.use_llvm = true;
+    const run_bench_lsp = b.addRunArtifact(bench_lsp_exe);
+    const bench_lsp_step = b.step("bench-lsp", "Run the doc 74 language-server benchmark (ReleaseFast)");
+    bench_lsp_step.dependOn(&run_bench_lsp.step);
+
     // `zig build bench-facts` — doc 67 §5.3: building a page's slab fact
     // tables, and one arm-time `proves`, at the trace size limits.
     // ReleaseFast, informational, not a test (global Rule #22).
