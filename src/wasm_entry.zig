@@ -1136,3 +1136,98 @@ fn appendU16(buf: *std.ArrayList(u8), v: u16) !void {
     std.mem.writeInt(u16, &b, v, .little);
     try buf.appendSlice(gpa, &b);
 }
+
+// ---- language server (doc 74) ---------------------------------------------
+//
+// The sans-IO LSP core behind a message-body API: no `Content-Length` framing
+// (the worker's `postMessage` already delimits), no threads, no clock of its
+// own. JS owns the debounce timer: after every `send`/`tick` it asks
+// `mahina_lsp_next_deadline` and schedules a `mahina_lsp_tick`. One server per
+// module instance; the worker is single-threaded, so `$/cancelRequest` is
+// handled in arrival order and the default no-cancellation hooks apply.
+
+const lsp_server = mahina.lsp.server;
+
+/// The one language server of this module instance, and the messages its last
+/// call produced (valid until the next `send`/`tick`/`close`).
+var lsp_state: ?struct {
+    server: lsp_server.Server,
+    out: lsp_server.Outbox,
+} = null;
+
+/// Milliseconds from JS (a `number`, `performance.now()`), as the core's clock.
+fn lspClock(now_ms: f64) u64 {
+    if (!(now_ms > 0)) return 0; // also catches NaN
+    return @intFromFloat(@min(now_ms, 9.0e15));
+}
+
+/// Start a fresh server, dropping any previous one. 0 on success, 1 on OOM.
+export fn mahina_lsp_open() u32 {
+    mahina_lsp_close();
+    lsp_state = .{
+        .server = lsp_server.Server.init(gpa, .{}),
+        .out = lsp_server.Outbox.init(gpa),
+    };
+    return 0;
+}
+
+export fn mahina_lsp_close() void {
+    if (lsp_state) |*s| {
+        s.server.deinit();
+        s.out.deinit();
+        lsp_state = null;
+    }
+}
+
+/// How many messages the last call left; `lsp_failed` when it ran out of memory.
+const lsp_failed: u32 = 0xFFFF_FFFF;
+
+fn lspCount() u32 {
+    return @intCast(lsp_state.?.out.messages().len);
+}
+
+/// Feed one message body (`[ptr, ptr+len)`, still owned by JS) at host time
+/// `now_ms`. Returns the number of messages to send back, read with
+/// `mahina_lsp_message_ptr/len`; `lsp_failed` if no server is open or memory ran out.
+export fn mahina_lsp_send(ptr: u32, len: u32, now_ms: f64) u32 {
+    const s = if (lsp_state) |*s| s else return lsp_failed;
+    s.out.reset();
+    const body: []const u8 = if (len == 0) &.{} else @as([*]const u8, @ptrFromInt(@as(usize, ptr)))[0..len];
+    s.server.handle(lspClock(now_ms), body, &s.out) catch return lsp_failed;
+    return lspCount();
+}
+
+/// Run what is due at `now_ms` (the debounce timers). Same return as `send`.
+export fn mahina_lsp_tick(now_ms: f64) u32 {
+    const s = if (lsp_state) |*s| s else return lsp_failed;
+    s.out.reset();
+    s.server.tick(lspClock(now_ms), &s.out) catch return lsp_failed;
+    return lspCount();
+}
+
+/// When JS should next call `mahina_lsp_tick`, in its own clock; -1 if nothing waits.
+export fn mahina_lsp_next_deadline() f64 {
+    const s = if (lsp_state) |*s| s else return -1;
+    const due = s.server.nextDeadline() orelse return -1;
+    return @floatFromInt(due);
+}
+
+export fn mahina_lsp_message_ptr(i: u32) u32 {
+    const s = if (lsp_state) |*s| s else return 0;
+    const m = s.out.messages();
+    if (i >= m.len) return 0;
+    return @intCast(@intFromPtr(m[i].ptr));
+}
+
+export fn mahina_lsp_message_len(i: u32) u32 {
+    const s = if (lsp_state) |*s| s else return 0;
+    const m = s.out.messages();
+    if (i >= m.len) return 0;
+    return @intCast(m[i].len);
+}
+
+/// 1 once the client has sent `exit`.
+export fn mahina_lsp_is_done() u32 {
+    const s = if (lsp_state) |*s| s else return 1;
+    return @intFromBool(s.server.isDone());
+}

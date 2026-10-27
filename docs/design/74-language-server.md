@@ -1,8 +1,8 @@
 # 74 — A language server (`mahina lsp`) — Design
 
 Status: partial — P0 landed (the `mahina lsp` stdio server: framing,
-lifecycle, positions, document sync, debounce, cancellation); the wasm host
-and everything from P1 on outstanding. Direction decided 2026-10-27 (server in
+lifecycle, positions, document sync, debounce, cancellation; the wasm host);
+everything from P1 on outstanding. Direction decided 2026-10-27 (server in
 Zig as a CLI subcommand; design before code). Review round 1 (Codex,
 Antigravity) folded in 2026-10-27; Bart delegated the picks where the
 reviewers disagreed (§12). Every open question decided 2026-10-27.
@@ -96,6 +96,9 @@ land; move whole phases to Done once everything inside them is checked.
     oversize bodies, EOF, the timer, cancellation) plus a real-pipe check
     and `tools/cli-smoke.sh` coverage.
   - [x] The core and its modules build for wasm32 (`zig build wasm`).
+  - [x] Wasm host: `mahina_lsp_open/send/tick/next_deadline/message_ptr/
+    message_len/is_done/close` in `src/wasm_entry.zig` (message bodies, no
+    framing; JS owns the debounce timer). `viz/test/lsp-wasm.test.ts`.
 
 ### Outstanding
 
@@ -103,9 +106,6 @@ land; move whole phases to Done once everything inside them is checked.
   host's `cancelled` hook once per request; the phase-boundary checks
   (after parse, resolve, compile) and the newest-version atomic arrive with
   the analysis in P2, since there is nothing long-running to abandon yet.
-- [ ] **P0 wasm host** (§13.1): `mahina_lsp_*` exports in
-  `src/wasm_entry.zig` driving the same core on wasm32-freestanding (the
-  core already builds for wasm).
 - [ ] **P1a — AST name spans** (§6.3): `name_span` on `local_function`,
   numeric/generic `for` variables, `FuncName` components, named table
   fields; implicit `self` gets a synthetic, zero-width span instead of the
