@@ -3,7 +3,7 @@
 // UTF-16 code-unit indices. ASCII is the identity; multibyte text shifts.
 
 import { test, expect } from "bun:test";
-import { byteToUtf16 } from "../src/editor/mahinaLinter";
+import { byteToUtf16 } from "../src/editor/byteOffsets";
 
 test("ASCII is the identity map", () => {
   const src = "local x = 1\n";

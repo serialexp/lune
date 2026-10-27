@@ -8,7 +8,7 @@
 // bun test suite imports `store.ts` (which imports this) and must not touch
 // `Worker`. Only a real run in the browser stands the worker up.
 
-import type { MahinaRunResult, MahinaReplayResult, MahinaDiagnostic, SourceFile } from "./mahina";
+import type { MahinaRunResult, MahinaReplayResult, SourceFile } from "./mahina";
 
 /** The wasm URL: `${base}mahina.wasm` resolved against the *page* URL to an
  *  absolute URL, so dev and built bases both work. It must be absolute before
@@ -80,10 +80,6 @@ class MahinaWorkerClient {
 
   runSource(src: string, argv: string[] = [], files: SourceFile[] = []): Promise<MahinaRunResult> {
     return this.#call<MahinaRunResult>({ method: "run", src, argv, files });
-  }
-
-  check(src: string): Promise<MahinaDiagnostic[]> {
-    return this.#call<MahinaDiagnostic[]>({ method: "check", src });
   }
 
   replay(src: string, effects: Uint8Array, stopAfter: number, argv: string[] = []): Promise<MahinaReplayResult> {

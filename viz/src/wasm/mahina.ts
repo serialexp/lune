@@ -19,6 +19,14 @@ interface MahinaExports {
   mahina_replay(srcPtr: number, srcLen: number, effPtr: number, effLen: number, argsPtr: number, argsLen: number, stopAfter: number): number;
   mahina_free_replay_result(resPtr: number): void;
   mahina_dispatch_smoke(iterations: number): number;
+  mahina_lsp_open(): number;
+  mahina_lsp_close(): void;
+  mahina_lsp_send(ptr: number, len: number, nowMs: number): number;
+  mahina_lsp_tick(nowMs: number): number;
+  mahina_lsp_next_deadline(): number;
+  mahina_lsp_message_ptr(i: number): number;
+  mahina_lsp_message_len(i: number): number;
+  mahina_lsp_is_done(): number;
   mahina_panic_message_ptr(): number;
   mahina_panic_message_len(): number;
 }
@@ -227,7 +235,24 @@ export interface MahinaDiagnostic {
 }
 
 /** A ready-to-use VM instance. */
+/** The language server (doc 74) in this module instance: message bodies in,
+ *  message bodies out, no framing. The caller owns the debounce timer — it
+ *  asks `nextDeadline()` after every call and calls `tick` when it arrives. */
+export interface MahinaLsp {
+  open(): void;
+  /** Hand the server one JSON-RPC body; returns the bodies it answers with. */
+  send(body: string, nowMs: number): string[];
+  /** Run the work whose debounce has expired; returns what it publishes. */
+  tick(nowMs: number): string[];
+  /** Absolute ms (same clock as `send`/`tick`) of the next `tick`, or null. */
+  nextDeadline(): number | null;
+  /** The server has seen `exit`. */
+  isDone(): boolean;
+  close(): void;
+}
+
 export interface MahinaModule {
+  lsp: MahinaLsp;
   /** Parse, compile, and run a source chunk; returns its artifacts. `argv`, when
    *  given, fills the global `arg` table (`argv[0]` = script name, `argv[1..]` =
    *  user args) exactly as the CLI does — so a script reading `arg[1]` (e.g.
@@ -673,7 +698,41 @@ function wrap(exports: MahinaExports): MahinaModule {
     return out;
   };
 
+  const lspMessages = (n: number): string[] => {
+    if (n === 0xffffffff) throw new Error("mahina lsp: the server could not take that message");
+    const out: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const p = exports.mahina_lsp_message_ptr(i);
+      const l = exports.mahina_lsp_message_len(i);
+      out.push(decoder.decode(new Uint8Array(exports.memory.buffer, p, l)));
+    }
+    return out;
+  };
+  const lsp: MahinaLsp = {
+    open: guarded("lsp open", () => {
+      exports.mahina_lsp_open();
+    }),
+    send: guarded("lsp send", (body: string, nowMs: number) => {
+      const bytes = encoder.encode(body);
+      const ptr = exports.mahina_alloc(bytes.length);
+      new Uint8Array(exports.memory.buffer, ptr, bytes.length).set(bytes);
+      const n = exports.mahina_lsp_send(ptr, bytes.length, nowMs);
+      exports.mahina_free(ptr, bytes.length);
+      return lspMessages(n);
+    }),
+    tick: guarded("lsp tick", (nowMs: number) => lspMessages(exports.mahina_lsp_tick(nowMs))),
+    nextDeadline: guarded("lsp deadline", () => {
+      const d = exports.mahina_lsp_next_deadline();
+      return d < 0 ? null : d;
+    }),
+    isDone: guarded("lsp done", () => exports.mahina_lsp_is_done() !== 0),
+    close: guarded("lsp close", () => {
+      exports.mahina_lsp_close();
+    }),
+  };
+
   return {
+    lsp,
     runSource: guarded("run", runSource),
     check: guarded("check", check),
     replay: guarded("replay", replay),

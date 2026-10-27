@@ -1,6 +1,6 @@
 // SolidJS <-> CodeMirror 6 bridge for the in-browser mahina editor. Highlights via
 // the mahina mode (mahinaLanguage) and validates live against the real compiler
-// (mahinaLinter -> store.checkSource -> wasm `check`). Shows the store's active
+// (the language server: lsp-client -> worker -> wasm `lsp`). Shows the store's active
 // tab (`activePath`), two-way bound to that file's text with a guard so the
 // view<->store sync never loops. Each tab keeps its own EditorState (undo
 // history, selection) while the program is open.
@@ -16,7 +16,6 @@ import {
   setFileText,
   fileText,
   activeReadOnly,
-  checkSource,
   coverageLinesOf,
   coverageLineTitle,
   fileMapped,
@@ -26,10 +25,11 @@ import {
   type CoverageClass,
 } from "../store";
 import { mahinaLanguage, mahinaHighlighting } from "./mahinaLanguage";
-import { mahinaLinter, byteToUtf16 } from "./mahinaLinter";
+import { byteToUtf16 } from "./byteOffsets";
+import { mahinaLanguageServer } from "../wasm/lsp-client";
 
 // Runtime-error squiggle — a channel separate from the compile linter. Compile
-// diagnostics (`mahinaLinter` → wasm `check`) fire as you type; a *runtime* error
+// diagnostics (the language server) fire as you type; a *runtime* error
 // is only known after a Run, so it lives in its own decoration field rather than
 // the lint state (the two would otherwise overwrite each other). The mark gets a
 // `title` attribute for a native hover tooltip carrying the mahina message.
@@ -168,7 +168,7 @@ export default function MahinaEditor() {
   let shownPath = state.activePath;
   const saved = new Map<string, EditorState>();
 
-  const makeState = (doc: string, readOnly: boolean): EditorState =>
+  const makeState = (path: string, doc: string, readOnly: boolean): EditorState =>
     EditorState.create({
       doc,
       extensions: [
@@ -182,7 +182,7 @@ export default function MahinaEditor() {
         keymap.of([...defaultKeymap, ...historyKeymap, ...lintKeymap, indentWithTab]),
         mahinaLanguage(),
         mahinaHighlighting,
-        mahinaLinter(checkSource),
+        mahinaLanguageServer(path),
         runtimeErrorField,
         replayLineField,
         traceLineField,
@@ -204,7 +204,7 @@ export default function MahinaEditor() {
     });
 
   onMount(() => {
-    view = new EditorView({ parent: host, state: makeState(fileText(shownPath) ?? "", activeReadOnly()) });
+    view = new EditorView({ parent: host, state: makeState(shownPath, fileText(shownPath) ?? "", activeReadOnly()) });
   });
 
   // Switch tabs: park the shown tab's state and show the active one's — its
@@ -217,7 +217,7 @@ export default function MahinaEditor() {
     saved.set(shownPath, view.state);
     const text = fileText(path) ?? "";
     const parked = saved.get(path);
-    view.setState(parked !== undefined && parked.doc.toString() === text ? parked : makeState(text, activeReadOnly()));
+    view.setState(parked !== undefined && parked.doc.toString() === text ? parked : makeState(path, text, activeReadOnly()));
     saved.delete(path);
     shownPath = path;
   });

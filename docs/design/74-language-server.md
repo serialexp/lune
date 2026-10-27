@@ -138,6 +138,12 @@ land; move whole phases to Done once everything inside them is checked.
     document stays dirty); the server publishes versioned diagnostics with
     code, source, severity, `relatedInformation`, ranges in the negotiated
     encoding, and empty sets on clear.
+  - [x] P2 viz client (§13.1): `@codemirror/lsp-client` over postMessage to a
+    dedicated worker (`mahina.lsp.worker.ts`, its own wasm instance, so a run
+    never stalls diagnostics and `stop()` never kills the session; the
+    worker owns the debounce timer). `mahinaLinter` and the run worker's
+    `check` call are gone; tab switches work with the default workspace.
+    `mahina_check` stays only for the bun tests of the shared path.
   - [x] `mahina_check` (wasm) runs `lsp.analysis.analyse`, the same
     recovering frontend path as the server; it reports every error, not
     just the first.
@@ -152,10 +158,6 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Bench follow-ups:** the 100k-line budget miss (check dominates); the
   recursive-descent parser has no nesting limit, so the wasm stack (much
   smaller than native) needs a depth test or a limit.
-- [ ] **P2 viz client** (§13.1): `@codemirror/lsp-client` in the viz with
-  a postMessage transport to the worker; its diagnostics replace
-  `mahinaLinter.ts`'s direct `mahina_check` path, so the browser has one
-  checking path. `mahina_check` is removed once nothing calls it.
 - [ ] **P2 Zed client** (§13.2): `editors/zed/` (extension manifest, the
   `language_server_command` launching `mahina lsp`, language config for
   `.mah`) and `editors/tree-sitter-mahina/` (grammar plus highlights,

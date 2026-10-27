@@ -577,21 +577,6 @@ export function resolveRunFiles(chunks: RunChunk[], entry: string, entryText: st
   });
 }
 
-/**
- * Compile-only validation: parse + compile `src` through the in-browser mahina
- * frontend (the wasm `check` entry — it does NOT run the program) and return its
- * diagnostics. Drives the editor's live linter. A transient wasm error yields no
- * diagnostics rather than spamming squiggles. Wasm access stays funnelled through
- * the store (the editor never touches the module directly — Rule #9).
- */
-export async function checkSource(src: string): Promise<MahinaDiagnostic[]> {
-  try {
-    return await mahinaWorker().check(src);
-  } catch {
-    return [];
-  }
-}
-
 /** Decode a wasm run's recorded trace and push it + stdout into the store. The
  *  trace flows into the existing views exactly as a loaded .mahinatrace would. */
 function applyWasmResult(result: MahinaRunResult, fileName: string, ran: RunInput): void {
