@@ -4,12 +4,12 @@ description = "mahina language support: highlighting and the `mahina lsp` langua
 version = "0.1.0"
 schema_version = 1
 authors = ["Bart Riepe"]
-repository = "https://github.com/serialexp/mahina"
+repository = "https://gothab.io/serialexp/lune"
 
 # The grammar lives in this repository, built from the checked-in src/parser.c.
 # Bump `commit` after changing editors/tree-sitter-mahina (see README.md).
 [grammars.mahina]
-repository = "file:///home/bart/Projects/lune"
+repository = "https://gothab.io/serialexp/lune.git"
 commit = "ed75b2a87e0febe1a96e1cc315d2d1e886959fb5"
 path = "editors/tree-sitter-mahina"
 
