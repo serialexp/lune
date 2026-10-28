@@ -522,16 +522,32 @@ keywords plus the names visible at the cursor.
 ### 7.3 P5 — stdlib knowledge
 
 Hover, `lib.` member completion and signature help need a table of name,
-signature, parameters, one-line description, tier and system group.
-Natives carry no arity or parameter names (`BaseNative`,
-`function.zig:594`), so the table comes from the inventory CSV
-(`docs/lua-stdlib-inventory.csv`, already canonical under Rule Z-5),
-which gains structured `signature` columns (parameters with names and
-optionality, overloads as separate rows). The build generates
-`stdlib_db.zig` from it, filters `excluded` and `not-started` rows, and a
-test cross-checks the generated names against the natives actually
-registered per system group. Inventory tier alone is not availability:
-natives are installed by group (`function.zig:621`).
+signature, parameters, description, tier and system group. Natives carry
+no arity or parameter names (`BaseNative`, `function.zig:594`), so the
+table comes from the inventory CSV (`docs/lua-stdlib-inventory.csv`, the
+Rule Z-5 canonical map), which gained a `signature` column in Lua-manual
+form: `[...]` marks optional parameters, and `file:read(...)` names
+methods.
+
+Decided while building it (2026-10-28):
+- **One row per name, one signature per row.** Overloads are not split
+  into rows, which would break Rule Z-5's one-row-per-function rule. A
+  function with two call forms gets its most complete one.
+- **Parsed at compile time, not by a build tool.** `build.zig` copies the
+  CSV into a generated wrapper module (`stdlib_inventory`), and
+  `src/lsp/stdlib_db.zig` parses it with comptime `@embedFile`. There is no
+  second generated artefact to keep in step.
+- **The system group is not a CSV column.** It is read from the native
+  registered under the same name (`interp.base_natives`), so the
+  registration is the one source. A cross-check test holds both
+  directions: every non-hidden native has a row, and every implemented or
+  partial row is a native, a constant, or a listed value (`_G`,
+  `io.stdin`, `package.*`). Hidden `@file` methods map to `file:read`.
+- Excluded and not-started rows are kept in the table with their status;
+  the features that read it (P5) filter on status.
+
+Inventory tier alone is not availability: natives are installed by group
+(`function.zig:621`).
 
 ### 7.4 P6 — cross-file
 

@@ -59,6 +59,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // The stdlib inventory (Rule Z-5), embedded for the language server's stdlib
+    // table (src/lsp/stdlib_db.zig). A module may only `@embedFile` inside its
+    // own root, so the CSV is copied next to a one-line wrapper module.
+    const inventory_mod = blk: {
+        const files = b.addWriteFiles();
+        _ = files.addCopyFile(b.path("docs/lua-stdlib-inventory.csv"), "lua-stdlib-inventory.csv");
+        const root = files.add("stdlib_inventory.zig", "pub const csv = @embedFile(\"lua-stdlib-inventory.csv\");\n");
+        break :blk b.createModule(.{ .root_source_file = root });
+    };
+
     // The library module: the VM core, importable by consumers and by tests.
     const mod = b.addModule("mahina", .{
         .root_source_file = b.path("src/root.zig"),
@@ -67,6 +77,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "binschema", .module = binschema_mod },
             .{ .name = "build_options", .module = build_opts_mod },
             .{ .name = "jit_unwind", .module = jit_unwind_mod },
+            .{ .name = "stdlib_inventory", .module = inventory_mod },
         },
     });
 
@@ -427,6 +438,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "binschema", .module = wasm_binschema_mod },
             .{ .name = "build_options", .module = build_opts_mod },
+            .{ .name = "stdlib_inventory", .module = inventory_mod },
         },
     });
     // `-Dwasm-strip=true` drops its debug info: the CLI's embedded web UI
