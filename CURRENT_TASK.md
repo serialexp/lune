@@ -3,7 +3,20 @@ DOC 44 STITCHING: numeric-for roots DONE (2026-10-28, coral-marten), committed, 
 - Known noise: euler14-bit +0.8% instructions with identical traces (interp.zig layout).
 - Next: doc 63 Phase 2b/2c (direct host calls; stitching is its fallback).
 
-DOC 74 LANGUAGE SERVER: P0 DONE (2026-10-27, coral-raven); P0 wasm host and P1a–P1d (frontend) are next.
+DOC 74 LANGUAGE SERVER: P0–P4 DONE (2026-10-27 to 2026-10-28, coral-raven). Next: P5 (stdlib knowledge), then P6 (cross-file, mahina.toml).
+- P2 viz client, P3 navigation/completion and P4 syntax (semantic tokens, outline,
+  folds, selection ranges, the trivia sink) are committed; the checklist in
+  docs/design/74-language-server.md has the follow-ups for each. Budget status:
+  the bench-lsp syntax table meets 10 ms at 10k lines; the 100k check stage is
+  ~8% over (Outstanding, bench follow-ups).
+- Open: the parser has no nesting limit, and the wasm stack is untested at depth.
+  Zed's dev-extension install is untested (GUI). The Gothab remote HEAD points at a
+  nonexistent ref (a bare `git clone` checks nothing out).
+- Not in these commits: src/asm/offsets_x64.inc (I did not edit it; its diff is
+  from another agent or a build step, unverified), and the uncommitted trace files.
+- Earlier status (P0–P1d, superseded above): what exists is `mahina lsp` over stdio
+  (src/lsp/: position, jsonrpc, protocol, documents, server = the sans-IO core,
+  host_stdio = threads + I/O); plan and decisions in docs/design/74-language-server.md.
 - What exists: `mahina lsp` serves LSP over stdio (src/lsp/: position, jsonrpc,
   protocol, documents, server = the sans-IO core, host_stdio = threads + I/O).
   Lifecycle, utf-8/utf-16 negotiation, incremental sync, 50/250 ms debounce,
