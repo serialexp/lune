@@ -34,11 +34,47 @@ fn isAlnum(c: u8) bool {
     return isAlpha(c) or isDigit(c);
 }
 
+/// A comment the lexer skipped (doc 74 §6.5): `start` and `end` are its bytes,
+/// delimiters included.
+pub const Comment = struct {
+    start: u32,
+    end: u32,
+    /// A long-bracket comment (`--[[ ... ]]`), not a line comment.
+    block: bool,
+    /// A long-bracket comment that found its closing bracket.
+    closed: bool,
+};
+
+/// Collects the comments a lexer skips when it is given one. Lexing with no
+/// sink, the parser's normal path, records nothing.
+pub const Trivia = struct {
+    gpa: std.mem.Allocator,
+    comments: std.ArrayList(Comment) = .empty,
+    /// An allocation failed: the list is missing comments.
+    incomplete: bool = false,
+
+    pub fn init(gpa: std.mem.Allocator) Trivia {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *Trivia) void {
+        self.comments.deinit(self.gpa);
+    }
+
+    fn add(self: *Trivia, c: Comment) void {
+        self.comments.append(self.gpa, c) catch {
+            self.incomplete = true;
+        };
+    }
+};
+
 pub const Lexer = struct {
     source: [:0]const u8,
     index: u32 = 0,
     line: u32 = 1,
     diags: *Diagnostics,
+    /// Where skipped comments go, if anyone wants them.
+    trivia: ?*Trivia = null,
 
     pub fn init(source: [:0]const u8, diags: *Diagnostics) Lexer {
         return .{ .source = source, .diags = diags };
@@ -87,15 +123,19 @@ pub const Lexer = struct {
                 '\n', '\r' => self.newline(),
                 '-' => {
                     if (self.peekNext() != '-') return;
+                    const start = self.index;
                     self.index += 2; // consume "--"
-                    self.skipComment();
+                    const info = self.skipComment();
+                    if (self.trivia) |t| t.add(.{ .start = start, .end = self.index, .block = info.block, .closed = info.closed });
                 },
                 else => return,
             }
         }
     }
 
-    fn skipComment(self: *Lexer) void {
+    /// Skip a comment's body, after its `--`. Reports whether it is a
+    /// long-bracket comment and, if so, whether it closed.
+    fn skipComment(self: *Lexer) struct { block: bool, closed: bool } {
         // Long-bracket block comment: --[[ ... ]] / --[==[ ... ]==] (any level).
         if (self.peek() == '[') {
             if (self.longBracketLevel()) |level| {
@@ -106,12 +146,12 @@ pub const Lexer = struct {
                     const c = self.peek();
                     if (c == 0) {
                         self.diags.report(.unterminated_block_comment, open_start, self.index, open_line);
-                        return;
+                        return .{ .block = true, .closed = false };
                     }
                     if (c == ']') {
                         if (self.longBracketClose(level)) |after| {
                             self.index = after;
-                            return;
+                            return .{ .block = true, .closed = true };
                         }
                     }
                     if (c == '\n' or c == '\r') self.newline() else self.index += 1;
@@ -120,6 +160,7 @@ pub const Lexer = struct {
         }
         // Line comment: to end of line (the newline is left for skipTrivia).
         while (self.peek() != '\n' and self.peek() != '\r' and self.peek() != 0) self.index += 1;
+        return .{ .block = false, .closed = false };
     }
 
     /// At a `[`, detect a long-bracket opener `[` `=`* `[` and return its level
@@ -403,9 +444,15 @@ pub const Lexer = struct {
 /// Convenience: tokenize an entire source into a slice (including the trailing
 /// `.eof`). Caller owns the returned slice.
 pub fn tokenize(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnostics) ![]Token {
+    return tokenizeTrivia(gpa, source, diags, null);
+}
+
+/// `tokenize`, recording the comments it skips in `trivia` when one is given.
+pub fn tokenizeTrivia(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnostics, trivia: ?*Trivia) ![]Token {
     var list: std.ArrayList(Token) = .empty;
     errdefer list.deinit(gpa);
     var lexer = Lexer.init(source, diags);
+    lexer.trivia = trivia;
     while (true) {
         const t = lexer.next();
         try list.append(gpa, t);
@@ -426,30 +473,21 @@ pub const Context = enum { code, string, comment };
 pub fn contextAt(gpa: std.mem.Allocator, source: [:0]const u8, offset: u32) std.mem.Allocator.Error!Context {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
+    var trivia = Trivia.init(gpa);
+    defer trivia.deinit();
     var lx = Lexer.init(source, &diags);
+    lx.trivia = &trivia;
+    var seen: usize = 0;
     while (true) {
-        // The trivia `next` would skip, walked here so comments can be seen.
-        while (true) {
-            switch (lx.peek()) {
-                ' ', '\t' => lx.index += 1,
-                '\n', '\r' => lx.newline(),
-                '-' => {
-                    if (lx.peekNext() != '-') break;
-                    const open = lx.index;
-                    lx.index += 2;
-                    const block = lx.peek() == '[' and lx.longBracketLevel() != null;
-                    lx.skipComment();
-                    const closed_block = block and lx.index >= open + 6 and lx.source[lx.index - 1] == ']';
-                    if (offset > open and (offset < lx.index or (offset == lx.index and !closed_block))) return .comment;
-                },
-                else => break,
-            }
-            if (lx.index > offset) return .code;
-        }
-        if (lx.index >= offset and lx.peek() != 0) return .code;
+        // `next` records the comments before its token first.
         const t = lx.next();
-        if (t.tag == .eof) return .code;
-        if (t.start >= offset) return .code;
+        if (trivia.incomplete) return error.OutOfMemory;
+        for (trivia.comments.items[seen..]) |c| {
+            if (c.start >= offset) return .code;
+            if (offset < c.end or (offset == c.end and !(c.block and c.closed))) return .comment;
+        }
+        seen = trivia.comments.items.len;
+        if (t.tag == .eof or t.start >= offset) return .code;
         const quoted = switch (t.tag) {
             .string_literal => offset < t.end,
             .invalid => switch (source[t.start]) {
@@ -478,6 +516,26 @@ fn contextOf(marked: []const u8) !Context {
     @memcpy(buf[bar .. bar + rest.len], rest);
     buf[bar + rest.len] = 0;
     return contextAt(testing.allocator, buf[0 .. bar + rest.len :0], @intCast(bar));
+}
+
+test "trivia: the sink records each comment's bytes and whether a block closed" {
+    const src: [:0]const u8 = "x --a\n--[==[ b ]==] y --[[ open";
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var trivia = Trivia.init(testing.allocator);
+    defer trivia.deinit();
+    const toks = try tokenizeTrivia(testing.allocator, src, &diags, &trivia);
+    defer testing.allocator.free(toks);
+    const cs = trivia.comments.items;
+    try testing.expectEqual(@as(usize, 3), cs.len);
+    try testing.expectEqual(@as(u32, 2), cs[0].start);
+    try testing.expectEqual(@as(u32, 5), cs[0].end); // the newline is not part of it
+    try testing.expect(!cs[0].block);
+    try testing.expect(cs[1].block and cs[1].closed);
+    try testing.expectEqual(@as(u32, 6), cs[1].start);
+    try testing.expectEqual(@as(u32, 19), cs[1].end);
+    try testing.expect(cs[2].block and !cs[2].closed);
+    try testing.expectEqual(@as(u32, @intCast(src.len)), cs[2].end);
 }
 
 test "contextAt: code, strings and comments" {

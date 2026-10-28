@@ -18,6 +18,7 @@ const resolve = @import("../resolve.zig");
 const compiler = @import("../compiler.zig");
 const diag = @import("../diag.zig");
 const gc = @import("../gc.zig");
+const lexer = @import("../lexer.zig");
 
 /// Asked between phases: has the answer stopped being wanted (a newer edit is
 /// waiting)? A phase already begun is not interrupted.
@@ -52,8 +53,10 @@ pub const Analysis = struct {
     res: resolve.Resolution,
     /// Every error and warning, in the order found.
     diagnostics: []const diag.Diagnostic,
-    /// A diagnostic was lost to an allocation failure: this set is not the
-    /// whole story and must not be shown as a clean result.
+    /// Every comment, in source order (the trivia sink, doc 74 §6.5).
+    comments: []const lexer.Comment,
+    /// A diagnostic or comment was lost to an allocation failure: this set is
+    /// not the whole story and must not be shown as a clean result.
     incomplete: bool,
 
     pub fn deinit(self: *Analysis) void {
@@ -79,8 +82,10 @@ pub fn analyse(
 
     var diags = diag.Diagnostics.init(gpa);
     defer diags.deinit();
+    var trivia = lexer.Trivia.init(gpa);
+    defer trivia.deinit();
 
-    var tree = parser.parse(gpa, source, &diags) catch |e| switch (e) {
+    var tree = parser.parseTrivia(gpa, source, &diags, &trivia) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseError => return error.Unparseable,
     };
@@ -105,13 +110,15 @@ pub fn analyse(
 
     // Every allocation from `a` is made before `arena` is copied into the result.
     const diagnostics = try a.dupe(diag.Diagnostic, diags.list.items);
+    const comments = try a.dupe(lexer.Comment, trivia.comments.items);
     return .{
         .arena = arena,
         .source = source,
         .tree = tree,
         .res = res,
         .diagnostics = diagnostics,
-        .incomplete = diags.incomplete,
+        .comments = comments,
+        .incomplete = diags.incomplete or trivia.incomplete,
     };
 }
 
@@ -146,6 +153,14 @@ test "analysis: syntax errors and compile errors are reported together" {
     try testing.expectEqual(@as(usize, 1), syntax);
     try testing.expectEqual(@as(usize, 1), compile);
     try testing.expectEqual(@as(usize, 1), lint);
+}
+
+test "analysis: comments are kept in source order, with their bytes" {
+    var an = try analyse(testing.allocator, "-- one\nx = 1 --[[ two ]]", &known, .{});
+    defer an.deinit();
+    try testing.expectEqual(@as(usize, 2), an.comments.len);
+    try testing.expectEqual(@as(u32, 0), an.comments[0].start);
+    try testing.expect(an.comments[1].block and an.comments[1].closed);
 }
 
 test "analysis: the result owns its text, so the document may change" {

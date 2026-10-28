@@ -29,11 +29,16 @@ const Error = error{ ParseError, OutOfMemory };
 /// `diags`; check `diags.hasErrors()` — on error the returned tree is partial
 /// but still well-formed.
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnostics) Error!ast.Ast {
+    return parseTrivia(gpa, source, diags, null);
+}
+
+/// `parse`, recording the comments it skips in `trivia` when one is given.
+pub fn parseTrivia(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnostics, trivia: ?*lexer.Trivia) Error!ast.Ast {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const tokens = try lexer.tokenize(a, source, diags);
+    const tokens = try lexer.tokenizeTrivia(a, source, diags, trivia);
 
     var p = Parser{
         .tokens = tokens,
