@@ -184,7 +184,8 @@ pub const ExecResult = struct {
     /// the transition count (see `TraceState.silentCellOwner`).
     silent_last_cell: u64 = 0,
     /// Doc 44 D11 / doc 54: how many REAL VM frames the native run pushed via
-    /// the inline self-call push sequence. Nonzero breaks the old
+    /// the inline self-call push sequence, plus one credit per borrowed pop
+    /// (see `popped_frames`). Nonzero breaks the old
     /// episode invariant "a native run never changes the VM frame stack":
     /// BOTH dispatcher consumers must branch on it FIRST — before the silent
     /// drain, the seed-decline handlers, the D10 burst consumer, and every
@@ -193,10 +194,12 @@ pub const ExecResult = struct {
     /// tier-1a leaves it 0 (defaulted, construction sites untouched).
     pushed_frames: u64 = 0,
     /// Doc 44 D12c / doc 54 P1: how many episode-pushed frames the native
-    /// run popped back via the inline pop sequence. The net floor
-    /// (`popped < pushed` at every pop, emitted inline) makes
-    /// `popped_frames > 0` imply `pushed_frames > 0`, so the dispatchers'
-    /// existing pushed-frame branch already routes every frame-motion result.
+    /// run popped back via the inline pop sequence. A pop of a frame the
+    /// episode did NOT push (a continuation page's entry frame, validated by
+    /// the emitted borrowed-frame walls) credits `pushed_frames` as it pops,
+    /// so the net floor (`pushed - popped` = frames the episode owns) stays
+    /// non-negative and `popped_frames > 0` still implies `pushed_frames > 0`:
+    /// the dispatchers' pushed-frame branch routes every frame-motion result.
     /// Native only; tier-1a leaves it 0.
     popped_frames: u64 = 0,
     /// Doc 54 P2: the episode took at least one ROW-FREE cross-page

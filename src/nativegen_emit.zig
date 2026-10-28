@@ -1098,6 +1098,8 @@ pub const InlineSelfRetPop = struct {
     /// `instr.b` — the produced result count (never `all_results`; static).
     count: i32,
     nreg: i32,
+    /// The anchor proto — the borrowed-frame path pins the parent to it.
+    proto_addr: u64,
 };
 
 /// Doc 54 P1: the inline return-side frame pop — the emitted twin of the
@@ -1115,7 +1117,8 @@ pub const InlineSelfRetPop = struct {
 ///   `b == all_results` the window the terminal carries);
 /// - the per-episode `descent_ok` byte (receipts inert ∧ no pending
 ///   reg-top ∧ no final cut);
-/// - inline runtime checks: the net-pushed floor, the open-upvalue
+/// - inline runtime checks: the net-pushed floor (net 0 = a BORROWED
+///   frame, which instead passes the step-2c structural walls), the open-upvalue
 ///   CEILING compare (`open_upvalue_ceiling <= frame.base` ⇒ no open cell
 ///   at or above the popped window — the watermark replaces the helper's
 ///   full-list scan), and the dynamic return wiring
@@ -1170,11 +1173,69 @@ pub fn emitInlineSelfRetPop(
     try a.movRegImm64(.r9, @bitCast(@as(u64, @intFromPtr(ctx))));
     try a.cmpByteMemImm(.r9, @offsetOf(Ctx, "descent_ok"), 1);
     try a.jcc(.ne, no_pop);
-    // -- step 2: the net-pushed floor (an episode only pops frames IT
-    // pushed; the entry frame's own return stays tier-0) -----------------
+    // -- step 2: net = pushed - popped = frames the episode owns (borrowed
+    // pops credit `pushed`, so it never goes negative).
+    // net > 0 ⇒ the top frame is one THIS episode pushed, and its identity
+    // holds by construction (the fast path below). Otherwise the top frame
+    // is BORROWED — pushed before the episode (a continuation page's entry
+    // frame, or a frame the episode already popped into) — and its
+    // structural premises are checked at run time instead (step 2c).
     try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "pushed_frames"));
     try a.subRegMem(.rax, .rdx, @offsetOf(NativeResult, "popped_frames"));
+    const episode_pushed = try a.label();
+    const walls_done = try a.label();
+    try a.jcc(.g, episode_pushed);
+    // -- step 2c: borrowed-frame walls (doc 44 D12c, borrowed pops). Every
+    // premise the fast path gets from episode ownership, checked: a parent
+    // exists (the entry frame of a coroutine body or the top level is
+    // `frames[0]`); the frame is no reentrant boundary (`parent.in_flight`
+    // — a native call is running above it, so tier-0's `opRet` would end
+    // its dispatch here); the frame carries no continuation / protection
+    // (`ctl` is the byte after `in_flight`; nonzero declines, which also
+    // declines `pcall`'d frames); the parent runs the anchor proto; and the
+    // windows are adjacent. rax = frame, r10 = parent, r8 = vm on success.
+    try a.movRegMem(.r8, .r9, @offsetOf(Ctx, "vm"));
+    try a.movRegMem32(.rax, .r8, abi.vm_depth_off);
+    try a.cmpRegImm32(.rax, 2);
+    try a.jcc(.b, no_pop);
+    try a.subRegImm32(.rax, 1);
+    try a.movRegImm64(.r10, abi.frame_size);
+    try a.imulRegReg(.rax, .r10);
+    try a.addRegMem(.rax, .r8, abi.vm_frames_off);
+    try a.movRegReg(.r10, .rax);
+    try a.subRegImm32(.r10, abi.frame_size);
+    try a.cmpByteMemImm(.r10, abi.frame_in_flight_off, 0);
+    try a.jcc(.ne, no_pop);
+    try a.cmpByteMemImm(.rax, abi.frame_in_flight_off + 1, 0);
+    try a.jcc(.ne, no_pop);
+    try a.movRegMem(.rcx, .r10, abi.frame_closure_off);
+    try a.movRegMem(.rcx, .rcx, abi.closure_proto_off);
+    try a.movRegImm64(.r11, @bitCast(p.proto_addr));
+    try a.cmpRegReg(.rcx, .r11);
+    try a.jcc(.ne, no_pop);
+    try a.movRegMem(.rcx, .r10, abi.frame_base_off);
+    try a.addRegImm32(.rcx, p.nreg);
+    try a.cmpRegMem(.rcx, .rax, abi.frame_base_off);
+    try a.jcc(.ne, no_pop);
+    // The shared tail's last two declining checks (steps 4 and 5), repeated
+    // so that nothing can decline AFTER the credit below: the pop is then
+    // certain to commit, and the caller's `popped_frames++` pairs with this
+    // `pushed_frames++` — net stays the count of frames the episode owns, so
+    // a later pop of a frame it pushed AFTER this one takes the fast path.
+    try a.movRegMem(.rcx, .r8, abi.vm_open_upvalue_ceiling_off);
+    try a.cmpRegMem(.rcx, .rax, abi.frame_base_off);
+    try a.jcc(.a, no_pop);
+    try a.movzxRegMem16(.r11, .rax, abi.frame_ret_count_off);
+    try a.cmpRegImm32(.r11, all_results);
     try a.jcc(.e, no_pop);
+    try a.movzxRegMem16(.r10, .rax, abi.frame_ret_dest_off);
+    try a.movRegReg(.rcx, .r10);
+    try a.addRegReg(.rcx, .r11);
+    try a.cmpRegImm32(.rcx, p.nreg);
+    try a.jcc(.a, no_pop);
+    try a.incMemQword(.rdx, @offsetOf(NativeResult, "pushed_frames"));
+    try a.jmp(walls_done);
+    a.bind(episode_pushed);
     // -- step 2b (jit-debug builds only): the structural-invariant assert
     // callout. Premised on net > 0 (episode-pushed top frame), so it sits
     // here; the invariants hold whether or not a later wall declines.
@@ -1199,6 +1260,7 @@ pub fn emitInlineSelfRetPop(
     try a.movRegImm64(.r10, abi.frame_size);
     try a.imulRegReg(.rax, .r10);
     try a.addRegMem(.rax, .r8, abi.vm_frames_off);
+    a.bind(walls_done);
     // -- step 4: open-upvalue ceiling wall (the watermark replaces the
     // helper's full open-list scan; stale-HIGH only declines) ------------
     try a.movRegMem(.rcx, .r8, abi.vm_open_upvalue_ceiling_off);
@@ -1219,6 +1281,7 @@ pub fn emitInlineSelfRetPop(
     // one-rowless-sibling-hop window (declined pops must not clear; see
     // the push twin's comment for the progress-bound rule).
     try a.movByteMemImm(.rdx, @offsetOf(NativeResult, "sibling_hop_taken"), 0);
+
     // -- step 6: result copy (opRet order: while the callee window is
     // still under stack_top; nil-fill the tail past `count`). Src slot
     // a_reg+k of the CALLEE window (lanes); dst slot ret_dest+k of the

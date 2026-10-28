@@ -2555,6 +2555,18 @@ pub const TraceState = struct {
     }
 
     /// Is a trace already cached for this anchor? (Prevents re-arming.)
+    /// Whether `proto` has a head trace that closes with a native self-call
+    /// push — evidence that its frames move natively, which is what makes a
+    /// `call_interp` sibling worth recording (`recCall`).
+    fn protoRecursesNatively(self: *const TraceState, proto: *const Proto) bool {
+        var it = self.registry.tracesAt(.{ .proto = proto, .pc = trace_code.FUNC_HEAD_PC, .proto_id = proto.id });
+        while (it.next()) |t| {
+            const last = t.code.instrs[t.code.instrs.len - 1];
+            if (last.op == .terminal and last.a == @intFromEnum(trace_ir.TerminalKind.self_call_interp)) return true;
+        }
+        return false;
+    }
+
     pub fn hasTrace(self: *const TraceState, anchor: AnchorKey) bool {
         return self.findTrace(anchor.proto, anchor.pc) != null;
     }
@@ -3587,6 +3599,11 @@ pub const TraceState = struct {
         else
             null;
         self.rec.context = .{ .heap = self.rec_heap, .upval_open = self.rec_upval_open, .globals_header = self.rec_globals_header, .upval_cell = self.rec_upval_cell };
+        if (instr.op == .call and trace_recorder_mod.isOneShotKind(self.rec.kind)) {
+            const callee = regs.get(instr.a);
+            if (callee.isHeap() and callee.heapType() == .native)
+                self.rec.context.anchor_recurses = self.protoRecursesNatively(self.rec.anchor.proto);
+        }
         if (target) |dest| {
             const inner = self.findLoopTrace(proto, dest);
             self.rec.context.inner_root = inner != null;

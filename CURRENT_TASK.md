@@ -19,7 +19,7 @@ DOC 74 LANGUAGE SERVER: P0 DONE (2026-10-27, coral-raven); P0 wasm host and P1aโ
   has uncommitted (src/trace_recorder.zig, src/interp_trace_test.zig); the LSP
   commits do not touch the recorder. Everything else passed (2040 pass, 2 skip).
 
-DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT): recursion half FIXED, coroutine barrier remainder open.
+DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT) DONE (2026-10-28).
 - P2 DIAGNOSIS (2026-10-27): the co_pingpong_d20/_d150 jit slowdown is NOT a
   coroutine cost. /tmp/nb/rec_plain.lua (the same `deep` recursion, no
   coroutine) is 297 ms jit vs 90 ms t0; with the base case written
@@ -37,12 +37,23 @@ DOC 73 COROUTINES: P0 + P1 + P3 + P4 DONE (2026-10-27, coral-marten); P2 (JIT): 
   declines such traces. rec_plain 297 -> 83 ms. Instruction counts on the
   guard benches within +-0.001% (publication is emitted code, NOT in
   enterSelectedTrace/consumers: those are layout-sensitive).
-- P2 REMAINDER: real co_pingpong d20/d150 unchanged. Base case is
-  `return yield(i)`, a native barrier call -> head sibling aborts
-  host_barrier at the call; cont pages enter with net 0 so cannot natively
-  pop frames they didn't push. Needs a design choice (e.g. a call_interp
-  terminal for depth-0 barrier calls). Windows past the anchor's register
-  file stay nyi_opcode (doc 44 Outstanding).
+- P2 BARRIER HALF LANDED (2026-10-28): doc 44 D4 follow-up. (A) call_interp
+  terminal closes a depth-0 one-shot recording at an untagged native call,
+  gated on the anchor already having a self_call_interp head trace
+  (TraceState.protoRecursesNatively; ungated, co_pingpong d1 was +30%
+  cycles). (B) borrowed pops: net==0 pops pass runtime walls (parent exists,
+  !parent.in_flight, frame ctl==0, parent proto == anchor, adjacent
+  windows) and credit pushed_frames. The .ret_pop consumer now calls
+  onRetResume (else fib's 2nd cont never forms: fib 4x slower) and the
+  .resume_frame_motion handlers flip .fast->.full. Plain-native base case
+  320->70 ms; co_pingpong d20 0.31->0.09 s, d150 2.22->0.42 s (both beat t0);
+  binary-trees -15.3% instr; recursive-fib -0.003%; spectral-norm +0.09%,
+  array3d +0.1% (layout noise, bisected to interp.zig codegen, not fixed).
+  capi_suspend_test's patch/image check was slot-based and broke when a
+  reinstall landed in a new slot; now judged per pc. Still open: windows past
+  the register file (nyi_opcode), call_interp for loop roots/inlined depth
+  (trace stitching), borrowed pops of pcall'd frames (doc 44 Outstanding).
+  Remaining coroutine perf: a loop containing `resume` never traces (d1).
 - All questions decided. Bart accepted the frames-pointer cost; P0a landed
   (4e37dfd). The P0 runtime design is doc 73 ยง5.1 (stack = one allocation
   of tags+payloads+scratch+frames; active fields stay in Vm and are

@@ -414,6 +414,9 @@ pub const FrameMotionAbi = struct {
     /// struct-literal default — doc 61 §4.2). Doc 68's `ctl` byte follows it,
     /// so the push clears both with one word store here.
     frame_in_flight_off: i32,
+    /// `Closure.proto` (pointer) — the borrowed-frame pop pins the parent's
+    /// proto to the anchor's.
+    closure_proto_off: i32,
     /// `interp.max_call_depth` — the depth wall immediate.
     max_call_depth: u32,
 };

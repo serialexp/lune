@@ -1589,6 +1589,7 @@ pub const Vm = struct {
             .frame_varargs_count_off = @offsetOf(CallFrame, "varargs_count"),
             .frame_code_cache_gen_off = @offsetOf(CallFrame, "code_cache_gen"),
             .frame_in_flight_off = @offsetOf(CallFrame, "in_flight"),
+            .closure_proto_off = @offsetOf(function.Closure, "proto"),
             .max_call_depth = max_call_depth,
         };
     };
@@ -5817,9 +5818,8 @@ pub const Vm = struct {
     ) EntryDirective {
         const ts = &self.trace;
         std.debug.assert(result.pushed_frames > 0);
-        // D12c: the pop sequence's net floor makes popped-without-pushed
-        // structurally impossible; a violation means the emitted preflight
-        // computed net from the wrong counters.
+        // D12c: a borrowed pop (a frame the episode did not push) credits
+        // `pushed_frames` as it pops, so `popped <= pushed` still holds.
         std.debug.assert(result.popped_frames <= result.pushed_frames);
         // The push sequence declines while region receipts are live (the
         // `descent_ok` gate), and heads never enter promoted silent cycles —
@@ -5981,6 +5981,16 @@ pub const Vm = struct {
                     ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
                     const resume_pc: u32 = @intCast(self.frames[self.depth - 1].pc);
                     ts.noteRetContTransition(owner, resume_pc);
+                    // Tier-0's `opRet` counts each return toward the CALLER's
+                    // continuation anchor; a native pop that ends the episode
+                    // at a resume pc is that same return. Without the count a
+                    // continuation whose returns are all popped natively (a
+                    // borrowed pop — the frame's tier-0 push predates the
+                    // episode) never gets hot, and `noteRetContTransition`'s
+                    // arm request has no child to link.
+                    const top = &self.frames[self.depth - 1];
+                    if (top.ctl.protect == .none)
+                        ts.onRetResume(top.closure.proto, resume_pc, top.base, top.call_seq, self.cachedCodeFor(top, top.closure.proto));
                     return .{ .resume_frame_motion = resume_pc };
                 },
                 .deopt => {
@@ -8945,6 +8955,11 @@ pub const Vm = struct {
                     // jfunc_head walk (which owns the failure accounting).
                     .resume_frame_motion => |rpc| {
                         reloadTopFrame(st);
+                        // A native pop's resume counted toward a continuation
+                        // anchor (`consumeDescentTerminalRow`); `.fast` parks
+                        // and flips, as `opRet` does (the frame's `pc` is
+                        // already the resume pc).
+                        if (mode == .fast and self.trace.pending_ret_anchor != null) return .switch_mode;
                         return dispatchTail(mode, st, rpc, vm);
                     },
                     // Doc 45 D5: park the precise effect error at its
@@ -9040,6 +9055,11 @@ pub const Vm = struct {
                     // pc exactly as the head-entry motion path does.
                     .resume_frame_motion => |rpc| {
                         reloadTopFrame(st);
+                        // A native pop's resume counted toward a continuation
+                        // anchor (`consumeDescentTerminalRow`); `.fast` parks
+                        // and flips, as `opRet` does (the frame's `pc` is
+                        // already the resume pc).
+                        if (mode == .fast and self.trace.pending_ret_anchor != null) return .switch_mode;
                         return dispatchTail(mode, st, rpc, vm);
                     },
                     // Doc 45 D5: park the precise effect error at its

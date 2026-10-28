@@ -5068,6 +5068,7 @@ test "recorder (head, doc 44 P0): fib-shaped recursion records a head trace clos
                 switch (@as(trace.trace_ir.TerminalKind, @enumFromInt(@as(u16, @intCast(last.a))))) {
                     .self_call_interp => saw_cont_self_call = true,
                     .return_interp => saw_cont_return = true,
+                    .call_interp => return error.TestUnexpectedResult, // no host calls in fib
                 }
             },
             .loop => return error.TestUnexpectedResult, // no loops in this program
@@ -6291,6 +6292,97 @@ test "doc 44 D4: a recursive base case that forwards a call's results is correct
             }
         }.inspect,
     });
+}
+
+test "doc 44 D4: a recursive base case that calls a host function closes at the call and unwinds natively" {
+    try util.expectProgramTuned(
+        \\local abs = math.abs
+        \\local function deep(d, i)
+        \\  if d <= 1 then local r = abs(i); return r end
+        \\  return deep(d - 1, i) + 0
+        \\end
+        \\local function deept(d, i)
+        \\  if d <= 1 then return abs(i) end
+        \\  return deept(d - 1, i) + 0
+        \\end
+        \\local acc = 0
+        \\for i = 1, 200 do acc = acc + deep(8, i) + deept(5, i) end
+        \\print(acc)
+    , "40200\n", .{
+        .hotguard = 2,
+        .inspect = &struct {
+            fn inspect(vm: *Vm, mode: util.TraceMode) !void {
+                if (mode != .record_execute_native or vm.heap.gc_stress or
+                    !@import("nativegen.zig").is_x64_linux) return;
+                // The base case's sibling closes at the host call
+                // (`call_interp`); tier-0 runs the call and the leaf's `ret`,
+                // then the callers' continuation pages pop their BORROWED
+                // frames natively — before, the call aborted the sibling
+                // (`host_barrier`) and every return paid a dispatcher entry.
+                try testing.expect(vm.trace.self_call_pushes > 0);
+                try testing.expect(vm.trace.self_ret_pops > 0);
+            }
+        }.inspect,
+    });
+}
+
+test "doc 44 D4: borrowed pops decline at protected and reentrant frames" {
+    // `pcall`'d frames carry `ctl.protect`; a `table.sort` comparator that is
+    // also the recursing function enters through a reentrant boundary whose
+    // parent is a same-proto frame with a native call in flight. Neither may
+    // be popped inline (tier-0's `opRet` ends the dispatch / wires the
+    // protected return itself).
+    try util.expectProgramTuned(
+        \\local abs = math.abs
+        \\local function r(d, i)
+        \\  if d == 0 then return abs(i) end
+        \\  local ok, v = pcall(r, d - 1, i)
+        \\  return v + 0
+        \\end
+        \\local acc = 0
+        \\for i = 1, 200 do acc = acc + r(6, i) end
+        \\print(acc)
+    , "20100\n", .{ .hotguard = 2 });
+    try util.expectProgramTuned(
+        \\local abs = math.abs
+        \\local depth = 0
+        \\local function f(a, b)
+        \\  if depth < 3 and a == 2 then
+        \\    depth = depth + 1
+        \\    local t = {4, 3, 2, 1, 5}
+        \\    table.sort(t, f)
+        \\    depth = depth - 1
+        \\  end
+        \\  return abs(a) < abs(b)
+        \\end
+        \\local out = 0
+        \\for rep = 1, 60 do
+        \\  local t = {5, 2, 8, 1, 9, 3, 7, 2, 6}
+        \\  table.sort(t, f)
+        \\  for i = 1, #t do out = out * 7 % 100003 + t[i] end
+        \\end
+        \\print(out)
+    , "65476\n", .{ .hotguard = 2 });
+}
+
+test "doc 44 D4: a host call that raises at a base case unwinds the borrowed frames" {
+    try util.expectProgramTuned(
+        \\local function deep(d, i)
+        \\  if d <= 1 then local r = string.rep("x", i % 5); return #r end
+        \\  return deep(d - 1, i) + 0
+        \\end
+        \\local acc = 0
+        \\for i = 1, 300 do acc = acc + deep(7, i) end
+        \\local function bad(d)
+        \\  if d <= 1 then return string.rep("x", -1, {}) .. nil end
+        \\  return bad(d - 1) + 0
+        \\end
+        \\for i = 1, 20 do
+        \\  local ok = pcall(bad, 6)
+        \\  if not ok then acc = acc + 1 end
+        \\end
+        \\print(acc)
+    , "620\n", .{ .hotguard = 2 });
 }
 
 test "doc 44 D4: forwarded result counts of zero, one and many reach the caller exactly" {

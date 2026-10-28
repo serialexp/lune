@@ -628,6 +628,11 @@ pub const RecordingSession = struct {
         /// enclosing-root `.link` close refuses a peeled root: its entry
         /// guards are its run-once iteration's types (doc 56 review finding 5).
         inner_root_peeled: bool = false,
+        /// Set per `.call` instruction: the anchor proto already has a head
+        /// trace that closes with a native self-call push (`self_call_interp`)
+        /// — i.e. it recurses natively, so a trace ending at a host call can
+        /// sit in its frame-link chains (`call_interp` gate in `recCall`).
+        anchor_recurses: bool = false,
         unroll_while: bool = false,
         upval_open: ?usize = null,
         globals_header: ?*const object.GcHeader = null,
@@ -4324,6 +4329,21 @@ pub const RecordingSession = struct {
             .native => {
                 const nat = function.Native.fromHeader(callee.asHeap());
                 if (nat.recorded) |rb| return self.recBuiltin(rb, instr, regs, multret);
+                // Doc 44 D4 follow-up: a one-shot (head/cont) recording at
+                // depth 0 ends HERE instead of aborting — everything before
+                // the call stays native, tier-0 performs the call. Without
+                // this a recursion's base case (`return abs(x)`) never gets
+                // a sibling, so the ancestors' returns can't unwind natively.
+                // Only for a natively RECURSING anchor: the sibling's value
+                // is its place in the frame-link chains; for any other
+                // proto it is a prefix-only trace whose episode entry costs
+                // more per call than the few instructions it covers.
+                // Deeper (inlined) calls and loop roots keep the barrier.
+                if (isOneShotKind(self.kind) and self.inline_depth == 0 and self.context.anchor_recurses) {
+                    if (instr.b == bytecode.all_results)
+                        return self.closeDynamicTerminal(.call_interp, @as(u32, instr.a) + 1, multret);
+                    return self.closeHeadTerminal(.call_interp, 0);
+                }
                 return self.abort(.host_barrier);
             },
             .function => {},

@@ -239,7 +239,15 @@ test "doc 63 suspend: logically invalidated patches reached while suspended stay
     try testing.expectEqual(@as(i64, 2584), try evalInt(box, "return fib(18)"));
     for (patches) |p| {
         try testing.expect(!p.pending_unpatch);
-        try testing.expectEqual(if (p.live) p.patched_op else p.orig.op, imageOp(box, p));
+        // The image at a patch's pc agrees with the slot table: the op of
+        // the LIVE patch there, else the canonical one. A tombstoned slot
+        // can share its pc with a later live patch (which slot a reinstall
+        // takes is the free list's business), so judge the pc, not the slot.
+        var expected = p.orig.op;
+        for (patches) |q| {
+            if (q.live and q.proto == p.proto and q.patch_pc == p.patch_pc) expected = q.patched_op;
+        }
+        try testing.expectEqual(expected, imageOp(box, p));
     }
 }
 

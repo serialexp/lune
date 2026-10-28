@@ -12,7 +12,7 @@ Remaining P1/P2/P4 work below is not claimed complete.
 Codex-reviewed ×6 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
-Last updated: 2026-10-27
+Last updated: 2026-10-28
 
 Prerequisite reading: doc 10 (cross-frame tracing, inline frames, `guard_func`),
 doc 16 (coherent state chaining — the seam-cost lesson that shapes this arc's
@@ -310,19 +310,60 @@ to Done once everything inside a phase is checked.
       refused, matrix legs for recursion, 0/1/many forwarded results,
       prefix + forwarded window, and a window feeding a self-call).
 
+- [x] **D4 follow-up — barrier-call terminals and borrowed pops
+      (2026-10-28).** Two halves, measured as a pair:
+      (A) `TerminalKind.call_interp`: a one-shot recording at depth 0 that
+      reaches an untagged native `call` closes there (before any guard; tier-0
+      performs the call and the rest) instead of aborting `host_barrier`, so
+      a recursion's base case (`return abs(x)`, `return yield(i)`) records
+      its sibling. Only for a natively recursing anchor
+      (`TraceState.protoRecursesNatively`: a head trace closing
+      `self_call_interp` already exists): for any other proto the sibling is a
+      prefix-only trace whose episode entry costs more per call than it
+      covers (co_pingpong d1 went +30% cycles without the gate).
+      (B) Borrowed pops: the inline pop's net-pushed floor assumed the entry
+      frame's return stays tier-0, so after the barrier call every ancestor's
+      return (a cont page entered at net 0) paid a dispatcher entry. The pop
+      now takes a second path for net == 0: runtime walls replace the
+      episode-ownership premises (a parent exists; `parent.in_flight` clear —
+      no reentrant boundary; the frame's `ctl` byte zero — no continuation
+      or protection; the parent runs the anchor proto; windows adjacent;
+      plus the shared open-upvalue and return-wiring checks, repeated so
+      nothing declines after the credit). A borrowed pop credits
+      `pushed_frames` as it pops, so net keeps counting the frames the
+      episode owns, `popped <= pushed` still holds, and a pop of a frame
+      pushed after a borrowed one takes the fast path (without the credit
+      those pops took the walled path: recursive-fib +1.8% instructions).
+      The `.ret_pop` consumer now feeds `onRetResume` (tier-0's `opRet`
+      counts every return toward the caller's continuation anchor; natively
+      popped returns skipped it, so fib's second continuation never formed
+      and fib went 4× slower), and the `.resume_frame_motion` handlers flip
+      `.fast` to `.full` when that count armed a recording.
+      Results (ReleaseFast, `--trace --jit-native`): a plain-native base
+      case 320 → 70 ms; co_pingpong d20 0.31 → 0.09 s (t0 0.09), d150 2.22 →
+      0.42 s (t0 0.62); binary-trees −15.3% instructions; recursive-fib
+      −0.003%; other benches within ±0.11% (code-layout noise).
+      Tests: "a recursive base case that calls a host function closes at the
+      call and unwinds natively", "borrowed pops decline at protected and
+      reentrant frames", "a host call that raises at a base case unwinds the
+      borrowed frames".
+
 ### Outstanding
 - [ ] **`all_results` windows past the register file.** `return g()` where
       `g` returns more values than the caller has registers (a one-register
       `f`) still aborts `nyi_opcode`: the extra results exist only in tier-0's
       slab scratch. Needs terminal-only outputs through finalize, the
       allocator and both writeback paths (Codex, 2026-10-27).
-- [ ] **Head/cont recordings that reach a depth-0 barrier call.** A native
-      call the recorder can't inline (`coroutine.yield`, `print`) aborts the
-      recording `host_barrier`, so a base case like `return yield(i)` still
-      never records a sibling; co_pingpong d20/d150 stay 3.2–3.6× slower than
-      t0 for that reason. Also: frames the episode didn't push can't be
-      popped natively (cont pages enter with net 0), so a closing terminal at
-      the barrier alone may not recover the returns.
+- [ ] **`call_interp` for loop roots and inlined depth.** The terminal closes
+      only depth-0 one-shot recordings of a natively recursing anchor. A
+      loop root (or a native call below an inlined callee) still aborts
+      `host_barrier`: LuaJIT's trace stitching (`LJ_TRLINK_STITCH`,
+      `lj_ffrecord.c:110`) would continue the trace after the call instead
+      of ending it, which needs a post-call continuation page and successor
+      entry guards (Codex, 2026-10-28).
+- [ ] **Borrowed pops: pcall'd frames.** The walls decline any frame with a
+      nonzero `ctl` byte, which includes `pcall`/`xpcall` frames
+      (`ctl.protect`). tier-0's `opRet` pops them like any other.
 - [ ] **Phase 1a follow-ups.** Remaining review-round-2 matrix tests
       (want-during-recording, sibling abort/cooldown retry,
       `max_traces_per_anchor == trial_visited_cap` truncation, unpatch

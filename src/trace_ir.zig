@@ -918,6 +918,13 @@ pub const TerminalKind = enum(u16) {
     /// analogue, staged): tier-0 performs the call; the callee's patched
     /// head re-enters the trace.
     self_call_interp = 1,
+    /// The trace ends at a depth-0 `call` of a host (`native`) function the
+    /// recorder cannot model (LuaJIT's trace stitching, adapted to the
+    /// coarse-deopt model): tier-0 performs the call and everything after
+    /// it. Closed BEFORE any guard — whatever sits in the callee slot at run
+    /// time is simply called generically — so, like `self_call_interp`, no
+    /// callee pin is needed. Plain terminal exit; no frame motion.
+    call_interp = 2,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that

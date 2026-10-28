@@ -2444,6 +2444,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                             .a_reg = ps.ci.a,
                             .count = @intCast(ps.count),
                             .nreg = t.anchor.proto.num_registers,
+                            .proto_addr = @intFromPtr(t.anchor.proto),
                         }, no_pop);
                         try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "popped_frames"));
                         try a.addRegImm32(.rax, 1);
