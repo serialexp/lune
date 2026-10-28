@@ -9,12 +9,17 @@ DOC 44 STITCHING: numeric-for roots DONE (2026-10-28, coral-marten), committed, 
 - Known noise: euler14-bit +0.8% instructions with identical traces (interp.zig layout).
 - Next: doc 63 Phase 2b/2c (direct host calls; stitching is its fallback).
 
-DOC 74 LANGUAGE SERVER: P0–P4 DONE (2026-10-27 to 2026-10-28, coral-raven). Next: P5 (stdlib knowledge), then P6 (cross-file, mahina.toml).
-- P2 viz client, P3 navigation/completion and P4 syntax (semantic tokens, outline,
-  folds, selection ranges, the trivia sink) are committed; the checklist in
+DOC 74 LANGUAGE SERVER: P0–P5 DONE (2026-10-27 to 2026-10-28, coral-raven). Next: P6 (cross-file, mahina.toml).
+- P2 viz client, P3 navigation/completion, P4 syntax (semantic tokens, outline,
+  folds, selection ranges, the trivia sink) and P5 (hover, `lib.` completion,
+  signature help from the inventory's signature column; src/lsp/stdlib_db.zig,
+  src/lsp/library.zig) are committed; the checklist in
   docs/design/74-language-server.md has the follow-ups for each. Budget status:
   the bench-lsp syntax table meets 10 ms at 10k lines; the 100k check stage is
-  ~8% over (Outstanding, bench follow-ups).
+  ~8% over (Outstanding, bench follow-ups). Library requests take 0.3–0.5 ms at
+  10k lines and 3–5 ms at 100k (lex from the start per request; P5 follow-up).
+- P5 found a stale-analysis bug: a re-open with the same version kept the old
+  analysis (documents.zig setText); fixed with a test.
 - Open: the parser has no nesting limit, and the wasm stack is untested at depth.
   Zed's dev-extension install is untested (GUI). The Gothab remote HEAD points at a
   nonexistent ref (a bare `git clone` checks nothing out).

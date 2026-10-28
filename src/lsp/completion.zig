@@ -1,8 +1,10 @@
-//! Completion of keywords and the names visible at the cursor (doc 74 §7.2).
+//! Completion of keywords and the names visible at the cursor (doc 74 §7.2),
+//! and of a library's members after `lib.` (doc 74 §7.3).
 //!
 //! The client filters by the typed prefix, so this returns every candidate. A
-//! cursor in a string or comment, on a name being declared, or after `.` / `:`
-//! (member access, which needs the stdlib tables of P5) gets nothing.
+//! cursor in a string or comment, or on a name being declared, gets nothing.
+//! After `lib.` it gets the library's members; after `:`, or after a local's
+//! `.`, it gets nothing, since a value's methods are not in the table.
 
 const std = @import("std");
 const lexer = @import("../lexer.zig");
@@ -10,6 +12,7 @@ const resolve = @import("../resolve.zig");
 const token = @import("../token.zig");
 const analysis_mod = @import("analysis.zig");
 const navigation = @import("navigation.zig");
+const library = @import("library.zig");
 
 const Analysis = analysis_mod.Analysis;
 
@@ -24,15 +27,11 @@ pub const Item = struct {
     rank: u8,
 };
 
-fn isIdentByte(c: u8) bool {
-    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
-}
-
 /// The cursor follows `.` or `:` before the identifier it is in: `t.fo|`,
 /// `obj:me|`. `..` and `...` are not member access.
 fn afterMemberAccess(src: []const u8, offset: u32) bool {
     var i: usize = @min(offset, src.len);
-    while (i > 0 and isIdentByte(src[i - 1])) i -= 1;
+    while (i > 0 and library.isIdentByte(src[i - 1])) i -= 1;
     if (i == 0) return false;
     return switch (src[i - 1]) {
         ':' => true,
@@ -62,7 +61,7 @@ pub fn complete(
         .code => {},
         .string, .comment => return &.{},
     }
-    if (afterMemberAccess(an.source, offset)) return &.{};
+    if (afterMemberAccess(an.source, offset)) return memberItems(a, an, offset);
     const under = an.res.occurrenceCovering(offset);
     if (under) |o| if (o.access == .declare) return &.{}; // naming something new
 
@@ -113,6 +112,23 @@ pub fn complete(
         try items.append(a, .{ .label = k, .kind = .keyword, .detail = "keyword", .rank = 3 });
     }
     return items.items;
+}
+
+/// After `lib.`: the library's members. A function has its signature as detail;
+/// a constant (`math.pi`) is a variable.
+fn memberItems(a: std.mem.Allocator, an: *const Analysis, offset: u32) std.mem.Allocator.Error![]const Item {
+    const ms = try library.members(a, an, offset);
+    const items = try a.alloc(Item, ms.len);
+    for (ms, items) |m, *slot| {
+        const callable = m.entry.signature.len > 0;
+        slot.* = .{
+            .label = m.label,
+            .kind = if (callable) .function else .variable,
+            .detail = if (callable) m.entry.signature else "constant",
+            .rank = 0,
+        };
+    }
+    return items;
 }
 
 fn onlyOccurrence(an: *const Analysis, binding: resolve.BindingId) bool {
@@ -199,6 +215,20 @@ test "completion: nothing in strings, comments, declarations or after a member d
     try testing.expectEqual(@as(usize, 0), (try completeAt(a, "local t = {}\nt.fo|")).len);
     try testing.expectEqual(@as(usize, 0), (try completeAt(a, "obj:|")).len);
     try testing.expect((try completeAt(a, "x = a ..|")).len > 0);
+}
+
+test "completion: a library's members after its dot, and nothing else there" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const items = try completeAt(a, "x = string.|");
+    const format = find(items, "format").?;
+    try testing.expectEqual(Kind.function, format.kind);
+    try testing.expectEqualStrings("string.format(formatstring, ...)", format.detail);
+    try testing.expectEqual(Kind.variable, find(try completeAt(a, "x = math.|"), "pi").?.kind);
+    // Keywords and locals are not members.
+    try testing.expect(find(items, "while") == null);
+    try testing.expect(find(items, "x") == null);
 }
 
 test "completion: a global that is only read, or is being typed, is not offered" {

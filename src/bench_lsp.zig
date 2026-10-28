@@ -159,7 +159,9 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, text: []const u8, reps: usize) !St
 
 /// One syntax request (doc 74 §7.1) answered on an open, analysed document:
 /// the request in, the encoded response out, best of `reps`.
-fn requestNs(gpa: std.mem.Allocator, io: std.Io, text: []const u8, method: []const u8, reps: usize) !u64 {
+/// Best-of-`reps` time of one request on an open, analysed `text`. `tail` is
+/// more `params` members (a `,"position":…`), or empty.
+fn requestNs(gpa: std.mem.Allocator, io: std.Io, text: []const u8, method: []const u8, tail: []const u8, reps: usize) !u64 {
     var core = server.Server.init(gpa, .{});
     defer core.deinit();
     core.known_globals = &mahina.interp.builtin_global_names;
@@ -167,7 +169,7 @@ fn requestNs(gpa: std.mem.Allocator, io: std.Io, text: []const u8, method: []con
     defer out.deinit();
     try open(gpa, &core, &out, text);
 
-    const body = try std.fmt.allocPrint(gpa, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"{s}\",\"params\":{{\"textDocument\":{{\"uri\":\"file:///bench.mh\"}}}}}}", .{method});
+    const body = try std.fmt.allocPrint(gpa, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"{s}\",\"params\":{{\"textDocument\":{{\"uri\":\"file:///bench.mh\"}}{s}}}}}", .{ method, tail });
     defer gpa.free(body);
     var best: u64 = std.math.maxInt(u64);
     for (0..reps) |_| {
@@ -348,11 +350,33 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
         \\
     , .{ "case", "bytes", "semanticTokens", "folding", "symbols" });
     for (cases.items[0..3]) |c| {
-        const tokens_ns = try requestNs(gpa, io, c.text, "textDocument/semanticTokens/full", c.reps);
-        const folds_ns = try requestNs(gpa, io, c.text, "textDocument/foldingRange", c.reps);
-        const symbols_ns = try requestNs(gpa, io, c.text, "textDocument/documentSymbol", c.reps);
+        const tokens_ns = try requestNs(gpa, io, c.text, "textDocument/semanticTokens/full", "", c.reps);
+        const folds_ns = try requestNs(gpa, io, c.text, "textDocument/foldingRange", "", c.reps);
+        const symbols_ns = try requestNs(gpa, io, c.text, "textDocument/documentSymbol", "", c.reps);
         mahina.io.print("{s: <30} {d: >9} {d: >14.2} {d: >10.2} {d: >10.2}\n", .{
             c.name, c.text.len, ms(tokens_ns), ms(folds_ns), ms(symbols_ns),
+        });
+    }
+
+    // The cursor past the last line: the worst case for the requests that lex
+    // from the start of the document to the cursor (doc 74 §7.3).
+    mahina.io.print(
+        \\
+        \\library requests with the cursor at the end of the document (doc 74 §7.3; best of N, ms)
+        \\
+        \\{s: <30} {s: >9} {s: >10} {s: >14} {s: >12}
+        \\
+    , .{ "case", "bytes", "hover", "signatureHelp", "completion" });
+    for (cases.items[0..3]) |c| {
+        var lines: usize = 0;
+        for (c.text) |ch| lines += @intFromBool(ch == '\n');
+        const tail = try std.fmt.allocPrint(gpa, ",\"position\":{{\"line\":{d},\"character\":0}}", .{lines});
+        defer gpa.free(tail);
+        const hover_ns = try requestNs(gpa, io, c.text, "textDocument/hover", tail, c.reps);
+        const sig_ns = try requestNs(gpa, io, c.text, "textDocument/signatureHelp", tail, c.reps);
+        const complete_ns = try requestNs(gpa, io, c.text, "textDocument/completion", tail, c.reps);
+        mahina.io.print("{s: <30} {d: >9} {d: >10.2} {d: >14.2} {d: >12.2}\n", .{
+            c.name, c.text.len, ms(hover_ns), ms(sig_ns), ms(complete_ns),
         });
     }
 

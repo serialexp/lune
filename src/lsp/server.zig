@@ -22,6 +22,7 @@ const navigation = @import("navigation.zig");
 const syntax = @import("syntax.zig");
 const tokens = @import("tokens.zig");
 const completion = @import("completion.zig");
+const library = @import("library.zig");
 
 /// Analysis runs this long after the last change...
 pub const debounce_ms: u64 = 50;
@@ -188,6 +189,8 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "textDocument/prepareRename")) return self.prepareRename(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/rename")) return self.rename(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/completion")) return self.complete(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/hover")) return self.hover(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/signatureHelp")) return self.signatureHelp(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) return self.semanticTokens(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/documentSymbol")) return self.documentSymbols(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/foldingRange")) return self.foldingRanges(a, id, params, out);
@@ -363,6 +366,37 @@ pub const Server = struct {
             };
         }
         try out.result(id, protocol.CompletionList{ .items = list });
+    }
+
+    /// The library name under the cursor, as Markdown (doc 74 §7.3).
+    fn hover(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        const named = (try library.hoverAt(a, c.an, c.offset)) orelse return out.result(id, @as(?u8, null));
+        const oa = out.arena.allocator();
+        try out.result(id, protocol.Hover{
+            .contents = .{ .kind = protocol.MarkupKind.markdown, .value = try library.markdown(oa, named.entry) },
+            .range = c.index.toRange(c.an.source, named.span.start, named.span.end, self.encoding),
+        });
+    }
+
+    /// The signature of the library call the cursor is in, with the argument it
+    /// is at (doc 74 §7.3).
+    fn signatureHelp(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        const call = (try library.callAt(a, c.an, c.offset)) orelse return out.result(id, @as(?u8, null));
+        const oa = out.arena.allocator();
+        const spans = try library.paramSpans(oa, call.entry.signature);
+        const parameters = try oa.alloc(protocol.ParameterInformation, spans.len);
+        for (spans, parameters) |s, *slot| slot.* = .{ .label = s };
+        const signatures = try oa.alloc(protocol.SignatureInformation, 1);
+        signatures[0] = .{
+            .label = call.entry.signature,
+            .documentation = .{ .kind = protocol.MarkupKind.markdown, .value = call.entry.description },
+            .parameters = parameters,
+        };
+        try out.result(id, protocol.SignatureHelp{ .signatures = signatures, .activeParameter = call.active });
     }
 
     // ---- syntax: tokens, outline, folds, selections (doc 74 §7.1) ----------
@@ -1280,10 +1314,55 @@ test "requests: an unopened document is invalid params; initialize advertises th
     try testing.expect(caps.get("renameProvider").?.object.get("prepareProvider").?.bool);
     try testing.expect(caps.get("semanticTokensProvider").?.object.get("full").?.bool);
     try testing.expect(caps.get("foldingRangeProvider").?.bool);
+    try testing.expect(caps.get("hoverProvider").?.bool);
+    try testing.expectEqualStrings("(", caps.get("signatureHelpProvider").?.object.get("triggerCharacters").?.array.items[0].string);
+    try testing.expectEqualStrings(".", caps.get("completionProvider").?.object.get("triggerCharacters").?.array.items[0].string);
     const r = try h.send(1,
         \\{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"nope"},"position":{"line":0,"character":0}}}
     );
     try testing.expectEqual(@as(i64, -32602), errorCode(r[0]));
+}
+
+// ---- the library over the wire (doc 74 §7.3) ----
+
+test "library: hover, signature help, and members after a dot, from the stdlib table" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.known_globals = &.{ "print", "string" };
+    try h.open();
+
+    const hover = try askAt(&h, "print(string.format)", "textDocument/hover", 0, 15, "");
+    const contents = hover.object.get("result").?.object.get("contents").?.object;
+    try testing.expectEqualStrings("markdown", contents.get("kind").?.string);
+    try testing.expect(std.mem.indexOf(u8, contents.get("value").?.string, "string.format(formatstring, ...)") != null);
+    const range = hover.object.get("result").?.object.get("range").?.object;
+    try testing.expectEqual(@as(i64, 13), range.get("start").?.object.get("character").?.integer);
+
+    // Nothing for a string's text.
+    const quoted = try askAt(&h, "x = \"print\"", "textDocument/hover", 0, 7, "");
+    try testing.expect(quoted.object.get("result").? == .null);
+
+    // The signature of the call the cursor is in, with its second argument active.
+    const sig = try askAt(&h, "string.sub(s, ", "textDocument/signatureHelp", 0, 14, "");
+    const info = sig.object.get("result").?.object;
+    try testing.expectEqual(@as(i64, 1), info.get("activeParameter").?.integer);
+    const sigs = info.get("signatures").?.array.items;
+    try testing.expectEqualStrings("string.sub(s, i [, j])", sigs[0].object.get("label").?.string);
+    const params = sigs[0].object.get("parameters").?.array.items;
+    const label = params[1].object.get("label").?.array.items;
+    try testing.expectEqual(@as(i64, 14), label[0].integer);
+    try testing.expectEqual(@as(i64, 15), label[1].integer);
+
+    // Members after `string.`: functions, with their signatures as detail.
+    const members = try askAt(&h, "x = string.", "textDocument/completion", 0, 11, "");
+    var found = false;
+    for (members.object.get("result").?.object.get("items").?.array.items) |it| {
+        if (!std.mem.eql(u8, it.object.get("label").?.string, "format")) continue;
+        found = true;
+        try testing.expectEqual(@as(i64, 3), it.object.get("kind").?.integer);
+        try testing.expectEqualStrings("string.format(formatstring, ...)", it.object.get("detail").?.string);
+    }
+    try testing.expect(found);
 }
 
 // ---- syntax over the wire (doc 74 §7.1) ----

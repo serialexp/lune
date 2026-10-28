@@ -40,6 +40,12 @@ pub const RenameOptions = struct {
 
 pub const CompletionOptions = struct {
     resolveProvider: bool = false,
+    /// `lib.` offers the library's members, so the client asks after a dot.
+    triggerCharacters: []const []const u8 = &.{"."},
+};
+
+pub const SignatureHelpOptions = struct {
+    triggerCharacters: []const []const u8 = &.{ "(", "," },
 };
 
 pub const SemanticTokensLegend = struct {
@@ -61,6 +67,8 @@ pub const ServerCapabilities = struct {
     documentHighlightProvider: bool = true,
     renameProvider: RenameOptions = .{},
     completionProvider: CompletionOptions = .{},
+    hoverProvider: bool = true,
+    signatureHelpProvider: ?SignatureHelpOptions = .{},
     semanticTokensProvider: ?SemanticTokensOptions = null,
     documentSymbolProvider: bool = true,
     foldingRangeProvider: bool = true,
@@ -277,6 +285,40 @@ pub const SelectionRangeParams = struct {
 pub const SelectionRange = struct {
     range: Range,
     parent: ?*const SelectionRange = null,
+};
+
+// ---- hover and signature help (doc 74 §7.3) ---------------------------------
+
+pub const MarkupKind = struct {
+    pub const markdown: []const u8 = "markdown";
+};
+
+pub const MarkupContent = struct {
+    kind: []const u8,
+    value: []const u8,
+};
+
+pub const Hover = struct {
+    contents: MarkupContent,
+    range: ?Range = null,
+};
+
+/// A parameter's `[start, end]` byte offsets into its signature's label (LSP's
+/// own label form, which a client highlights without searching for the text).
+pub const ParameterInformation = struct {
+    label: [2]u32,
+};
+
+pub const SignatureInformation = struct {
+    label: []const u8,
+    documentation: ?MarkupContent = null,
+    parameters: []const ParameterInformation = &.{},
+};
+
+pub const SignatureHelp = struct {
+    signatures: []const SignatureInformation,
+    activeSignature: u32 = 0,
+    activeParameter: u32 = 0,
 };
 
 // ---- window ----------------------------------------------------------------

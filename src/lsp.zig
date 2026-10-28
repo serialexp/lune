@@ -11,6 +11,7 @@ pub const syntax = @import("lsp/syntax.zig");
 pub const tokens = @import("lsp/tokens.zig");
 pub const completion = @import("lsp/completion.zig");
 pub const stdlib_db = @import("lsp/stdlib_db.zig");
+pub const library = @import("lsp/library.zig");
 pub const server = @import("lsp/server.zig");
 /// The stdio host; native only (the browser has its own, in `wasm_entry.zig`).
 pub const host_stdio = @import("lsp/host_stdio.zig");
@@ -26,6 +27,7 @@ test {
     _ = tokens;
     _ = completion;
     _ = stdlib_db;
+    _ = library;
     _ = server;
     _ = host_stdio;
 }

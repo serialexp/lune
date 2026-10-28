@@ -127,3 +127,27 @@ test("semantic tokens, outline and folds answer over the wasm boundary", () => {
   expect(outline.result.map((s: any) => s.name)).toEqual(["n"]);
   e.mahina_lsp_close();
 });
+test("hover, signature help and library members answer over the wasm boundary", () => {
+  e.mahina_lsp_open();
+  send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { capabilities: {} } }, 0);
+  const uri = "file:///lib.mh";
+  const text = 'print(string.format("%d", 1))\nlocal s = string.\n';
+  send({ jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri, languageId: "mahina", version: 1, text } } }, 1);
+
+  // `format` starts at character 13 of the first line.
+  const hover = send({ jsonrpc: "2.0", id: 2, method: "textDocument/hover", params: { textDocument: { uri }, position: { line: 0, character: 15 } } }, 2).at(-1);
+  expect(hover.result.contents.kind).toBe("markdown");
+  expect(hover.result.contents.value).toContain("string.format(formatstring, ...)");
+  expect(hover.result.range.start).toEqual({ line: 0, character: 13 });
+
+  // The cursor is after the comma that follows the format string: argument 1.
+  const sig = send({ jsonrpc: "2.0", id: 3, method: "textDocument/signatureHelp", params: { textDocument: { uri }, position: { line: 0, character: 26 } } }, 3).at(-1);
+  expect(sig.result.signatures[0].label).toBe("string.format(formatstring, ...)");
+  expect(sig.result.activeParameter).toBe(1);
+
+  const members = send({ jsonrpc: "2.0", id: 4, method: "textDocument/completion", params: { textDocument: { uri }, position: { line: 1, character: 17 } } }, 4).at(-1);
+  const format = members.result.items.find((x: any) => x.label === "format");
+  expect(format.kind).toBe(3);
+  expect(format.detail).toBe("string.format(formatstring, ...)");
+  e.mahina_lsp_close();
+});

@@ -210,8 +210,20 @@ land; move whole phases to Done once everything inside them is checked.
   resolver's name tokens, so a name's parent is its statement, not the list it
   sits in; `contextAt` still lexes from the start per completion request (its
   comments now come from the sink).
-- [ ] **P5 — stdlib knowledge** (§7.3): hover, `lib.` member completion,
-  signature help from the generated table.
+- [x] **P5 — stdlib knowledge** (§7.3): hover, `lib.` member completion and
+  signature help, all read from `stdlib_db.zig` (the inventory's table).
+- [ ] **P5 follow-ups:** the call scan (`callAt`) and the name lookups lex the
+  document from its start per request, as `contextAt` already does: 0.3–0.5 ms
+  at 10k lines and 3–5 ms at 100k (`bench-lsp`, "library requests"), against a
+  110 ms analysis at 100k. Keeping a token list with the analysis would remove
+  that scan if it ever matters. Calls are resolved by name only: `f:read(` on a
+  value (a local `file`) answers nothing, and so does a callee with a space in
+  it (`string . sub(`). Overloads are not split (one signature per name). Values
+  (`math.pi`, `io.stdin`) have no signature; `io.stdin`'s system group is not
+  shown, since it is installed through a value list in `interp.zig` that the
+  table does not read. The group note says what the host needs but does not
+  check that it has it. The inventory's descriptions are implementation notes,
+  shown verbatim in hover.
 - [ ] **P6 — cross-file** (§7.4): `require` resolution mirroring
   `package.searchpath`, `mahina.toml` (with a TOML-subset reader in
   `src/lsp/config.zig`), open-document overlays,
