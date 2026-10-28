@@ -208,7 +208,12 @@ pub const Stmt = struct {
         /// the compiler keeps the body scope open across the condition.
         repeat: struct { body: Block, cond: *Expr },
         /// `if c then ... elseif ... else ... end`
-        if_: struct { branches: []const Branch, else_body: ?Block },
+        if_: struct {
+            branches: []const Branch,
+            else_body: ?Block,
+            /// Start of the `else` keyword; meaningless without an `else_body`.
+            else_start: u32 = 0,
+        },
         /// `for i = a, b, c do ... end`
         numeric_for: struct {
             name: []const u8,
@@ -235,7 +240,8 @@ pub const Stmt = struct {
         err,
     };
 
-    pub const Branch = struct { cond: *Expr, body: Block };
+    /// `kw_start` is where the `if` / `elseif` keyword starts.
+    pub const Branch = struct { kw_start: u32, cond: *Expr, body: Block };
 };
 
 /// A block is a sequence of statements (slice provides the indirection that

@@ -414,11 +414,90 @@ pub fn tokenize(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnostic
     return list.toOwnedSlice(gpa);
 }
 
+/// What a cursor sits in (doc 74 §7.2): editors offer no completions inside a
+/// string or a comment.
+pub const Context = enum { code, string, comment };
+
+/// Classify the cursor at byte `offset` by lexing from the start. A cursor
+/// strictly inside a string, or anywhere after a comment's opener (at its very
+/// end too, unless it is a closed block comment), is not in code; so is the end
+/// of an unterminated string. Lexing is a linear scan, which the caller pays
+/// per request instead of keeping a token list per document version.
+pub fn contextAt(gpa: std.mem.Allocator, source: [:0]const u8, offset: u32) std.mem.Allocator.Error!Context {
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var lx = Lexer.init(source, &diags);
+    while (true) {
+        // The trivia `next` would skip, walked here so comments can be seen.
+        while (true) {
+            switch (lx.peek()) {
+                ' ', '\t' => lx.index += 1,
+                '\n', '\r' => lx.newline(),
+                '-' => {
+                    if (lx.peekNext() != '-') break;
+                    const open = lx.index;
+                    lx.index += 2;
+                    const block = lx.peek() == '[' and lx.longBracketLevel() != null;
+                    lx.skipComment();
+                    const closed_block = block and lx.index >= open + 6 and lx.source[lx.index - 1] == ']';
+                    if (offset > open and (offset < lx.index or (offset == lx.index and !closed_block))) return .comment;
+                },
+                else => break,
+            }
+            if (lx.index > offset) return .code;
+        }
+        if (lx.index >= offset and lx.peek() != 0) return .code;
+        const t = lx.next();
+        if (t.tag == .eof) return .code;
+        if (t.start >= offset) return .code;
+        const quoted = switch (t.tag) {
+            .string_literal => offset < t.end,
+            .invalid => switch (source[t.start]) {
+                '"', '\'', '[' => offset <= t.end,
+                else => false,
+            },
+            else => false,
+        };
+        if (quoted) return .string;
+        if (t.end >= offset) return .code;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+/// The context at the `|` in `marked`.
+fn contextOf(marked: []const u8) !Context {
+    const bar = std.mem.find(u8, marked, "|").?;
+    var buf: [256:0]u8 = undefined;
+    @memcpy(buf[0..bar], marked[0..bar]);
+    const rest = marked[bar + 1 ..];
+    @memcpy(buf[bar .. bar + rest.len], rest);
+    buf[bar + rest.len] = 0;
+    return contextAt(testing.allocator, buf[0 .. bar + rest.len :0], @intCast(bar));
+}
+
+test "contextAt: code, strings and comments" {
+    try testing.expectEqual(Context.code, try contextOf("local x = fo|"));
+    try testing.expectEqual(Context.code, try contextOf("|"));
+    try testing.expectEqual(Context.code, try contextOf("x = 1 |\ny = 2"));
+    try testing.expectEqual(Context.string, try contextOf("x = \"ab|c\""));
+    try testing.expectEqual(Context.code, try contextOf("x = \"abc\"|"));
+    try testing.expectEqual(Context.code, try contextOf("x = |\"abc\""));
+    try testing.expectEqual(Context.string, try contextOf("x = 'abc|"));
+    try testing.expectEqual(Context.string, try contextOf("x = [[a\nb|c]]"));
+    try testing.expectEqual(Context.comment, try contextOf("x = 1 -- hi |there"));
+    try testing.expectEqual(Context.comment, try contextOf("x = 1 -- hi there|"));
+    try testing.expectEqual(Context.code, try contextOf("x = 1 -- hi\n|y = 2"));
+    try testing.expectEqual(Context.comment, try contextOf("--[[ a\nb| ]] x"));
+    try testing.expectEqual(Context.code, try contextOf("--[[ a ]]| x"));
+    try testing.expectEqual(Context.comment, try contextOf("--[==[ a ]] b| ]==] x"));
+    try testing.expectEqual(Context.comment, try contextOf("--[[ unterminated|"));
+    try testing.expectEqual(Context.code, try contextOf("x = a - |b"));
+}
 
 /// Lex `source` and assert the produced tags (excluding the trailing eof).
 fn expectTags(source: [:0]const u8, expected: []const Token.Tag) !void {

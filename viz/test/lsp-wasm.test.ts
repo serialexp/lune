@@ -80,3 +80,29 @@ test("malformed input answers with an error instead of trapping", () => {
   expect(err.error.code).toBe(-32700);
   e.mahina_lsp_close();
 });
+
+test("navigation and completion answer over the wasm boundary", () => {
+  e.mahina_lsp_open();
+  send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { capabilities: {} } }, 0);
+  const uri = "file:///nav.mh";
+  const text = "local count = 1\nprint(count)\n";
+  send({ jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri, languageId: "mahina", version: 1, text } } }, 1);
+  const at = { textDocument: { uri }, position: { line: 1, character: 8 } };
+
+  // Asked before the debounce ran: the request analyses the text itself.
+  const def = send({ jsonrpc: "2.0", id: 2, method: "textDocument/definition", params: at }, 2).at(-1);
+  expect(def.result.range.start).toEqual({ line: 0, character: 6 });
+
+  const rename = send({ jsonrpc: "2.0", id: 3, method: "textDocument/rename", params: { ...at, newName: "total" } }, 3).at(-1);
+  expect(rename.result.changes[uri].map((x: any) => x.newText)).toEqual(["total", "total"]);
+
+  const refused = send({ jsonrpc: "2.0", id: 4, method: "textDocument/rename", params: { ...at, newName: "end" } }, 4).at(-1);
+  expect(refused.error.code).toBe(-32803);
+
+  const list = send({ jsonrpc: "2.0", id: 5, method: "textDocument/completion", params: { textDocument: { uri }, position: { line: 2, character: 0 } } }, 5).at(-1);
+  const labels = list.result.items.map((x: any) => x.label);
+  expect(labels).toContain("count");
+  expect(labels).toContain("print");
+  expect(labels).toContain("while");
+  e.mahina_lsp_close();
+});

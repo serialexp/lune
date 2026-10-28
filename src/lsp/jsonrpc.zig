@@ -20,6 +20,8 @@ pub const ErrorCode = enum(i32) {
     request_cancelled = -32800,
     content_modified = -32801,
     server_cancelled = -32802,
+    /// The request was understood and refused (LSP 3.17 `RequestFailed`).
+    request_failed = -32803,
 };
 
 /// A request id: the spec allows an integer or a string.

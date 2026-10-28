@@ -58,9 +58,10 @@ pub const Binding = struct {
     /// The offset from which the name means this binding. The scope runs
     /// `[visible_from, scope_end)`. A global is visible everywhere.
     visible_from: u32,
-    /// Where the scope ends. For a block this is the end of the construct that
-    /// owns it (an `if` branch ends where the next branch's condition starts),
-    /// not the closing keyword's start, which the AST does not record.
+    /// Where the scope ends: the start of the keyword that closes it (`end`,
+    /// `elseif`, `else`), so a cursor just before it still sees the block's
+    /// names and one just after the construct does not. A `repeat` scope also
+    /// holds its `until` condition and ends with it.
     scope_end: u32,
     /// The function that declares it: 0 is the chunk, then pre-order. A
     /// global belongs to no function.
@@ -151,6 +152,13 @@ pub fn resolve(gpa: std.mem.Allocator, root: ast.Block, source_len: u32) std.mem
 }
 
 const no_entry: u32 = std.math.maxInt(u32);
+
+/// Where the closing `end` of a closed construct starts. The parser only builds
+/// such a node after consuming that keyword, and it is the construct's last
+/// token (an unclosed one is an error node and never reaches the resolver).
+fn closeStart(span: Span) u32 {
+    return span.end - @as(u32, "end".len);
+}
 
 /// A name that is currently in scope.
 const Entry = struct {
@@ -281,10 +289,10 @@ const Walker = struct {
                 try self.expr(ca.value);
             },
             .call => |e| try self.expr(e),
-            .do => |body| try self.block(body, s.span.end),
+            .do => |body| try self.block(body, closeStart(s.span)),
             .while_ => |w| {
                 try self.expr(w.cond);
-                try self.block(w.body, s.span.end);
+                try self.block(w.body, closeStart(s.span));
             },
             .repeat => |r| {
                 // `until` sees the body's locals: one scope around both.
@@ -296,10 +304,15 @@ const Walker = struct {
             .if_ => |f| {
                 for (f.branches, 0..) |br, i| {
                     try self.expr(br.cond);
-                    const end = if (i + 1 < f.branches.len) f.branches[i + 1].cond.span.start else s.span.end;
+                    const end = if (i + 1 < f.branches.len)
+                        f.branches[i + 1].kw_start
+                    else if (f.else_body != null)
+                        f.else_start
+                    else
+                        closeStart(s.span);
                     try self.block(br.body, end);
                 }
-                if (f.else_body) |eb| try self.block(eb, s.span.end);
+                if (f.else_body) |eb| try self.block(eb, closeStart(s.span));
             },
             .numeric_for => |nf| {
                 try self.expr(nf.start);
@@ -309,7 +322,7 @@ const Walker = struct {
                 const m = self.mark();
                 try self.declare(.for_var, nf.name, nf.name_span, header_end);
                 try self.stmtList(nf.body);
-                self.pop(m, s.span.end);
+                self.pop(m, closeStart(s.span));
             },
             .generic_for => |gf| {
                 try self.exprList(gf.exprs);
@@ -317,7 +330,7 @@ const Walker = struct {
                 const m = self.mark();
                 for (gf.names) |n| try self.declare(.for_var, n.text, n.span, header_end);
                 try self.stmtList(gf.body);
-                self.pop(m, s.span.end);
+                self.pop(m, closeStart(s.span));
             },
             .function_decl => |fd| {
                 // `function f()` assigns `f`; `function a.b()` and `a:m()`
@@ -391,7 +404,7 @@ const Walker = struct {
             try self.declare(kind, p.name, p.name_span, p.name_span.end);
         }
         try self.stmtList(body.body);
-        self.pop(m, body.span.end);
+        self.pop(m, closeStart(body.span));
         self.func = outer;
     }
 
@@ -585,8 +598,27 @@ test "resolve: scope extents" {
     try testing.expectEqual(@as(u32, @intCast(std.mem.find(u8, src, "\nif").?)), a.visible_from);
     try testing.expectEqual(@as(u32, @intCast(src.len)), a.scope_end);
     const b = f.res.binding(try f.at("b", 0));
-    // `b` ends where the `elseif` condition begins, so `c`'s branch cannot see it.
-    try testing.expectEqual(@as(u32, @intCast(std.mem.find(u8, src, "a then local c").?)), b.scope_end);
+    // `b` ends at the `elseif` keyword, so `c`'s branch cannot see it.
+    try testing.expectEqual(@as(u32, @intCast(std.mem.find(u8, src, "elseif").?)), b.scope_end);
+    // `c` ends at the closing `end`.
+    const c = f.res.binding(try f.at("c", 0));
+    try testing.expectEqual(@as(u32, @intCast(std.mem.findLast(u8, src, "end").?)), c.scope_end);
+}
+
+test "resolve: a branch before `else` does not reach into it" {
+    const src = "if true then local b = 1 else local c = 2 end";
+    var f = try Fixture.init(src);
+    defer f.deinit();
+    try testing.expectEqual(@as(u32, @intCast(std.mem.find(u8, src, "else").?)), f.res.binding(try f.at("b", 0)).scope_end);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.findLast(u8, src, "end").?)), f.res.binding(try f.at("c", 0)).scope_end);
+}
+
+test "resolve: loop and function scopes end at their `end`" {
+    const src = "for i = 1, 2 do local a = i end\nfunction f(p) return p end";
+    var f = try Fixture.init(src);
+    defer f.deinit();
+    try testing.expectEqual(@as(u32, @intCast(std.mem.find(u8, src, "end").?)), f.res.binding(try f.at("i", 0)).scope_end);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.findLast(u8, src, "end").?)), f.res.binding(try f.at("p", 0)).scope_end);
 }
 
 test "resolve: occurrences are sorted and a lookup misses between names" {

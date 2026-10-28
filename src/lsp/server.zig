@@ -17,6 +17,9 @@ const protocol = @import("protocol.zig");
 const documents = @import("documents.zig");
 const analysis_mod = @import("analysis.zig");
 const position = @import("position.zig");
+const ast = @import("../ast.zig");
+const navigation = @import("navigation.zig");
+const completion = @import("completion.zig");
 
 /// Analysis runs this long after the last change...
 pub const debounce_ms: u64 = 50;
@@ -177,8 +180,182 @@ pub const Server = struct {
             self.state = .shutdown;
             return out.result(id, @as(?u8, null));
         }
+        if (std.mem.eql(u8, method, "textDocument/definition")) return self.definition(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/references")) return self.references(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/documentHighlight")) return self.highlights(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/prepareRename")) return self.prepareRename(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/rename")) return self.rename(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/completion")) return self.complete(a, id, params, out);
         const msg = try std.fmt.allocPrint(a, "method not found: {s}", .{method});
         return out.fail(id, .method_not_found, msg);
+    }
+
+    // ---- navigation and completion (doc 74 §7.2) ---------------------------
+
+    /// What a position-based request works on: the document's analysis of its
+    /// current text, and the cursor as a byte offset into it.
+    const Cursor = struct {
+        doc: *documents.Document,
+        an: *const analysis_mod.Analysis,
+        index: *const position.LineIndex,
+        offset: u32,
+    };
+
+    /// Find the document and make sure its analysis is of the text as it is now
+    /// (an edit still inside its debounce is analysed here, ahead of the
+    /// timer). Answers the request with an error and returns null when it
+    /// cannot be served.
+    fn cursor(self: *Server, id: jsonrpc.Id, uri: []const u8, pos: position.Position, out: *Outbox) Error!?Cursor {
+        const doc = self.docs.get(uri) orelse {
+            try out.fail(id, .invalid_params, "the document is not open");
+            return null;
+        };
+        if (doc.currentAnalysis() == null) try self.analyse(doc, out);
+        const an = doc.currentAnalysis() orelse {
+            // Newer input is waiting, or there is no tree; the client asks again.
+            try out.fail(id, .content_modified, "the document changed");
+            return null;
+        };
+        const index = doc.lineIndex(self.gpa) catch return error.OutOfMemory;
+        return .{ .doc = doc, .an = an, .index = index, .offset = index.toOffset(an.source, pos, self.encoding) };
+    }
+
+    fn definition(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        const occ = navigation.occurrenceAt(c.an, c.offset) orelse return out.result(id, @as(?u8, null));
+        const span = navigation.definition(c.an, occ) orelse return out.result(id, @as(?u8, null));
+        try out.result(id, protocol.Location{
+            .uri = c.doc.uri,
+            .range = c.index.toRange(c.an.source, span.start, span.end, self.encoding),
+        });
+    }
+
+    fn references(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.ReferenceParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        const occ = navigation.occurrenceAt(c.an, c.offset) orelse return out.result(id, @as(?u8, null));
+        const occs = try navigation.references(a, c.an, occ.binding, p.context.includeDeclaration);
+        const oa = out.arena.allocator();
+        const list = try oa.alloc(protocol.Location, occs.len);
+        var cur = position.Cursor.init(c.index, c.an.source, self.encoding);
+        for (occs, list) |o, *slot| {
+            const start = cur.positionOf(o.span.start);
+            slot.* = .{ .uri = c.doc.uri, .range = .{ .start = start, .end = cur.positionOf(o.span.end) } };
+        }
+        try out.result(id, list);
+    }
+
+    fn highlights(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        const occ = navigation.occurrenceAt(c.an, c.offset) orelse return out.result(id, @as(?u8, null));
+        const occs = try navigation.references(a, c.an, occ.binding, true);
+        const list = try out.arena.allocator().alloc(protocol.DocumentHighlight, occs.len);
+        var cur = position.Cursor.init(c.index, c.an.source, self.encoding);
+        for (occs, list) |o, *slot| {
+            const start = cur.positionOf(o.span.start);
+            slot.* = .{
+                .range = .{ .start = start, .end = cur.positionOf(o.span.end) },
+                .kind = if (o.access == .read) protocol.DocumentHighlightKind.read else protocol.DocumentHighlightKind.write,
+            };
+        }
+        try out.result(id, list);
+    }
+
+    fn prepareRename(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        const occ = navigation.occurrenceAt(c.an, c.offset) orelse return out.result(id, @as(?u8, null));
+        const name = c.an.res.binding(occ.binding).name;
+        // The binding's own name is always a valid new spelling, so only the
+        // refusals about the binding itself can come back.
+        switch (navigation.checkRename(c.an, self.known_globals, occ.binding, &.{}, name)) {
+            .ok => {},
+            .refused => |r| return out.fail(id, .request_failed, try refusalMessage(a, c, r.reason, null, name, name)),
+        }
+        try out.result(id, protocol.PrepareRenameResult{
+            .range = c.index.toRange(c.an.source, occ.span.start, occ.span.end, self.encoding),
+            .placeholder = name,
+        });
+    }
+
+    fn rename(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.RenameParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        const occ = navigation.occurrenceAt(c.an, c.offset) orelse
+            return out.fail(id, .request_failed, "there is no name to rename here");
+        const b = c.an.res.binding(occ.binding);
+        const occs = try navigation.references(a, c.an, occ.binding, true);
+        switch (navigation.checkRename(c.an, self.known_globals, occ.binding, occs, p.newName)) {
+            .ok => {},
+            .refused => |r| return out.fail(id, .request_failed, try refusalMessage(a, c, r.reason, r.at, b.name, p.newName)),
+        }
+        const oa = out.arena.allocator();
+        const edits = try oa.alloc(protocol.TextEdit, if (std.mem.eql(u8, b.name, p.newName)) 0 else occs.len);
+        var cur = position.Cursor.init(c.index, c.an.source, self.encoding);
+        for (edits, occs[0..edits.len]) |*slot, o| {
+            const start = cur.positionOf(o.span.start);
+            slot.* = .{ .range = .{ .start = start, .end = cur.positionOf(o.span.end) }, .newText = p.newName };
+        }
+        if (b.kind == .global and edits.len > 0) {
+            const message = if (c.an.res.damaged.items.len > 0)
+                try std.fmt.allocPrint(oa, "{s} is a global: only this file was renamed, and text the parser could not read was left alone.", .{b.name})
+            else
+                try std.fmt.allocPrint(oa, "{s} is a global: only this file was renamed; other files that use it are unchanged.", .{b.name});
+            try out.notify("window/showMessage", protocol.LogMessageParams{
+                .type = protocol.MessageType.warning,
+                .message = message,
+            });
+        }
+        try out.result(id, protocol.WorkspaceEdit{ .uri = c.doc.uri, .edits = edits });
+    }
+
+    fn refusalMessage(
+        a: std.mem.Allocator,
+        c: Cursor,
+        reason: navigation.Refusal,
+        at: ?ast.Span,
+        old: []const u8,
+        new: []const u8,
+    ) std.mem.Allocator.Error![]const u8 {
+        const line: u32 = if (at) |s| c.index.lineOf(s.start) + 1 else 0;
+        return switch (reason) {
+            .not_a_name => "there is no name to rename here",
+            .implicit_self => "'self' is implicit here: there is no parameter to rename",
+            .builtin => std.fmt.allocPrint(a, "'{s}' is installed by the host and cannot be renamed", .{old}),
+            .invalid_name => std.fmt.allocPrint(a, "'{s}' is not a valid name", .{new}),
+            .keyword => std.fmt.allocPrint(a, "'{s}' is a keyword", .{new}),
+            .would_capture => std.fmt.allocPrint(a, "renaming to '{s}' would capture the use of '{s}' at line {d}, where another '{s}' is in scope", .{ new, old, line, new }),
+            .would_be_captured => std.fmt.allocPrint(a, "the use of '{s}' at line {d} is inside the scope of '{s}' and would start meaning it", .{ new, line, old }),
+        };
+    }
+
+    fn complete(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        const items = try completion.complete(a, c.an, self.known_globals, c.offset);
+        const oa = out.arena.allocator();
+        const list = try oa.alloc(protocol.CompletionItem, items.len);
+        for (items, list) |it, *slot| {
+            slot.* = .{
+                .label = it.label,
+                .kind = switch (it.kind) {
+                    .variable => protocol.CompletionItemKind.variable,
+                    .function => protocol.CompletionItemKind.function,
+                    .keyword => protocol.CompletionItemKind.keyword,
+                },
+                .detail = it.detail,
+                .sortText = try std.fmt.allocPrint(oa, "{d}{s}", .{ it.rank, it.label }),
+            };
+        }
+        try out.result(id, protocol.CompletionList{ .items = list });
+    }
+
+    fn badParams(self: *Server, id: jsonrpc.Id, err: anyerror, out: *Outbox) Error!void {
+        _ = self;
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        try out.fail(id, .invalid_params, "malformed params");
     }
 
     fn notification(
@@ -762,4 +939,176 @@ test "diagnostics: input already waiting abandons the analysis, which runs again
     const r = try h.tick(60);
     try testing.expectEqual(@as(usize, 1), r.len);
     try testing.expect(h.server.nextDeadline() == null);
+}
+
+// ---- navigation and completion over the wire ----
+
+/// Open `text` as document "u" (version 1) without ticking, then send one
+/// position request and return its response.
+fn askAt(h: *Harness, text: []const u8, method: []const u8, line: u32, ch: u32, extra: []const u8) !json.Value {
+    var buf: [1024]u8 = undefined;
+    const open = try std.fmt.bufPrint(&buf,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"u","version":1,"text":{f}}}}}}}
+    , .{std.json.fmt(text, .{})});
+    _ = try h.send(0, open);
+    var buf2: [512]u8 = undefined;
+    const req = try std.fmt.bufPrint(&buf2,
+        \\{{"jsonrpc":"2.0","id":7,"method":"{s}","params":{{"textDocument":{{"uri":"u"}},"position":{{"line":{d},"character":{d}}}{s}}}}}
+    , .{ method, line, ch, extra });
+    const r = try h.send(1, req);
+    // The edit was not yet due, so the request itself analysed the document and
+    // published: the response is the last message.
+    return r[r.len - 1];
+}
+
+test "definition: answers from the text as it is, ahead of the debounce" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const r = try askAt(&h, "local abc = 1\nprint(abc)", "textDocument/definition", 1, 7, "");
+    const loc = r.object.get("result").?.object;
+    try testing.expectEqualStrings("u", loc.get("uri").?.string);
+    const range = loc.get("range").?.object;
+    try testing.expectEqual(@as(i64, 0), range.get("start").?.object.get("line").?.integer);
+    try testing.expectEqual(@as(i64, 6), range.get("start").?.object.get("character").?.integer);
+    try testing.expectEqual(@as(i64, 9), range.get("end").?.object.get("character").?.integer);
+}
+
+test "definition: nothing under the cursor, or for a name nothing defines, is null" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.known_globals = &.{"print"};
+    try h.open();
+    const r = try askAt(&h, "print(1)", "textDocument/definition", 0, 2, "");
+    try testing.expect(r.object.get("result").? == .null);
+}
+
+test "references: every use, the declaration on request, columns in the negotiated unit" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    // `é` is two bytes but one UTF-16 unit, so the `a` in `print(a)` is at
+    // column 32 although it is at byte 33.
+    const text = "local s = \"é\" local a = 1 print(a)";
+    const with = try askAt(&h, text, "textDocument/references", 0, 32, ",\"context\":{\"includeDeclaration\":true}");
+    try testing.expectEqual(@as(usize, 2), with.object.get("result").?.array.items.len);
+    const last = with.object.get("result").?.array.items[1].object.get("range").?.object;
+    try testing.expectEqual(@as(i64, 32), last.get("start").?.object.get("character").?.integer);
+}
+
+test "references: includeDeclaration false leaves the declaring name out" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const r = try askAt(&h, "local a = 1\nprint(a)", "textDocument/references", 1, 6, ",\"context\":{\"includeDeclaration\":false}");
+    try testing.expectEqual(@as(usize, 1), r.object.get("result").?.array.items.len);
+}
+
+test "documentHighlight: reads and writes" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const r = try askAt(&h, "local a = 1\na = a + 1", "textDocument/documentHighlight", 1, 0, "");
+    const items = r.object.get("result").?.array.items;
+    try testing.expectEqual(@as(usize, 3), items.len);
+    try testing.expectEqual(@as(i64, 3), items[0].object.get("kind").?.integer); // the declaration
+    try testing.expectEqual(@as(i64, 3), items[1].object.get("kind").?.integer); // `a =`
+    try testing.expectEqual(@as(i64, 2), items[2].object.get("kind").?.integer); // `= a`
+}
+
+test "rename: edits every occurrence, in the form clients read" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const r = try askAt(&h, "local a = 1\nprint(a)", "textDocument/rename", 1, 6, ",\"newName\":\"count\"");
+    const changes = r.object.get("result").?.object.get("changes").?.object;
+    const edits = changes.get("u").?.array.items;
+    try testing.expectEqual(@as(usize, 2), edits.len);
+    try testing.expectEqualStrings("count", edits[0].object.get("newText").?.string);
+    try testing.expectEqual(@as(i64, 6), edits[1].object.get("range").?.object.get("start").?.object.get("character").?.integer);
+}
+
+test "rename: a refusal is an error response that says why" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.known_globals = &.{"print"};
+    try h.open();
+    const text = "local a = 1\ndo local b = 2 print(a, b) end";
+    const capture = try askAt(&h, text, "textDocument/rename", 0, 6, ",\"newName\":\"b\"");
+    try testing.expectEqual(@as(i64, -32803), errorCode(capture));
+    try testing.expect(std.mem.indexOf(u8, capture.object.get("error").?.object.get("message").?.string, "capture") != null);
+}
+
+test "rename: a global changes this file and says so" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    var buf: [1024]u8 = undefined;
+    _ = try h.send(0, try std.fmt.bufPrint(&buf,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"u","version":1,"text":"g = 1\nprint(g)"}}}}}}
+    , .{}));
+    const r = try h.send(1,
+        \\{"jsonrpc":"2.0","id":7,"method":"textDocument/rename","params":{"textDocument":{"uri":"u"},"position":{"line":0,"character":0},"newName":"h"}}
+    );
+    var warned = false;
+    for (r) |m| {
+        const method = m.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "window/showMessage")) warned = true;
+    }
+    try testing.expect(warned);
+    try testing.expectEqual(@as(usize, 2), r[r.len - 1].object.get("result").?.object.get("changes").?.object.get("u").?.array.items.len);
+}
+
+test "prepareRename: the name's range, or a refusal for what cannot be renamed" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.known_globals = &.{"print"};
+    try h.open();
+    const ok = try askAt(&h, "local abc = 1", "textDocument/prepareRename", 0, 7, "");
+    const res = ok.object.get("result").?.object;
+    try testing.expectEqualStrings("abc", res.get("placeholder").?.string);
+    try testing.expectEqual(@as(i64, 9), res.get("range").?.object.get("end").?.object.get("character").?.integer);
+
+    h.server.docs.close("u");
+    const bad = try askAt(&h, "print(1)", "textDocument/prepareRename", 0, 1, "");
+    try testing.expectEqual(@as(i64, -32803), errorCode(bad));
+}
+
+test "completion: a list with kinds and an ordering that puts locals first" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.known_globals = &.{"print"};
+    try h.open();
+    const r = try askAt(&h, "local mine = 1\n", "textDocument/completion", 1, 0, "");
+    const list = r.object.get("result").?.object;
+    try testing.expect(!list.get("isIncomplete").?.bool);
+    var found_local = false;
+    var found_keyword = false;
+    for (list.get("items").?.array.items) |it| {
+        const label = it.object.get("label").?.string;
+        if (std.mem.eql(u8, label, "mine")) {
+            found_local = true;
+            try testing.expectEqualStrings("0mine", it.object.get("sortText").?.string);
+        }
+        if (std.mem.eql(u8, label, "while")) {
+            found_keyword = true;
+            try testing.expectEqual(@as(i64, 14), it.object.get("kind").?.integer);
+        }
+    }
+    try testing.expect(found_local and found_keyword);
+}
+
+test "requests: an unopened document is invalid params; initialize advertises the features" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    const init = try h.send(0,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
+    );
+    const caps = init[0].object.get("result").?.object.get("capabilities").?.object;
+    try testing.expect(caps.get("definitionProvider").?.bool);
+    try testing.expect(caps.get("renameProvider").?.object.get("prepareProvider").?.bool);
+    const r = try h.send(1,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"nope"},"position":{"line":0,"character":0}}}
+    );
+    try testing.expectEqual(@as(i64, -32602), errorCode(r[0]));
 }

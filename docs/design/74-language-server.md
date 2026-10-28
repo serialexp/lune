@@ -117,9 +117,7 @@ land; move whole phases to Done once everything inside them is checked.
     `Local` carries a `BindingId`, `declareLocal` takes the name token's
     span, and `endScope` asserts the compiler's dynamic capture marking
     equals the resolver's `captured`, so the two cannot drift. `builtin`
-    and `unresolved` binding kinds are not produced yet (P5 and P1d), and
-    `scope_end` is the end of the owning construct, since the AST does not
-    record a block's closing keyword.
+    and `unresolved` binding kinds are not produced yet (P5 and P1d).
   - [x] P1d diagnostics model (§6.4, sink half): `diag.Code` (stable
     number per message, `E0109`-style `id()`, `W0001` for lints; 65 call
     sites in the lexer, parser and compiler now name a code and the message
@@ -161,14 +159,30 @@ land; move whole phases to Done once everything inside them is checked.
     9 ms, 60k constants 28 ms, 50k-deep nesting 136 ms with no crash on the
     native stack, 200-edit burst 23 ms, 49 documents in one tick 39 ms.
 
+  - [x] P3 navigation and completion (§7.2): `src/lsp/navigation.zig`
+    (definition, references, document highlight, rename checks),
+    `src/lsp/completion.zig`, `lexer.contextAt` (no completion in strings,
+    comments, declarations, after `.`/`:`). `resolve.Binding.scope_end` is
+    now the closing keyword's start (`end`, `elseif`, `else`), from
+    `Branch.kw_start` / `if_.else_start`. Position requests analyse the
+    document first if its debounce has not run. Rename refuses an invalid
+    name, keyword, host global, implicit `self`, and any rename where a use
+    would capture or be captured (checked against occurrences, not by
+    re-resolving), answering `RequestFailed` with the line; it replies with
+    `changes` (what `@codemirror/lsp-client` reads). Verified in the viz
+    editor: completion list, F2 rename.
+
 ### Outstanding
 
 - [ ] **Bench follow-ups:** the 100k-line budget miss (check dominates); the
   recursive-descent parser has no nesting limit, so the wasm stack (much
   smaller than native) needs a depth test or a limit.
-- [ ] **P3 — navigation and basic completion** (§7.2): definition,
-  references, document highlight, prepareRename/rename with capture
-  checks; completion of keywords and in-scope names.
+- [ ] **P3 follow-ups:** rename of a global renames this file only (the
+  warning says so) until P6 has a workspace; completion after `.`/`:` waits
+  for P5; a `local x =` with a missing value still offers `x` right after
+  the `=` (the parser cannot say where the missing value would end);
+  `contextAt` lexes from the start per completion request (replace with
+  the P4 trivia sink); no completion/definition bench yet.
 - [ ] **P4 — syntactic features** (§7.1): semantic tokens (with comments
   from the trivia sink and locals vs globals from the resolver), document
   symbols, folding ranges (incl. comments), selection ranges.

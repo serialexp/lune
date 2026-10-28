@@ -406,21 +406,26 @@ const Parser = struct {
 
         const cond = try self.parseExpr(0);
         _ = try self.expect(.keyword_then, .expected_then);
-        try branches.append(self.arena, .{ .cond = cond, .body = try self.parseBlock() });
+        try branches.append(self.arena, .{ .kw_start = open.start, .cond = cond, .body = try self.parseBlock() });
 
-        while (self.match(.keyword_elseif)) {
+        while (self.check(.keyword_elseif)) {
+            const kw = self.advance();
             const c = try self.parseExpr(0);
             _ = try self.expect(.keyword_then, .expected_then);
-            try branches.append(self.arena, .{ .cond = c, .body = try self.parseBlock() });
+            try branches.append(self.arena, .{ .kw_start = kw.start, .cond = c, .body = try self.parseBlock() });
         }
 
         var else_body: ?ast.Block = null;
-        if (self.match(.keyword_else)) else_body = try self.parseBlock();
+        var else_start: u32 = 0;
+        if (self.check(.keyword_else)) {
+            else_start = self.advance().start;
+            else_body = try self.parseBlock();
+        }
 
         _ = try self.expectClosing(.keyword_end, .expected_end_if, open, "'if' opened here");
         return .{
             .span = self.spanFrom(start),
-            .data = .{ .if_ = .{ .branches = try branches.toOwnedSlice(self.arena), .else_body = else_body } },
+            .data = .{ .if_ = .{ .branches = try branches.toOwnedSlice(self.arena), .else_body = else_body, .else_start = else_start } },
         };
     }
 

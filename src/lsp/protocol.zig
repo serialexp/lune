@@ -34,10 +34,23 @@ pub const TextDocumentSyncOptions = struct {
     change: u8 = TextDocumentSyncKind.incremental,
 };
 
+pub const RenameOptions = struct {
+    prepareProvider: bool = true,
+};
+
+pub const CompletionOptions = struct {
+    resolveProvider: bool = false,
+};
+
 pub const ServerCapabilities = struct {
     /// Omitted when the client offered no encodings (then UTF-16 is implied).
     positionEncoding: ?[]const u8 = null,
     textDocumentSync: TextDocumentSyncOptions = .{},
+    definitionProvider: bool = true,
+    referencesProvider: bool = true,
+    documentHighlightProvider: bool = true,
+    renameProvider: RenameOptions = .{},
+    completionProvider: CompletionOptions = .{},
 };
 
 pub const ServerInfo = struct {
@@ -121,6 +134,83 @@ pub const PublishDiagnosticsParams = struct {
     uri: []const u8,
     version: ?i64 = null,
     diagnostics: []const Diagnostic,
+};
+
+// ---- navigation (doc 74 §7.2) -----------------------------------------------
+
+pub const TextDocumentPositionParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+};
+
+pub const ReferenceParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+    context: struct { includeDeclaration: bool = true } = .{},
+};
+
+pub const RenameParams = struct {
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+    newName: []const u8,
+};
+
+pub const DocumentHighlightKind = struct {
+    pub const read: u8 = 2;
+    pub const write: u8 = 3;
+};
+
+pub const DocumentHighlight = struct {
+    range: Range,
+    kind: u8,
+};
+
+pub const PrepareRenameResult = struct {
+    range: Range,
+    placeholder: []const u8,
+};
+
+pub const TextEdit = struct {
+    range: Range,
+    newText: []const u8,
+};
+
+/// `{"changes": {uri: edits}}`: the shape every client reads, and the only one
+/// `@codemirror/lsp-client` does. A document's URI is the key, which a Zig
+/// struct cannot name, hence the custom writer. One document until P6.
+pub const WorkspaceEdit = struct {
+    uri: []const u8,
+    edits: []const TextEdit,
+
+    pub fn jsonStringify(self: WorkspaceEdit, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("changes");
+        try jw.beginObject();
+        try jw.objectField(self.uri);
+        try jw.write(self.edits);
+        try jw.endObject();
+        try jw.endObject();
+    }
+};
+
+// ---- completion --------------------------------------------------------------
+
+pub const CompletionItemKind = struct {
+    pub const function: u8 = 3;
+    pub const variable: u8 = 6;
+    pub const keyword: u8 = 14;
+};
+
+pub const CompletionItem = struct {
+    label: []const u8,
+    kind: u8,
+    detail: ?[]const u8 = null,
+    sortText: ?[]const u8 = null,
+};
+
+pub const CompletionList = struct {
+    isIncomplete: bool = false,
+    items: []const CompletionItem,
 };
 
 // ---- window ----------------------------------------------------------------
