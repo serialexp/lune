@@ -262,7 +262,7 @@ pub const LineIndex = struct {
 
 /// Converts a non-decreasing sequence of byte offsets to positions in one
 /// pass over the text, however long a line is. An offset smaller than the
-/// previous one restarts from the line's start (correct, just not O(1)).
+/// previous one is searched for (correct, just not O(1)).
 pub const Cursor = struct {
     index: *const LineIndex,
     text: []const u8,
@@ -279,9 +279,16 @@ pub const Cursor = struct {
     pub fn positionOf(self: *Cursor, offset: u32) Position {
         const idx = self.index;
         const want = @min(offset, idx.len);
-        // Off the current line, or behind the scan: re-seat on the right line.
-        if (want < self.pos or want >= idx.lineStart(self.line + 1) and self.line + 1 < idx.lineCount()) {
+        // Behind the scan: search for the line.
+        if (want < self.pos) {
             self.line = idx.lineOf(want);
+            self.pos = idx.starts[self.line];
+            self.col = 0;
+        }
+        // Ahead of it: step over the whole lines in between. Each line is passed
+        // once over the cursor's life, so a sorted batch costs no search at all.
+        while (self.line + 1 < idx.lineCount() and want >= idx.lineStart(self.line + 1)) {
+            self.line += 1;
             self.pos = idx.starts[self.line];
             self.col = 0;
         }

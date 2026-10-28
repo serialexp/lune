@@ -106,3 +106,24 @@ test("navigation and completion answer over the wasm boundary", () => {
   expect(labels).toContain("while");
   e.mahina_lsp_close();
 });
+
+test("semantic tokens, outline and folds answer over the wasm boundary", () => {
+  e.mahina_lsp_open();
+  send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { capabilities: {} } }, 0);
+  const uri = "file:///syntax.mh";
+  const text = "local n = 1\nif n then\n  n = 2\nend\n";
+  send({ jsonrpc: "2.0", method: "textDocument/didOpen", params: { textDocument: { uri, languageId: "mahina", version: 1, text } } }, 1);
+
+  const tokens = send({ jsonrpc: "2.0", id: 2, method: "textDocument/semanticTokens/full", params: { textDocument: { uri } } }, 2).at(-1);
+  // Five integers per token, the first being `local` (a keyword) at 0:0.
+  expect(tokens.result.data.slice(0, 5)).toEqual([0, 0, 5, 0, 0]);
+  expect(tokens.result.data.length % 5).toBe(0);
+
+  const folds = send({ jsonrpc: "2.0", id: 3, method: "textDocument/foldingRange", params: { textDocument: { uri } } }, 3).at(-1);
+  // The `if` opens on line 1 and its `end` is on line 3: line 2 folds away.
+  expect(folds.result).toEqual([{ startLine: 1, endLine: 2 }]);
+
+  const outline = send({ jsonrpc: "2.0", id: 4, method: "textDocument/documentSymbol", params: { textDocument: { uri } } }, 4).at(-1);
+  expect(outline.result.map((s: any) => s.name)).toEqual(["n"]);
+  e.mahina_lsp_close();
+});

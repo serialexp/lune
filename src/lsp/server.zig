@@ -19,6 +19,8 @@ const analysis_mod = @import("analysis.zig");
 const position = @import("position.zig");
 const ast = @import("../ast.zig");
 const navigation = @import("navigation.zig");
+const syntax = @import("syntax.zig");
+const tokens = @import("tokens.zig");
 const completion = @import("completion.zig");
 
 /// Analysis runs this long after the last change...
@@ -186,6 +188,10 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "textDocument/prepareRename")) return self.prepareRename(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/rename")) return self.rename(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/completion")) return self.complete(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) return self.semanticTokens(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/documentSymbol")) return self.documentSymbols(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/foldingRange")) return self.foldingRanges(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/selectionRange")) return self.selectionRanges(a, id, params, out);
         const msg = try std.fmt.allocPrint(a, "method not found: {s}", .{method});
         return out.fail(id, .method_not_found, msg);
     }
@@ -204,8 +210,8 @@ pub const Server = struct {
     /// Find the document and make sure its analysis is of the text as it is now
     /// (an edit still inside its debounce is analysed here, ahead of the
     /// timer). Answers the request with an error and returns null when it
-    /// cannot be served.
-    fn cursor(self: *Server, id: jsonrpc.Id, uri: []const u8, pos: position.Position, out: *Outbox) Error!?Cursor {
+    /// cannot be served. The offset is left at 0 for the caller to set.
+    fn analysed(self: *Server, id: jsonrpc.Id, uri: []const u8, out: *Outbox) Error!?Cursor {
         const doc = self.docs.get(uri) orelse {
             try out.fail(id, .invalid_params, "the document is not open");
             return null;
@@ -217,7 +223,14 @@ pub const Server = struct {
             return null;
         };
         const index = doc.lineIndex(self.gpa) catch return error.OutOfMemory;
-        return .{ .doc = doc, .an = an, .index = index, .offset = index.toOffset(an.source, pos, self.encoding) };
+        return .{ .doc = doc, .an = an, .index = index, .offset = 0 };
+    }
+
+    /// `analysed`, with the cursor position converted to a byte offset.
+    fn cursor(self: *Server, id: jsonrpc.Id, uri: []const u8, pos: position.Position, out: *Outbox) Error!?Cursor {
+        var c = (try self.analysed(id, uri, out)) orelse return null;
+        c.offset = c.index.toOffset(c.an.source, pos, self.encoding);
+        return c;
     }
 
     fn definition(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
@@ -352,6 +365,161 @@ pub const Server = struct {
         try out.result(id, protocol.CompletionList{ .items = list });
     }
 
+    // ---- syntax: tokens, outline, folds, selections (doc 74 §7.1) ----------
+
+    /// LSP's delta encoding: each token is `deltaLine, deltaStart, length, type,
+    /// modifiers`, where `deltaStart` is relative to the previous token's start
+    /// only when they share a line. A token spanning lines goes out as one piece
+    /// per line, each clipped to its line.
+    fn semanticTokens(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.SemanticTokensParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.analysed(id, p.textDocument.uri, out)) orelse return;
+        const toks = try tokens.collect(a, c.an, self.known_globals);
+        var data: std.ArrayList(u32) = .empty;
+        var cur = position.Cursor.init(c.index, c.an.source, self.encoding);
+        var prev_line: u32 = 0;
+        var prev_start: u32 = 0;
+        for (toks) |t| {
+            var s = t.span.start;
+            while (true) {
+                const from = cur.positionOf(s);
+                const e = @min(t.span.end, c.index.lineEnd(c.an.source, from.line));
+                if (e > s) {
+                    const to = cur.positionOf(e);
+                    const delta_start = if (from.line == prev_line) from.character - prev_start else from.character;
+                    try data.appendSlice(a, &[_]u32{
+                        from.line - prev_line,
+                        delta_start,
+                        to.character - from.character,
+                        @intFromEnum(t.kind),
+                        t.modifiers,
+                    });
+                    prev_line = from.line;
+                    prev_start = from.character;
+                }
+                if (e >= t.span.end) break;
+                s = c.index.lineStart(from.line + 1);
+            }
+        }
+        try out.result(id, protocol.SemanticTokens{ .data = data.items });
+    }
+
+    fn documentSymbols(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.DocumentSymbolParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.analysed(id, p.textDocument.uri, out)) orelse return;
+        const syms = try syntax.symbols(a, c.an.tree.root);
+        try out.result(id, try self.symbolList(a, c.index, c.an.source, syms));
+    }
+
+    fn symbolList(
+        self: *Server,
+        a: std.mem.Allocator,
+        index: *const position.LineIndex,
+        text: []const u8,
+        syms: []const syntax.Symbol,
+    ) Error![]const protocol.DocumentSymbol {
+        const list = try a.alloc(protocol.DocumentSymbol, syms.len);
+        for (syms, list) |s, *slot| {
+            slot.* = .{
+                .name = s.name,
+                .kind = switch (s.kind) {
+                    .function => protocol.SymbolKind.function,
+                    .method => protocol.SymbolKind.method,
+                    .variable => protocol.SymbolKind.variable,
+                    .field => protocol.SymbolKind.field,
+                    .object => protocol.SymbolKind.object,
+                },
+                .range = index.toRange(text, s.range.start, s.range.end, self.encoding),
+                .selectionRange = index.toRange(text, s.selection.start, s.selection.end, self.encoding),
+                .children = if (s.children.len == 0) null else try self.symbolList(a, index, text, s.children),
+            };
+        }
+        return list;
+    }
+
+    fn foldingRanges(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.FoldingRangeParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.analysed(id, p.textDocument.uri, out)) orelse return;
+        var list: std.ArrayList(protocol.FoldingRange) = .empty;
+        for (try syntax.nodes(a, c.an.tree.root)) |n| {
+            if (n.foldable) try appendFold(&list, a, c.index, n.span, null);
+        }
+        for (c.an.comments) |cm| {
+            if (cm.block) try appendFold(&list, a, c.index, .{ .start = cm.start, .end = cm.end }, "comment");
+        }
+        try out.result(id, list.items);
+    }
+
+    /// A fold over `span`. The closing line stays visible (the `end` or `}`),
+    /// so the fold runs from the line after the opening one to the line before
+    /// the closing one, and nothing is folded when no line lies between.
+    fn appendFold(
+        list: *std.ArrayList(protocol.FoldingRange),
+        a: std.mem.Allocator,
+        index: *const position.LineIndex,
+        span: ast.Span,
+        kind: ?[]const u8,
+    ) Error!void {
+        if (span.end <= span.start) return;
+        const first = index.lineOf(span.start);
+        const last = index.lineOf(span.end - 1);
+        if (last <= first + 1) return;
+        try list.append(a, .{ .startLine = first, .endLine = last - 1, .kind = kind });
+    }
+
+    fn selectionRanges(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.SelectionRangeParams, a, params) catch |e| return self.badParams(id, e, out);
+        const c = (try self.analysed(id, p.textDocument.uri, out)) orelse return;
+        const ns = try syntax.nodes(a, c.an.tree.root);
+        const results = try a.alloc(protocol.SelectionRange, p.positions.len);
+        for (p.positions, results) |pos, *slot| {
+            const offset = c.index.toOffset(c.an.source, pos, self.encoding);
+            // Every range around the position: the file, each node, each name.
+            var spans: std.ArrayList(ast.Span) = .empty;
+            try spans.append(a, .{ .start = 0, .end = @intCast(c.an.source.len) });
+            for (ns) |n| {
+                if (encloses(n.span, offset)) try spans.append(a, n.span);
+            }
+            for (c.an.res.occurrences.items) |o| {
+                if (encloses(o.span, offset)) try spans.append(a, o.span);
+            }
+            slot.* = try selectionChain(a, c.index, c.an.source, spans.items, self.encoding);
+        }
+        try out.result(id, results);
+    }
+
+    fn encloses(span: ast.Span, offset: u32) bool {
+        return span.end > span.start and span.start <= offset and offset <= span.end;
+    }
+
+    /// The chain for one position, innermost first. `spans` holds every range
+    /// around it, in any order; equal ranges collapse to one step.
+    fn selectionChain(
+        a: std.mem.Allocator,
+        index: *const position.LineIndex,
+        text: []const u8,
+        spans: []ast.Span,
+        enc: position.Encoding,
+    ) Error!protocol.SelectionRange {
+        // Largest first, so each range is built before the one inside it.
+        std.mem.sort(ast.Span, spans, {}, struct {
+            fn larger(_: void, x: ast.Span, y: ast.Span) bool {
+                const lx = x.end - x.start;
+                const ly = y.end - y.start;
+                if (lx != ly) return lx > ly;
+                return x.start < y.start;
+            }
+        }.larger);
+        var parent: ?*const protocol.SelectionRange = null;
+        for (spans, 0..) |s, i| {
+            if (i > 0 and s.start == spans[i - 1].start and s.end == spans[i - 1].end) continue;
+            const node = try a.create(protocol.SelectionRange);
+            node.* = .{ .range = index.toRange(text, s.start, s.end, enc), .parent = parent };
+            parent = node;
+        }
+        return parent.?.*;
+    }
+
     fn badParams(self: *Server, id: jsonrpc.Id, err: anyerror, out: *Outbox) Error!void {
         _ = self;
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -443,7 +611,10 @@ pub const Server = struct {
         self.encoding = if (chosen != null and std.mem.eql(u8, chosen.?, "utf-8")) .utf8 else .utf16;
         self.state = .running;
         try out.result(id, protocol.InitializeResult{
-            .capabilities = .{ .positionEncoding = chosen },
+            .capabilities = .{
+                .positionEncoding = chosen,
+                .semanticTokensProvider = .{ .legend = .{ .tokenTypes = &tokens.token_types, .tokenModifiers = &tokens.token_modifiers } },
+            },
             .serverInfo = .{ .name = server_name },
         });
     }
@@ -1107,8 +1278,166 @@ test "requests: an unopened document is invalid params; initialize advertises th
     const caps = init[0].object.get("result").?.object.get("capabilities").?.object;
     try testing.expect(caps.get("definitionProvider").?.bool);
     try testing.expect(caps.get("renameProvider").?.object.get("prepareProvider").?.bool);
+    try testing.expect(caps.get("semanticTokensProvider").?.object.get("full").?.bool);
+    try testing.expect(caps.get("foldingRangeProvider").?.bool);
     const r = try h.send(1,
         \\{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"nope"},"position":{"line":0,"character":0}}}
     );
     try testing.expectEqual(@as(i64, -32602), errorCode(r[0]));
+}
+
+// ---- syntax over the wire (doc 74 §7.1) ----
+
+/// Open `text` as document "u" and answer one request whose `params` are the
+/// document identifier plus `tail` (more members, starting with a comma).
+fn askWith(h: *Harness, text: []const u8, method: []const u8, tail: []const u8) !json.Value {
+    var buf: [4096]u8 = undefined;
+    const open = try std.fmt.bufPrint(&buf,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"u","version":1,"text":{f}}}}}}}
+    , .{std.json.fmt(text, .{})});
+    _ = try h.send(0, open);
+    var buf2: [1024]u8 = undefined;
+    const req = try std.fmt.bufPrint(&buf2,
+        \\{{"jsonrpc":"2.0","id":7,"method":"{s}","params":{{"textDocument":{{"uri":"u"}}{s}}}}}
+    , .{ method, tail });
+    const r = try h.send(1, req);
+    return r[r.len - 1];
+}
+
+/// The wire's delta encoding, decoded back to absolute
+/// `[line, character, length, type, modifiers]` rows.
+fn absoluteTokens(a: std.mem.Allocator, data: []const json.Value) ![]const [5]i64 {
+    const rows = try a.alloc([5]i64, data.len / 5);
+    var line: i64 = 0;
+    var ch: i64 = 0;
+    for (rows, 0..) |*row, i| {
+        const d = data[i * 5 ..][0..5];
+        const dl = d[0].integer;
+        line += dl;
+        ch = if (dl == 0) ch + d[1].integer else d[1].integer;
+        row.* = .{ line, ch, d[2].integer, d[3].integer, d[4].integer };
+    }
+    return rows;
+}
+
+test "semantic tokens: the delta encoding, with types, modifiers and the comment" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.known_globals = &.{"print"};
+    try h.open();
+    const r = try askWith(&h, "local x = 1 -- c\nprint(x.y)", "textDocument/semanticTokens/full", "");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const data = r.object.get("result").?.object.get("data").?.array.items;
+    const rows = try absoluteTokens(arena.allocator(), data);
+    const want = [_][5]i64{
+        .{ 0, 0, 5, 0, 0 }, // local
+        .{ 0, 6, 1, 7, 1 }, // x, declared
+        .{ 0, 8, 1, 1, 0 }, // =
+        .{ 0, 10, 1, 2, 0 }, // 1
+        .{ 0, 12, 4, 4, 0 }, // -- c
+        .{ 1, 0, 5, 7, 2 }, // print, a built-in
+        .{ 1, 6, 1, 7, 0 }, // x
+        .{ 1, 7, 1, 1, 0 }, // .
+        .{ 1, 8, 1, 8, 0 }, // y, a property
+    };
+    try testing.expectEqualSlices([5]i64, &want, rows);
+}
+
+test "semantic tokens: a long string spanning lines is one piece per line" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const r = try askWith(&h, "local s = [[a\nb]]", "textDocument/semanticTokens/full", "");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rows = try absoluteTokens(arena.allocator(), r.object.get("result").?.object.get("data").?.array.items);
+    try testing.expectEqualSlices([5]i64, &.{
+        .{ 0, 0, 5, 0, 0 },
+        .{ 0, 6, 1, 7, 1 },
+        .{ 0, 8, 1, 1, 0 },
+        .{ 0, 10, 3, 3, 0 },
+        .{ 1, 0, 3, 3, 0 },
+    }, rows);
+}
+
+test "folding: multi-line statements, tables and block comments keep their closing line" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const text = "if x then\n  print(1)\nend\nlocal t = {\n  a = 1,\n}\n--[[ a\nb\nc ]]\n";
+    const r = try askWith(&h, text, "textDocument/foldingRange", "");
+    const folds = r.object.get("result").?.array.items;
+    try testing.expectEqual(@as(usize, 3), folds.len);
+    try testing.expectEqual(@as(i64, 0), folds[0].object.get("startLine").?.integer);
+    try testing.expectEqual(@as(i64, 1), folds[0].object.get("endLine").?.integer);
+    try testing.expectEqual(@as(i64, 3), folds[1].object.get("startLine").?.integer);
+    try testing.expectEqual(@as(i64, 4), folds[1].object.get("endLine").?.integer);
+    try testing.expectEqualStrings("comment", folds[2].object.get("kind").?.string);
+    try testing.expectEqual(@as(i64, 6), folds[2].object.get("startLine").?.integer);
+    try testing.expectEqual(@as(i64, 7), folds[2].object.get("endLine").?.integer);
+}
+
+test "document symbols: the outline nests functions and table fields" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const text = "local M = {\n  add = function(a) return a end,\n  n = 1,\n}\nfunction M.run(x) local y = 2 end\nlocal function f() end";
+    const r = try askWith(&h, text, "textDocument/documentSymbol", "");
+    const top = r.object.get("result").?.array.items;
+    try testing.expectEqual(@as(usize, 3), top.len);
+    try testing.expectEqualStrings("M", top[0].object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 19), top[0].object.get("kind").?.integer);
+    try testing.expectEqualStrings("M.run", top[1].object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 12), top[1].object.get("kind").?.integer);
+    try testing.expectEqualStrings("f", top[2].object.get("name").?.string);
+
+    const fields = top[0].object.get("children").?.array.items;
+    try testing.expectEqualStrings("add", fields[0].object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 12), fields[0].object.get("kind").?.integer);
+    try testing.expectEqual(@as(i64, 8), fields[1].object.get("kind").?.integer);
+    // The selection is the name, inside the whole declaration.
+    const sel = fields[1].object.get("selectionRange").?.object.get("start").?.object;
+    try testing.expectEqual(@as(i64, 2), sel.get("line").?.integer);
+    try testing.expectEqual(@as(i64, 2), sel.get("character").?.integer);
+    try testing.expect(top[1].object.get("children") != null);
+    try testing.expectEqualStrings("y", top[1].object.get("children").?.array.items[0].object.get("name").?.string);
+}
+
+test "selection ranges: the chain from the name outwards, each range containing the last" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const r = try askWith(&h, "local x = f(a.b)", "textDocument/selectionRange", ",\"positions\":[{\"line\":0,\"character\":14}]");
+    var node = r.object.get("result").?.array.items[0].object;
+    var count: usize = 0;
+    var inner_start: i64 = 12;
+    var inner_end: i64 = 15;
+    while (true) {
+        count += 1;
+        const range = node.get("range").?.object;
+        const start = range.get("start").?.object.get("character").?.integer;
+        const end = range.get("end").?.object.get("character").?.integer;
+        try testing.expect(start <= inner_start and inner_end <= end);
+        inner_start = start;
+        inner_end = end;
+        node = (node.get("parent") orelse break).object;
+    }
+    // `a.b`, the call `f(a.b)`, and the statement, which is also the file.
+    try testing.expectEqual(@as(usize, 3), count);
+}
+
+test "syntax requests answer on damaged text, and for an unopened document" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const r = try askWith(&h, "local x =", "textDocument/semanticTokens/full", "");
+    try testing.expect(r.object.get("result") != null);
+    const r2 = try askWith(&h, "local x =", "textDocument/documentSymbol", "");
+    try testing.expect(r2.object.get("result") != null);
+    h.server.docs.close("u");
+    const bad = try h.send(2,
+        \\{"jsonrpc":"2.0","id":9,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":"nope"}}}
+    );
+    try testing.expectEqual(@as(i64, -32602), errorCode(bad[0]));
 }

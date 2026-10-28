@@ -157,6 +157,30 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, text: []const u8, reps: usize) !St
     return r;
 }
 
+/// One syntax request (doc 74 §7.1) answered on an open, analysed document:
+/// the request in, the encoded response out, best of `reps`.
+fn requestNs(gpa: std.mem.Allocator, io: std.Io, text: []const u8, method: []const u8, reps: usize) !u64 {
+    var core = server.Server.init(gpa, .{});
+    defer core.deinit();
+    core.known_globals = &mahina.interp.builtin_global_names;
+    var out = server.Outbox.init(gpa);
+    defer out.deinit();
+    try open(gpa, &core, &out, text);
+
+    const body = try std.fmt.allocPrint(gpa, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"{s}\",\"params\":{{\"textDocument\":{{\"uri\":\"file:///bench.mh\"}}}}}}", .{method});
+    defer gpa.free(body);
+    var best: u64 = std.math.maxInt(u64);
+    for (0..reps) |_| {
+        out.reset();
+        const t0 = now(io);
+        try core.handle(0, body, &out);
+        const t1 = now(io);
+        if (out.messages().len != 1) return error.NoResponse;
+        best = @min(best, @as(u64, @intCast(t1 - t0)));
+    }
+    return best;
+}
+
 /// A change in, the encoded `publishDiagnostics` out: the budget's own
 /// measurement. The edit replaces the whole text; the debounce is not waited.
 fn endToEnd(gpa: std.mem.Allocator, io: std.Io, text: []const u8, reps: usize) !u64 {
@@ -313,6 +337,22 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
             @as(f64, @floatFromInt(s.peak)) / (1024.0 * 1024.0),
             s.allocs,
             s.diags,
+        });
+    }
+
+    mahina.io.print(
+        \\
+        \\syntax requests on an open, analysed document (doc 74 §7.1; best of N, ms)
+        \\
+        \\{s: <30} {s: >9} {s: >14} {s: >10} {s: >10}
+        \\
+    , .{ "case", "bytes", "semanticTokens", "folding", "symbols" });
+    for (cases.items[0..3]) |c| {
+        const tokens_ns = try requestNs(gpa, io, c.text, "textDocument/semanticTokens/full", c.reps);
+        const folds_ns = try requestNs(gpa, io, c.text, "textDocument/foldingRange", c.reps);
+        const symbols_ns = try requestNs(gpa, io, c.text, "textDocument/documentSymbol", c.reps);
+        mahina.io.print("{s: <30} {d: >9} {d: >14.2} {d: >10.2} {d: >10.2}\n", .{
+            c.name, c.text.len, ms(tokens_ns), ms(folds_ns), ms(symbols_ns),
         });
     }
 

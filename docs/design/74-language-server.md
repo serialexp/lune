@@ -172,6 +172,26 @@ land; move whole phases to Done once everything inside them is checked.
     `changes` (what `@codemirror/lsp-client` reads). Verified in the viz
     editor: completion list, F2 rename.
 
+  - [x] P4 syntactic features (§7.1) and the trivia sink (§6.5):
+    `lexer.Trivia` records each skipped comment (`Comment`: bytes, block,
+    closed), passed through `parser.parseTrivia` and `tokenizeTrivia`;
+    `Analysis.comments` keeps them. `src/lsp/tokens.zig` classifies each
+    token from the lexer and the resolver's occurrences (keyword, operator,
+    number, string, comment, function, parameter, variable with
+    `declaration`/`defaultLibrary`, property for a name with no binding).
+    `src/lsp/syntax.zig` gives folding nodes, the document outline (functions,
+    methods, locals, table constructors and their fields, plain blocks
+    flattened into their enclosing list), and the spans selection ranges
+    chain. Multi-line folds keep their closing `end`/`}` line visible.
+    Budget (Rule #20, the same as the keystroke budget since editors ask on
+    every change): semantic tokens and the outline ≤ 10 ms at 10k lines,
+    ≤ 100 ms at 100k. `zig build bench-lsp` (the "syntax requests" table)
+    measured them at 3.4 / 3.2 ms (10k) and 38 / 35 ms (100k) under a load
+    average of 5–9. Folding is 0.6 ms (10k). The fix that brought tokens from
+    7.1 to 3.4 ms at 10k: the occurrence and line lookups walk forward with the
+    sorted tokens instead of searching per token (`position.Cursor` now steps
+    over lines too).
+
 ### Outstanding
 
 - [ ] **Bench follow-ups:** the 100k-line budget miss (check dominates); the
@@ -181,11 +201,15 @@ land; move whole phases to Done once everything inside them is checked.
   warning says so) until P6 has a workspace; completion after `.`/`:` waits
   for P5; a `local x =` with a missing value still offers `x` right after
   the `=` (the parser cannot say where the missing value would end);
-  `contextAt` lexes from the start per completion request (replace with
-  the P4 trivia sink); no completion/definition bench yet.
-- [ ] **P4 — syntactic features** (§7.1): semantic tokens (with comments
-  from the trivia sink and locals vs globals from the resolver), document
-  symbols, folding ranges (incl. comments), selection ranges.
+  `contextAt` now takes its comments from the trivia sink, but still lexes
+  from the start per completion request; no completion/definition bench yet.
+- [ ] **P4 follow-ups:** semantic tokens are full-document only (no
+  `range` or `delta` requests); multi-line tokens are always split per line,
+  whatever `multilineTokenSupport` says; consecutive line comments do not fold
+  (only block comments do); selection ranges come from AST spans and the
+  resolver's name tokens, so a name's parent is its statement, not the list it
+  sits in; `contextAt` still lexes from the start per completion request (its
+  comments now come from the sink).
 - [ ] **P5 — stdlib knowledge** (§7.3): hover, `lib.` member completion,
   signature help from the generated table.
 - [ ] **P6 — cross-file** (§7.4): `require` resolution mirroring

@@ -42,6 +42,16 @@ pub const CompletionOptions = struct {
     resolveProvider: bool = false,
 };
 
+pub const SemanticTokensLegend = struct {
+    tokenTypes: []const []const u8,
+    tokenModifiers: []const []const u8,
+};
+
+pub const SemanticTokensOptions = struct {
+    legend: SemanticTokensLegend,
+    full: bool = true,
+};
+
 pub const ServerCapabilities = struct {
     /// Omitted when the client offered no encodings (then UTF-16 is implied).
     positionEncoding: ?[]const u8 = null,
@@ -51,6 +61,10 @@ pub const ServerCapabilities = struct {
     documentHighlightProvider: bool = true,
     renameProvider: RenameOptions = .{},
     completionProvider: CompletionOptions = .{},
+    semanticTokensProvider: ?SemanticTokensOptions = null,
+    documentSymbolProvider: bool = true,
+    foldingRangeProvider: bool = true,
+    selectionRangeProvider: bool = true,
 };
 
 pub const ServerInfo = struct {
@@ -211,6 +225,58 @@ pub const CompletionItem = struct {
 pub const CompletionList = struct {
     isIncomplete: bool = false,
     items: []const CompletionItem,
+};
+
+// ---- syntax (doc 74 §7.1) ---------------------------------------------------
+
+pub const SemanticTokensParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+/// The delta encoding of LSP: five integers per token, see `server.zig`.
+pub const SemanticTokens = struct {
+    data: []const u32,
+};
+
+pub const DocumentSymbolParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+pub const SymbolKind = struct {
+    pub const method: u8 = 6;
+    pub const field: u8 = 8;
+    pub const function: u8 = 12;
+    pub const variable: u8 = 13;
+    pub const object: u8 = 19;
+};
+
+pub const DocumentSymbol = struct {
+    name: []const u8,
+    kind: u8,
+    range: Range,
+    selectionRange: Range,
+    children: ?[]const DocumentSymbol = null,
+};
+
+pub const FoldingRangeParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+pub const FoldingRange = struct {
+    startLine: u32,
+    endLine: u32,
+    kind: ?[]const u8 = null,
+};
+
+pub const SelectionRangeParams = struct {
+    textDocument: TextDocumentIdentifier,
+    positions: []const Position,
+};
+
+/// A position's chain of enclosing ranges: this one, then its `parent`.
+pub const SelectionRange = struct {
+    range: Range,
+    parent: ?*const SelectionRange = null,
 };
 
 // ---- window ----------------------------------------------------------------
