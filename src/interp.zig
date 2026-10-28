@@ -5102,6 +5102,18 @@ pub const Vm = struct {
 
     /// General dispatch: `pc` is an arbitrary target (jump, frame reload,
     /// chain entry), so derive the fetch pointer from the cached image.
+    /// Dispatch at the pc a trace completion hands back to tier-0. A
+    /// `call_interp` terminal files a continuation anchor
+    /// (`noteHostCallTerminal`) that only a `.full` prologue can arm, so
+    /// `.fast` parks and flips first.
+    inline fn resumeTier0(comptime mode: ExecMode, st: *ExecState, pc: usize, vm: *Vm) HandlerResult {
+        if (mode == .fast and vm.trace.pending_ret_anchor != null) {
+            st.frame.pc = pc;
+            return .switch_mode;
+        }
+        return dispatchTail(mode, st, pc, vm);
+    }
+
     inline fn dispatchTail(comptime mode: ExecMode, st: *ExecState, pc: usize, vm: *Vm) HandlerResult {
         // Lanes re-derived from `st.regs` — the authoritative window for an
         // arbitrary target (post-reload, post-epilogue); identical reads to
@@ -5737,6 +5749,7 @@ pub const Vm = struct {
                     // Verbatim the scalar terminal consumer's receipt: one
                     // completed head run, productive (clears penalty/gate).
                     ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
+                    self.noteHostCallTerminal(term);
                     ts.noteHeadSiblingCompletion(.{ .proto = owner.code.anchor.proto, .pc = owner.code.anchor.pc, .proto_id = owner.code.anchor.proto_id }, owner.id);
                     self.consumeHeadWalkFail(owner.id);
                     return .{ .resume_tier0 = @intCast(term.aux) };
@@ -5917,6 +5930,7 @@ pub const Vm = struct {
                     const term = owner.code.instrs[row.exit];
                     ts.dbg("pushed-descent terminal: pushed={d} rows={d} final t={d} resume={d}", .{ result.pushed_frames, ledger_len, owner.id, term.aux });
                     ts.onSideExitReceipt(owner, 1, row.exit, 1, .deferred, .entered);
+                    self.noteHostCallTerminal(term);
                     // D12a: want retirement moved to the single funnel above
                     // (keyed on the ENTERED trace, round-6 change 5 — a second
                     // call here would double-fire with a different id).
@@ -6210,6 +6224,7 @@ pub const Vm = struct {
             // removals no-op on empty maps — leaving exactly these two calls.
             ts.accountTraceRun(ct, 1);
             trace.TraceState.accountCandidateCharge(ct, .entered);
+            self.noteHostCallTerminal(term);
             // Doc 44 D8: a completion by a NON-source sibling retires a
             // standing head-sibling want.
             ts.noteHeadSiblingCompletion(.{ .proto = ct.code.anchor.proto, .pc = ct.code.anchor.pc, .proto_id = ct.code.anchor.proto_id }, ct.id);
@@ -6376,6 +6391,16 @@ pub const Vm = struct {
         }
         if (mode == .full and self.runFastPath()) return .{ .switch_mode_at = p };
         return .{ .resume_tier0 = p };
+    }
+
+    /// Trace stitching (doc 44): a `.terminal(call_interp)` completed; tier-0
+    /// resumes AT the host call (`term.aux`) and performs it. File the
+    /// continuation anchor after it, on the frame that runs the call.
+    noinline fn noteHostCallTerminal(self: *Vm, term: trace.IrInstr) void {
+        if (term.a != @intFromEnum(trace.trace_ir.TerminalKind.call_interp)) return;
+        const top = &self.frames[self.depth - 1];
+        if (top.ctl.protect != .none) return;
+        self.trace.onHostCallTerminal(top.closure.proto, @intCast(term.aux), top.base, top.call_seq, self.cachedCodeFor(top, top.closure.proto));
     }
 
     fn enterSelectedTrace(
@@ -6794,6 +6819,7 @@ pub const Vm = struct {
                 // successes could never un-earn — exactly the str_gmatch
                 // starvation shape). One completed head run = one iteration.
                 self.trace.onSideExitReceipt(final, 1, result.exit_instr, 1, .deferred, .entered);
+                self.noteHostCallTerminal(term);
                 // Doc 44 D8: a completion by a NON-source sibling retires a
                 // standing head-sibling want (clear + DONE-latch the raising
                 // exit) — the walk only reached this trace past the source's
@@ -7515,6 +7541,14 @@ pub const Vm = struct {
             directive = .next_candidate;
         } else if (one_shot) {
             all_nonnative_declines = false;
+            directive = if (self.headEpisodeQuiet(ct)) |nt|
+                self.enterHeadNativeQuiet(ct, nt, closure, proto, regs, base)
+            else
+                self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+        } else if (ct.code.endsInTerminal()) {
+            // Trace stitching (doc 44): a loop root that ends at a host call
+            // is a one-shot episode like a head: the lean entry when nothing
+            // could observe it. Its sibling walk stays the loop grammar's.
             directive = if (self.headEpisodeQuiet(ct)) |nt|
                 self.enterHeadNativeQuiet(ct, nt, closure, proto, regs, base)
             else
@@ -8741,7 +8775,7 @@ pub const Vm = struct {
                 }
                 return dispatchTail(mode, st, npc, vm);
             },
-            .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
+            .resume_tier0 => |rpc| return resumeTier0(mode, st, rpc, vm),
             .switch_mode_at => |rpc| {
                 st.frame.pc = rpc;
                 return .switch_mode;
@@ -8833,7 +8867,7 @@ pub const Vm = struct {
                         }
                         return dispatchTail(mode, st, npc, vm);
                     },
-                    .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
+                    .resume_tier0 => |rpc| return resumeTier0(mode, st, rpc, vm),
                     .switch_mode_at => |rpc| {
                         st.frame.pc = rpc;
                         return .switch_mode;
@@ -8943,7 +8977,7 @@ pub const Vm = struct {
                     // both are ordinary tier-0 dispatches. pc 0 re-dispatch
                     // cannot loop: a failed entry returns `.next_candidate`
                     // (handled above), never `.resume_tier0(0)`.
-                    .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
+                    .resume_tier0 => |rpc| return resumeTier0(mode, st, rpc, vm),
                     .switch_mode_at => |rpc| {
                         st.frame.pc = rpc;
                         return .switch_mode;
@@ -9043,7 +9077,7 @@ pub const Vm = struct {
                         }
                         return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
                     },
-                    .resume_tier0 => |rpc| return dispatchTail(mode, st, rpc, vm),
+                    .resume_tier0 => |rpc| return resumeTier0(mode, st, rpc, vm),
                     .switch_mode_at => |rpc| {
                         st.frame.pc = rpc;
                         return .switch_mode;
@@ -10686,7 +10720,12 @@ pub const Vm = struct {
                     }
                     switch (directive) {
                         .next_candidate => {},
-                        .resume_tier0 => |npc| return .{ .dispatch_at = npc },
+                        .resume_tier0 => |npc| {
+                            // A `call_interp` terminal filed a continuation
+                            // anchor: only a `.full` prologue can arm it.
+                            if (mode == .fast and self.trace.pending_ret_anchor != null) return .{ .switch_mode_at = npc };
+                            return .{ .dispatch_at = npc };
+                        },
                         .switch_mode_at => |npc| return .{ .switch_mode_at = npc },
                         // Doc 44 D11: only head pages emit the push epilogue.
                         .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),

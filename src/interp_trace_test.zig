@@ -5068,7 +5068,7 @@ test "recorder (head, doc 44 P0): fib-shaped recursion records a head trace clos
                 switch (@as(trace.trace_ir.TerminalKind, @enumFromInt(@as(u16, @intCast(last.a))))) {
                     .self_call_interp => saw_cont_self_call = true,
                     .return_interp => saw_cont_return = true,
-                    .call_interp => return error.TestUnexpectedResult, // no host calls in fib
+                    .call_interp, .backedge_interp => return error.TestUnexpectedResult, // no host calls or loops in fib
                 }
             },
             .loop => return error.TestUnexpectedResult, // no loops in this program
@@ -8367,4 +8367,108 @@ test "generic for: the ctrl pin survives a collection inside the recorded iterat
         \\
     , &sink, true, .record_execute_native, .{ .record_aborts = true, .inspect = Inspect.run });
     try testing.expectEqualStrings("300\t750\n", sink.buffered());
+}
+
+/// How many cached traces end in terminal `kind`.
+fn countTerminals(vm: *Vm, kind: trace.trace_ir.TerminalKind) usize {
+    var n: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        const k = t.code.instrs.len;
+        if (k == 0 or t.code.instrs[k - 1].op != .terminal) continue;
+        if (t.code.instrs[k - 1].a == @intFromEnum(kind)) n += 1;
+    }
+    return n;
+}
+
+const stitch_inspect = struct {
+    fn inspect(vm: *Vm, mode: util.TraceMode) !void {
+        if (mode != .record_execute_native or vm.heap.gc_stress or
+            !@import("nativegen.zig").is_x64_linux) return;
+        // The loop root ends at the host call, the continuation after it
+        // ends at the loop's back-edge; both ran as traces.
+        try testing.expect(countTerminals(vm, .call_interp) >= 1);
+        try testing.expect(countTerminals(vm, .backedge_interp) >= 1);
+        try testing.expect(vm.trace.native_entries > 100);
+    }
+}.inspect;
+
+test "doc 44 stitching: a numeric-for loop with a host call splits into a root and a continuation" {
+    try util.expectProgramTuned(
+        \\local fmt = string.format
+        \\local function run(n)
+        \\  local acc, x = 0, 0.5
+        \\  for i = 1, n do
+        \\    x = x * 0.5 + i * 0.25
+        \\    local s = fmt("%d|%d", i, i * 2)
+        \\    acc = acc + #s
+        \\    x = x + acc * 0.001
+        \\  end
+        \\  return acc, x
+        \\end
+        \\print(run(1000))
+    , "7341\t514.165\n", .{ .hotguard = 2, .hotloop = 4, .minstitch = 0, .inspect = stitch_inspect });
+}
+
+test "doc 44 stitching: two host calls in one iteration chain through two continuations" {
+    try util.expectProgramTuned(
+        \\local fmt, sub = string.format, string.sub
+        \\local function run(n)
+        \\  local acc, x = 0, 1.5
+        \\  for i = 1, n do
+        \\    x = x * 0.5 + i
+        \\    local s = fmt("%d", i)
+        \\    x = x + #s
+        \\    local c = sub(s, 1, 2)
+        \\    acc = acc + #c
+        \\    x = x * 0.25
+        \\  end
+        \\  return acc, x
+        \\end
+        \\print(run(1000))
+    , "1991\t286.78061224489795\n", .{ .hotguard = 2, .hotloop = 4, .minstitch = 0, .inspect = stitch_inspect });
+}
+
+test "doc 44 stitching: the callee rebinds, the host call raises, the host call mutates what the trace read" {
+    // The terminal closes before any callee guard (tier-0 calls whatever is
+    // in the slot); a raise leaves the stitched halves cleanly; a callback
+    // that writes a table the continuation then reads is seen, because the
+    // continuation is entered after the call, never with pre-call values.
+    try util.expectProgramTuned(
+        \\local t = {0, 0, 0}
+        \\local function bump(k) t[1] = t[1] + k; return t[1] end
+        \\local f = bump
+        \\local acc, x = 0, 0.0
+        \\for i = 1, 600 do
+        \\  x = x * 0.5 + i
+        \\  if i == 300 then f = function(k) return k * 2 end end
+        \\  local r = f(i)
+        \\  acc = acc + r + t[1]
+        \\  x = x + r * 0.5
+        \\end
+        \\print(acc, x)
+        \\local function boom(i)
+        \\  local s = 0.5
+        \\  for k = 1, 400 do
+        \\    s = s * 0.5 + k
+        \\    local v = string.rep("a", k < 390 and 2 or {})
+        \\    s = s + #v
+        \\  end
+        \\  return s
+        \\end
+        \\print((pcall(boom, 1)))
+    , "22770650\t2396\nfalse\n", .{ .hotguard = 2, .hotloop = 4, .minstitch = 0 });
+}
+
+test "doc 44 stitching: minstitch keeps a short body in tier-0" {
+    try util.expectProgramTuned(
+        \\local fmt = string.format
+        \\local acc = 0
+        \\for i = 1, 600 do acc = acc + #fmt("%d", i) end
+        \\print(acc)
+    , "1692\n", .{ .hotguard = 2, .hotloop = 4, .inspect = &struct {
+        fn inspect(vm: *Vm, mode: util.TraceMode) !void {
+            _ = mode;
+            try testing.expectEqual(@as(usize, 0), countTerminals(vm, .call_interp));
+        }
+    }.inspect });
 }

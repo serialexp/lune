@@ -118,6 +118,13 @@ pub const PendingRetAnchor = struct {
     call_seq: u64,
     /// A1' (doc 45 / task 27): ordinary-probe request — see PendingCallAnchor.
     force_ordinary: bool = false,
+    /// Trace stitching (doc 44): the pending was filed by a `call_interp`
+    /// terminal, so tier-0 is still about to perform the host call at this
+    /// pc (`resume_pc - 1`). The prologue that reaches the call itself must
+    /// leave the pending standing; the one after it (the resume pc) arms.
+    host_call_pc: u32 = no_host_call,
+
+    pub const no_host_call = std.math.maxInt(u32);
 };
 pub const isHeadAnchorPc = trace_code.isHeadAnchorPc;
 pub const AnchorPcKind = trace_code.AnchorPcKind;
@@ -463,6 +470,10 @@ pub const TraceConfig = struct {
     /// loop iterations a side or continuation recording may unroll — loops it
     /// goes round without linking to a root — before aborting `.loop_unroll`.
     loopunroll: u8 = 15,
+    /// LuaJIT's `minstitch` (see `RecordingSession.Options.minstitch`).
+    /// Measured break-even: a stitched half costs ~460 instructions of
+    /// entry/exit, a traced IR instruction saves ~8–10 over tier-0.
+    minstitch: u32 = 48,
     /// Back-edge count at which a loop header becomes a trace anchor.
     hotloop: u32 = 56,
     /// Doc 44: call count at which a Lua function head becomes a trace anchor.
@@ -3576,7 +3587,7 @@ pub const TraceState = struct {
     /// frame; recording proper begins at the next dispatch-loop iteration (which
     /// is the anchor instruction). On OOM we simply don't arm.
     fn configureRecording(self: *TraceState) void {
-        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .loopunroll = self.config.loopunroll, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
+        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .loopunroll = self.config.loopunroll, .minstitch = self.config.minstitch, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
     }
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
         // In sync on the way in (nothing between two recorded instructions
@@ -3609,6 +3620,7 @@ pub const TraceState = struct {
             self.rec.context.inner_root = inner != null;
             self.rec.context.inner_root_peeled = if (inner) |t| t.code.peeled else false;
             self.rec.context.inner_root_guards = if (inner) |t| t.code.entry_guards else &.{};
+            self.rec.context.loop_traced = self.hasTrace(.{ .proto = proto, .pc = dest, .proto_id = proto.id });
             const leaves = self.lleave_count.get(.{ .proto = proto, .pc = dest, .proto_id = proto.id }) orelse 0;
             const fails = self.unroll_fail.get(self.rec.anchor) orelse 0;
             self.rec.context.unroll_while = leaves >= self.config.lleave_fast_retries or fails < self.config.unroll_fail_flip;
@@ -3719,6 +3731,25 @@ pub const TraceState = struct {
     ///   `stop_depth` path exits `execImpl` before it).
     /// `opRet` calls it only with tracing enabled.
     pub fn onRetResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
+        self.noteResume(proto, resume_pc, base, call_seq, img, null);
+    }
+
+    /// Trace stitching (doc 44): a `call_interp` terminal exited at the host
+    /// call `call_pc`; tier-0 performs it next, then resumes at `call_pc + 1`.
+    /// That resume pc is counted toward a continuation anchor exactly as a
+    /// Lua return into it is (`onRetResume`), and the armed recording starts
+    /// there once the call is done. `base`/`call_seq` are the frame running
+    /// the call.
+    pub fn onHostCallTerminal(self: *TraceState, proto: *const Proto, call_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
+        if (!self.config.enabled) return;
+        // A call whose result is returned at once (`return f(x)`'s tail, a
+        // recursion's base case) has no continuation worth a trace; refuse
+        // before the counter, which would otherwise be hashed per exit.
+        if (call_pc + 1 < proto.code.len and proto.code[call_pc + 1].op == .ret) return;
+        self.noteResume(proto, call_pc + 1, base, call_seq, img, call_pc);
+    }
+
+    fn noteResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr, host_call_pc: ?u32) void {
         std.debug.assert(self.config.enabled);
         // A recording owns the stream; don't compete. Suspended (doc 63
         // §5.9): as `onCallEntry`, one `fast_block` test for both.
@@ -3750,7 +3781,7 @@ pub const TraceState = struct {
         // terminal would resume at its own patched pc (`.self_terminal`).
         // Refused at the threshold, so no other return pays the test.
         if (proto.code[resume_pc].op == .ret) return;
-        self.setPendingRetAnchor(.{ .proto = proto, .resume_pc = resume_pc, .base = base, .call_seq = call_seq });
+        self.setPendingRetAnchor(.{ .proto = proto, .resume_pc = resume_pc, .base = base, .call_seq = call_seq, .host_call_pc = host_call_pc orelse PendingRetAnchor.no_host_call });
     }
 
     /// Doc 44 D12b: deterministic cont entry-patch recovery (`maybeRepatchHead`
@@ -3772,6 +3803,9 @@ pub const TraceState = struct {
     /// self-cleaning as the head consumer.
     pub fn maybeStartCont(self: *TraceState, proto: *const Proto, pc: u32, base: usize, call_seq: u64) bool {
         const pending = self.pending_ret_anchor orelse return false;
+        // Stitching: the prologue of the host call itself keeps the pending
+        // (same activation); any other instruction discards it as ever.
+        if (pending.host_call_pc == pc and pending.proto == proto and pending.call_seq == call_seq and pending.base == base) return false;
         self.setPendingRetAnchor(null); // consume-or-discard, never linger
         if (pending.proto != proto or pending.resume_pc != pc or pending.call_seq != call_seq or pending.base != base) return false;
         if (self.rec.active) return false;
@@ -4197,7 +4231,10 @@ pub const TraceState = struct {
         // test harness) loop patches are unreachable too — they qualify via
         // receipts, which need traces to run — and a one-shot patch must not
         // become the one path that runs a trace anyway.
-        if (self.config.execute and anchorKind(t.code.anchor.pc) != .loop) {
+        // A loop root that ends in a terminal (a stitched one) runs once per
+        // entry and never completes the `min_useful` iterations the receipt
+        // funnel qualifies on, so it installs here too.
+        if (self.config.execute and (anchorKind(t.code.anchor.pc) != .loop or t.code.endsInTerminal())) {
             self.registry.entry_registry.markInstallPending(t);
             self.drainEntryPatchWork();
         }

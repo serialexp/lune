@@ -2967,7 +2967,9 @@ pub fn installPending(self: *TraceState, t: *Trace) void {
     // unreachable on every tier-1a leg. The loop-patch rationale (a patch
     // merely SHORTCUTS the walk, so only pay for it when native is ready)
     // does not transfer.
-    if (t.native != .compiled and trace_mod.anchorKind(t.code.anchor.pc) == .loop) {
+    // A loop root that ends in a terminal (stitching) is one-shot too: its
+    // patch is how it is reached cheaply, and it qualifies at commit.
+    if (t.native != .compiled and trace_mod.anchorKind(t.code.anchor.pc) == .loop and !t.code.endsInTerminal()) {
         t.entry_patch = .suppressed_permanent;
         return;
     }

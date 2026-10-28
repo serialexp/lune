@@ -8,6 +8,7 @@ continuation and call-head links. The final seven-rep board measures fib
 185.7 ms (pre-D12c 402.8 ms) and binary-trees 394.7 ms (425.7 ms).
 Binary-trees still has no native pops: its table-construction and nil-child
 base-case recorder gaps prevent the required return traces from forming.
+Trace stitching at host calls (numeric-for roots, 2026-10-28) landed too.
 Remaining P1/P2/P4 work below is not claimed complete.
 Codex-reviewed ×6 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
@@ -348,19 +349,38 @@ to Done once everything inside a phase is checked.
       reentrant frames", "a host call that raises at a base case unwinds the
       borrowed frames".
 
+- [x] **Trace stitching at host calls — numeric-for roots (2026-10-28).**
+      A `for_loop` root that reaches an untagged host call no longer aborts
+      `host_barrier`: it closes with `call_interp`, tier-0 performs the call,
+      and a `.cont` anchor armed at `call_pc + 1` (counted via `noteResume`,
+      held across the call's own prologue by `PendingRetAnchor.host_call_pc`)
+      records the rest of the iteration up to the `for_loop` back-edge, closing
+      with the new `backedge_interp` terminal; tier-0 runs the back-edge and
+      the patched `jfor_loop` re-enters the root. A `.cont` may also close at
+      a further host call (chaining). Terminal-closed roots install at commit
+      and enter through the quiet one-shot entry. `Config.minstitch` (default
+      48 IR instructions, LuaJIT's name) keeps short bodies in tier-0: each
+      stitched half costs ~460 instructions of entry/exit, break-even ≈ 48.
+      Measured: −27% instructions on a heavy-body loop, cycles flat (the
+      tier-0 re-entry is indirect-branch-mispredict bound); stdlib benches
+      neutral apart from ≤0.8% interp.zig code-layout noise (euler14-bit,
+      identical traces). Tests: four "doc 44 stitching" cases in
+      interp_trace_test. The `.link` route to the root was tried and dropped:
+      it needs a `.loop`-terminated root. Doc 63's direct host calls remain
+      the long-term seam removal; stitching is its §7.1 fallback.
+
 ### Outstanding
 - [ ] **`all_results` windows past the register file.** `return g()` where
       `g` returns more values than the caller has registers (a one-register
       `f`) still aborts `nyi_opcode`: the extra results exist only in tier-0's
       slab scratch. Needs terminal-only outputs through finalize, the
       allocator and both writeback paths (Codex, 2026-10-27).
-- [ ] **`call_interp` for loop roots and inlined depth.** The terminal closes
-      only depth-0 one-shot recordings of a natively recursing anchor. A
-      loop root (or a native call below an inlined callee) still aborts
-      `host_barrier`: LuaJIT's trace stitching (`LJ_TRLINK_STITCH`,
-      `lj_ffrecord.c:110`) would continue the trace after the call instead
-      of ending it, which needs a post-call continuation page and successor
-      entry guards (Codex, 2026-10-28).
+- [ ] **`call_interp` below depth 0, and non-`for_loop` roots.** Numeric-for
+      roots and recursing heads stitch (above). A native call below an
+      inlined callee, and `while`/`tfor_loop` roots (only `for_loop` back-edges
+      are handled), still abort `host_barrier`. Also open: a cheaper
+      tier-0→trace entry and a fused native C→R link (cycles stay flat
+      today).
 - [ ] **Borrowed pops: pcall'd frames.** The walls decline any frame with a
       nonzero `ctl` byte, which includes `pcall`/`xpcall` frames
       (`ctl.protect`). tier-0's `opRet` pops them like any other.

@@ -95,6 +95,9 @@ pub const CapturedOpts = struct {
     /// Doc 57 P3: override `Config.instunroll` (the instability-unroll
     /// budget); null keeps the default.
     instunroll: ?u8 = null,
+    /// Override `Config.minstitch` (the fewest IR instructions a trace needs
+    /// to end at a host call or loop back-edge); null keeps the default.
+    minstitch: ?u32 = null,
     /// Override `Config.silent_promotion_enabled` (doc 56 Phase 6's rowed
     /// vs silent comparisons); null keeps the default.
     silent_promotion: ?bool = null,
@@ -151,6 +154,7 @@ fn configureLeg(vm: *Vm, sink: *io.Writer, stress: bool, mode: TraceMode, opts: 
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
     if (opts.hotexit) |he| vm.trace.config.hotexit = he;
     if (opts.instunroll) |n| vm.trace.config.instunroll = n;
+    if (opts.minstitch) |n| vm.trace.config.minstitch = n;
     if (opts.silent_promotion) |on| vm.trace.config.silent_promotion_enabled = on;
     if (opts.setup) |setup| try setup(vm);
 }

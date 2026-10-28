@@ -925,6 +925,12 @@ pub const TerminalKind = enum(u16) {
     /// time is simply called generically — so, like `self_call_interp`, no
     /// callee pin is needed. Plain terminal exit; no frame motion.
     call_interp = 2,
+    /// A `.cont` trace ends at a depth-0 loop back-edge (`for_loop`) of a loop
+    /// that already has a trace: tier-0 executes the back-edge instruction
+    /// (terminal.aux is its pc), whose patched entry re-enters that loop's
+    /// root. No link machinery: the second half of a stitched iteration
+    /// (doc 44, trace stitching). Plain terminal exit; no frame motion.
+    backedge_interp = 3,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that

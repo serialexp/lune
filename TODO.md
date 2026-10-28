@@ -3608,3 +3608,8 @@ test in `src/interp_phaseq_test.zig` and were dodged there, not fixed.
       one-element `{ p }`, in a side recording. Storing nil (an array
       shrink / hole) seems to have no recorded store shape.
 
+
+- doc 44 stitching follow-ups: while/`tfor_loop` stitched roots; `call_interp`
+  below an inlined depth; pcall'd borrowed pops; `all_results` windows past the
+  register file; cheaper tier-0→trace entry and a fused native C→R link (cycles
+  flat despite −27% instructions); doc 63 Phase 2b/2c supersede this seam.

@@ -1,3 +1,8 @@
+DOC 44 STITCHING: numeric-for roots DONE (2026-10-28, coral-marten), committed, not pushed.
+- A for_loop root stops at an untagged host call (call_interp), a .cont anchor at call_pc+1 records to the back-edge (backedge_interp). Config.minstitch=48 keeps short bodies in tier-0. -27% instructions on heavy bodies, cycles flat (re-entry stalls). Details: doc 44 Done bullet; open items in its Outstanding + TODO.md.
+- Known noise: euler14-bit +0.8% instructions with identical traces (interp.zig layout).
+- Next: doc 63 Phase 2b/2c (direct host calls; stitching is its fallback).
+
 DOC 74 LANGUAGE SERVER: P0 DONE (2026-10-27, coral-raven); P0 wasm host and P1a–P1d (frontend) are next.
 - What exists: `mahina lsp` serves LSP over stdio (src/lsp/: position, jsonrpc,
   protocol, documents, server = the sans-IO core, host_stdio = threads + I/O).

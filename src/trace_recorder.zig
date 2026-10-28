@@ -595,6 +595,12 @@ pub const RecordingSession = struct {
         /// Doc 56 G6-Q1(d): LuaJIT's `loopunroll` (15) — loop iterations a
         /// side or continuation recording may unroll before `.loop_unroll`.
         loopunroll: u8 = 15,
+        /// LuaJIT's `minstitch`: the fewest recorded IR instructions a
+        /// trace needs before it may END at a host call or a loop back-edge
+        /// (`call_interp`, `backedge_interp`). Every stitched half costs a
+        /// tier-0 → trace entry; a shorter one is slower than tier-0 would
+        /// have been, so the recording aborts as it did before stitching.
+        minstitch: u32 = 0,
         optimize: bool = true,
         /// Doc 45 D2: deterministic snapshot admission budgets for PRECISE
         /// recordings. Defaults are the contract values; tests inject smaller
@@ -633,6 +639,10 @@ pub const RecordingSession = struct {
         /// — i.e. it recurses natively, so a trace ending at a host call can
         /// sit in its frame-link chains (`call_interp` gate in `recCall`).
         anchor_recurses: bool = false,
+        /// Set per `for_loop` instruction: the loop it closes already has a
+        /// trace at its header (`.loop` root or a stitched one) — a `.cont`
+        /// recording may end here (`backedge_interp`).
+        loop_traced: bool = false,
         unroll_while: bool = false,
         upval_open: ?usize = null,
         globals_header: ?*const object.GcHeader = null,
@@ -3770,6 +3780,12 @@ pub const RecordingSession = struct {
     }
 
     pub fn recForLoop(self: *RecordingSession, instr: Instr, regs: RegWindow, pc: u32) !void {
+        // Trace stitching: a `.cont` recording reaching the back-edge of a
+        // traced loop ends there; tier-0 runs the `for_loop` and the loop's
+        // patched entry takes the next iteration.
+        if (self.kind == .cont and self.inline_depth == 0 and self.context.loop_traced and self.pending_link_close == null and
+            self.instrs.items.len >= self.options.minstitch)
+            return self.closeHeadTerminal(.backedge_interp, 0);
         const a = instr.a;
         // The back-edge target, computed exactly as the interpreter's
         // `applyJump`.
@@ -4175,7 +4191,7 @@ pub const RecordingSession = struct {
     /// `anchor.pc` (a `.continuation` anchor is a raw pc).
     fn linkKindAt(self: *const RecordingSession, proto: *const Proto, target: u32) trace_ir.LinkKind {
         std.debug.assert(self.inline_depth == 0);
-        const a = self.anchor.pc;
+        const a = trace_code.entryPc(self.anchor.pc);
         const ext = bytecode.loopExtentFor(proto, target) orelse return .inner_root;
         return if (ext.start <= a and a <= ext.end) .enclosing_iteration else .inner_root;
     }
@@ -4338,8 +4354,12 @@ pub const RecordingSession = struct {
                 // is its place in the frame-link chains; for any other
                 // proto it is a prefix-only trace whose episode entry costs
                 // more per call than the few instructions it covers.
-                // Deeper (inlined) calls and loop roots keep the barrier.
-                if (isOneShotKind(self.kind) and self.inline_depth == 0 and self.context.anchor_recurses) {
+                // Trace stitching (LuaJIT's `LJ_TRLINK_STITCH`, adapted): a
+                // numeric-`for` ROOT, or a stitched continuation, ends here
+                // too; the continuation armed after the call carries the
+                // iteration on and links back into the root. Deeper
+                // (inlined) calls keep the barrier.
+                if (self.mayEndAtHostCall() and (self.kind == .head or self.instrs.items.len >= self.options.minstitch)) {
                     if (instr.b == bytecode.all_results)
                         return self.closeDynamicTerminal(.call_interp, @as(u32, instr.a) + 1, multret);
                     return self.closeHeadTerminal(.call_interp, 0);
@@ -5505,13 +5525,36 @@ pub const RecordingSession = struct {
     /// restores `base_off`. The result writes use *absolute* `reg_map` indices (the
     /// caller region is disjoint from and below the callee source region, so a
     /// single forward pass can read source then write dest without a buffer).
+    /// Whether this recording may end at an untagged host call (a
+    /// `call_interp` terminal) rather than abort `host_barrier`: at depth 0
+    /// only, and for
+    /// - a `.head` of a natively recursing anchor (the base-case sibling in
+    ///   its frame-link chains; any other proto's prefix-only trace costs
+    ///   more per entry than it covers),
+    /// - a `.cont` (the chain goes on: tier-0 performs the call and the
+    ///   `call_interp` consumer arms the next continuation after it),
+    /// - a ROOT whose loop is a numeric `for`: the stitched continuation
+    ///   links back into it at the `for_loop`.
+    fn mayEndAtHostCall(self: *const RecordingSession) bool {
+        if (self.inline_depth != 0) return false;
+        return switch (self.kind) {
+            .head => self.context.anchor_recurses,
+            .cont => true,
+            .root => blk: {
+                const ext = bytecode.loopExtentFor(self.anchor.proto, self.anchor.pc) orelse break :blk false;
+                break :blk ext.back_edge_op == .for_loop and !self.precise;
+            },
+            .side, .continuation => false,
+        };
+    }
+
     /// Doc 44 P0: request the one-shot close of a `.head` (or, D12b, `.cont`)
     /// recording.
     /// `cur_pc` is post-increment, so the terminating instruction's own pc —
     /// where tier-0 resumes on a successful terminal exit and executes it
     /// exactly once — is `cur_pc - 1`.
     fn closeHeadTerminal(self: *RecordingSession, kind: trace_ir.TerminalKind, top: u16) void {
-        std.debug.assert(isOneShotKind(self.kind) and self.inline_depth == 0);
+        std.debug.assert((isOneShotKind(self.kind) or self.kind == .root) and self.inline_depth == 0);
         if (self.cur_pc - 1 == trace_code.entryPc(self.anchor.pc)) return self.abort(.self_terminal);
         self.terminal_close = .{ .kind = kind, .resume_pc = self.cur_pc - 1, .top = top };
         self.close_requested = true;

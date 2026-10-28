@@ -647,6 +647,13 @@ pub const TraceCode = struct {
         return self.anchor.proto.code[self.anchorSourcePc(idx) orelse return null];
     }
 
+    /// The trace ends in a one-shot `.terminal` (head, cont, or a stitched
+    /// loop root) rather than looping or linking.
+    pub fn endsInTerminal(self: *const TraceCode) bool {
+        const n = self.instrs.len;
+        return n != 0 and self.instrs[n - 1].op == .terminal;
+    }
+
     /// The conditional branch guard `idx` was recorded from, when its source
     /// opcode (`anchorSourcePc`) is one.
     pub fn anchorCondBranch(self: *const TraceCode, idx: usize) ?bytecode.CondBranch {
