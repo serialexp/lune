@@ -434,6 +434,78 @@ test "phase Q: the trial walk's dead list retires once — a second retire is a 
     try testing.expectEqual(keep_id, vm.trace.registry.cache.items[0].id);
 }
 
+test "doc 63 §5.10: a retirement under a suspension queues its physical half until the lowering" {
+    // A trace retired while a callback runs guest code: the record leaves
+    // every lookup at once, but its link teardown and graph rebuilds wait
+    // for the release point, and the record is destroyed there.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var code = [_]Instr{Instr.op0(.ret)};
+    const proto = Proto{ .code = &code, .id = 9011, .name = "phaseq-suspend-defer", .num_registers = 1 };
+    const t1 = try publishFake(&vm, &proto, 0, &.{Value.int(1)});
+    const t2 = try publishFake(&vm, &proto, 0, &.{Value.int(2)});
+    const t1_id = t1.id;
+    const keep_id = t2.id;
+    const rebuilds0 = vm.trace.region_rebuilds;
+
+    vm.trace.raiseSuspend();
+    vm.trace.removeTrace(t1);
+    try testing.expect(vm.trace.registry.traceById(t1_id) == null);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.deferred_retire.items.len);
+    try testing.expectEqual(t1, vm.trace.registry.deferred_retire.items[0]);
+    try testing.expectEqual(rebuilds0, vm.trace.region_rebuilds);
+
+    vm.trace.lowerSuspend();
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.deferred_retire.items.len);
+    try testing.expectEqual(rebuilds0 + 1, vm.trace.region_rebuilds);
+    try testing.expectEqual(keep_id, vm.trace.registry.cache.items[0].id);
+}
+
+test "doc 63 §5.10: an entry lease defers only the destruction of a retired record" {
+    // A wrapper that is still reading its trace record: the link teardown
+    // has no reason to wait, so it happens at once, but the record is kept
+    // until the lease is lowered.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var code = [_]Instr{Instr.op0(.ret)};
+    const proto = Proto{ .code = &code, .id = 9012, .name = "phaseq-lease-defer", .num_registers = 1 };
+    const t1 = try publishFake(&vm, &proto, 0, &.{Value.int(1)});
+    _ = try publishFake(&vm, &proto, 0, &.{Value.int(2)});
+    const rebuilds0 = vm.trace.region_rebuilds;
+
+    vm.trace.raiseLease();
+    vm.trace.removeTrace(t1);
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.deferred_retire.items.len);
+    try testing.expectEqual(rebuilds0 + 1, vm.trace.region_rebuilds);
+    vm.trace.lowerLease();
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.deferred_retire.items.len);
+    try testing.expectEqual(rebuilds0 + 1, vm.trace.region_rebuilds);
+}
+
+test "doc 63 §5.10: a lease inside a suspension holds the physical half until both lift" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var code = [_]Instr{Instr.op0(.ret)};
+    const proto = Proto{ .code = &code, .id = 9013, .name = "phaseq-both-defer", .num_registers = 1 };
+    const t1 = try publishFake(&vm, &proto, 0, &.{Value.int(1)});
+    _ = try publishFake(&vm, &proto, 0, &.{Value.int(2)});
+    const rebuilds0 = vm.trace.region_rebuilds;
+
+    vm.trace.raiseSuspend();
+    vm.trace.raiseLease();
+    vm.trace.removeTrace(t1);
+    vm.trace.lowerSuspend();
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.deferred_retire.items.len);
+    try testing.expectEqual(rebuilds0, vm.trace.region_rebuilds);
+    vm.trace.lowerLease();
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.deferred_retire.items.len);
+    try testing.expectEqual(rebuilds0 + 1, vm.trace.region_rebuilds);
+}
+
 fn stubTrace(slots: []usize, linked_entry: usize) trace.Trace {
     return .{
         .code = .{

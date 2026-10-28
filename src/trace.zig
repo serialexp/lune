@@ -962,6 +962,22 @@ pub const TraceState = struct {
     /// recording). Changed only through `raiseSuspend`/`lowerSuspend`, which
     /// keep `FastBit.jit_suspended` in step; read through `suspended`.
     suspend_depth: u32 = 0,
+    /// Doc 63 §5.10: entry wrappers (`enterSelectedTrace`,
+    /// `enterHeadNativeQuiet`, `enterPatchedTrace`, the back-edge walk) hold a
+    /// lease from before they enter a trace until their last access to the
+    /// patch and the trace record. While any lease is outstanding a retired
+    /// trace's record is queued, not destroyed. Changed only through
+    /// `raiseLease`/`lowerLease`.
+    entry_leases: u32 = 0,
+    /// The trace the dispatcher is running (a borrow, valid until its result
+    /// has been consumed; it survives logical retirement, unlike an id
+    /// lookup). Doc 63 §5.8. Null between entries.
+    executing: ?*Trace = null,
+    /// Set by the traced-call shim from `executing` while the host call runs,
+    /// so the collector's F3 assertion can tell the one trace that may be
+    /// doomed under a running callback. At most one: nothing enters a trace
+    /// while `suspend_depth > 0`.
+    suspended_trace: ?*Trace = null,
     /// Direct-mapped hot-count pre-filter (see `hotIndex`/`HOTCOUNT_SIZE`). A slot
     /// holds the number of back-edges to skip cheaply before re-consulting the slow
     /// path for the anchor(s) that hash there. Zero ⇒ take the slow path now. Set
@@ -3058,6 +3074,7 @@ pub const TraceState = struct {
     pub const disarmStaleRegionBridgeLinks = trace_link_mod.disarmStaleRegionBridgeLinks;
     pub const removeTrace = trace_link_mod.removeTrace;
     pub const removeTraces = trace_link_mod.removeTraces;
+    pub const releaseDeferredRetire = trace_link_mod.releaseDeferredRetire;
     pub const codeFor = trace_link_mod.codeFor;
     pub const ensureImage = trace_link_mod.ensureImage;
     pub const patchedEntryOp = trace_link_mod.patchedEntryOp;
@@ -3103,6 +3120,19 @@ pub const TraceState = struct {
         std.debug.assert(self.suspend_depth != 0);
         self.suspend_depth -= 1;
         self.setFastBit(FastBit.jit_suspended, self.suspend_depth != 0);
+        if (self.suspend_depth == 0 and self.registry.deferred_retire.items.len != 0) self.releaseDeferredRetire();
+    }
+
+    /// Doc 63 §5.10: take an entry lease. Pair with `lowerLease`; the pair
+    /// is two instructions around a trace entry.
+    pub inline fn raiseLease(self: *TraceState) void {
+        self.entry_leases += 1;
+    }
+
+    pub inline fn lowerLease(self: *TraceState) void {
+        std.debug.assert(self.entry_leases != 0);
+        self.entry_leases -= 1;
+        if (self.entry_leases == 0 and self.registry.deferred_retire.items.len != 0) self.releaseDeferredRetire();
     }
 
     /// Bit assignment of `fast_block` (doc 60 §5.4).

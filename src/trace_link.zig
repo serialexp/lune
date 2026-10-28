@@ -2732,9 +2732,20 @@ pub fn removeTraces(self: *TraceState, doomed: []const *Trace) void {
     retireProvenanceEdgesTouchingDoomed(self);
     dropWantsFromDoomed(self);
     dropExecLogsOfDoomed(self);
-    // Steps 3 (physical) and 4.
+    // Steps 3 (physical) and 4. Doc 63 §5.10: under a suspension (a host
+    // call a trace made is running guest code) the physical half is queued
+    // wholesale: the suspended trace's episode state is live and the link
+    // teardown would mutate it. Under a lease alone only the destruction
+    // waits, because a wrapper still reads its trace record and patch.
     self.registry.native_physical.debug_log = self.config.debug_log;
-    self.registry.unpublishDoomed(doomed);
+    const suspended = self.suspend_depth != 0;
+    const leased = suspended or self.entry_leases != 0;
+    if (suspended) {
+        self.registry.unpublishLogical(doomed);
+        self.registry.deferred_teardown = true;
+    } else {
+        self.registry.unpublishDoomed(doomed);
+    }
     self.retired_traces +|= doomed.len;
     self.retire_batches +|= 1;
     // Step 5: reopen anchors left with no trace. `onBackEdge` only arms when
@@ -2762,8 +2773,18 @@ pub fn removeTraces(self: *TraceState, doomed: []const *Trace) void {
             if (self.coverage.getPtr(anchor)) |cov| cov.has_trace = false;
         }
     }
-    // Step 6.
-    self.registry.destroyDoomed(doomed);
+    if (leased) {
+        // Reserved by `attach`: queueing never allocates.
+        self.registry.deferred_retire.appendSliceAssumeCapacity(doomed);
+    } else {
+        // Step 6.
+        self.registry.destroyDoomed(doomed);
+    }
+    // While suspended the edge cache and region indices stay as they were
+    // until the release point. Both are read only by entries, chains and
+    // recording, which the suspension gates (§5.9), so the stale rows name
+    // no entry that can run.
+    if (suspended) return;
     // Step 7. A-ii.2: a retired trace changes which edges remain resolvable
     // for SURVIVING traces, so rebuild the whole edge cache from the
     // surviving cache — never a surgical key delete. A-ii.4: then the
@@ -2771,6 +2792,28 @@ pub fn removeTraces(self: *TraceState, doomed: []const *Trace) void {
     self.syncNativeInvalidation();
     self.rebuildEdgeCache();
     self.rebuildRegions();
+}
+
+/// Doc 63 §5.10, the release point: when no suspension and no entry lease
+/// remain, the queued retirements finish. Link teardown and graph rebuilds
+/// run only for traces retired under a suspension; then every queued record
+/// is destroyed. A no-op while either counter is non-zero, so every lowering
+/// can call it.
+pub fn releaseDeferredRetire(self: *TraceState) void {
+    if (self.suspend_depth != 0 or self.entry_leases != 0) return;
+    const queue = &self.registry.deferred_retire;
+    if (queue.items.len == 0) return;
+    const teardown = self.registry.deferred_teardown;
+    self.registry.deferred_teardown = false;
+    self.registry.native_physical.debug_log = self.config.debug_log;
+    if (teardown) self.registry.tearDownDoomedLinks();
+    self.registry.destroyDoomed(queue.items);
+    queue.clearRetainingCapacity();
+    if (teardown) {
+        self.syncNativeInvalidation();
+        self.rebuildEdgeCache();
+        self.rebuildRegions();
+    }
 }
 
 /// Doc 61 §7.1 item 4: a want or recording request whose source exit is on

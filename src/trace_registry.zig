@@ -56,6 +56,18 @@ pub const TraceRegistry = struct {
     /// reserved by `attach` so a collection's doomed set and the entry-patch
     /// drain's install list never allocate. Contents live for one operation.
     batch_scratch: std.ArrayListUnmanaged(*Trace) = .empty,
+    /// Doc 63 §5.10: traces already removed from every lookup (cache, id
+    /// index, anchor index, entry patches) whose records are still allocated,
+    /// because a suspension or an entry lease is outstanding. Capacity covers
+    /// every trace ever published (reserved by `attach`), so queueing never
+    /// allocates. Destroyed by `TraceState.releaseDeferredRetire`, `clear`
+    /// and `deinit`.
+    deferred_retire: std.ArrayListUnmanaged(*Trace) = .empty,
+    /// Some queued trace was retired under a suspension, so its link
+    /// teardown and graph rebuilds (the physical half) still have to run.
+    /// A lease-only retirement tears those down at once and queues only the
+    /// destruction.
+    deferred_teardown: bool = false,
     /// Items each retirement step visited, over every batch. The
     /// coordinator's steps in `TraceState.removeTraces` add theirs here too.
     retire_work: RetireWork = .initFill(0),
@@ -95,6 +107,7 @@ pub const TraceRegistry = struct {
         }
         std.debug.assert(self.trace_by_id.items[t.id] == null); // ids are unique among published traces
         try self.batch_scratch.ensureTotalCapacity(self.gpa, self.cache.items.len + 1);
+        try self.deferred_retire.ensureTotalCapacity(self.gpa, self.cache.items.len + self.deferred_retire.items.len + 1);
         try self.by_anchor.ensureUnusedCapacity(self.gpa, 1);
         try self.cache.ensureUnusedCapacity(self.gpa, 1);
         self.cache.appendAssumeCapacity(t);
@@ -193,8 +206,20 @@ pub const TraceRegistry = struct {
     /// remain stable; `EntryPatch.trace` is poisoned), and the cache is
     /// compacted in order.
     pub fn unpublishDoomed(self: *TraceRegistry, doomed: []const *Trace) void {
+        self.tearDownDoomedLinks();
+        self.unpublishLogical(doomed);
+    }
+    /// Links, proofs and promoted sets touching a doomed trace. Rewrites
+    /// surviving parents' slots, so it is physical JIT-state mutation.
+    pub fn tearDownDoomedLinks(self: *TraceRegistry) void {
         if (self.native_physical.inReplayWalk()) @panic("trace retirement during replay");
         self.native_physical.resetLinksTouchingDoomed(&self.mcode_arena, &self.retire_work);
+    }
+    /// Doc 63 §5.10, the logical half of `unpublishDoomed`: the traces stop
+    /// being reachable from any lookup (id index, anchor index, cache, entry
+    /// patches), and nothing else changes.
+    pub fn unpublishLogical(self: *TraceRegistry, doomed: []const *Trace) void {
+        if (self.native_physical.inReplayWalk()) @panic("trace retirement during replay");
         self.retire_work.getPtr(.unpublish).* += doomed.len;
         self.retire_work.getPtr(.compact).* += self.cache.items.len;
         for (doomed) |t| {
@@ -231,6 +256,9 @@ pub const TraceRegistry = struct {
         _ = self.native_physical.drainBarrier(&self.mcode_arena);
         self.entry_registry.dropEntryPatchState();
         for (self.cache.items) |t| t.destroy(self.gpa);
+        for (self.deferred_retire.items) |t| t.destroy(self.gpa);
+        self.deferred_retire.clearRetainingCapacity();
+        self.deferred_teardown = false;
         self.cache.clearRetainingCapacity();
         self.by_anchor.clearRetainingCapacity();
         @memset(self.trace_by_id.items, null);
@@ -249,6 +277,7 @@ pub const TraceRegistry = struct {
         self.cache.deinit(self.gpa);
         self.by_anchor.deinit(self.gpa);
         self.batch_scratch.deinit(self.gpa);
+        self.deferred_retire.deinit(self.gpa);
         self.trace_by_id.deinit(self.gpa);
         self.mcode_arena.deinit();
         if (self.native_seed_ctx) |ctx| self.gpa.destroy(ctx);

@@ -1,3 +1,9 @@
+DOC 63 PHASE 2b (part 1) DONE (2026-10-28, coral-marten), committed, not pushed.
+- Landed inert: deferred physical retirement (registry.deferred_retire, released at lowerSuspend/lowerLease) and entry leases in enterSelectedTrace/enterHeadNativeQuiet. Doc 63 §5.10.2.
+- Cost: binary-trees +0.35%, co_pingpong_d20 +0.12% (ReleaseFast instr vs the stitching build); spectral-norm +0.43% judged layout noise.
+- Open for Bart: `executing` publication (costs ~0.25% binary-trees; currently deferred to Phase 2c). The F3 assertion in invalidateDeadTraceConsts is vacuous until then.
+- Still open in 2b: F1 test, recording-time collection tests (need Phase 2c's tier-0 suspension), blacklist-through-patched-entry test, §8.1 probe A/B.
+
 DOC 44 STITCHING: numeric-for roots DONE (2026-10-28, coral-marten), committed, not pushed.
 - A for_loop root stops at an untagged host call (call_interp), a .cont anchor at call_pc+1 records to the back-edge (backedge_interp). Config.minstitch=48 keeps short bodies in tier-0. -27% instructions on heavy bodies, cycles flat (re-entry stalls). Details: doc 44 Done bullet; open items in its Outstanding + TODO.md.
 - Known noise: euler14-bit +0.8% instructions with identical traces (interp.zig layout).

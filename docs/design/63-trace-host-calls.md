@@ -1,15 +1,16 @@
 # 63 — Traces call host functions directly — Design
 
 Status: partial — prerequisites, Phase 0 (benchmark and budget),
-Phase 1 (epoch, disturbance and suspension, inert) and Phase 2a
-(coherent snapshots, the host ops and statuses, inert) landed; no host
+Phase 1 (epoch, disturbance and suspension, inert), Phase 2a
+(coherent snapshots, the host ops and statuses, inert) and Phase 2b
+part 1 (deferred retirement and entry leases, inert) landed; no host
 call is traced yet. Revision 6, approved by Codex and Antigravity
 (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
 Prerequisites A and B, Phase 0, Phase 1 (with the §5.9.2
 region-accounting amendment) and Phase 2a done. Phases 2b–4 not started.
 Owner: Bart
-Last updated: 2026-10-20
+Last updated: 2026-10-28
 
 ## Implementation status
 
@@ -109,7 +110,10 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   - Fixed on the way: a pre-existing bug in `nativegen_alloc`'s debug
     check, which read the undefined home of every snapshot-only slot.
 
-- [ ] **Phase 2b — GC lifetime across a callback.** Native constants in
+- [ ] **Phase 2b — GC lifetime across a callback** (part 1 landed 2026-10-28:
+  the deferred physical retirement and entry leases, §5.10.1; open: `executing`
+  publication, the F1 and recording-time collection tests, the §8.1 probe A/B).
+  Native constants in
   the weak pools; Phase Q's transaction split into logical invalidation
   and deferred physical work, released only when no suspension and no
   entry lease remain, at the entry wrapper or at the end of a
@@ -1317,6 +1321,48 @@ rests on, and what each changes for the phases.
 
 The line numbers cited elsewhere in this document are from revision 6
 and have drifted; the named functions are the reference.
+
+### 5.10.2 As landed: Phase 2b, part 1 (2026-10-28)
+
+Inert: no host call is traced yet, so only the physical teardown of a retirement
+changes, and only when a suspension or a lease is outstanding.
+
+- **Queue.** `TraceRegistry.deferred_retire` holds traces already removed from
+  every lookup whose records are still allocated. `attach` reserves its capacity,
+  so queueing never allocates. `deferred_teardown` records that a suspended
+  retirement still owes its link teardown and graph rebuilds.
+- **Logical / physical split.** `unpublishDoomed` is now `tearDownDoomedLinks`
+  followed by `unpublishLogical`. A retirement under suspension runs only the
+  logical half, the anchor reopen, and queues. Under a lease alone the link
+  teardown runs at once and only the destruction waits. Suspended retirements
+  leave the edge cache and region indices stale until release; §5.9's gates keep
+  entries, chains and recording from reading them meanwhile.
+- **Entry leases.** `TraceState.entry_leases`, raised and lowered by
+  `enterSelectedTrace` and `enterHeadNativeQuiet` (so every caller, the patched
+  routes and the back-edge included) through a `defer`.
+- **Release point.** `lowerSuspend` and `lowerLease` call `releaseDeferredRetire`
+  when the last counter reaches zero. It runs the deferred teardown and rebuilds,
+  then destroys the queued records. Both counters are checked in one place.
+- **Tests** (`interp_phaseq_test.zig`, "doc 63 §5.10"): a suspended retirement
+  waits for the lowering; a lease defers only the destruction; a lease inside a
+  suspension holds the physical half until both lift. Mutation-checked: disabling
+  the suspended queue fails the first.
+- **Offsets.** `offsets_x64.inc` tracks the new `TraceState` fields in both
+  blocks.
+- **Cost** (ReleaseFast user instructions, `--trace --jit-native`, against the
+  stitching build `/tmp/st/out5`, which matches commit 233b5c4):
+  - with `executing` published on every entry (not kept): binary-trees +0.60%,
+    co_pingpong_d20 +0.21%, spectral-norm +0.28%; every other `bench/` row
+    within ±0.1%;
+  - without it (the state landed here): binary-trees +0.35%, co_pingpong_d20
+    +0.12%, spectral-norm +0.43%. Spectral-norm rose, which the lease does not
+    explain; it is code-layout noise, not measured further.
+  Publishing `executing` cost about 0.25% on binary-trees and is deferred to
+  Phase 2c, its only reader (the shim).
+- **Not done in part 1:** `executing` publication, the F1 test (a replaced native
+  retires its guard), the recording-time collection tests (they need the tier-0
+  suspension that Phase 2c adds), the blacklist-through-patched-entry test, and
+  the §8.1 probe A/B.
 
 ### 5.11 Tier-1a
 

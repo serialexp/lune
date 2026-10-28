@@ -3770,6 +3770,9 @@ pub const Vm = struct {
         for (ts.registry.cache.items) |t| {
             for (t.code.heap_consts) |i| {
                 if (gc.Heap.willFree(t.code.consts[i].asHeap())) {
+                    // Doc 63 F3 (restated, §5.10): a doomed trace is not
+                    // executing, or it is the trace a suspended host call runs.
+                    std.debug.assert(ts.executing != t or ts.suspended_trace == t);
                     const dying = t.code.consts[i];
                     const bytes: []const u8 = if (dying.heapType() == .string) string.String.fromHeader(dying.asHeap()).bytes() else "";
                     ts.dbg("const-swept: t={d} const={d} type={s} bytes=\"{s}\"", .{ t.id, i, @tagName(dying.heapType()), bytes });
@@ -6169,6 +6172,9 @@ pub const Vm = struct {
         base: usize,
     ) EntryDirective {
         const ts = &self.trace;
+        // Doc 63 §5.10: entry lease, as in `enterSelectedTrace`.
+        ts.raiseLease();
+        defer ts.lowerLease();
         // The `jfunc_head` §R1-5 bypass set already excluded every
         // observation/recording entry mode; assert rather than re-check.
         std.debug.assert(!ts.config.record_exec_log);
@@ -6414,6 +6420,13 @@ pub const Vm = struct {
         pc_in: usize,
         wctx: *TrialWalkCtx,
     ) EntryDirective {
+        // Doc 63 §5.10: a retirement inside this entry (a collection in a
+        // callback, or a blacklist retirement) only queues the record's
+        // destruction until the lease is lowered after the last access.
+        self.trace.raiseLease();
+        defer self.trace.lowerLease();
+        // Doc 63 §5.8: the entered trace is the borrow a traced host call
+        // reads. Restored on every return, so a nested entry nests the borrow.
         var pc = pc_in;
         // Doc 45 D8 interim: a PRECISE trace cannot serialize yet
         // (`traceser` has no snapshot schema until the format bump), so under
