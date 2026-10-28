@@ -75,7 +75,7 @@ fn headOfDot(src: []const u8, s: usize) ?ast.Span {
 /// scope at `pos`. Decided from the bindings, not the occurrences, so it holds
 /// in a damaged chunk too: `string.` typed by itself loses the occurrence of
 /// `string`, and a local `string` must still shadow the library.
-fn isLocal(an: *const Analysis, name: []const u8, pos: u32) bool {
+pub fn isLocal(an: *const Analysis, name: []const u8, pos: u32) bool {
     for (an.res.bindings.items) |b| {
         if (b.kind == .global or !std.mem.eql(u8, b.name, name)) continue;
         // Strictly after `visible_from`, as completion has it: a local is not
