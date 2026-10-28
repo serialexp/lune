@@ -3386,6 +3386,57 @@ pub const Vm = struct {
     /// range is free again once this returns: the caller copies the slice out
     /// before anything else can run a host fn. Inline, because both callers
     /// are on the host-call path and a call here costs more than the work.
+    /// Doc 63 §5.8: the thunk `irinterp.HostCall` carries. The executor passes
+    /// the entered trace record, so the shim can suspend against it.
+    fn hostCallThunk(ctx: *anyopaque, record: *anyopaque, site: u32, regs: RegWindow) u32 {
+        const self: *Vm = @ptrCast(@alignCast(ctx));
+        const ct: *trace.Trace = @ptrCast(@alignCast(record));
+        return @intFromEnum(self.traceHostCall(ct, site, regs));
+    }
+
+    /// Doc 63 §5.8: the shim a traced `call_host` runs. Mirrors tier-0's host
+    /// arm: the frame is left as tier-0 has it at a call in progress (§5.5, so a
+    /// collection masks it at B and an error locates at B), the callback runs
+    /// with the JIT suspended (§5.9), and the results land in the window for the
+    /// coherent `host_result` reads. The trace's own entry lease stays held, so
+    /// a retirement inside the callback only defers.
+    pub fn traceHostCall(self: *Vm, ct: *trace.Trace, site_ix: u32, regs: RegWindow) table_runtime.Status {
+        const site = ct.code.host_sites[site_ix];
+        const frame = &self.frames[self.depth - 1];
+        frame.pc = site.b_pc;
+        frame.in_flight = true;
+        const ts = &self.trace;
+        std.debug.assert(ts.suspended_trace == null);
+        ts.suspended_trace = ct;
+        ts.raiseSuspend();
+        defer {
+            ts.lowerSuspend();
+            ts.suspended_trace = null;
+        }
+        const nat = function.Native.fromHeader(regs.get(site.a).asHeap());
+        const args = self.gatherScratch(frame.base + site.a + 1, frame.base + site.a + 1 + site.nargs);
+        const res = self.callHostNative(nat, args, site.nwanted) catch |e| return hostStatus(e);
+        // A failure above leaves `in_flight` set and `pc` at B, as tier-0 does.
+        var k: usize = 0;
+        while (k < res.len) : (k += 1) regs.set(site.a + k, res[k]);
+        while (k < site.nwanted) : (k += 1) regs.set(site.a + k, Value.nil());
+        frame.pc = site.b_pc + 1;
+        frame.in_flight = false;
+        return .ok;
+    }
+
+    /// Doc 63 §5.8: the status a failed host call raises. A host call's failure
+    /// set is exactly these four (`capi.zig` stages nothing else).
+    fn hostStatus(e: Error) table_runtime.Status {
+        return switch (e) {
+            error.OutOfMemory => .out_of_memory,
+            error.TypeError => .type_error,
+            error.LuaError => .lua_error,
+            error.StackOverflow => .stack_overflow,
+            else => unreachable,
+        };
+    }
+
     inline fn callHostNative(self: *Vm, nat: *function.Native, args: []const Value, want: usize) Error![]const Value {
         const hb = nat.host.?;
         std.debug.assert(nat.effect == null and nat.multi == null and nat.recorded == null);
@@ -6565,7 +6616,12 @@ pub const Vm = struct {
             // Doc 56 Phase 3: every direct tier-1a run of `ct` (plain,
             // exec-log, seed-hash-decline rerun) honours its exit-side
             // state; a wanted/attached exit comes back `.exit_side`.
-            const ir_ctx: irinterp.ExecCtx = .{ .heap = self.heap, .exit_side = ct.exit_side };
+            // Doc 63 §5.8: a trace with host calls gets the shim bound to its record.
+            const ir_ctx: irinterp.ExecCtx = .{
+                .heap = self.heap,
+                .exit_side = ct.exit_side,
+                .host_call = if (ct.code.host_sites.len != 0) .{ .ctx = self, .record = ct, .run = &hostCallThunk } else null,
+            };
             var result = if (self.trace.config.record_exec_log) blk: {
                 const rec = self.trace.execRecorderFor(ct.id) orelse break :blk irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
                 break :blk irinterp.executeTracedCtx(ir_ctx, rec, &ct.code, trace_regs, buf);

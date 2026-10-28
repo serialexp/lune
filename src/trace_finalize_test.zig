@@ -655,3 +655,146 @@ test "doc 63 finalize: placement and site-ownership failures refuse the candidat
         try std.testing.expectError(error.InvalidSnapshotMetadata, finalizer.finalize(gpa, &scratch, .{ .optimize = false }));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Doc 63 §5.1 / §5.8: tier-1a runs a finalized host run through its coherent exits
+// ---------------------------------------------------------------------------
+
+const irinterp = @import("irinterp.zig");
+const trace_exec = @import("trace_exec.zig");
+const function = @import("function.zig");
+const gc = @import("gc.zig");
+const RegWindow = @import("regwindow.zig").RegWindow;
+
+/// The shim tier-1a calls in place of tier-0's host arm: counts its calls,
+/// bumps the epoch on one of them, and either returns one result or a status.
+const FakeHost = struct {
+    calls: u32 = 0,
+    result: Value = Value.int(42),
+    /// The call that bumps the epoch (0 = none), and the call that fails.
+    bump_at: u32 = 0,
+    status_at: u32 = 0,
+    status: u32 = 3,
+    heap: *gc.Heap = undefined,
+
+    fn run(ctx: *anyopaque, record: *anyopaque, site: u32, regs: RegWindow) u32 {
+        _ = record;
+        std.debug.assert(site == 0);
+        const self: *FakeHost = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.calls == self.bump_at) self.heap.host_epoch += 1;
+        if (self.calls == self.status_at) return self.status;
+        regs.set(host_site.a, self.result);
+        return 0;
+    }
+};
+
+fn nopNative(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = ctx;
+    _ = args;
+    return Value.nil();
+}
+
+/// Finalizes the well-formed host run with a `loop` closing it, with `callee`
+/// as its guarded native, and runs it under tier-1a. `host` is the shim the
+/// dispatcher would bind (null: a trace run without one).
+fn runHostRun(gpa: std.mem.Allocator, host: ?*FakeHost, callee: *function.Native, regs: RegWindow, values: []Value) !trace_exec.ExecResult {
+    const proto = hostProto();
+    var scratch: Scratch = .{};
+    defer scratch.deinit(gpa);
+    try hostScratch(gpa, &scratch, &proto);
+    defer scratch.snap_builder.deinit();
+    scratch.consts.items[0] = Value.heap(&callee.header);
+    var candidate = try finalizer.finalize(gpa, &scratch, .{ .optimize = false });
+    defer candidate.deinit(gpa);
+    const c = candidate.getCode().?;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    if (host) |h| h.heap = &heap;
+    const ctx: irinterp.ExecCtx = .{
+        .heap = &heap,
+        .host_call = if (host) |h| .{ .ctx = h, .record = @ptrCast(@constCast(c)), .run = &FakeHost.run } else null,
+    };
+    return irinterp.executeCtx(ctx, c, regs, values);
+}
+
+/// A window with `r0` = the callee and `r1`, `r2` = ints, as the trace's
+/// `slot_load`s read them.
+fn hostWindow(callee: *function.Native, tags: []u8, payloads: []u64) RegWindow {
+    const regs = RegWindow.of(tags, payloads);
+    regs.set(0, Value.heap(&callee.header));
+    regs.set(1, Value.int(1));
+    regs.set(2, Value.int(2));
+    return regs;
+}
+
+test "doc 63 tier-1a: a failing host call exits at call_host as a precise error" {
+    const gpa = std.testing.allocator;
+    const callee = try function.Native.create(gpa, &nopNative, "host");
+    defer callee.destroy(gpa);
+    var tags: [4]u8 = @splat(0);
+    var payloads: [4]u64 = @splat(0);
+    var values: [16]Value = undefined;
+    var fake: FakeHost = .{ .status_at = 1 };
+    const r = try runHostRun(gpa, &fake, callee, hostWindow(callee, &tags, &payloads), &values);
+    try std.testing.expectEqual(@as(u32, 1), fake.calls);
+    try std.testing.expectEqual(@as(u32, 5), r.exit_instr); // call_host
+    try std.testing.expectEqual(trace_exec.ExitReason.precise_error, r.exit_reason);
+    try std.testing.expectEqual(@as(u32, 3), r.runtime_error);
+    try std.testing.expectEqual(@as(usize, 0), r.completed);
+}
+
+test "doc 63 tier-1a: guard_native refuses a disturbed native and a run without a shim, before any call" {
+    const gpa = std.testing.allocator;
+    const callee = try function.Native.create(gpa, &nopNative, "host");
+    defer callee.destroy(gpa);
+    var values: [16]Value = undefined;
+    {
+        callee.disturbs = 1;
+        defer callee.disturbs = 0;
+        var tags: [4]u8 = @splat(0);
+        var payloads: [4]u64 = @splat(0);
+        var fake: FakeHost = .{};
+        const r = try runHostRun(gpa, &fake, callee, hostWindow(callee, &tags, &payloads), &values);
+        try std.testing.expectEqual(@as(u32, 0), fake.calls);
+        try std.testing.expectEqual(@as(u32, 4), r.exit_instr); // guard_native
+        try std.testing.expectEqual(trace_exec.ExitReason.precise_resume, r.exit_reason);
+    }
+    {
+        var tags: [4]u8 = @splat(0);
+        var payloads: [4]u64 = @splat(0);
+        const r = try runHostRun(gpa, null, callee, hostWindow(callee, &tags, &payloads), &values);
+        try std.testing.expectEqual(@as(u32, 4), r.exit_instr);
+        try std.testing.expectEqual(trace_exec.ExitReason.precise_resume, r.exit_reason);
+    }
+}
+
+test "doc 63 tier-1a: a callback that moves the epoch exits at B + 1 with its results in the window" {
+    const gpa = std.testing.allocator;
+    const callee = try function.Native.create(gpa, &nopNative, "host");
+    defer callee.destroy(gpa);
+    var tags: [4]u8 = @splat(0);
+    var payloads: [4]u64 = @splat(0);
+    var values: [16]Value = undefined;
+    var fake: FakeHost = .{ .bump_at = 1 };
+    const r = try runHostRun(gpa, &fake, callee, hostWindow(callee, &tags, &payloads), &values);
+    try std.testing.expectEqual(@as(u32, 1), fake.calls);
+    try std.testing.expectEqual(@as(u32, 6), r.exit_instr); // guard_host_epoch
+    try std.testing.expectEqual(trace_exec.ExitReason.precise_resume, r.exit_reason);
+    try std.testing.expectEqual(@as(u32, 3), r.snapshot_id); // C_B1
+    try std.testing.expectEqual(Value.int(42), RegWindow.of(&tags, &payloads).get(0));
+}
+
+test "doc 63 tier-1a: a result of the wrong type exits at B + 1 before it is used" {
+    const gpa = std.testing.allocator;
+    const callee = try function.Native.create(gpa, &nopNative, "host");
+    defer callee.destroy(gpa);
+    var tags: [4]u8 = @splat(0);
+    var payloads: [4]u64 = @splat(0);
+    var values: [16]Value = undefined;
+    var fake: FakeHost = .{ .result = Value.float(1.5) };
+    const r = try runHostRun(gpa, &fake, callee, hostWindow(callee, &tags, &payloads), &values);
+    try std.testing.expectEqual(@as(u32, 1), fake.calls);
+    try std.testing.expectEqual(@as(u32, 7), r.exit_instr); // host_result
+    try std.testing.expectEqual(trace_exec.ExitReason.precise_resume, r.exit_reason);
+}

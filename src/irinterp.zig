@@ -241,8 +241,46 @@ pub fn execute(t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
 /// (Rule Z-4: no global heap); the bare default (`.{}`) means "no VM attached"
 /// and every allocating arm then fails CLOSED (side-exit) — a hand-built test
 /// trace without a heap can never allocate.
+/// Doc 63 §5.8: the shim `call_host` runs, as a thunk over the dispatcher's
+/// `Vm` (this module never names it). `run` performs host site `site` of the
+/// trace `record`, writes the results into `regs`, and returns a
+/// `table_runtime.Status` ordinal (0 = ok).
+pub const HostCall = struct {
+    ctx: *anyopaque,
+    record: *anyopaque,
+    run: *const fn (ctx: *anyopaque, record: *anyopaque, site: u32, regs: RegWindow) u32,
+};
+
+/// Doc 45 D6 / doc 63 §5.5: write snapshot `snap` (1-based) of `t` into the
+/// window, the state tier-0 has at the op at `at`. Finalize guarantees every
+/// captured ref precedes `at`, so `values[ref]` is this iteration's value.
+fn materializeSnapshot(t: *const Trace, regs: RegWindow, values: []const Value, snap: u32, at: u32) void {
+    const s = t.snapshots[snap - 1];
+    for (t.snapshot_slots[s.slots_begin..][0..s.slots_len]) |ss| {
+        std.debug.assert(@as(u32, ss.ref) < at);
+        regs.set(ss.slot, values[ss.ref]);
+    }
+}
+
+/// Doc 63 §5.1: `host_result`'s tag check against the type the recorder observed.
+fn observedMatches(ty: trace_ir.ObsType, v: Value) bool {
+    return switch (ty) {
+        .int => v.isInt(),
+        .float => v.isFloat(),
+        .boolean => v.isBool(),
+        .nil => v.isNil(),
+        .heap => v.isHeap(),
+        .unknown => false,
+    };
+}
+
 pub const ExecCtx = struct {
     heap: ?*gc.Heap = null,
+    /// Doc 63 §5.8: the host-call shim `call_host` runs, bound to the entered
+    /// trace record. Null for a trace without host calls. A host-call trace
+    /// run without one fails `guard_native` through S_B, before any call, so
+    /// tier-0 makes it instead.
+    host_call: ?HostCall = null,
     /// Doc 45 D6 activation contract for precise exits (echoed verbatim into
     /// `ExecResult.activation_base`/`.activation_depth`): the frame-window
     /// base and inlined-frame depth the trace's snapshots are relative to.
@@ -352,6 +390,8 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
     // into the result: same snapshot restore as a guard miss, but the exit
     // becomes `.precise_error` (the dispatcher raises, never resumes).
     var runtime_error: u32 = 0;
+    // Doc 63 §5.6: the heap's epoch before the traced call, for `guard_host_epoch`.
+    var host_epoch: u64 = 0;
     // Phase E1 (LICM): instructions before the `preheader` marker run **once**
     // (on the first pass); their `values[]` persist and are reused every later
     // iteration. `body_start` is the first per-iteration instruction (0 when there
@@ -1357,17 +1397,64 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
 
-                // ---- doc 63 §5.1: host calls (semantics land in Phase 2c) ----
-                // Until then `guard_native` always fails, through its full
-                // snapshot S_B: tier-0 resumes at B and makes the call itself,
-                // exactly once. Finalize places `guard_native` immediately
-                // before every `call_host`, so the other three are never
-                // reached.
+                // ---- doc 63 §5.1: host calls (tier-1a, Phase 2c) ----
+                // `guard_native` passes only for this trace's own native, below
+                // the disturb threshold, with a host shim and a heap. It then
+                // flushes S_B (the §5.5 preflush: the window tier-0 has at B).
+                // Every other failure exits through S_B, so tier-0 makes the
+                // call itself, exactly once. Finalize places `guard_native`
+                // immediately before its `call_host`.
                 .guard_native => {
-                    if (record) rec.exit(i, .guard, values[ins.a]);
-                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    const callee = values[ins.a];
+                    const expected = t.consts[@intCast(ins.aux)];
+                    const pass = ctx.host_call != null and ctx.heap != null and callee.isHeap() and expected.isHeap() and
+                        callee.asHeap() == expected.asHeap() and
+                        function.Native.fromHeader(callee.asHeap()).disturbs < function.disturb_threshold;
+                    if (!pass) {
+                        if (record) rec.exit(i, .guard, values[ins.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                    materializeSnapshot(t, regs, values, ins.snap, @intCast(i));
                 },
-                .call_host, .guard_host_epoch, .host_result => unreachable,
+                // The shim performs the call, writes the results into the window
+                // and reports its status. A failure exits `.precise_error` through
+                // C_B, which restores nothing: the callback's changes stand and
+                // nothing is retried. Finalize places this op right after the
+                // `guard_native` that checked `host_call`.
+                .call_host => {
+                    const hc = ctx.host_call.?;
+                    host_epoch = ctx.heap.?.host_epoch;
+                    const status = hc.run(hc.ctx, hc.record, @intCast(ins.a), regs);
+                    if (status != 0) {
+                        runtime_error = status;
+                        if (record) rec.exit(i, .guard, Value.nil());
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+                // Doc 63 §5.6: the epoch moved, or the budget for the rest of the
+                // iteration is spent (`guard_gc`'s rule, counting the callback's
+                // own allocations). Exits at B + 1 with nothing written back.
+                .guard_host_epoch => {
+                    const heap = ctx.heap.?;
+                    const a_bound: usize = @intCast(ins.aux);
+                    const pass = heap.host_epoch == host_epoch and !heap.gc_stress and (heap.object_count +| a_bound) < heap.next_gc;
+                    if (!pass) {
+                        if (record) rec.exit(i, .guard, Value.nil());
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+                // Doc 63 §5.1: result `aux` of the site, read from the window the
+                // shim wrote, checked against its observed type before it is used.
+                .host_result => {
+                    const site = t.host_sites[@intCast(ins.a)];
+                    const v = regs.get(site.a + @as(usize, @intCast(ins.aux)));
+                    if (!observedMatches(ins.ty, v)) {
+                        if (record) rec.exit(i, .guard, Value.nil());
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                    values[i] = v;
+                    if (record) rec.value(i, v);
+                },
 
                 // ---- close: commit the loop-carried writes, then iterate ----
                 .loop => {
@@ -1454,12 +1541,7 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // placement rule) has no vector: the slab is already the
                 // truth, and this loop writes nothing.
                 std.debug.assert(!s.coherent or (trace_ir.isHostCoherentOp(ins.op) and s.slots_len == 0));
-                for (t.snapshot_slots[s.slots_begin..][0 .. s.slots_len]) |ss| {
-                    // Every captured ref precedes the failing op (validated at
-                    // finalize), so `values[ref]` is this iteration's value.
-                    std.debug.assert(@as(u32, ss.ref) < out.exit_instr);
-                    regs.set(ss.slot, values[ss.ref]);
-                }
+                materializeSnapshot(t, regs, values, ins.snap, out.exit_instr);
                 // Doc 45 D5: a shim failure (`runtime_error != 0`) shares
                 // the restore verbatim — the guest registers ARE the
                 // pre-instruction state — but exits `.precise_error`: the

@@ -1,3 +1,5 @@
+DOC 63 PHASE 2c slice 1 DONE (2026-10-28, coral-marten): tier-1a executes guard_native/call_host/guard_host_epoch/host_result (doc 63 §5.10.3), tested on hand-built finalized runs. Not committed until the gate is green on the final tree. Next: slice 2, recording.
+
 DOC 63 PHASE 2b (part 1) DONE (2026-10-28, coral-marten), committed, not pushed.
 - Landed inert: deferred physical retirement (registry.deferred_retire, released at lowerSuspend/lowerLease) and entry leases in enterSelectedTrace/enterHeadNativeQuiet. Doc 63 §5.10.2.
 - Cost: binary-trees +0.35%, co_pingpong_d20 +0.12% (ReleaseFast instr vs the stitching build); spectral-norm +0.43% judged layout noise.

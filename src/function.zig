@@ -464,6 +464,10 @@ pub const EffectKind = enum(u8) {
     aio_result = 18,
 };
 
+/// Doc 63 §5.9 (Q4): the disturb count at which a native stops being traced.
+/// LuaJIT's choice: the first disturbing call ends it.
+pub const disturb_threshold: u8 = 1;
+
 pub const Native = struct {
     header: GcHeader,
     func: NativeFn,

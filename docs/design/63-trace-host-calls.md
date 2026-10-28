@@ -111,7 +111,7 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
     check, which read the undefined home of every snapshot-only slot.
 
 - [ ] **Phase 2b — GC lifetime across a callback** (part 1 landed 2026-10-28:
-  the deferred physical retirement and entry leases, §5.10.1; open: `executing`
+  the deferred physical retirement and entry leases, §5.10.2; open: `executing`
   publication, the F1 and recording-time collection tests, the §8.1 probe A/B).
   Native constants in
   the weak pools; Phase Q's transaction split into logical invalidation
@@ -122,7 +122,8 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   `stack_top` with a debug check that they survive an epoch-clean call
   (§5.5). The instruction-count A/B of the entry lease on `bench/` and
   the §8.1 probe (§8).
-- [ ] **Phase 2c — recording and tier-1a.** `guard_native`, `call_host`,
+- [ ] **Phase 2c — recording and tier-1a** (slice 1 landed 2026-10-28: tier-1a
+  executes the four ops, §5.10.3; slice 2, recording, is next). `guard_native`, `call_host`,
   `guard_host_epoch`, `host_result` (§5.1); host calls force precise
   recording (§5.3); the tier-1a arms; exactly-once tests across the ten
   equivalence legs and every route in §5.4.
@@ -1363,6 +1364,48 @@ changes, and only when a suspension or a lease is outstanding.
   retires its guard), the recording-time collection tests (they need the tier-0
   suspension that Phase 2c adds), the blacklist-through-patched-entry test, and
   the §8.1 probe A/B.
+
+### 5.10.3 As landed: Phase 2c, slice 1 — tier-1a semantics (2026-10-28)
+
+Inert: the recorder still emits no host op, so no committed trace contains one.
+Tier-1a now executes the four §5.1 ops, tested on finalized hand-built runs.
+
+- **`guard_native`** passes only for the trace's own native, below the disturb
+  threshold (`function.disturb_threshold`, Q4), with a shim and a heap bound.
+  It then flushes S_B: the §5.5 preflush, the same materializer a precise exit
+  uses (`materializeSnapshot`). Any other failure exits through S_B, so tier-0
+  makes the call once. A run with no shim fails closed the same way.
+- **`call_host`** calls the shim, which performs the call, writes the results
+  and returns a status. Nonzero exits `.precise_error` through C_B with no
+  restore, so the callback's changes stand.
+- **`guard_host_epoch`** passes when the epoch equals the value before the call
+  and the budget holds (`guard_gc`'s rule). Otherwise it exits through C_B1.
+- **`host_result`** checks the tag against the observed type (`observedMatches`)
+  and exits through C_B1 on a mismatch.
+- **The shim** (`Vm.traceHostCall`) mirrors tier-0's host arm. It leaves the
+  frame at B with `in_flight` set, raises suspension with `suspended_trace` set,
+  calls `callHostNative`, writes the results with nil padding, and on success
+  sets pc to B+1 and clears `in_flight`. Statuses map from the four host errors
+  (`hostStatus`).
+- **`ExecCtx.host_call`** carries the shim, bound to the entered trace record.
+  The dispatcher sets it only for traces with host sites.
+
+**Deviation from §5.8.** The shim takes the executing trace as a parameter
+instead of reading `TraceState.executing`. Tier-1a has the record in hand, so
+the borrow is not needed here. `executing` stays unpublished, so the F3
+assertion in `invalidateDeadTraceConsts` is still vacuous. Publishing it is
+Phase 3's job, because native reaches the shim only through a baked context.
+
+**Tests** (`trace_finalize_test.zig`, "doc 63 tier-1a"): a failing call exits
+at `call_host` as a precise error with status 3, having made one call. A
+disturbed native, and a run without a shim, both refuse at `guard_native`
+before any call. A callback that moves the epoch exits at B+1 with its result
+in the window. A wrong-typed result exits at B+1. Mutation-checked: making the
+epoch guard always pass fails the epoch test.
+
+**Not done in this slice:** recording emits no host op yet (2c slice 2), so no
+end-to-end trace runs a host call. The precise-only admission, the exact
+exactly-once tests across the ten legs, and the §8.1 probe A/B wait for it.
 
 ### 5.11 Tier-1a
 
