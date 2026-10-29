@@ -29,6 +29,10 @@ Metadata line (anywhere in the file):
               semantically-equivalent LuaJIT-idiomatic source (the bit.* original)
               gives byte-identical output. mahina always runs this file.
   name=       optional display name (defaults to the path stem)
+  exclusive=  true → the program needs the machine to itself (e.g. a safety-
+              checked Debug build of co_many holds ~14 GB, since std fills
+              every allocation it hands out); tools/hashgate.py runs it alone,
+              one tier at a time, after everything else
 
 Usage:
     python3 bench/run.py                 # whole suite, default sizes
@@ -69,11 +73,12 @@ TIERS = {
 
 
 class Bench:
-    def __init__(self, path, name, argv, luajit, luajit_src=None):
+    def __init__(self, path, name, argv, luajit, luajit_src=None, exclusive=False):
         self.path = path
         self.name = name
         self.argv = argv          # list[str]
         self.luajit = luajit      # "compatible" | "skip"
+        self.exclusive = exclusive  # run alone, never beside another program
         # Optional alternate source run on LuaJIT instead of `path`. Used when the
         # mahina file uses 5.4 syntax LuaJIT (5.1) can't parse — e.g. native bitwise
         # operators — but a semantically-equivalent LuaJIT-idiomatic source (the
@@ -123,7 +128,10 @@ def discover(filter_sub, scale):
                     "  .mah = a mahina program (mahina only)\n"
                     "  Either rename it to .lua, or drop the parity claim."
                 )
-            benches.append(Bench(path, name, argv, luajit, lj_src))
+            exclusive = kv.get("exclusive", "false")
+            if exclusive not in ("true", "false"):
+                sys.exit(f"{path}: exclusive= must be true or false, not {exclusive!r}")
+            benches.append(Bench(path, name, argv, luajit, lj_src, exclusive == "true"))
     return benches
 
 

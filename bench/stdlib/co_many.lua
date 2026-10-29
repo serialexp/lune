@@ -7,7 +7,7 @@
 --
 --   mahina bench/stdlib/co_many.lua 10000 4
 --
--- @bench args="10000 4" luajit=compatible
+-- @bench args="10000 4" luajit=compatible exclusive=true
 
 local n = tonumber(arg and arg[1]) or 10000
 local rounds = tonumber(arg and arg[2]) or 4

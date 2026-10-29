@@ -139,6 +139,10 @@ def observe(mahina, benches, jobs_n, reps):
     Returns (observed, unstable, errored). `unstable` is only ever populated
     when reps > 1 — a program whose own output varies run to run cannot be a
     reference, and is worth catching there rather than as a mystery mismatch.
+
+    Programs marked `exclusive=true` (bench/run.py) run after the parallel
+    pool has drained, one (program, mode) at a time, so a memory-heavy program
+    never shares the machine with another run.
     """
     jobs = [(b, mode, flags) for b in benches for mode, flags in BR.TIERS.items()]
 
@@ -147,14 +151,22 @@ def observe(mahina, benches, jobs_n, reps):
         return job, [run_digest(mahina, b, flags) for _ in range(reps)]
 
     observed, unstable, errored = {}, [], []
+
+    def record(job, results):
+        b, mode, _ = job
+        rc, digest, err = results[0]
+        if rc != 0:
+            errored.append((b.name, mode, rc, BR.short(err.decode("utf-8", "replace"))))
+        if any((r[0], r[1]) != (rc, digest) for r in results[1:]):
+            unstable.append((b.name, mode))
+        observed[(b.name, mode)] = (" ".join(b.argv), rc, digest)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs_n) as pool:
-        for (b, mode, _), results in pool.map(work, jobs):
-            rc, digest, err = results[0]
-            if rc != 0:
-                errored.append((b.name, mode, rc, BR.short(err.decode("utf-8", "replace"))))
-            if any((r[0], r[1]) != (rc, digest) for r in results[1:]):
-                unstable.append((b.name, mode))
-            observed[(b.name, mode)] = (" ".join(b.argv), rc, digest)
+        for job, results in pool.map(work, [j for j in jobs if not j[0].exclusive]):
+            record(job, results)
+    for job in jobs:
+        if job[0].exclusive:
+            record(*work(job))
     return observed, unstable, errored
 
 
