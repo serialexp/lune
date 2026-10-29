@@ -11,7 +11,10 @@
 -- @bench args="1000000" luajit=compatible
 -- The input: 1 M lines of 100 bytes (100 MB of ASCII), created on first use
 -- at a fixed path (arg[2]) and reused while its size matches, so the timed
--- runs only read. ASCII keeps the output identical to LuaJIT's.
+-- runs only read. ASCII keeps the output identical to LuaJIT's. It is written
+-- to its own temporary file and renamed into place, so a run that starts
+-- while another is still creating it (hashgate runs the tiers in parallel)
+-- sees no file or the whole file, never a partial one.
 local N = tonumber(arg and arg[1]) or 1000000
 local path = (arg and arg[2]) or "/tmp/mahina-bench-lines.txt"
 local function ensure()
@@ -22,12 +25,14 @@ local function ensure()
     f:close()
     if size == N * 100 then return end
   end
-  local w = io.open(path, "w")
+  local tmp = os.tmpname()
+  local w = io.open(tmp, "w")
   local pad = string.rep("x", 91)
   for i = 1, N do
     w:write(string.format("%07d ", i), pad, "\n")
   end
   w:close()
+  os.rename(tmp, path)
 end
 ensure()
 
