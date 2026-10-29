@@ -14,7 +14,17 @@ DOC 44 STITCHING: numeric-for roots DONE (2026-10-28, coral-marten), committed, 
 - Known noise: euler14-bit +0.8% instructions with identical traces (interp.zig layout).
 - Next: doc 63 Phase 2b/2c (direct host calls; stitching is its fallback).
 
-DOC 74 LANGUAGE SERVER: P0–P5 DONE (2026-10-27 to 2026-10-28, coral-raven). Next: P6 (cross-file, mahina.toml).
+DOC 74 LANGUAGE SERVER: P0–P5 DONE, P6a–c DONE (2026-10-27 to 2026-10-29, coral-raven). Next: P6d (module exports + analysis cache), then P6e (watched files, workspace symbols, initializationOptions).
+- P6a–c (2026-10-29): mahina.toml reader (config.zig), require resolution
+  (modules.zig), multi-root workspace with per-folder config (workspace.zig,
+  uri.zig), host disk via workspace.Files (host_stdio.disk), definition on a
+  module name, `unresolved-require` information diagnostics. Decisions
+  (multi-root, severity, definition files with a type grammar based on the
+  base grammar) are in doc 74 §7.4. A mahina.toml edit is not picked up until
+  P6e (restart or re-add the folder).
+- Fixed on the way: host_stdio's detached reader could touch the caller's
+  allocator after `run` returned (a flaky leak + invalid-free panic in the
+  session tests under parallel load). Joinable transports are now joined.
 - P2 viz client, P3 navigation/completion, P4 syntax (semantic tokens, outline,
   folds, selection ranges, the trivia sink) and P5 (hover, `lib.` completion,
   signature help from the inventory's signature column; src/lsp/stdlib_db.zig,

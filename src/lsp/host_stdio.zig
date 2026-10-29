@@ -15,6 +15,7 @@
 const std = @import("std");
 const jsonrpc = @import("jsonrpc.zig");
 const server_mod = @import("server.zig");
+const workspace = @import("workspace.zig");
 const io_mod = @import("../io.zig");
 
 const Io = std.Io;
@@ -24,6 +25,11 @@ pub const Transport = struct {
     ctx: ?*anyopaque = null,
     read: *const fn (ctx: ?*anyopaque, buf: []u8) anyerror!usize,
     write: *const fn (ctx: ?*anyopaque, bytes: []const u8) anyerror!void,
+    /// `read` always returns in bounded time (0 at the end), so `run` waits
+    /// for the reader thread before it returns and nothing touches the
+    /// allocator afterwards. Stdin can block forever after `exit`, so its
+    /// reader is detached instead and lets go of its share when it wakes.
+    joinable: bool = false,
 };
 
 pub const Config = struct {
@@ -39,6 +45,22 @@ pub const Config = struct {
     /// The global names the host installs, which are not flagged as undefined.
     known_globals: []const []const u8 = &.{},
 };
+
+/// The largest file the server reads: a `mahina.toml` (doc 74 §7.4).
+const max_file_bytes = 1 << 20;
+
+/// The disk, for `mahina.toml` and `require` resolution.
+pub const disk: workspace.Files = .{ .read = diskRead, .exists = diskExists };
+
+fn diskRead(_: ?*anyopaque, a: std.mem.Allocator, path: []const u8) ?[]u8 {
+    // Missing, unreadable or too large: no config, the defaults apply.
+    return Io.Dir.cwd().readFileAlloc(io_mod.hostIo(), path, a, Io.Limit.limited(max_file_bytes)) catch null;
+}
+
+fn diskExists(_: ?*anyopaque, path: []const u8) bool {
+    const st = Io.Dir.cwd().statFile(io_mod.hostIo(), path, .{}) catch return false;
+    return st.kind == .file;
+}
 
 fn logStderr(msg: []const u8) void {
     io_mod.eprint("mahina lsp: {s}\n", .{msg});
@@ -264,12 +286,18 @@ pub fn run(gpa: std.mem.Allocator, transport: Transport, cfg: Config) !u8 {
         sh.release();
         return error.ThreadSpawnFailed;
     };
-    reader.detach(); // it may be blocked in `read`; `Shared` is ref-counted for that
-    defer sh.stop();
+    // A reader that may be blocked in `read` is detached; `Shared` is
+    // ref-counted for that. One that cannot block is joined on the way out.
+    if (!transport.joinable) reader.detach();
+    defer {
+        sh.stop();
+        if (transport.joinable) reader.join();
+    }
 
     var core = server_mod.Server.init(gpa, .{ .ctx = sh, .cancelled = cancelledHook, .input_pending = inputPendingHook });
     defer core.deinit();
     core.known_globals = cfg.known_globals;
+    core.files = disk;
     var out = server_mod.Outbox.init(gpa);
     defer out.deinit();
     var wire: std.ArrayList(u8) = .empty;
@@ -370,7 +398,8 @@ const Pipe = struct {
     }
 
     fn transport(self: *Pipe) Transport {
-        return .{ .ctx = self, .read = read, .write = write };
+        // Every `read` returns, at worst after the hold's bounded wait.
+        return .{ .ctx = self, .read = read, .write = write, .joinable = true };
     }
 
     fn read(ctx: ?*anyopaque, buf: []u8) anyerror!usize {

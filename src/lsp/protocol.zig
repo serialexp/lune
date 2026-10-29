@@ -18,9 +18,27 @@ pub const ClientCapabilities = struct {
     general: ?ClientGeneral = null,
 };
 
+pub const WorkspaceFolder = struct {
+    uri: []const u8,
+    name: []const u8 = "",
+};
+
 pub const InitializeParams = struct {
     processId: ?i64 = null,
     capabilities: ClientCapabilities = .{},
+    /// The single root of a client without workspace folders.
+    rootUri: ?[]const u8 = null,
+    /// Every folder of the workspace; takes precedence over `rootUri`.
+    workspaceFolders: ?[]const WorkspaceFolder = null,
+};
+
+pub const WorkspaceFoldersChangeEvent = struct {
+    added: []const WorkspaceFolder = &.{},
+    removed: []const WorkspaceFolder = &.{},
+};
+
+pub const DidChangeWorkspaceFoldersParams = struct {
+    event: WorkspaceFoldersChangeEvent,
 };
 
 pub const TextDocumentSyncKind = struct {
@@ -58,6 +76,16 @@ pub const SemanticTokensOptions = struct {
     full: bool = true,
 };
 
+pub const WorkspaceFoldersServerCapabilities = struct {
+    supported: bool = true,
+    changeNotifications: bool = true,
+};
+
+pub const WorkspaceServerCapabilities = struct {
+    /// One server serves every folder (doc 74 §7.4).
+    workspaceFolders: WorkspaceFoldersServerCapabilities = .{},
+};
+
 pub const ServerCapabilities = struct {
     /// Omitted when the client offered no encodings (then UTF-16 is implied).
     positionEncoding: ?[]const u8 = null,
@@ -73,6 +101,7 @@ pub const ServerCapabilities = struct {
     documentSymbolProvider: bool = true,
     foldingRangeProvider: bool = true,
     selectionRangeProvider: bool = true,
+    workspace: WorkspaceServerCapabilities = .{},
 };
 
 pub const ServerInfo = struct {

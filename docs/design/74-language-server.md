@@ -228,6 +228,27 @@ land; move whole phases to Done once everything inside them is checked.
   `package.searchpath`, `mahina.toml` (with a TOML-subset reader in
   `src/lsp/config.zig`), open-document overlays,
   module exports for `local M = {} … return M`, workspace symbols.
+  - [x] P6a `mahina.toml` reader (`config.zig`): the TOML subset, located
+    errors, `version = 1`, tables `[runtime]` (`cwd`, `package_path`,
+    `system`), `[globals]`, `[diagnostics]` (`suppress`).
+  - [x] P6b `require` resolution (`modules.zig`): built-ins, then
+    `package.path` templates against the runtime cwd, through a probe the
+    host supplies; literal sites from the tokens, a shadowed or field
+    `require` skipped, dynamic arguments named as such.
+  - [x] P6c server integration: one server for every workspace folder, each
+    folder's `mahina.toml` (`workspace.zig`), `file:` URIs (`uri.zig`), the
+    host's disk as `workspace.Files` (stdio: `host_stdio.disk`; the browser
+    has none), open documents ahead of the disk, definition on a module name,
+    `unresolved-require` information diagnostics, `[globals]` and `suppress`
+    applied, a rejected config published on the file,
+    `workspace/didChangeWorkspaceFolders`.
+  - [ ] P6d module exports (`local M = {} … return M`) for member completion
+    and definition across files, with an analysis cache per module path.
+  - [ ] P6e `workspace/didChangeWatchedFiles` (client registration): reload a
+    changed `mahina.toml` (today a config edit needs the folder re-added or a
+    restart) and invalidate the P6d cache; workspace symbols;
+    `initializationOptions` overriding `mahina.toml`; `system` groups
+    filtering the host globals (parsed, not applied yet).
 - [ ] **P7 — JIT lenses** (§7.6): extend the `--emit-coverage` artifact
   with source spans and structured abort records; in Zed, a code action
   running the file and inlay hints from the result. The viz already shades
@@ -590,6 +611,40 @@ per-root behaviour in multi-root workspaces. Content: runtime cwd,
 `package.path`, enabled system groups, extra host globals with optional
 member descriptions (for embedding hosts), and diagnostic code
 suppressions.
+
+**Decided 2026-10-29 (Bart), as built in P6c:**
+- *Multi-root.* One server process serves every workspace folder; each
+  folder's own `mahina.toml` governs the files under it, and when folders
+  nest the innermost wins. A file in no folder gets the defaults and
+  searches from its own directory, the likeliest place the CLI is run from.
+  A document that names no file (`untitled:`) resolves only built-ins.
+- *An unresolved literal `require` is information* (code
+  `unresolved-require`), not a warning: the runtime may still find it
+  through a searcher or `package.preload` entry the host installs
+  (`package.searchers` is a real table hosts may prepend to,
+  `package.zig:21`), which the server cannot see. With no disk (the browser)
+  a miss says nothing, so nothing is reported. A dynamic argument gets no
+  diagnostic. `suppress = ["unresolved-require"]` silences it per folder.
+  Once definition files exist (below), a host can declare its modules and a
+  miss outside them can become a warning.
+- *Definition files for every module, the stdlib included,* generated from
+  the implementations where they can be (lua-language-server's meta files,
+  TypeScript's `.d.ts`): stub `.mah` files with empty bodies. They need a
+  type grammar the language does not have yet — today an annotation is a
+  dotted name only, and the `?` of an optional type is reserved but not
+  parsed (`parser.zig` `matchOptionalMarker`) — so they wait for their own
+  design doc. The type grammar is **based on the base grammar**: it extends
+  what the language can already say, so constructs can later move between
+  the type grammar and the main grammar as needed. When stubs land, the
+  stdlib inventory stops feeding the server and stays the implementation
+  checklist (Rule Z-5).
+
+**Cost, measured** (`zig build bench-lsp`, cross-file table: a literal
+`require` per 14 lines, half resolving nowhere, real disk): 0.08 ms added
+at 1k lines, 0.9 ms at 10k, 6 ms at 100k (7,143 requires). Each distinct
+module name is looked for once per analysis, and a `require` is told to be
+the global by the resolver's occurrence lookup (O(log n)); the first cut
+scanned every binding per site and added 468 ms at 100k.
 
 ### 7.5 Tier 5 — inference (deferred)
 

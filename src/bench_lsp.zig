@@ -5,7 +5,8 @@
 //! (debounce excluded), over realistic files at 1k / 10k / 100k lines and the
 //! adversarial corpus (one 1 MB line of astral characters, 60k distinct
 //! constants, 500-deep nesting, a file broken every 20 lines, an edit burst of
-//! 200 changes, 50 open documents).
+//! 200 changes, 50 open documents), and the cost `require` resolution adds
+//! against the real disk (doc 74 §7.4).
 //!
 //! Budget (doc 74 Q12): ≤ 10 ms end to end at 10k lines, ≤ 100 ms at 100k.
 //! Informational, not a gate (global Rule #22): run it deliberately, on a
@@ -37,12 +38,18 @@ fn ms(ns: u64) f64 {
 /// Roughly `lines` lines of ordinary code: functions with loops, tables,
 /// closures and calls to earlier functions. `break_every` > 0 injects a
 /// syntax error every that many lines.
-fn realistic(gpa: std.mem.Allocator, lines: usize, break_every: usize) ![]u8 {
+/// `requires`: each block starts with a literal `require` of `mod_<i % 200>`,
+/// for the cross-file table.
+fn realistic(gpa: std.mem.Allocator, lines: usize, break_every: usize, requires: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var line: usize = 0;
     var i: usize = 0;
     while (line < lines) : (i += 1) {
+        if (requires) {
+            try out.print(gpa, "local m_{d} = require(\"mod_{d}\")\n", .{ i, i % cross_modules_named });
+            line += 1;
+        }
         const block = try std.fmt.allocPrint(gpa,
             \\local function work_{d}(items, scale)
             \\  local total = 0
@@ -211,6 +218,61 @@ fn endToEnd(gpa: std.mem.Allocator, io: std.Io, text: []const u8, reps: usize) !
     return best;
 }
 
+/// The cross-file table's modules: `mod_0` … `mod_99` exist on disk, and the
+/// text names `mod_0` … `mod_199`, so half its requires resolve nowhere and try
+/// every template.
+const cross_modules_on_disk = 100;
+const cross_modules_named = 200;
+const cross_dir = "/tmp/mahina-bench-lsp";
+
+fn writeModules(io: std.Io) !void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, cross_dir) catch {};
+    try cwd.createDirPath(io, cross_dir);
+    for (0..cross_modules_on_disk) |k| {
+        var buf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, cross_dir ++ "/mod_{d}.mah", .{k});
+        try cwd.writeFile(io, .{ .sub_path = path, .data = "return {}\n" });
+    }
+}
+
+/// `endToEnd` for a document in a workspace folder at `cross_dir`, reading
+/// `files` (null: no disk, so nothing is probed and no miss is reported).
+fn crossFile(gpa: std.mem.Allocator, io: std.Io, text: []const u8, files: ?lsp.workspace.Files, reps: usize) !u64 {
+    var core = server.Server.init(gpa, .{});
+    defer core.deinit();
+    core.known_globals = &mahina.interp.builtin_global_names;
+    core.files = files;
+    var out = server.Outbox.init(gpa);
+    defer out.deinit();
+    try core.handle(0, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{},\"rootUri\":\"file://" ++ cross_dir ++ "\"}}", &out);
+    try core.handle(0, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}", &out);
+    const uri = "file://" ++ cross_dir ++ "/bench.mh";
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" ++ uri ++ "\",\"version\":1,\"text\":");
+    try std.json.Stringify.value(text, .{}, &aw.writer);
+    try aw.writer.writeAll("}}}");
+    try core.handle(0, aw.written(), &out);
+    try core.tick(250, &out);
+
+    var best: u64 = std.math.maxInt(u64);
+    for (0..reps) |rep| {
+        aw.clearRetainingCapacity();
+        try aw.writer.print("{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{\"textDocument\":{{\"uri\":\"" ++ uri ++ "\",\"version\":{d}}},\"contentChanges\":[{{\"text\":", .{rep + 2});
+        try std.json.Stringify.value(text, .{}, &aw.writer);
+        try aw.writer.writeAll("}]}}");
+        out.reset();
+        const t0 = now(io);
+        try core.handle(1000 + rep * 1000, aw.written(), &out);
+        try core.tick(1000 + rep * 1000 + 250, &out);
+        const t1 = now(io);
+        if (out.messages().len != 1) return error.NoPublish;
+        best = @min(best, @as(u64, @intCast(t1 - t0)));
+    }
+    return best;
+}
+
 fn open(gpa: std.mem.Allocator, core: *server.Server, out: *server.Outbox, text: []const u8) !void {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -310,10 +372,10 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
         for (cases.items) |c| gpa.free(c.text);
         cases.deinit(gpa);
     }
-    try cases.append(gpa, .{ .name = "realistic 1k lines", .text = try realistic(gpa, 1_000, 0), .reps = 20 });
-    try cases.append(gpa, .{ .name = "realistic 10k lines", .text = try realistic(gpa, 10_000, 0), .reps = 10 });
-    try cases.append(gpa, .{ .name = "realistic 100k lines", .text = try realistic(gpa, 100_000, 0), .reps = 5 });
-    try cases.append(gpa, .{ .name = "broken every 20 lines (10k)", .text = try realistic(gpa, 10_000, 20), .reps = 10 });
+    try cases.append(gpa, .{ .name = "realistic 1k lines", .text = try realistic(gpa, 1_000, 0, false), .reps = 20 });
+    try cases.append(gpa, .{ .name = "realistic 10k lines", .text = try realistic(gpa, 10_000, 0, false), .reps = 10 });
+    try cases.append(gpa, .{ .name = "realistic 100k lines", .text = try realistic(gpa, 100_000, 0, false), .reps = 5 });
+    try cases.append(gpa, .{ .name = "broken every 20 lines (10k)", .text = try realistic(gpa, 10_000, 20, false), .reps = 10 });
     try cases.append(gpa, .{ .name = "one 1 MB line, astral chars", .text = try astralLine(gpa, 1 << 20), .reps = 5 });
     try cases.append(gpa, .{ .name = "60k distinct constants", .text = try manyConstants(gpa, 60_000), .reps = 5 });
     try cases.append(gpa, .{ .name = "500-deep nesting", .text = try nested(gpa, 500), .reps = 20 });
@@ -377,6 +439,35 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
         const complete_ns = try requestNs(gpa, io, c.text, "textDocument/completion", tail, c.reps);
         mahina.io.print("{s: <30} {d: >9} {d: >10.2} {d: >14.2} {d: >12.2}\n", .{
             c.name, c.text.len, ms(hover_ns), ms(sig_ns), ms(complete_ns),
+        });
+    }
+
+    mahina.io.print(
+        \\
+        \\cross-file: a literal require per block, half resolving nowhere, real disk (doc 74 §7.4; best of N, ms)
+        \\
+        \\{s: <30} {s: >9} {s: >9} {s: >10} {s: >10} {s: >8}
+        \\
+    , .{ "case", "bytes", "requires", "no disk", "disk", "added" });
+    try writeModules(io);
+    defer std.Io.Dir.cwd().deleteTree(io, cross_dir) catch {};
+    const cross = [_]struct { name: []const u8, lines: usize, reps: usize }{
+        .{ .name = "1k lines", .lines = 1_000, .reps = 20 },
+        .{ .name = "10k lines", .lines = 10_000, .reps = 10 },
+        .{ .name = "100k lines", .lines = 100_000, .reps = 5 },
+    };
+    for (cross) |c| {
+        const text = try realistic(gpa, c.lines, 0, true);
+        defer gpa.free(text);
+        const no_disk = try crossFile(gpa, io, text, null, c.reps);
+        const disk = try crossFile(gpa, io, text, lsp.host_stdio.disk, c.reps);
+        mahina.io.print("{s: <30} {d: >9} {d: >9} {d: >10.2} {d: >10.2} {d: >8.2}\n", .{
+            c.name,
+            text.len,
+            std.mem.count(u8, text, "require("),
+            ms(no_disk),
+            ms(disk),
+            ms(disk) - ms(no_disk),
         });
     }
 

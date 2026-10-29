@@ -45,8 +45,10 @@ pub fn mappedName(a: std.mem.Allocator, name: []const u8) std.mem.Allocator.Erro
     return std.mem.replaceOwned(u8, a, name, ".", "/");
 }
 
-/// The candidate paths for `name`, one per template, with `cwd` joined in. A
-/// `.` cwd is left out, so the paths read as the templates do (`./a/b.mah`).
+/// The candidate paths for `name`, one per template, with `cwd` joined in and
+/// `.`/`..` resolved, `/`-separated on every OS so they compare equal to an open
+/// document's path. A `.` cwd is left out, so the paths read as the templates
+/// do (`./a/b.mah`).
 pub fn candidates(
     a: std.mem.Allocator,
     cwd: []const u8,
@@ -57,7 +59,7 @@ pub fn candidates(
     const out = try a.alloc([]const u8, templates.len);
     for (templates, out) |t, *slot| {
         const sub = try std.mem.replaceOwned(u8, a, t, "?", mapped);
-        slot.* = if (std.mem.eql(u8, cwd, ".")) sub else try std.fs.path.join(a, &.{ cwd, sub });
+        slot.* = if (std.mem.eql(u8, cwd, ".")) sub else try std.fs.path.resolveAllocPosix(a, &.{ cwd, sub });
     }
     return out;
 }
@@ -103,7 +105,7 @@ pub fn sites(a: std.mem.Allocator, an: *const Analysis) std.mem.Allocator.Error!
         const word = an.source[t.start..t.end];
         if (!std.mem.eql(u8, word, "require")) continue;
         if (i > 0 and (toks[i - 1].tag == .dot or toks[i - 1].tag == .colon)) continue;
-        if (library.isLocal(an, word, t.start)) continue;
+        if (!isGlobal(an, word, t.start)) continue;
 
         // `require "a"` or `require("a")`.
         const arg_i = if (i + 1 < toks.len and toks[i + 1].tag == .lparen) i + 2 else i + 1;
@@ -113,6 +115,53 @@ pub fn sites(a: std.mem.Allocator, an: *const Analysis) std.mem.Allocator.Error!
             try out.append(a, .{ .span = .{ .start = arg.start, .end = arg.end }, .name = plainName(an.source[arg.start..arg.end]) });
         } else if (i + 1 < toks.len and toks[i + 1].tag == .lparen) {
             try out.append(a, .{ .span = .{ .start = t.start, .end = t.end }, .name = null });
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Whether the name at `start` is the global. The resolver answers in
+/// O(log n); text it could not read has no occurrence there, and then the
+/// bindings in scope decide.
+fn isGlobal(an: *const Analysis, name: []const u8, start: u32) bool {
+    if (an.res.bindingAt(start)) |id| return an.res.binding(id).kind == .global;
+    return !library.isLocal(an, name, start);
+}
+
+/// The site whose literal (or dynamic `require`) the cursor is in or touches.
+pub fn siteAt(all: []const Site, offset: u32) ?Site {
+    for (all) |s| {
+        if (s.span.start <= offset and offset <= s.span.end) return s;
+    }
+    return null;
+}
+
+/// A literal `require` that names no built-in module and no existing file.
+pub const Missing = struct {
+    span: Span,
+    name: []const u8,
+    /// The candidates tried, in order.
+    tried: []const []const u8,
+};
+
+/// Every literal `require` in the source that does not resolve.
+pub fn unresolved(
+    a: std.mem.Allocator,
+    an: *const Analysis,
+    cwd: []const u8,
+    templates: []const []const u8,
+    probe: Probe,
+) std.mem.Allocator.Error![]const Missing {
+    var out: std.ArrayList(Missing) = .empty;
+    // A module required twice is looked for once.
+    var seen: std.StringHashMapUnmanaged(Resolution) = .empty;
+    for (try sites(a, an)) |s| {
+        const name = s.name orelse continue;
+        const got = try seen.getOrPut(a, name);
+        if (!got.found_existing) got.value_ptr.* = try resolve(a, name, cwd, templates, probe);
+        switch (got.value_ptr.*) {
+            .missing => |tried| try out.append(a, .{ .span = s.span, .name = name, .tried = tried }),
+            .builtin, .file => {},
         }
     }
     return out.toOwnedSlice(a);
@@ -167,13 +216,16 @@ test "modules: a dotted name maps to a path, and templates are tried in order" {
     try testing.expectEqualStrings("a/b/c", try mappedName(a, "a.b.c"));
 
     const cands = try candidates(a, "src", &default_templates, "a.b");
-    try testing.expectEqualStrings("src/./a/b.mah", cands[0]);
-    try testing.expectEqualStrings("src/./a/b/init.mah", cands[1]);
+    try testing.expectEqualStrings("src/a/b.mah", cands[0]);
+    try testing.expectEqualStrings("src/a/b/init.mah", cands[1]);
 
     // The init file exists and the plain one does not: the second template wins.
-    var fs: FakeFs = .{ .files = &.{"src/./a/b/init.mah"} };
+    var fs: FakeFs = .{ .files = &.{"src/a/b/init.mah"} };
     const r = try resolve(a, "a.b", "src", &default_templates, fs.probe());
-    try testing.expectEqualStrings("src/./a/b/init.mah", r.file);
+    try testing.expectEqualStrings("src/a/b/init.mah", r.file);
+    // An absolute cwd, and `..` in a template, resolve.
+    const up = try candidates(a, "/p/src", &.{"../lib/?.mah"}, "x");
+    try testing.expectEqualStrings("/p/lib/x.mah", up[0]);
 }
 
 test "modules: a built-in short-circuits, and a miss lists every candidate" {
@@ -240,4 +292,28 @@ test "modules: a shadowed or field require is not the global one" {
     );
     try testing.expectEqual(@as(usize, 1), s.len);
     try testing.expectEqualStrings("global", s[0].name.?);
+}
+
+test "modules: only literal requires that resolve nowhere are unresolved" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var an = try analysis_mod.analyse(testing.allocator,
+        \\local s = require("string")
+        \\local h = require("here")
+        \\local g = require("gone")
+        \\local d = require(name)
+    , &.{}, .{});
+    defer an.deinit();
+    var fs: FakeFs = .{ .files = &.{"/p/here.mah"} };
+    const miss = try unresolved(a, &an, "/p", &default_templates, fs.probe());
+    try testing.expectEqual(@as(usize, 1), miss.len);
+    try testing.expectEqualStrings("gone", miss[0].name);
+    try testing.expectEqualStrings("/p/gone.mah", miss[0].tried[0]);
+    try testing.expectEqualStrings("\"gone\"", an.source[miss[0].span.start..miss[0].span.end]);
+
+    const all = try sites(a, &an);
+    const here: u32 = @intCast(std.mem.find(u8, an.source, "\"here\"").?);
+    try testing.expectEqualStrings("here", siteAt(all, here + 2).?.name.?);
+    try testing.expect(siteAt(all, 0) == null);
 }

@@ -14,6 +14,8 @@ pub const stdlib_db = @import("lsp/stdlib_db.zig");
 pub const library = @import("lsp/library.zig");
 pub const config = @import("lsp/config.zig");
 pub const modules = @import("lsp/modules.zig");
+pub const uri = @import("lsp/uri.zig");
+pub const workspace = @import("lsp/workspace.zig");
 pub const server = @import("lsp/server.zig");
 /// The stdio host; native only (the browser has its own, in `wasm_entry.zig`).
 pub const host_stdio = @import("lsp/host_stdio.zig");
@@ -32,6 +34,8 @@ test {
     _ = library;
     _ = config;
     _ = modules;
+    _ = uri;
+    _ = workspace;
     _ = server;
     _ = host_stdio;
 }

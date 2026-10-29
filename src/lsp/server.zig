@@ -23,6 +23,9 @@ const syntax = @import("syntax.zig");
 const tokens = @import("tokens.zig");
 const completion = @import("completion.zig");
 const library = @import("library.zig");
+const modules = @import("modules.zig");
+const uri_mod = @import("uri.zig");
+const workspace = @import("workspace.zig");
 
 /// Analysis runs this long after the last change...
 pub const debounce_ms: u64 = 50;
@@ -111,15 +114,25 @@ pub const Server = struct {
     /// The global names the host installs, so they are not flagged as
     /// undefined. Set by the host after `init`.
     known_globals: []const []const u8 = &.{},
+    /// The host's disk, for `mahina.toml` and `require` (doc 74 §7.4). Set by
+    /// the host after `init`; a host without one (the browser) leaves it null,
+    /// and then only built-in modules and open documents resolve.
+    files: ?workspace.Files = null,
+    /// The workspace folders and their configs.
+    ws: workspace.Workspace,
 
     pub const Error = error{OutOfMemory};
 
+    /// The diagnostic code of a literal `require` that resolves nowhere.
+    pub const unresolved_require_code = "unresolved-require";
+
     pub fn init(gpa: std.mem.Allocator, hooks: Hooks) Server {
-        return .{ .gpa = gpa, .hooks = hooks, .docs = documents.Store.init(gpa) };
+        return .{ .gpa = gpa, .hooks = hooks, .docs = documents.Store.init(gpa), .ws = workspace.Workspace.init(gpa) };
     }
 
     pub fn deinit(self: *Server) void {
         self.docs.deinit();
+        self.ws.deinit();
     }
 
     /// Whether the process should now stop (`exit` arrived).
@@ -208,6 +221,8 @@ pub const Server = struct {
         an: *const analysis_mod.Analysis,
         index: *const position.LineIndex,
         offset: u32,
+        /// What governs the document: its folder's config, or the defaults.
+        settings: workspace.Settings,
     };
 
     /// Find the document and make sure its analysis is of the text as it is now
@@ -226,7 +241,37 @@ pub const Server = struct {
             return null;
         };
         const index = doc.lineIndex(self.gpa) catch return error.OutOfMemory;
-        return .{ .doc = doc, .an = an, .index = index, .offset = 0 };
+        const settings = try self.settingsOf(out.arena.allocator(), doc.uri);
+        return .{ .doc = doc, .an = an, .index = index, .offset = 0, .settings = settings };
+    }
+
+    /// The settings for the document at `uri`, allocated in `a`.
+    fn settingsOf(self: *const Server, a: std.mem.Allocator, uri: []const u8) Error!workspace.Settings {
+        return self.ws.settingsFor(a, try uri_mod.toPath(a, uri), self.known_globals);
+    }
+
+    /// A probe that sees the open documents ahead of the host's disk. Its paths
+    /// live in `a`.
+    fn overlay(self: *const Server, a: std.mem.Allocator) Error!workspace.Overlay {
+        var paths: std.ArrayList([]const u8) = .empty;
+        var it = self.docs.map.valueIterator();
+        while (it.next()) |d| {
+            const path = (try uri_mod.toPath(a, d.*.uri)) orelse continue;
+            try paths.append(a, try std.fs.path.resolveAllocPosix(a, &.{path}));
+        }
+        return .{ .open_paths = paths.items, .files = self.files };
+    }
+
+    /// The file a literal `require` at the cursor loads, as a URI.
+    fn requireTarget(self: *const Server, a: std.mem.Allocator, c: Cursor) Error!?[]const u8 {
+        const cwd = c.settings.cwd orelse return null;
+        const site = modules.siteAt(try modules.sites(a, c.an), c.offset) orelse return null;
+        const name = site.name orelse return null;
+        var ov = try self.overlay(a);
+        return switch (try modules.resolve(a, name, cwd, c.settings.package_path, ov.probe())) {
+            .file => |path| try uri_mod.fromPath(a, path),
+            .builtin, .missing => null,
+        };
     }
 
     /// `analysed`, with the cursor position converted to a byte offset.
@@ -239,6 +284,11 @@ pub const Server = struct {
     fn definition(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
         const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
         const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        // On the name in `require("a.b")`: the module's file, from its start.
+        if (try self.requireTarget(out.arena.allocator(), c)) |target| {
+            const top: position.Position = .{ .line = 0, .character = 0 };
+            return out.result(id, protocol.Location{ .uri = target, .range = .{ .start = top, .end = top } });
+        }
         const occ = navigation.occurrenceAt(c.an, c.offset) orelse return out.result(id, @as(?u8, null));
         const span = navigation.definition(c.an, occ) orelse return out.result(id, @as(?u8, null));
         try out.result(id, protocol.Location{
@@ -286,7 +336,7 @@ pub const Server = struct {
         const name = c.an.res.binding(occ.binding).name;
         // The binding's own name is always a valid new spelling, so only the
         // refusals about the binding itself can come back.
-        switch (navigation.checkRename(c.an, self.known_globals, occ.binding, &.{}, name)) {
+        switch (navigation.checkRename(c.an, c.settings.known_globals, occ.binding, &.{}, name)) {
             .ok => {},
             .refused => |r| return out.fail(id, .request_failed, try refusalMessage(a, c, r.reason, null, name, name)),
         }
@@ -303,7 +353,7 @@ pub const Server = struct {
             return out.fail(id, .request_failed, "there is no name to rename here");
         const b = c.an.res.binding(occ.binding);
         const occs = try navigation.references(a, c.an, occ.binding, true);
-        switch (navigation.checkRename(c.an, self.known_globals, occ.binding, occs, p.newName)) {
+        switch (navigation.checkRename(c.an, c.settings.known_globals, occ.binding, occs, p.newName)) {
             .ok => {},
             .refused => |r| return out.fail(id, .request_failed, try refusalMessage(a, c, r.reason, r.at, b.name, p.newName)),
         }
@@ -350,7 +400,7 @@ pub const Server = struct {
     fn complete(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
         const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
         const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
-        const items = try completion.complete(a, c.an, self.known_globals, c.offset);
+        const items = try completion.complete(a, c.an, c.settings.known_globals, c.offset);
         const oa = out.arena.allocator();
         const list = try oa.alloc(protocol.CompletionItem, items.len);
         for (items, list) |it, *slot| {
@@ -408,7 +458,7 @@ pub const Server = struct {
     fn semanticTokens(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
         const p = jsonrpc.decodeParams(protocol.SemanticTokensParams, a, params) catch |e| return self.badParams(id, e, out);
         const c = (try self.analysed(id, p.textDocument.uri, out)) orelse return;
-        const toks = try tokens.collect(a, c.an, self.known_globals);
+        const toks = try tokens.collect(a, c.an, c.settings.known_globals);
         var data: std.ArrayList(u32) = .empty;
         var cur = position.Cursor.init(c.index, c.an.source, self.encoding);
         var prev_line: u32 = 0;
@@ -594,6 +644,14 @@ pub const Server = struct {
             }
             doc.version = p.textDocument.version;
             markDirty(doc, now_ms);
+        } else if (std.mem.eql(u8, method, "workspace/didChangeWorkspaceFolders")) {
+            const p = jsonrpc.decodeParams(protocol.DidChangeWorkspaceFoldersParams, a, params) catch |e|
+                return self.badNotification(a, method, e, out);
+            for (p.event.removed) |f| try self.removeFolder(a, f.uri, out);
+            for (p.event.added) |f| try self.addFolder(a, f.uri, out);
+            // A document may now fall under another folder's config.
+            var it = self.docs.map.valueIterator();
+            while (it.next()) |d| markDirty(d.*, now_ms);
         } else if (std.mem.eql(u8, method, "textDocument/didClose")) {
             const p = jsonrpc.decodeParams(protocol.DidCloseTextDocumentParams, a, params) catch |e|
                 return self.badNotification(a, method, e, out);
@@ -651,6 +709,68 @@ pub const Server = struct {
             },
             .serverInfo = .{ .name = server_name },
         });
+        // After the response: a folder's config may publish diagnostics, and
+        // nothing may precede the answer to `initialize`.
+        if (p.workspaceFolders) |folders| {
+            for (folders) |f| try self.addFolder(a, f.uri, out);
+        } else if (p.rootUri) |root| {
+            try self.addFolder(a, root, out);
+        }
+    }
+
+    // ---- workspace folders and their config (doc 74 §7.4) ------------------
+
+    /// Add a workspace folder, read its `mahina.toml`, and publish what is
+    /// wrong with it (or clear what was).
+    fn addFolder(self: *Server, a: std.mem.Allocator, folder_uri: []const u8, out: *Outbox) Error!void {
+        const path = (try uri_mod.toPath(a, folder_uri)) orelse {
+            const m = try std.fmt.allocPrint(a, "workspace folder is not a local directory, so it has no mahina.toml: {s}", .{folder_uri});
+            return out.log(protocol.MessageType.info, m);
+        };
+        const had_failure = if (try self.ws.find(a, path)) |old| old.failure != null else false;
+        const f = try self.ws.add(folder_uri, path, self.files, self.known_globals);
+        if (f.failure != null or had_failure) try self.publishConfig(a, f, out);
+    }
+
+    /// Drop a workspace folder, taking back the diagnostics on its config.
+    fn removeFolder(self: *Server, a: std.mem.Allocator, folder_uri: []const u8, out: *Outbox) Error!void {
+        const path = (try uri_mod.toPath(a, folder_uri)) orelse return;
+        const f = (try self.ws.find(a, path)) orelse return;
+        if (f.failure != null) {
+            try out.notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
+                .uri = try uri_mod.fromPath(out.arena.allocator(), try f.configPath(a)),
+                .diagnostics = &.{},
+            });
+        }
+        _ = try self.ws.remove(path);
+    }
+
+    /// A rejected `mahina.toml` as one error, from the column it names to the
+    /// end of that line; an accepted one as no diagnostics.
+    fn publishConfig(self: *Server, a: std.mem.Allocator, f: *const workspace.Folder, out: *Outbox) Error!void {
+        const oa = out.arena.allocator();
+        const cfg_uri = try uri_mod.fromPath(oa, try f.configPath(a));
+        const why = f.failure orelse return out.notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
+            .uri = cfg_uri,
+            .diagnostics = &.{},
+        });
+        const text = f.config_text orelse "";
+        const index = position.LineIndex.build(a, text) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TextTooLong => return out.log(protocol.MessageType.@"error", why.message),
+        };
+        const line = @min(why.line - 1, index.lineCount() - 1);
+        const line_end = index.lineEnd(text, line);
+        const start = @min(index.lineStart(line) + why.column - 1, line_end);
+        const one = try oa.alloc(protocol.Diagnostic, 1);
+        one[0] = .{
+            .range = index.toRange(text, start, line_end, self.encoding),
+            .severity = protocol.DiagnosticSeverity.@"error",
+            .code = "config",
+            .source = server_name,
+            .message = try oa.dupe(u8, why.message),
+        };
+        try out.notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{ .uri = cfg_uri, .diagnostics = one });
     }
 
     fn offers(list: []const []const u8, name: []const u8) bool {
@@ -696,8 +816,10 @@ pub const Server = struct {
     /// waiting makes the work pointless, so the host's `input_pending` is asked
     /// between phases and the document stays dirty if it says yes.
     fn analyse(self: *Server, doc: *documents.Document, out: *Outbox) Error!void {
+        const a = out.arena.allocator();
+        const settings = try self.settingsOf(a, doc.uri);
         const abandon: analysis_mod.Abandon = .{ .ctx = self.hooks.ctx, .stale = self.hooks.input_pending };
-        const result = analysis_mod.analyse(self.gpa, doc.source(), self.known_globals, abandon) catch |e| switch (e) {
+        const result = analysis_mod.analyse(self.gpa, doc.source(), settings.known_globals, abandon) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Abandoned => return, // stays dirty: `tick` comes round again
             error.Unparseable => {
@@ -712,9 +834,9 @@ pub const Server = struct {
         if (an.incomplete) try out.log(protocol.MessageType.warning, "analysis incomplete: out of memory while collecting diagnostics");
 
         const index = doc.lineIndex(self.gpa) catch return error.OutOfMemory;
-        const a = out.arena.allocator();
-        const list = try a.alloc(protocol.Diagnostic, an.diagnostics.len);
-        for (an.diagnostics, list) |d, *slot| {
+        var list: std.ArrayList(protocol.Diagnostic) = try .initCapacity(a, an.diagnostics.len);
+        for (an.diagnostics) |d| {
+            if (suppressed(settings, d.code.id())) continue;
             var related: ?[]const protocol.DiagnosticRelatedInformation = null;
             if (d.related) |r| {
                 const one = try a.alloc(protocol.DiagnosticRelatedInformation, 1);
@@ -724,7 +846,7 @@ pub const Server = struct {
                 };
                 related = one;
             }
-            slot.* = .{
+            list.appendAssumeCapacity(.{
                 .range = index.toRange(an.source, d.start, d.end, self.encoding),
                 .severity = switch (d.severity) {
                     .@"error" => protocol.DiagnosticSeverity.@"error",
@@ -734,13 +856,51 @@ pub const Server = struct {
                 .source = server_name,
                 .message = d.message,
                 .relatedInformation = related,
-            };
+            });
         }
+        try self.requireDiagnostics(a, an, index, settings, &list);
         try out.notify("textDocument/publishDiagnostics", protocol.PublishDiagnosticsParams{
             .uri = doc.uri,
             .version = doc.version,
-            .diagnostics = list,
+            .diagnostics = list.items,
         });
+    }
+
+    fn suppressed(settings: workspace.Settings, code: []const u8) bool {
+        for (settings.suppress) |s| {
+            if (std.mem.eql(u8, s, code)) return true;
+        }
+        return false;
+    }
+
+    /// A literal `require` that resolves nowhere, as information: the runtime
+    /// may still find it through a searcher or preload entry the host installs,
+    /// which the server cannot see (doc 74 §7.4). With no disk to look at, a
+    /// miss says nothing, so there is none.
+    fn requireDiagnostics(
+        self: *const Server,
+        a: std.mem.Allocator,
+        an: *const analysis_mod.Analysis,
+        index: *const position.LineIndex,
+        settings: workspace.Settings,
+        list: *std.ArrayList(protocol.Diagnostic),
+    ) Error!void {
+        if (self.files == null) return;
+        const cwd = settings.cwd orelse return;
+        if (suppressed(settings, unresolved_require_code)) return;
+        var ov = try self.overlay(a);
+        for (try modules.unresolved(a, an, cwd, settings.package_path, ov.probe())) |m| {
+            var msg: std.ArrayList(u8) = .empty;
+            try msg.print(a, "module '{s}' not found:", .{m.name});
+            for (m.tried) |t| try msg.print(a, "\n\tno file '{s}'", .{t});
+            try list.append(a, .{
+                .range = index.toRange(an.source, m.span.start, m.span.end, self.encoding),
+                .severity = protocol.DiagnosticSeverity.information,
+                .code = unresolved_require_code,
+                .source = server_name,
+                .message = msg.items,
+            });
+        }
     }
 
 };
@@ -1519,4 +1679,148 @@ test "syntax requests answer on damaged text, and for an unopened document" {
         \\{"jsonrpc":"2.0","id":9,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":"nope"}}}
     );
     try testing.expectEqual(@as(i64, -32602), errorCode(bad[0]));
+}
+// ---- workspace folders, mahina.toml and require (doc 74 §7.4) ----------------
+
+const MemoryFiles = workspace.MemoryFiles;
+
+/// `initialize` with `extra` (folders or a root) in its params, then `initialized`.
+fn initWith(h: *Harness, extra: []const u8) ![]json.Value {
+    var buf: [1024]u8 = undefined;
+    const body = try std.fmt.bufPrint(&buf,
+        \\{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"capabilities":{{}},{s}}}}}
+    , .{extra});
+    const r = try h.send(0, body);
+    _ = try h.send(0,
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+    );
+    return r;
+}
+
+fn openDoc(h: *Harness, now: u64, uri: []const u8, text: []const u8) ![]json.Value {
+    var buf: [1024]u8 = undefined;
+    const body = try std.fmt.bufPrint(&buf,
+        \\{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{s}","version":1,"text":{f}}}}}}}
+    , .{ uri, std.json.fmt(text, .{}) });
+    return h.send(now, body);
+}
+
+/// The diagnostics published for `uri` among `msgs`, or null if none were.
+fn diagnosticsFor(msgs: []const json.Value, uri: []const u8) ?[]json.Value {
+    for (msgs) |m| {
+        const method = m.object.get("method") orelse continue;
+        if (!std.mem.eql(u8, method.string, "textDocument/publishDiagnostics")) continue;
+        const params = m.object.get("params").?.object;
+        if (std.mem.eql(u8, params.get("uri").?.string, uri)) return params.get("diagnostics").?.array.items;
+    }
+    return null;
+}
+
+test "workspace: one server serves every folder; a rejected mahina.toml is an error on the file" {
+    var mem: MemoryFiles = .{ .entries = &.{
+        .{ "/w/a/mahina.toml", "version = 1\n[runtme]\n" },
+        .{ "/w/b/mahina.toml", "version = 1\n[globals]\nspawn = \"starts a process\"\n" },
+    } };
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.files = mem.files();
+    const r = try initWith(&h,
+        \\"workspaceFolders":[{"uri":"file:///w/a","name":"a"},{"uri":"file:///w/b","name":"b"}]
+    );
+    // The response comes first; the config's error follows it.
+    const caps = r[0].object.get("result").?.object.get("capabilities").?.object;
+    try testing.expect(caps.get("workspace").?.object.get("workspaceFolders").?.object.get("supported").?.bool);
+    const errs = diagnosticsFor(r, "file:///w/a/mahina.toml").?;
+    try testing.expectEqual(@as(usize, 1), errs.len);
+    const range = errs[0].object.get("range").?.object;
+    try testing.expectEqual(@as(i64, 1), range.get("start").?.object.get("line").?.integer);
+    try testing.expectEqual(@as(i64, 1), range.get("start").?.object.get("character").?.integer);
+    try testing.expectEqual(@as(i64, 8), range.get("end").?.object.get("character").?.integer);
+    try testing.expect(diagnosticsFor(r, "file:///w/b/mahina.toml") == null);
+
+    // b's `[globals]` reach b's files and no others.
+    _ = try openDoc(&h, 0, "file:///w/b/m.mah", "spawn()\n");
+    _ = try openDoc(&h, 0, "file:///w/a/m.mah", "spawn()\n");
+    const t = try h.tick(50);
+    try testing.expectEqual(@as(usize, 0), diagnosticsFor(t, "file:///w/b/m.mah").?.len);
+    try testing.expectEqual(@as(usize, 1), diagnosticsFor(t, "file:///w/a/m.mah").?.len);
+
+    // Removing a folder takes its config's error back, and its files are
+    // analysed again under the defaults.
+    const rm = try h.send(60,
+        \\{"jsonrpc":"2.0","method":"workspace/didChangeWorkspaceFolders","params":{"event":{"added":[],"removed":[{"uri":"file:///w/b","name":"b"},{"uri":"file:///w/a","name":"a"}]}}}
+    );
+    try testing.expectEqual(@as(usize, 0), diagnosticsFor(rm, "file:///w/a/mahina.toml").?.len);
+    const again = try h.tick(200);
+    try testing.expectEqual(@as(usize, 1), diagnosticsFor(again, "file:///w/b/m.mah").?.len);
+}
+
+test "require: the module name goes to its file; an unresolved literal is information unless suppressed" {
+    var mem: MemoryFiles = .{ .entries = &.{
+        .{ "/w/lib/util.mah", "return {}\n" },
+        .{ "/q/mahina.toml", "version = 1\n[diagnostics]\nsuppress = [\"unresolved-require\"]\n" },
+    } };
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.files = mem.files();
+    h.server.known_globals = &.{ "print", "require" };
+    _ = try initWith(&h,
+        \\"workspaceFolders":[{"uri":"file:///w","name":"w"},{"uri":"file:///q","name":"q"}]
+    );
+    const main_text = "local u = require(\"lib.util\")\nlocal g = require(\"gone\")\nlocal s = require \"string\"\nprint(u, g, s, require(name))\n";
+    _ = try openDoc(&h, 0, "file:///w/main.mah", main_text);
+    const t = try h.tick(50);
+    const ds = diagnosticsFor(t, "file:///w/main.mah").?;
+    // `name` is an undefined global; `gone` is the one module that is missing.
+    var missing: ?json.ObjectMap = null;
+    for (ds) |d| {
+        if (std.mem.eql(u8, d.object.get("code").?.string, Server.unresolved_require_code)) {
+            try testing.expect(missing == null);
+            missing = d.object;
+        }
+    }
+    try testing.expectEqual(@as(i64, 3), missing.?.get("severity").?.integer);
+    try testing.expectEqual(@as(i64, 1), missing.?.get("range").?.object.get("start").?.object.get("line").?.integer);
+    try testing.expect(std.mem.indexOf(u8, missing.?.get("message").?.string, "no file '/w/gone.mah'") != null);
+
+    // Definition on the module name: the file, from its start.
+    const def = try h.send(60,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///w/main.mah"},"position":{"line":0,"character":21}}}
+    );
+    const loc = def[def.len - 1].object.get("result").?.object;
+    try testing.expectEqualStrings("file:///w/lib/util.mah", loc.get("uri").?.string);
+    try testing.expectEqual(@as(i64, 0), loc.get("range").?.object.get("start").?.object.get("character").?.integer);
+
+    // An open document that was never saved resolves.
+    _ = try openDoc(&h, 70, "file:///w/gone.mah", "return 1\n");
+    _ = try h.send(70,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///w/main.mah","version":2},"contentChanges":[{"text":"local g = require(\"gone\")\nprint(g)\n"}]}}
+    );
+    const after = try h.tick(200);
+    try testing.expectEqual(@as(usize, 0), diagnosticsFor(after, "file:///w/main.mah").?.len);
+
+    // Suppressed by the folder's config; and a document that names no file
+    // has no directory to search from.
+    _ = try openDoc(&h, 300, "file:///q/x.mah", "local g = require(\"gone\")\nprint(g)\n");
+    _ = try openDoc(&h, 300, "untitled:1", "local g = require(\"gone\")\nprint(g)\n");
+    const rest = try h.tick(400);
+    try testing.expectEqual(@as(usize, 0), diagnosticsFor(rest, "file:///q/x.mah").?.len);
+    try testing.expectEqual(@as(usize, 0), diagnosticsFor(rest, "untitled:1").?.len);
+}
+
+test "require: without a disk only built-ins and open documents resolve, and no miss is reported" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.known_globals = &.{ "print", "require" };
+    _ = try initWith(&h,
+        \\"rootUri":"file:///w"
+    );
+    _ = try openDoc(&h, 0, "file:///w/main.mah", "local g = require(\"gone\")\nlocal o = require(\"other\")\nprint(g, o)\n");
+    _ = try openDoc(&h, 0, "file:///w/other.mah", "return 1\n");
+    const t = try h.tick(50);
+    try testing.expectEqual(@as(usize, 0), diagnosticsFor(t, "file:///w/main.mah").?.len);
+    const def = try h.send(60,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///w/main.mah"},"position":{"line":1,"character":20}}}
+    );
+    try testing.expectEqualStrings("file:///w/other.mah", def[def.len - 1].object.get("result").?.object.get("uri").?.string);
 }
