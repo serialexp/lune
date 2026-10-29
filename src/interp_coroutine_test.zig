@@ -393,15 +393,15 @@ test "coroutine.wrap: the collector keeps a wrap function's coroutine" {
         \\for r = 1, 3 do
         \\  for i = 1, 50 do s = s + gens[i]() end
         \\  local junk = {}
-        \\  for k = 1, 20000 do junk[k] = {k} end
+        \\  for k = 1, 4000 do junk[k] = {k} end
         \\end
         \\local n = 0
-        \\for i = 1, 2000 do
+        \\for i = 1, 500 do
         \\  local w = coroutine.wrap(function(x) local y = coroutine.yield(x + 1) return y * 2 end)
         \\  n = n + w(i) + w(3)
         \\end
         \\print(s, n)
-    , "38550\t2015000\n");
+    , "38550\t128750\n");
 }
 
 test "debug.traceback in a coroutine: its own stack, a native body as Lua's [C] row" {

@@ -168,7 +168,11 @@ pub fn build(b: *std.Build) void {
     runner.addImports(mod);
     const mod_tests = b.addTest(.{ .root_module = mod, .filters = test_filters, .test_runner = runner.config() });
     mod_tests.use_llvm = true; // tail-call smoke test needs LLVM (see above)
-    const run_mod_tests = b.addRunArtifact(mod_tests);
+    // The library tests dominate the gate (one core, ~20 min before sharding,
+    // mostly GC-stress legs), so they run as N parallel shards of the same
+    // binary; tests/test_runner.zig filters on MAHINA_TEST_SHARD. `-Dtest-shards=1`
+    // runs them in one process (what a debugger or a single-test filter wants).
+    const test_shards = b.option(u8, "test-shards", "Run the library tests as N parallel shards (default 4; 1 = one process)") orelse 4;
 
     runner.addImports(exe.root_module);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters, .test_runner = runner.config() });
@@ -181,7 +185,12 @@ pub fn build(b: *std.Build) void {
     const run_jit_unwind_tests = b.addRunArtifact(jit_unwind_tests);
 
     const test_step = b.step("test", "Run all unit tests");
-    test_step.dependOn(&run_mod_tests.step);
+    var shard: u8 = 0;
+    while (shard < @max(test_shards, 1)) : (shard += 1) {
+        const run_shard = b.addRunArtifact(mod_tests);
+        if (test_shards > 1) run_shard.setEnvironmentVariable("MAHINA_TEST_SHARD", b.fmt("{d}/{d}", .{ shard, test_shards }));
+        test_step.dependOn(&run_shard.step);
+    }
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_jit_unwind_tests.step);
 
