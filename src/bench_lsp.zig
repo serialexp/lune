@@ -5,8 +5,9 @@
 //! (debounce excluded), over realistic files at 1k / 10k / 100k lines and the
 //! adversarial corpus (one 1 MB line of astral characters, 60k distinct
 //! constants, 500-deep nesting, a file broken every 20 lines, an edit burst of
-//! 200 changes, 50 open documents), and the cost `require` resolution adds
-//! against the real disk (doc 74 §7.4).
+//! 200 changes, 50 open documents), the cost `require` resolution adds
+//! against the real disk, and member completion on a required module, cold and
+//! from the module cache (doc 74 §7.4).
 //!
 //! Budget (doc 74 Q12): ≤ 10 ms end to end at 10k lines, ≤ 100 ms at 100k.
 //! Informational, not a gate (global Rule #22): run it deliberately, on a
@@ -273,6 +274,56 @@ fn crossFile(gpa: std.mem.Allocator, io: std.Io, text: []const u8, files: ?lsp.w
     return best;
 }
 
+/// A module of `lines` lines that exports every block's function, written to
+/// `cross_dir/big.mah`.
+fn writeBigModule(gpa: std.mem.Allocator, io: std.Io, lines: usize) !usize {
+    const body = try realistic(gpa, lines, 0, false);
+    defer gpa.free(body);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.appendSlice(gpa, "local M = {}\n");
+    try out.appendSlice(gpa, body);
+    const blocks = std.mem.count(u8, body, "local function work_");
+    for (0..blocks) |i| try out.print(gpa, "M.work_{d} = work_{d}\n", .{ i, i });
+    try out.appendSlice(gpa, "return M\n");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cross_dir ++ "/big.mah", .data = out.items });
+    return blocks;
+}
+
+/// Member completion after `m.` for a module local bound to `big.mah` on disk:
+/// cold (the module read, parsed and its exports listed) and warm (the cache
+/// checks the text it read again and answers), best of `reps`.
+fn moduleMembers(gpa: std.mem.Allocator, io: std.Io, reps: usize) !struct { cold: u64, warm: u64 } {
+    var core = server.Server.init(gpa, .{});
+    defer core.deinit();
+    core.known_globals = &mahina.interp.builtin_global_names;
+    core.files = lsp.host_stdio.disk;
+    var out = server.Outbox.init(gpa);
+    defer out.deinit();
+    try core.handle(0, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{},\"rootUri\":\"file://" ++ cross_dir ++ "\"}}", &out);
+    try core.handle(0, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}", &out);
+    const uri = "file://" ++ cross_dir ++ "/use.mh";
+    try core.handle(0, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" ++ uri ++ "\",\"version\":1,\"text\":\"local m = require(\\\"big\\\")\\nm.\\n\"}}}", &out);
+    try core.tick(250, &out);
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"" ++ uri ++ "\"},\"position\":{\"line\":1,\"character\":2}}}";
+
+    var cold: u64 = std.math.maxInt(u64);
+    var warm: u64 = std.math.maxInt(u64);
+    for (0..reps) |_| {
+        core.module_cache.remove(cross_dir ++ "/big.mah");
+        for ([_]*u64{ &cold, &warm }) |slot| {
+            out.reset();
+            const t0 = now(io);
+            try core.handle(300, body, &out);
+            const t1 = now(io);
+            if (out.messages().len != 1) return error.NoResponse;
+            slot.* = @min(slot.*, @as(u64, @intCast(t1 - t0)));
+        }
+    }
+    if (core.module_cache.builds != reps) return error.CacheMissed;
+    return .{ .cold = cold, .warm = warm };
+}
+
 fn open(gpa: std.mem.Allocator, core: *server.Server, out: *server.Outbox, text: []const u8) !void {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -469,6 +520,20 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
             ms(disk),
             ms(disk) - ms(no_disk),
         });
+    }
+
+    mahina.io.print(
+        \\
+        \\module members: completion after `m.` for a module on disk exporting every block's function (doc 74 §7.4; best of N, ms)
+        \\
+        \\{s: <30} {s: >9} {s: >9} {s: >10} {s: >10}
+        \\
+    , .{ "module", "bytes", "exports", "cold", "warm" });
+    for (cross) |c| {
+        const n = try writeBigModule(gpa, io, c.lines);
+        const got = try moduleMembers(gpa, io, c.reps);
+        const stat = try std.Io.Dir.cwd().statFile(io, cross_dir ++ "/big.mah", .{});
+        mahina.io.print("{s: <30} {d: >9} {d: >9} {d: >10.2} {d: >10.2}\n", .{ c.name, stat.size, n, ms(got.cold), ms(got.warm) });
     }
 
     const base = cases.items[1].text;

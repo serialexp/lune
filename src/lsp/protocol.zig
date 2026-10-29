@@ -247,7 +247,9 @@ pub const WorkspaceEdit = struct {
 // ---- completion --------------------------------------------------------------
 
 pub const CompletionItemKind = struct {
+    pub const method: u8 = 2;
     pub const function: u8 = 3;
+    pub const field: u8 = 5;
     pub const variable: u8 = 6;
     pub const keyword: u8 = 14;
 };

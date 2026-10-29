@@ -14,6 +14,8 @@ pub const stdlib_db = @import("lsp/stdlib_db.zig");
 pub const library = @import("lsp/library.zig");
 pub const config = @import("lsp/config.zig");
 pub const modules = @import("lsp/modules.zig");
+pub const exports = @import("lsp/exports.zig");
+pub const module_cache = @import("lsp/module_cache.zig");
 pub const uri = @import("lsp/uri.zig");
 pub const workspace = @import("lsp/workspace.zig");
 pub const server = @import("lsp/server.zig");
@@ -34,6 +36,8 @@ test {
     _ = library;
     _ = config;
     _ = modules;
+    _ = exports;
+    _ = module_cache;
     _ = uri;
     _ = workspace;
     _ = server;

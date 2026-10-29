@@ -24,6 +24,8 @@ const tokens = @import("tokens.zig");
 const completion = @import("completion.zig");
 const library = @import("library.zig");
 const modules = @import("modules.zig");
+const exports = @import("exports.zig");
+const module_cache = @import("module_cache.zig");
 const uri_mod = @import("uri.zig");
 const workspace = @import("workspace.zig");
 
@@ -120,6 +122,8 @@ pub const Server = struct {
     files: ?workspace.Files = null,
     /// The workspace folders and their configs.
     ws: workspace.Workspace,
+    /// The exports of the modules `require` reached, per path (P6d).
+    module_cache: module_cache.Cache,
 
     pub const Error = error{OutOfMemory};
 
@@ -127,12 +131,19 @@ pub const Server = struct {
     pub const unresolved_require_code = "unresolved-require";
 
     pub fn init(gpa: std.mem.Allocator, hooks: Hooks) Server {
-        return .{ .gpa = gpa, .hooks = hooks, .docs = documents.Store.init(gpa), .ws = workspace.Workspace.init(gpa) };
+        return .{
+            .gpa = gpa,
+            .hooks = hooks,
+            .docs = documents.Store.init(gpa),
+            .ws = workspace.Workspace.init(gpa),
+            .module_cache = module_cache.Cache.init(gpa),
+        };
     }
 
     pub fn deinit(self: *Server) void {
         self.docs.deinit();
         self.ws.deinit();
+        self.module_cache.deinit();
     }
 
     /// Whether the process should now stop (`exit` arrived).
@@ -274,6 +285,41 @@ pub const Server = struct {
         };
     }
 
+    /// The open document whose file is `path` (resolved, as `overlay` has it).
+    fn openAt(self: *const Server, a: std.mem.Allocator, path: []const u8) Error!?*documents.Document {
+        var it = self.docs.map.valueIterator();
+        while (it.next()) |d| {
+            const p = (try uri_mod.toPath(a, d.*.uri)) orelse continue;
+            if (std.mem.eql(u8, try std.fs.path.resolveAllocPosix(a, &.{p}), path)) return d.*;
+        }
+        return null;
+    }
+
+    /// A member access on a module local at the cursor, the file it reaches,
+    /// and that module's exports (valid until the cache is next asked).
+    const ModuleAccess = struct {
+        access: exports.Access,
+        path: []const u8,
+        members: []const module_cache.Member,
+    };
+
+    /// The module behind `m.` or `m:` at the cursor, read from its open
+    /// document ahead of the disk.
+    fn moduleAccess(self: *Server, a: std.mem.Allocator, c: Cursor) Error!?ModuleAccess {
+        const access = (try exports.accessAt(a, c.an, c.offset)) orelse return null;
+        const cwd = c.settings.cwd orelse return null;
+        var ov = try self.overlay(a);
+        const path = switch (try modules.resolve(a, access.module, cwd, c.settings.package_path, ov.probe())) {
+            .file => |file| file,
+            .builtin, .missing => return null,
+        };
+        const text = if (try self.openAt(a, path)) |d| d.source() else blk: {
+            const fs = self.files orelse return null;
+            break :blk fs.read(fs.ctx, a, path) orelse return null;
+        };
+        return .{ .access = access, .path = path, .members = try self.module_cache.get(path, text, self.encoding) };
+    }
+
     /// `analysed`, with the cursor position converted to a byte offset.
     fn cursor(self: *Server, id: jsonrpc.Id, uri: []const u8, pos: position.Position, out: *Outbox) Error!?Cursor {
         var c = (try self.analysed(id, uri, out)) orelse return null;
@@ -288,6 +334,16 @@ pub const Server = struct {
         if (try self.requireTarget(out.arena.allocator(), c)) |target| {
             const top: position.Position = .{ .line = 0, .character = 0 };
             return out.result(id, protocol.Location{ .uri = target, .range = .{ .start = top, .end = top } });
+        }
+        // On the `f` of `m.f`, for a module local `m`: where the module writes it.
+        if (try self.moduleAccess(a, c)) |m| {
+            const name = c.an.source[m.access.member.start..m.access.member.end];
+            for (m.members) |x| {
+                if (!std.mem.eql(u8, x.name, name)) continue;
+                const target = try uri_mod.fromPath(out.arena.allocator(), m.path);
+                return out.result(id, protocol.Location{ .uri = target, .range = x.range });
+            }
+            return out.result(id, @as(?u8, null));
         }
         const occ = navigation.occurrenceAt(c.an, c.offset) orelse return out.result(id, @as(?u8, null));
         const span = navigation.definition(c.an, occ) orelse return out.result(id, @as(?u8, null));
@@ -400,6 +456,7 @@ pub const Server = struct {
     fn complete(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
         const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
         const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
+        if (try self.moduleAccess(a, c)) |m| return memberCompletion(id, m, out);
         const items = try completion.complete(a, c.an, c.settings.known_globals, c.offset);
         const oa = out.arena.allocator();
         const list = try oa.alloc(protocol.CompletionItem, items.len);
@@ -416,6 +473,26 @@ pub const Server = struct {
             };
         }
         try out.result(id, protocol.CompletionList{ .items = list });
+    }
+
+    /// After `m.` on a module local: the module's exports. After `m:`, only
+    /// what can be called.
+    fn memberCompletion(id: jsonrpc.Id, m: ModuleAccess, out: *Outbox) Error!void {
+        const oa = out.arena.allocator();
+        var list: std.ArrayList(protocol.CompletionItem) = .empty;
+        for (m.members) |x| {
+            if (m.access.method and x.kind == .value) continue;
+            try list.append(oa, .{
+                .label = x.name,
+                .kind = switch (x.kind) {
+                    .function => protocol.CompletionItemKind.function,
+                    .method => protocol.CompletionItemKind.method,
+                    .value => protocol.CompletionItemKind.field,
+                },
+                .detail = x.signature orelse try std.fmt.allocPrint(oa, "field of {s}", .{m.access.module}),
+            });
+        }
+        try out.result(id, protocol.CompletionList{ .items = list.items });
     }
 
     /// The library name under the cursor, as Markdown (doc 74 §7.3).
@@ -1823,4 +1900,65 @@ test "require: without a disk only built-ins and open documents resolve, and no 
         \\{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///w/main.mah"},"position":{"line":1,"character":20}}}
     );
     try testing.expectEqualStrings("file:///w/other.mah", def[def.len - 1].object.get("result").?.object.get("uri").?.string);
+}
+/// The response to `method` at `line:ch` in the open document `uri`.
+fn requestAt(h: *Harness, now: u64, uri: []const u8, method: []const u8, line: u32, ch: u32) !json.Value {
+    var buf: [512]u8 = undefined;
+    const req = try std.fmt.bufPrint(&buf,
+        \\{{"jsonrpc":"2.0","id":9,"method":"{s}","params":{{"textDocument":{{"uri":"{s}"}},"position":{{"line":{d},"character":{d}}}}}}}
+    , .{ method, uri, line, ch });
+    const r = try h.send(now, req);
+    return r[r.len - 1];
+}
+
+/// The completion item labelled `label` in a completion response.
+fn itemNamed(resp: json.Value, label: []const u8) ?json.ObjectMap {
+    for (resp.object.get("result").?.object.get("items").?.array.items) |it| {
+        if (std.mem.eql(u8, it.object.get("label").?.string, label)) return it.object;
+    }
+    return null;
+}
+
+test "module exports: members after a module local's dot or colon, and definition in the module's file" {
+    var mem: MemoryFiles = .{ .entries = &.{
+        .{ "/w/lib/util.mah", "local M = { version = 1 }\nfunction M.add(a, b) end\nfunction M:size() end\nreturn M\n" },
+    } };
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.files = mem.files();
+    h.server.known_globals = &.{ "print", "require" };
+    _ = try initWith(&h,
+        \\"workspaceFolders":[{"uri":"file:///w","name":"w"}]
+    );
+    _ = try openDoc(&h, 0, "file:///w/main.mah", "local u = require(\"lib.util\")\nu.\n");
+    const dot = try requestAt(&h, 1, "file:///w/main.mah", "textDocument/completion", 1, 2);
+    try testing.expectEqualStrings("add(a, b)", itemNamed(dot, "add").?.get("detail").?.string);
+    try testing.expectEqual(@as(i64, protocol.CompletionItemKind.method), itemNamed(dot, "size").?.get("kind").?.integer);
+    try testing.expectEqualStrings("field of lib.util", itemNamed(dot, "version").?.get("detail").?.string);
+    try testing.expect(itemNamed(dot, "while") == null);
+    try testing.expectEqual(@as(u64, 1), h.server.module_cache.builds);
+
+    // After a colon, only what can be called; the module was not read again.
+    _ = try h.send(2,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///w/main.mah","version":2},"contentChanges":[{"text":"local u = require(\"lib.util\")\nu:\nprint(u.add)\n"}]}}
+    );
+    const colon = try requestAt(&h, 3, "file:///w/main.mah", "textDocument/completion", 1, 2);
+    try testing.expect(itemNamed(colon, "size") != null);
+    try testing.expect(itemNamed(colon, "version") == null);
+    try testing.expectEqual(@as(u64, 1), h.server.module_cache.builds);
+
+    // Definition on `add`: where the module writes it.
+    const def = try requestAt(&h, 4, "file:///w/main.mah", "textDocument/definition", 2, 9);
+    const loc = def.object.get("result").?.object;
+    try testing.expectEqualStrings("file:///w/lib/util.mah", loc.get("uri").?.string);
+    const start = loc.get("range").?.object.get("start").?.object;
+    try testing.expectEqual(@as(i64, 1), start.get("line").?.integer);
+    try testing.expectEqual(@as(i64, 11), start.get("character").?.integer);
+
+    // The module open in the editor is read ahead of the disk, edits included.
+    _ = try openDoc(&h, 5, "file:///w/lib/util.mah", "local M = {}\nfunction M.sub(x) end\nreturn M\n");
+    const open = try requestAt(&h, 6, "file:///w/main.mah", "textDocument/completion", 1, 2);
+    try testing.expect(itemNamed(open, "sub") != null);
+    try testing.expect(itemNamed(open, "add") == null);
+    try testing.expectEqual(@as(u64, 2), h.server.module_cache.builds);
 }

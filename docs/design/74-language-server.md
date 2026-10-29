@@ -242,11 +242,22 @@ land; move whole phases to Done once everything inside them is checked.
     `unresolved-require` information diagnostics, `[globals]` and `suppress`
     applied, a rejected config published on the file,
     `workspace/didChangeWorkspaceFolders`.
-  - [ ] P6d module exports (`local M = {} … return M`) for member completion
-    and definition across files, with an analysis cache per module path.
+  - [x] P6d module exports (`exports.zig`): the returned constructor's
+    fields, or for `return M` the fields `M`'s constructor names plus
+    `function M.f`, `function M:m` and `M.x =` in the chunk's own code;
+    a consumer's `local m = require("x")`, never assigned again, offers
+    them after `m.` (after `m:`, only what can be called) and goes to them
+    on definition. `module_cache.zig` keeps each module's exports per path,
+    checked against the text by hash on every lookup, 64 paths, least
+    recently used out. Follow-ups: hover and signature help on `m.f`;
+    `local s = require("string")` could offer the library's members;
+    `require("x").f` without a local; a typed local
+    (`local m: T = require("x")`); a module that is itself a required
+    value (`return require("y")`).
   - [ ] P6e `workspace/didChangeWatchedFiles` (client registration): reload a
     changed `mahina.toml` (today a config edit needs the folder re-added or a
-    restart) and invalidate the P6d cache; workspace symbols;
+    restart); workspace symbols (the P6d cache needs no invalidation: it
+    checks the text on each lookup);
     `initializationOptions` overriding `mahina.toml`; `system` groups
     filtering the host globals (parsed, not applied yet).
 - [ ] **P7 — JIT lenses** (§7.6): extend the `--emit-coverage` artifact
@@ -323,6 +334,10 @@ src/lsp/
   analysis.zig      parse + resolve + compile for one document version
   stdlib_db.zig     generated builtin table (P5)
   config.zig        mahina.toml reader, a TOML subset (P6)
+  modules.zig       `require` sites and resolution over package.path (P6)
+  workspace.zig     workspace folders, their configs, the host's files (P6)
+  exports.zig       a module's exports; the consumer's module locals (P6)
+  module_cache.zig  exports per module path, checked by text, bounded (P6)
 src/main.zig        `lsp` subcommand, next to `viz`
 src/wasm_entry.zig  `mahina_lsp_*` exports: the browser host (§13.1)
 editors/zed/                 the Zed extension (§13.2)
@@ -593,8 +608,9 @@ cwd-relative, `host_system.zig:84`), not implicitly the workspace root.
 Only string-literal arguments to an unshadowed `require` resolve; anything
 else, or a host-installed searcher, is reported as "unresolved
 (dynamic)", never as an error. Open documents shadow their files on disk.
-The module cache invalidates on file changes (`workspace/didChangeWatchedFiles`),
-on config changes, and when a new file could shadow an earlier candidate.
+Resolution runs again on every request, so a new file that shadows an earlier
+candidate is seen at once; the module cache checks each module's text on
+every lookup (P6d, below), so it needs no invalidation.
 
 Module exports: P6 includes one bounded piece of shape tracking — fields
 assigned to a local table that the chunk's top-level `return` returns
@@ -638,6 +654,15 @@ suppressions.
   the type grammar and the main grammar as needed. When stubs land, the
   stdlib inventory stops feeding the server and stays the implementation
   checklist (Rule Z-5).
+
+**Module exports, as built in P6d (2026-10-29).** The cache is checked
+against the module's text on every lookup (a read and a Wyhash), not
+invalidated by file events: an edit on disk or in an open document is never
+missed, and a hit is cheap next to a parse. Watched files (P6e) are then
+needed only for `mahina.toml`. Measured (`bench-lsp`, "module members", a
+module exporting one function per 13 lines, load average ~16): completion
+after `m.` costs 0.31 / 4.0 / 64 ms cold and 0.02 / 0.12 / 1.5 ms warm at
+1k / 10k / 100k lines of module. The host reads files up to 16 MiB.
 
 **Cost, measured** (`zig build bench-lsp`, cross-file table: a literal
 `require` per 14 lines, half resolving nowhere, real disk): 0.08 ms added

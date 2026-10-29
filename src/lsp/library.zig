@@ -8,6 +8,7 @@ const std = @import("std");
 const ast = @import("../ast.zig");
 const diag = @import("../diag.zig");
 const lexer = @import("../lexer.zig");
+const resolve = @import("../resolve.zig");
 const system = @import("../system.zig");
 const token = @import("../token.zig");
 const analysis_mod = @import("analysis.zig");
@@ -56,7 +57,7 @@ fn identifierAt(src: []const u8, offset: u32) ?ast.Span {
 }
 
 /// The identifier that ends at `end`, or null. The head of `head.` is one.
-fn headEndingAt(src: []const u8, end: usize) ?ast.Span {
+pub fn headEndingAt(src: []const u8, end: usize) ?ast.Span {
     var s = end;
     while (s > 0 and isIdentByte(src[s - 1])) s -= 1;
     if (s == end or isDigit(src[s])) return null;
@@ -76,13 +77,23 @@ fn headOfDot(src: []const u8, s: usize) ?ast.Span {
 /// in a damaged chunk too: `string.` typed by itself loses the occurrence of
 /// `string`, and a local `string` must still shadow the library.
 pub fn isLocal(an: *const Analysis, name: []const u8, pos: u32) bool {
-    for (an.res.bindings.items) |b| {
+    return localAt(an, name, pos) != null;
+}
+
+/// The local `name` means at `pos`: of the ones in scope there, the one
+/// declared last, which shadows the others. Null when `name` is not a local
+/// there.
+pub fn localAt(an: *const Analysis, name: []const u8, pos: u32) ?resolve.BindingId {
+    var best: ?resolve.BindingId = null;
+    for (an.res.bindings.items, 0..) |b, id| {
         if (b.kind == .global or !std.mem.eql(u8, b.name, name)) continue;
         // Strictly after `visible_from`, as completion has it: a local is not
         // yet in scope inside its own initializer.
-        if (b.visible_from < pos and pos <= b.scope_end) return true;
+        if (!(b.visible_from < pos and pos <= b.scope_end)) continue;
+        if (best) |cur| if (an.res.binding(cur).visible_from >= b.visible_from) continue;
+        best = @intCast(id);
     }
-    return false;
+    return best;
 }
 
 /// The head of a name or path: `string` of `string.sub`, `file` of `file:read`.

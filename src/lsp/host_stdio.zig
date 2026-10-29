@@ -46,14 +46,17 @@ pub const Config = struct {
     known_globals: []const []const u8 = &.{},
 };
 
-/// The largest file the server reads: a `mahina.toml` (doc 74 §7.4).
-const max_file_bytes = 1 << 20;
+/// The largest file the server reads: a `mahina.toml`, or a module `require`
+/// reaches for its exports (doc 74 §7.4). Well past the 100k-line budget
+/// (3 MB); a larger file is treated as unreadable.
+const max_file_bytes = 16 << 20;
 
-/// The disk, for `mahina.toml` and `require` resolution.
+/// The disk, for `mahina.toml`, `require` resolution and module exports.
 pub const disk: workspace.Files = .{ .read = diskRead, .exists = diskExists };
 
 fn diskRead(_: ?*anyopaque, a: std.mem.Allocator, path: []const u8) ?[]u8 {
-    // Missing, unreadable or too large: no config, the defaults apply.
+    // Missing, unreadable or too large: no config (the defaults apply), or no
+    // exports.
     return Io.Dir.cwd().readFileAlloc(io_mod.hostIo(), path, a, Io.Limit.limited(max_file_bytes)) catch null;
 }
 

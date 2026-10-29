@@ -123,7 +123,7 @@ pub fn sites(a: std.mem.Allocator, an: *const Analysis) std.mem.Allocator.Error!
 /// Whether the name at `start` is the global. The resolver answers in
 /// O(log n); text it could not read has no occurrence there, and then the
 /// bindings in scope decide.
-fn isGlobal(an: *const Analysis, name: []const u8, start: u32) bool {
+pub fn isGlobal(an: *const Analysis, name: []const u8, start: u32) bool {
     if (an.res.bindingAt(start)) |id| return an.res.binding(id).kind == .global;
     return !library.isLocal(an, name, start);
 }
@@ -177,7 +177,7 @@ fn literalFollowedByClose(toks: []const token.Token, require_i: usize, arg_i: us
 
 /// The module name inside a plain `"..."` or `'...'` literal. Escapes and long
 /// brackets are not decoded, so they are dynamic (null).
-fn plainName(lexeme: []const u8) ?[]const u8 {
+pub fn plainName(lexeme: []const u8) ?[]const u8 {
     if (lexeme.len < 2) return null;
     const q = lexeme[0];
     if ((q != '"' and q != '\'') or lexeme[lexeme.len - 1] != q) return null;
