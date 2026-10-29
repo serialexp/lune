@@ -474,6 +474,11 @@ pub const TraceConfig = struct {
     /// Measured break-even: a stitched half costs ~460 instructions of
     /// entry/exit, a traced IR instruction saves ~8–10 over tier-0.
     minstitch: u32 = 48,
+    /// Doc 63: record host calls in precise loop roots (tier-1a runs them)
+    /// instead of stitching around them. Off until Phase 3 lowers the ops
+    /// natively: tier-1a is slower than the stitched native halves, so
+    /// enabling it earlier would make host-calling loops slower.
+    trace_host_calls: bool = false,
     /// Back-edge count at which a loop header becomes a trace anchor.
     hotloop: u32 = 56,
     /// Doc 44: call count at which a Lua function head becomes a trace anchor.
@@ -3617,7 +3622,8 @@ pub const TraceState = struct {
     /// frame; recording proper begins at the next dispatch-loop iteration (which
     /// is the anchor instruction). On OOM we simply don't arm.
     fn configureRecording(self: *TraceState) void {
-        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .loopunroll = self.config.loopunroll, .minstitch = self.config.minstitch, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
+        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .loopunroll = self.config.loopunroll, .minstitch = self.config.minstitch, .host_calls = self.config.trace_host_calls and !self.config.record_exec_log, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
+        self.rec.host_epoch_probe = if (self.exec_heap) |h| &h.host_epoch else null;
     }
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
         // In sync on the way in (nothing between two recorded instructions

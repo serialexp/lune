@@ -134,6 +134,15 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         if (!rec.precise) std.debug.assert(rec.alloc_count > 0);
         rec.instrs.items[@intCast(gr)].aux = @intCast(rec.alloc_count);
     }
+    // Doc 63 §5.6: `guard_host_epoch`'s `aux` holds the allocation count at its
+    // site; the budget it checks is the worst case from there to the back-edge.
+    if (rec.precise) {
+        for (rec.instrs.items) |*ins| {
+            if (ins.op != .guard_host_epoch) continue;
+            std.debug.assert(@as(u32, @intCast(ins.aux)) <= rec.alloc_count);
+            ins.aux = @intCast(rec.alloc_count - @as(u32, @intCast(ins.aux)));
+        }
+    }
     // Doc 45 D3: precise candidates keep a single guest-ordered stream — the
     // recorder refuses every deferral, so nothing may be waiting here.
     if (rec.precise) std.debug.assert(rec.pending_stores.items.len == 0);

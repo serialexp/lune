@@ -10,7 +10,7 @@ Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
 Prerequisites A and B, Phase 0, Phase 1 (with the §5.9.2
 region-accounting amendment) and Phase 2a done. Phases 2b–4 not started.
 Owner: Bart
-Last updated: 2026-10-28
+Last updated: 2026-10-29
 
 ## Implementation status
 
@@ -122,8 +122,11 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   `stack_top` with a debug check that they survive an epoch-clean call
   (§5.5). The instruction-count A/B of the entry lease on `bench/` and
   the §8.1 probe (§8).
-- [ ] **Phase 2c — recording and tier-1a** (slice 1 landed 2026-10-28: tier-1a
-  executes the four ops, §5.10.3; slice 2, recording, is next). `guard_native`, `call_host`,
+- [ ] **Phase 2c — recording and tier-1a** (slices 1–2 landed: tier-1a executes
+  the four ops, §5.10.3; recording behind `Config.trace_host_calls`, default
+  off because tier-1a is 3.5× slower than tier-0 here, §5.10.4. Open: the
+  ten-leg exactly-once matrix, the `disturbs` re-measure, the doc 00/02
+  amendments). `guard_native`, `call_host`,
   `guard_host_epoch`, `host_result` (§5.1); host calls force precise
   recording (§5.3); the tier-1a arms; exactly-once tests across the ten
   equivalence legs and every route in §5.4.
@@ -1406,6 +1409,71 @@ epoch guard always pass fails the epoch test.
 **Not done in this slice:** recording emits no host op yet (2c slice 2), so no
 end-to-end trace runs a host call. The precise-only admission, the exact
 exactly-once tests across the ten legs, and the §8.1 probe A/B wait for it.
+
+### 5.10.4 As landed: Phase 2c, slice 2 — recording (2026-10-29)
+
+Behind `Config.trace_host_calls`, default **off** (measured below). With it on,
+a host call in a loop root records and tier-1a runs it.
+
+- **Recording** (`RecordingSession.recHostCall`). A host native in a
+  loop-anchored root at depth 0 records only when:
+  - no multret operand or result is involved, and no link close is pending;
+  - the native is below the disturb threshold (otherwise it aborts with
+    `host_barrier`);
+  - the recording is precise. An ordinary recording cancels with
+    `.needs_precise` and re-records, as `tnew` does.
+  Every shape it declines falls through to the existing paths, stitching
+  included. The run is `guard_native` (S_B), `call_host` (C_B) and
+  `guard_host_epoch` (C_B1). The native joins the pool without a `konst`, so
+  the weak pool indexes it (F1).
+- **Result typing.** `pending_host` lives in the session, so a cancelled
+  recording discards it. The next instruction's prologue checks that the epoch
+  is unchanged (otherwise it aborts with `host_barrier`), then emits one
+  `host_result` per wanted result, typed from the registers tier-0 wrote, and
+  binds them to their slots.
+- **`A_rem`.** The recorder stores the allocation count at the site, and
+  finalize rewrites it to the count remaining after the site.
+- **Recording-time suspension.** `callHostNative` raises suspension while a
+  recording is active, so a callback cannot feed it (§5.9).
+- **Exec-log sessions** never record host ops.
+
+**Tests** (`capi_hosttrace_test.zig`, "doc 63 2c"). Each traced run is paired
+with a flag-off control and gets the same answer and the same host call count:
+- a pure host in a loop (one call per iteration, and a precise trace with one
+  site exists);
+- a wide window with carried locals;
+- a host that raises mid-loop under `pcall`;
+- a host that calls back: it disturbs once, and no host trace survives.
+
+Mutation-checked: disabling `recHostCall` fails the three traced tests.
+
+**Measured** (§8.1 probe, `--iters 200000`, instructions per iteration, JIT on):
+
+| Shape | tier-0 | flag off (today) | flag on (tier-1a) |
+|---|---:|---:|---:|
+| `min` | 498 | 527 | 1851 |
+| `a4` | 559 | 588 | 2160 |
+| `w8` | 810 | 840 | 3167 |
+| `w16` | 1178 | 1208 | 4557 |
+| `nestq` | 558 | 587 | 2047 |
+| `nest` (one disturbing call, total) | 9.50M | 1.30M | 21.9M |
+
+`wide`, `cb`, `tw`, `two` and `fail` are unchanged with the flag on: they do
+not record a host trace (`cb`/`tw`/`two` disturb; `wide` and `fail` take a
+declined shape).
+
+- **Tier-1a is 3.5–3.9× slower than tier-0 on these bodies.** A profile of
+  `min` shows the trace stays resident; the time is the IR interpreter itself
+  (`executeCtx` 39%, `evalBinary` 32%, `flushPhiWriteback` 17%). The flag stays
+  off until Phase 3 lowers the ops natively, where §8's ≤250 budget applies.
+- **Flag off, the JIT costs ~29 instructions per host call** over tier-0 on
+  every shape: these bodies are below `minstitch`, so nothing traces and only
+  the JIT's overhead remains. Pre-existing, unchanged by this slice.
+- **`nest` with the flag on: 21.9M**, against 9.5M in tier-0. The callback's
+  long guest loop runs suspended, and a suspended VM dispatches in `.full`
+  (§5.9.1), which costs about 2.3× `.fast` tier-0 here. This is §5.9's accepted
+  once-per-native cost, but it is larger than "tier-0 speed" suggests. Phase 3
+  should re-measure it.
 
 ### 5.11 Tier-1a
 

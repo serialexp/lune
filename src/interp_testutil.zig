@@ -98,6 +98,8 @@ pub const CapturedOpts = struct {
     /// Override `Config.minstitch` (the fewest IR instructions a trace needs
     /// to end at a host call or loop back-edge); null keeps the default.
     minstitch: ?u32 = null,
+    /// Set `Config.trace_host_calls` (doc 63).
+    trace_host_calls: bool = false,
     /// Override `Config.silent_promotion_enabled` (doc 56 Phase 6's rowed
     /// vs silent comparisons); null keeps the default.
     silent_promotion: ?bool = null,
@@ -155,6 +157,7 @@ fn configureLeg(vm: *Vm, sink: *io.Writer, stress: bool, mode: TraceMode, opts: 
     if (opts.hotexit) |he| vm.trace.config.hotexit = he;
     if (opts.instunroll) |n| vm.trace.config.instunroll = n;
     if (opts.minstitch) |n| vm.trace.config.minstitch = n;
+    vm.trace.config.trace_host_calls = opts.trace_host_calls;
     if (opts.silent_promotion) |on| vm.trace.config.silent_promotion_enabled = on;
     if (opts.setup) |setup| try setup(vm);
 }

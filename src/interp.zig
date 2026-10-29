@@ -3454,6 +3454,12 @@ pub const Vm = struct {
             nat.disturbs +|= 1;
         };
         const buf = self.host_out[lo .. lo + n];
+        // Doc 63 §5.9: a call made while a recording is active runs its
+        // callbacks suspended, so they cannot feed that recording. (A traced
+        // call's shim has raised it already, and no recording is active then.)
+        const suspend_for_recording = self.trace.isRecording();
+        if (suspend_for_recording) self.trace.raiseSuspend();
+        defer if (suspend_for_recording) self.trace.lowerSuspend();
         const produced = hb.call(hb.ctx, @ptrCast(self), args, buf) catch |e| return narrowError(e);
         return buf[0..@min(produced, n)];
     }

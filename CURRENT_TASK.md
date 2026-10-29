@@ -1,4 +1,7 @@
-DOC 63 PHASE 2c slice 1 DONE (2026-10-28, coral-marten): tier-1a executes guard_native/call_host/guard_host_epoch/host_result (doc 63 §5.10.3), tested on hand-built finalized runs. Not committed until the gate is green on the final tree. Next: slice 2, recording.
+DOC 63 PHASE 2c slices 1+2 DONE (2026-10-29, coral-marten), committed, not pushed.
+- Host calls record in precise loop roots behind Config.trace_host_calls (default OFF). Doc 63 §5.10.3–4.
+- Flag on, tier-1a is 3.5x SLOWER than tier-0 on the §8.1 probe (min 1851 vs 498 instr/iter): the IR interpreter itself. Keep off until Phase 3 (native lowering).
+- Next: Phase 3, or the 2c leftovers (ten-leg matrix, disturbs re-measure, doc 00/02 amendments).
 
 DOC 63 PHASE 2b (part 1) DONE (2026-10-28, coral-marten), committed, not pushed.
 - Landed inert: deferred physical retirement (registry.deferred_retire, released at lowerSuspend/lowerLease) and entry leases in enterSelectedTrace/enterHeadNativeQuiet. Doc 63 §5.10.2.

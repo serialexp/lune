@@ -586,6 +586,18 @@ pub inline fn isOneShotKind(kind: TraceKind) bool {
 }
 
 pub const RecordingSession = struct {
+    /// Doc 63 §5.3: see `pending_host`.
+    pub const PendingHost = struct {
+        site: u32,
+        /// Callee register; results land at `a ..`.
+        a: u16,
+        nwanted: u16,
+        /// `heap.host_epoch` before the call.
+        epoch: u64,
+        /// C_B1: the coherent snapshot every result check exits through.
+        c_b1: trace_ir.SnapIdx,
+    };
+
     pub const Options = struct {
         maxrecord: usize = 4096,
         peel: bool = true,
@@ -601,6 +613,11 @@ pub const RecordingSession = struct {
         /// tier-0 → trace entry; a shorter one is slower than tier-0 would
         /// have been, so the recording aborts as it did before stitching.
         minstitch: u32 = 0,
+        /// Doc 63 §5.3: record host calls in precise loop roots (`guard_native`,
+        /// `call_host`, `guard_host_epoch`, `host_result`) instead of
+        /// stitching around them. `Config.trace_host_calls`, and never under an
+        /// exec-log session (precise traces cannot serialize yet).
+        host_calls: bool = false,
         optimize: bool = true,
         /// Doc 45 D2: deterministic snapshot admission budgets for PRECISE
         /// recordings. Defaults are the contract values; tests inject smaller
@@ -1015,6 +1032,13 @@ pub const RecordingSession = struct {
     /// host ops' `a`. Nothing appends to it until Phase 2c; finalize copies
     /// it into `TraceCode.host_sites`.
     host_sites: std.ArrayListUnmanaged(trace_ir.HostCallSite) = .empty,
+    /// Doc 63 §5.3: the host call just emitted, whose results are typed at the
+    /// NEXT instruction's prologue, from the registers tier-0 wrote. Held in the
+    /// session so a cancelled recording discards it.
+    pending_host: ?PendingHost = null,
+    /// `&heap.host_epoch`, stamped by every `start`. Null in tests that record
+    /// without a heap; a host call then records no epoch comparison and aborts.
+    host_epoch_probe: ?*const u64 = null,
     /// Doc 45 D2: whether the precise entry prologue (full slot_load map +
     /// eager guard_gc) has been emitted yet this recording. Deferred to the
     /// first body `recordInstr`; cleared in `reset`.
@@ -1370,6 +1394,18 @@ pub const RecordingSession = struct {
             if (!self.precise_prologue_done) {
                 self.beginPreciseInner() catch return self.abort(.alloc);
                 self.precise_prologue_done = true;
+            }
+            // Doc 63 §5.3: the previous instruction was a traced host call; type
+            // its results from the registers tier-0 just wrote, before this
+            // boundary's snapshot captures them.
+            if (self.pending_host) |ph| {
+                self.pending_host = null;
+                self.recHostResults(ph, regs) catch |e| switch (e) {
+                    error.SnapshotLimit => return self.abort(.snapshot_limit),
+                    error.OutOfMemory => return self.abort(.alloc),
+                    error.EpochMoved => return self.abort(.host_barrier),
+                };
+                if (!self.active) return;
             }
             self.snapBoundary(pc) catch |e| switch (e) {
                 error.SnapshotLimit => return self.abort(.snapshot_limit),
@@ -4345,6 +4381,9 @@ pub const RecordingSession = struct {
             .native => {
                 const nat = function.Native.fromHeader(callee.asHeap());
                 if (nat.recorded) |rb| return self.recBuiltin(rb, instr, regs, multret);
+                // Doc 63: a host call in a precise loop root is recorded, not a
+                // barrier; every shape it declines falls through to stitching.
+                if (try self.recHostCall(nat, instr, regs, multret)) return;
                 // Doc 44 D4 follow-up: a one-shot (head/cont) recording at
                 // depth 0 ends HERE instead of aborting — everything before
                 // the call stays native, tier-0 performs the call. Without
@@ -4507,6 +4546,93 @@ pub const RecordingSession = struct {
     /// byte-identical to the untagged path — a registry row only gains its
     /// `.recorded` tag together with its arm, so those prongs are unreachable
     /// until then and exist to keep the switch exhaustive as the enum grows.
+    /// Doc 63 §5.1/§5.3: record a host call as `guard_native`, `call_host` and
+    /// `guard_host_epoch`; its `host_result`s follow at the next instruction
+    /// (`recHostResults`), once tier-0 has written the results to type. True
+    /// when the call is handled (recorded, or the recording was aborted or
+    /// cancelled for it); false to fall through to the existing paths.
+    ///
+    /// Recorded only where v1 can run it (§5.3): a loop-anchored root, no
+    /// multret operand or result, a native not yet disturbing. A non-precise
+    /// recording cancels with `.needs_precise` and is re-recorded precisely.
+    fn recHostCall(self: *RecordingSession, nat: *function.Native, instr: Instr, regs: RegWindow, multret: ?u32) !bool {
+        if (!self.options.host_calls or nat.host == null) return false;
+        if (self.kind != .root or self.inline_depth != 0 or self.pending_link_close != null) return false;
+        if (trace_code.anchorKind(self.anchor.pc) != .loop) return false;
+        if (instr.b == bytecode.all_results or instr.c == bytecode.all_results or multret != null) return false;
+        const probe = self.host_epoch_probe orelse return false;
+        if (nat.disturbs >= function.disturb_threshold) {
+            self.abort(.host_barrier);
+            return true;
+        }
+        if (!self.precise) {
+            self.abort(.needs_precise);
+            return true;
+        }
+        const callee_ref = try self.refOf(instr.a);
+        // The native joins the constant pool without a `konst` op: only the
+        // guard names it, and finalize indexes it into the weak pool (§5.10).
+        const callee = regs.get(instr.a);
+        var k: ?usize = null;
+        for (self.consts.items, 0..) |c, i| {
+            if (c.isHeap() and c.asHeap() == callee.asHeap()) k = i;
+        }
+        const const_ix = k orelse blk: {
+            try self.consts.append(self.gpa, callee);
+            break :blk self.consts.items.len - 1;
+        };
+        const b_pc = self.cur_pc - 1;
+        const n: u16 = @intCast(self.anchor_num_registers);
+        const s_b = self.cur_snap;
+        const c_b = self.snap_builder.addCoherent(b_pc, n) catch |e| switch (e) {
+            error.SnapshotLimit => {
+                self.abort(.snapshot_limit);
+                return true;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        const c_b1 = self.snap_builder.addCoherent(b_pc + 1, n) catch |e| switch (e) {
+            error.SnapshotLimit => {
+                self.abort(.snapshot_limit);
+                return true;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        const site: u32 = @intCast(self.host_sites.items.len);
+        try self.host_sites.append(self.gpa, .{ .a = instr.a, .nargs = instr.b, .nwanted = instr.c, .b_pc = b_pc, .preflush_snap = s_b });
+        _ = try self.emit(.{ .op = .guard_native, .a = callee_ref, .aux = @intCast(const_ix) });
+        // `emit` stamps the current boundary snapshot (S_B) on every body op;
+        // the call and its epoch guard exit through the coherent ones.
+        self.cur_snap = c_b;
+        _ = try self.emit(.{ .op = .call_host, .a = @intCast(site) });
+        self.cur_snap = c_b1;
+        // `aux` holds the allocation count so far; finalize turns it into the
+        // allocations remaining after the site (`A_rem`).
+        _ = try self.emit(.{ .op = .guard_host_epoch, .a = @intCast(site), .aux = @intCast(self.alloc_count) });
+        self.cur_snap = s_b;
+        self.pending_host = .{ .site = site, .a = instr.a, .nwanted = instr.c, .epoch = probe.*, .c_b1 = c_b1 };
+        return true;
+    }
+
+    /// Doc 63 §5.3: type the results of the host call recorded by the previous
+    /// instruction from the registers tier-0 wrote, and bind them to their
+    /// window slots. An epoch that moved across the call means the recording
+    /// no longer describes the VM.
+    fn recHostResults(self: *RecordingSession, ph: PendingHost, regs: RegWindow) error{ OutOfMemory, SnapshotLimit, EpochMoved }!void {
+        const probe = self.host_epoch_probe orelse return error.EpochMoved;
+        if (probe.* != ph.epoch) return error.EpochMoved;
+        const saved = self.cur_snap;
+        self.cur_snap = ph.c_b1;
+        defer self.cur_snap = saved;
+        var k: u16 = 0;
+        while (k < ph.nwanted) : (k += 1) {
+            const v = regs.get(ph.a + k);
+            const ty = obsTypeOf(v);
+            const ref = try self.emit(.{ .op = .host_result, .a = @intCast(ph.site), .aux = k, .ty = ty });
+            self.setReg(ph.a + k, ref);
+        }
+    }
+
     pub fn recBuiltin(self: *RecordingSession, rb: function.RecordedBuiltin, instr: Instr, regs: RegWindow, multret: ?u32) !void {
         // Doc 27: dynamic multret windows resolve here instead of aborting.
         //
@@ -6458,6 +6584,7 @@ pub const RecordingSession = struct {
         self.force_ordinary = false; // A1' (task 27): arm() sets it from the pending's policy
         self.cur_snap = 0; // doc 45 D2: no boundary exists until the first precise bytecode
         self.host_sites.clearRetainingCapacity(); // doc 63 §5.1
+        self.pending_host = null;
         self.precise_prologue_done = false; // doc 45 D2: prologue emitted at first body instr
         self.cur_ord = 0; // doc 56 §4.2: first body bytecode opens ordinal 1
         self.exit_ord_overflow = false;

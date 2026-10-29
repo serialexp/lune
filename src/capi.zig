@@ -1765,6 +1765,7 @@ test {
     _ = @import("capi_hostcall_test.zig");
     _ = @import("capi_epoch_test.zig");
     _ = @import("capi_suspend_test.zig");
+    _ = @import("capi_hosttrace_test.zig");
     _ = @import("capi_task_test.zig");
     if (hostcall_asm) _ = @import("asm/offsets_x64.zig");
 }
