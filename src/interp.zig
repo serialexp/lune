@@ -1625,6 +1625,7 @@ pub const Vm = struct {
             // Doc 54 P1: the structural-invariant assert callout exists only
             // in -Djit-debug builds; normal builds emit no callout at all.
             .frame_motion_assert_fn = if (@import("jitdbg.zig").enabled) &nativeFrameMotionAssert else null,
+            .host_call_fn = &nativeHostCallFn,
             .frame_abi = frame_motion_abi,
         });
         // Doc 24 D5: the stable mutable heap channel for allocating traces
@@ -3394,6 +3395,21 @@ pub const Vm = struct {
         return @intFromEnum(self.traceHostCall(ct, site, regs));
     }
 
+    /// Doc 63 §5.8: the C-ABI shim a native `call_host` calls
+    /// (`NativeSeedCtx.host_call_fn`). The page bakes the ctx, whose `vm` is
+    /// valid for the episode, and the site index; the trace is the
+    /// dispatcher's published `executing` borrow (a precise page never links
+    /// or fuses, so the code reaching here is always that trace's).
+    fn nativeHostCallFn(ctx: *const trace.NativeSeedCtx, site_ix: u32) callconv(.c) u32 {
+        const self: *Vm = @ptrCast(@alignCast(ctx.vm));
+        const ct = self.trace.executing.?;
+        self.trace.native_host_calls +%= 1;
+        const site = ct.code.host_sites[site_ix];
+        const frame = &self.frames[self.depth - 1];
+        const regs = self.frameWindow(frame.base, @as(usize, site.a) + @max(@as(usize, site.nargs) + 1, site.nwanted));
+        return @intFromEnum(self.traceHostCall(ct, site_ix, regs));
+    }
+
     /// Doc 63 §5.8: the shim a traced `call_host` runs. Mirrors tier-0's host
     /// arm: the frame is left as tier-0 has it at a call in progress (§5.5, so a
     /// collection masks it at B and an error locates at B), the callback runs
@@ -3415,7 +3431,7 @@ pub const Vm = struct {
         }
         const nat = function.Native.fromHeader(regs.get(site.a).asHeap());
         const args = self.gatherScratch(frame.base + site.a + 1, frame.base + site.a + 1 + site.nargs);
-        const res = self.callHostNative(nat, args, site.nwanted) catch |e| return hostStatus(e);
+        const res = self.callHostNative(nat, args, site.nwanted, true) catch |e| return hostStatus(e);
         // A failure above leaves `in_flight` set and `pc` at B, as tier-0 does.
         var k: usize = 0;
         while (k < res.len) : (k += 1) regs.set(site.a + k, res[k]);
@@ -3446,7 +3462,9 @@ pub const Vm = struct {
         };
     }
 
-    inline fn callHostNative(self: *Vm, nat: *function.Native, args: []const Value, want: usize) Error![]const Value {
+    /// `traced` (a traced call's shim, doc 63 §5.8) drops the recording
+    /// branch: no recording is active while a trace runs.
+    inline fn callHostNative(self: *Vm, nat: *function.Native, args: []const Value, want: usize, comptime traced: bool) Error![]const Value {
         const hb = nat.host.?;
         std.debug.assert(nat.effect == null and nat.multi == null and nat.recorded == null);
         if (self.host_out.len == 0) self.host_out = try self.gpa.alloc(Value, host_out_slots);
@@ -3462,7 +3480,9 @@ pub const Vm = struct {
         // call's shim has raised it already, and no recording is active then.)
         // Out of line, so the common call keeps no flag live across the host:
         // inline, the pair cost 20 instructions per pure call (§5.10.5).
-        if (self.trace.isRecording()) return self.callHostRecording(nat, args, buf);
+        if (traced) {
+            std.debug.assert(!self.trace.isRecording());
+        } else if (self.trace.isRecording()) return self.callHostRecording(nat, args, buf);
         // Doc 63 §5.9: a call during which the epoch moved disturbs. Counted
         // in a `defer` so a failing call counts the same as a successful one.
         const epoch = self.heap.host_epoch;
@@ -3472,6 +3492,7 @@ pub const Vm = struct {
         const produced = hb.call(hb.ctx, @ptrCast(self), args, buf) catch |e| return narrowError(e);
         return buf[0..@min(produced, n)];
     }
+
 
     /// `callHostNative`'s call while a recording is active: the same call and
     /// disturbance count, with the JIT suspended around it (§5.9). `buf` is
@@ -3497,7 +3518,7 @@ pub const Vm = struct {
             // funnel. `results_out` may alias `args` (`pcall` passes slices
             // of its own args and out); the funnel's private buffer makes
             // that safe.
-            const res = try self.callHostNative(nat, args, results_out.len);
+            const res = try self.callHostNative(nat, args, results_out.len, false);
             // Whole-word stores: `results_out` is often a host buffer the C
             // side reads as 8-byte words (`Value.storeWords`).
             for (res, 0..) |v, k| Value.storeWords(&results_out[k], v);
@@ -6513,6 +6534,9 @@ pub const Vm = struct {
         defer self.trace.lowerLease();
         // Doc 63 §5.8: the entered trace is the borrow a traced host call
         // reads. Restored on every return, so a nested entry nests the borrow.
+        const outer = self.trace.executing;
+        self.trace.executing = ct;
+        defer self.trace.executing = outer;
         var pc = pc_in;
         // Doc 45 D8 interim: a PRECISE trace cannot serialize yet
         // (`traceser` has no snapshot schema until the format bump), so under
@@ -6809,7 +6833,12 @@ pub const Vm = struct {
             // instrs would misclassify the guard / resume PC). Panic
             // rather than silently fall back, in release builds too.
             // tier-1a never arms, so its `final` is unconditionally `ct`.
-            const resolved: ?*trace.Trace = self.trace.traceById(result.final_trace_id);
+            // Doc 63 §5.10: the one exception is `ct` itself, retired by a
+            // collection in a host call's callback: its id no longer
+            // resolves, but its record outlives the lease, and a precise page
+            // never links or fuses, so the final trace is the borrow.
+            const resolved: ?*trace.Trace = self.trace.traceById(result.final_trace_id) orelse
+                if (ct.doomed and result.final_trace_id == ct.id and ct.code.host_sites.len != 0) ct else null;
             const final: *trace.Trace = if (ran_native)
                 (resolved orelse @panic("dispatcher: native final_trace_id did not resolve"))
             else
@@ -10248,7 +10277,7 @@ pub const Vm = struct {
                 const out_lo = base + a;
                 const want: usize = if (all) self.regCapacity() -| out_lo else nwanted;
                 if (out_lo + want > self.regCapacity()) return parkErr(st, Error.StackOverflow);
-                const res = self.callHostNative(nat, args, want) catch |e| return parkErr(st, e);
+                const res = self.callHostNative(nat, args, want, false) catch |e| return parkErr(st, e);
                 const produced = res.len;
                 // Straight-line from here to the register writes —
                 // no allocation, so the results (rooted only via

@@ -1,3 +1,10 @@
+DOC 63 PHASE 3 PART 1 DONE (2026-10-29, coral-marten): native lowering of the four host ops. Doc 63 §5.10.6.
+- Host traces compile natively; the shim is Vm.nativeHostCallFn (site by index, trace via the published TraceState.executing). Flag still OFF.
+- §8.1 probe, flag on: min 369 instr/iter (budget 250, tier-0 479). Split and options (a)-(d) for Bart in §5.10.6.
+- w4/w8/w16/wide never compile: untyped loop-carried φs (also pure-guest loops). With the flag on they run tier-1a at 3-4x tier-0. Options in §5.10.6; blocks the flag.
+- General wins on the way: live-only callout save (str_manip -8.8%, str_find_match -6%, array3d -5% JIT on); markBodyReads phi bug; bindEntry (precise only; on all roots it moved bench both ways, TODO.md).
+- Open for Bart: the budget options, the untyped-φ options, and `nest` (a)/(b)/(c) from §5.10.5.
+
 DOC 63 PHASES 2b + 2c DONE (2026-10-29, coral-marten). Doc 63 §5.10.2–5.
 - Host calls record in precise loop roots behind Config.trace_host_calls (default OFF until Phase 3: tier-1a is 3.5x slower than tier-0 on these bodies; breakdown in §5.10.5).
 - Slice 3: exactly-once matrix + §5.10 lifetime tests (src/interp_hosttrace_test.zig), callHostRecording out of line (+20 -> +1 instr per pure host call; recursive-fib -2.2% tier-0), the §5.9 blacklist retirement (was missing), doc 00/02/59 amendments.

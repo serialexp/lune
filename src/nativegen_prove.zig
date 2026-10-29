@@ -83,11 +83,18 @@ fn markBodyReads(t: *const Trace, body_read: []bool) void {
         if (reads.a) markRead(body_read, ins.a, i);
         if (reads.b) markRead(body_read, ins.b, i);
         // A φ mentioning a ref anywhere (writeback `b`, internal init /
-        // steady association `a`) is a use.
+        // steady association `a`) is a use. A slot-bound φ's `a` is zero
+        // when it has no steady association (`analyzeInner` reads it the
+        // same way), and zero then names no ref: counting it as a read of
+        // `%0` made a precise body's dead first window load fail the proof.
+        if (ins.op == .phi) {
+            markRead(body_read, ins.b, i);
+            if (ins.aux == trace.PHI_INTERNAL or ins.a != 0) markRead(body_read, ins.a, i);
+        }
         // href's operandReads is {false,false} (seeded-slab discipline), but a
         // dynamically-rooted href DOES read its table root (`a`); count the
         // key (`b`) too, conservatively.
-        if (ins.op == .phi or ins.op == .href) {
+        if (ins.op == .href) {
             markRead(body_read, ins.a, i);
             markRead(body_read, ins.b, i);
         }
@@ -145,6 +152,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     const pure_guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(pure_guarded);
     @memset(pure_guarded, false);
+    // Doc 63 §5.1: a slot_load a `guard_native` covers is the host callee →
+    // classified `.heap` (a raw `*GcHeader`, TAG_HEAP checked in the prologue).
+    // Its identity and disturbance count are body checks: they run at the call.
+    const host_guarded = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(host_guarded);
+    @memset(host_guarded, false);
     // Parallel to `table_guarded`, but for `guard_string` (doc 24 c3): a slot_load
     // it covers is an OBSERVED string input → classified `.heap` (an invariant raw
     // `*GcHeader`), with the type pinned once in the prologue (TAG_HEAP tag-lane
@@ -347,6 +360,11 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (t.instrs[r].op != .slot_load) return false;
                 pure_guarded[r] = true;
             },
+            .guard_native => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                if (t.instrs[r].op == .slot_load) host_guarded[r] = true;
+            },
             // guard_string (doc 24 c3): on a slot_load it pins the observed-string
             // input for the prologue (marked here); on anything else Pass B decides
             // — a guard on a proven-string producer discharges to nothing, any
@@ -429,6 +447,8 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     kinds[i] = .func; // guard_func-covered → invariant callee closure
                 } else if (pure_guarded[i]) {
                     kinds[i] = .native; // guard_builtin-covered → invariant callee native
+                } else if (host_guarded[i]) {
+                    kinds[i] = .heap; // guard_native-covered → the host callee (doc 63)
                 } else if (string_guarded[i]) {
                     // guard_string-covered → invariant string pointer (doc 24 c3).
                     // Same `.heap` home/flush class as a producer result; the
@@ -1538,6 +1558,39 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     else => return false,
                 }
             },
+            // ---- doc 63 §5.1: host calls (precise traces only) ----
+            // `guard_native` checks its callee is the trace's native constant,
+            // below the disturb threshold; the callee is any `.heap` value.
+            .guard_native => {
+                if (t.deopt_mode != .precise) return false;
+                if (ins.a >= i or kinds[ins.a] != .heap) return false;
+                if (ins.aux < 0 or ins.aux >= t.consts.len) return false;
+                const k = t.consts[@intCast(ins.aux)];
+                if (!k.isHeap() or k.heapType() != .native) return false;
+                kinds[i] = .none;
+            },
+            // `a` is a site index, not a ref.
+            .call_host, .guard_host_epoch => {
+                if (t.deopt_mode != .precise) return false;
+                if (ins.a >= t.host_sites.len) return false;
+                if (ins.op == .guard_host_epoch and ins.aux < 0) return false;
+                kinds[i] = .none;
+            },
+            // A result read from the slab the shim wrote, typed by the tag
+            // check its lowering makes.
+            .host_result => {
+                if (t.deopt_mode != .precise) return false;
+                if (ins.a >= t.host_sites.len) return false;
+                if (ins.aux < 0 or ins.aux >= t.host_sites[ins.a].nwanted) return false;
+                kinds[i] = switch (ins.ty) {
+                    .int => .int,
+                    .float => .float,
+                    .boolean => .bool,
+                    .nil => .nil,
+                    .heap => .heap,
+                    .unknown => return false,
+                };
+            },
             // Everything else (guard_number/float-neg) is deferred — bail to
             // tier-1a. (shl/shr, guard_float, guard_builtin and fsqrt are handled
             // above.)
@@ -1606,6 +1659,9 @@ pub fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         // guard_builtin reads the callee-snapshot native it identity-checks (a);
         // fsqrt/fsin/fcos read their sole float operand (a).
         .guard_builtin, .fsqrt, .fsin, .fcos, .ffloor, .fceil => .{ .a = true, .b = false },
+        // Doc 63: guard_native reads its callee (a). call_host,
+        // guard_host_epoch and host_result name a site in `a`, not a ref.
+        .guard_native => .{ .a = true, .b = false },
         // doc 24: tostr_* read their guard-pinned scalar (a); slen its string
         // (a). guard_gc reads NOTHING (`a` unused, aux = the bound A).
         .tostr_int, .tostr_num, .slen => .{ .a = true, .b = false },

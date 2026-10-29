@@ -1043,6 +1043,10 @@ pub const RecordingSession = struct {
     /// eager guard_gc) has been emitted yet this recording. Deferred to the
     /// first body `recordInstr`; cleared in `reset`.
     precise_prologue_done: bool = false,
+    /// Whether the entry bindings (`bindEntry`) have been made this recording.
+    /// Deferred to the first body `recordInstr` like the precise prologue, so
+    /// an armed recording stays empty until it records; cleared in `reset`.
+    entry_bound: bool = false,
     /// Doc 56 §4.2 (ORDINARY recordings): the current guest bytecode's
     /// boundary ordinal — one-based, bumped once per `recordInstr`; 0 before
     /// the first body bytecode (arm-time ops). `emit` stamps it on every op
@@ -1390,6 +1394,10 @@ pub const RecordingSession = struct {
         // the last COMPLETED instruction, so a failing body op resumes at this
         // pc with those values. Budget overflow is deterministic admission
         // refusal (`.snapshot_limit`), never a partial candidate.
+        if (!self.entry_bound) {
+            self.entry_bound = true;
+            self.bindEntry() catch return self.abort(.alloc);
+        }
         if (self.precise) {
             if (!self.precise_prologue_done) {
                 self.beginPreciseInner() catch return self.abort(.alloc);
@@ -1595,6 +1603,35 @@ pub const RecordingSession = struct {
     /// `maybeCloseAtAnchor` close an empty-body trace). Everything emitted here
     /// carries `snap == 0`: prologue/seed failures remain pre-body ENTRY
     /// failures, not mid-body deopts.
+    /// LuaJIT's `rec_for_loop` entry binding: a root anchored at a numeric
+    /// `for` body starts with the visible variable `R[a+3]` equal to the index
+    /// `R[a]`, because both of tier-0's arrivals at the body start copy one
+    /// into the other (`for_prep`, and `for_loop`'s taken back-edge). So the
+    /// visible variable's entry value is the index's ref, carrying the type
+    /// proof the index gets, instead of a slot_load of its own that a body
+    /// using `i` only as a copy (a host-call argument, a move into a φ'd
+    /// slot) would leave untyped. `.input`, not `.def`: the binding is not a
+    /// write, so it adds no φ and no back-edge store.
+    ///
+    /// Precise recordings only. There a full-window snapshot names the
+    /// visible variable at every exit, so an untyped load of it is
+    /// unflushable and refuses native. An ordinary recording only reads it
+    /// where the body does, and binding it there moved bench/ both ways
+    /// (nsieve-bit −4.6%, nsieve and sieve_int +3.1%, grid_matmul +1.3%,
+    /// JIT on; TODO.md).
+    fn bindEntry(self: *RecordingSession) !void {
+        if (!self.precise or self.kind != .root or self.inline_depth != 0) return;
+        const pc = self.anchor.pc;
+        if (pc == 0 or pc > self.anchor.proto.code.len) return;
+        const prep = self.anchor.proto.code[pc - 1];
+        if (prep.op != .for_prep) return;
+        const vis: usize = @as(usize, prep.a) + 3;
+        if (vis >= self.anchor_num_registers) return;
+        std.debug.assert(self.reg_map[vis].state == .undef);
+        const idx = try self.refOf(prep.a);
+        self.reg_map[vis] = .{ .ref = idx, .state = .input };
+    }
+
     fn beginPreciseInner(self: *RecordingSession) !void {
         try self.prepareSnapBuilder();
         var slot: u16 = 0;
@@ -6586,6 +6623,7 @@ pub const RecordingSession = struct {
         self.host_sites.clearRetainingCapacity(); // doc 63 §5.1
         self.pending_host = null;
         self.precise_prologue_done = false; // doc 45 D2: prologue emitted at first body instr
+        self.entry_bound = false;
         self.cur_ord = 0; // doc 56 §4.2: first body bytecode opens ordinal 1
         self.exit_ord_overflow = false;
         self.exit_snap_exhausted = false;

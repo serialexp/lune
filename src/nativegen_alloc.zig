@@ -158,6 +158,13 @@ pub const Alloc = struct {
     // callout_save_base + callout_save_count - 1).
     callout_save_base: u32 = 0, // first spill-slot index of save area
     callout_save_count: u32 = 0, // number of 8-byte slots reserved
+    // Which caller-saved allocatable registers the save area covers: every
+    // r8–r11 / xmm2–xmm15 the allocation hands to any ref, slot home or
+    // array-base home. A register no value is ever placed in holds nothing
+    // a callout can clobber, so saving it is pure cost (a float-free trace
+    // skipped none of its 14 XMM saves and restores).
+    callout_gp_mask: u16 = 0,
+    callout_xmm_mask: u16 = 0,
 
     // --- rdx park slot for the inline int mod/idiv lowering (doc 25 D1) ---
     // `idiv` clobbers rdx:rax unconditionally and rdx carries the live
@@ -176,6 +183,13 @@ pub const Alloc = struct {
     // body: the out-param is strictly instruction-local. Addressed
     // `tnew_out*8`; null when the trace allocates no tables.
     tnew_out: ?u32 = null,
+
+    // --- host-call epoch word (doc 63 §5.6) ---
+    // `call_host` saves `heap.host_epoch` here before the shim runs, and the
+    // following `guard_host_epoch` compares against it. A dedicated frame
+    // word with `tnew_out`'s discipline; one serves every site, since a
+    // site's guard immediately follows its call. Null without host calls.
+    host_epoch_save: ?u32 = null,
 
     pub fn deinit(self: *Alloc, gpa: std.mem.Allocator) void {
         gpa.free(self.loc);
@@ -211,6 +225,11 @@ pub const BASE_HOME_ORDER = [_]Reg{ .r15, .r14, .r13, .r12, .rbp, .r11, .r10, .r
 /// hence no XMM analogue of `CALLEE_SAVED_MASK`. The `Reg` indices are reused for
 /// XMM (same 0..15 ModRM/REX bits); a `Loc.xmm`/`Place.xmm` tag keeps them disjoint
 /// from the identically-indexed GP registers.
+/// The caller-saved GPRs every body callout must preserve (rax/rcx are the
+/// JIT's scratch pair and deliberately excluded — a callout result rides
+/// through the restore in one of them).
+pub const CALLOUT_SAVED_GP = [_]Reg{ .r8, .r9, .r10, .r11 };
+
 pub const XMM_ALLOC_ORDER = [_]Reg{
     x64.xmm2,  x64.xmm3,  x64.xmm4,  x64.xmm5,  x64.xmm6,  x64.xmm7,
     x64.xmm8,  x64.xmm9,  x64.xmm10, x64.xmm11, x64.xmm12, x64.xmm13,
@@ -270,6 +289,9 @@ pub fn isTransient(op: trace_ir.IrOp) bool {
         // doc 45 D6: tnew materializes the fresh `*Table`'s `*GcHeader` in a
         // GP home (kind `.heap`), like the snew producer class.
         .tnew => true,
+        // doc 63: host_result materializes the result the shim wrote to the
+        // slab, by its kind.
+        .host_result => true,
         else => false,
     };
 }
@@ -677,6 +699,13 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         if (has_heap_phi) {
             for (0..n) |ci| {
                 if (bodyCalloutOf(t, kinds, slots.items, slot_id_of_ref, ci)) |c| {
+                    // Doc 63 §5.7: a host call may collect, but nothing reads
+                    // a pre-call value until its `guard_host_epoch` has
+                    // proven no collection ran (finalize's placement rule).
+                    if (c == .host_call) {
+                        std.debug.assert(ci + 1 < n and t.instrs[ci + 1].op == .guard_host_epoch);
+                        continue;
+                    }
                     if (calloutMayCollect(c)) return error.Bail;
                 }
             }
@@ -794,18 +823,20 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // callouts as a `*String`. (A CARRIED `.heap` string slot got the same
     // `is_string` tag — plus the writeback-producer proof — in the doc 30 c4b
     // classification arm above; this block is the invariant half only.)
+    // Doc 63: the other path is a `guard_native`-covered host callee, which
+    // its body guard identity-checks against the native constant, so it needs
+    // no type pin.
     for (slots.items) |*s| {
         if (s.class != .invariant or s.kind != .heap) continue;
         const lr: u16 = @intCast(s.load_ref);
-        var found = false;
+        var string = false;
+        var host = false;
         for (t.instrs) |g| {
-            if (g.op == .guard_string and g.a == lr) {
-                found = true;
-                break;
-            }
+            if (g.op == .guard_string and g.a == lr) string = true;
+            if (g.op == .guard_native and g.a == lr) host = true;
         }
-        if (!found) return error.Bail;
-        s.is_string = true;
+        if (!string and !host) return error.Bail;
+        s.is_string = string;
     }
 
     // --- liveness: last_use, single backward pass; carried/write store_refs live to the marker ---
@@ -1417,6 +1448,8 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // on — so a new callout can never silently miss its save area.
     var callout_save_base: u32 = 0;
     var callout_save_count: u32 = 0;
+    var callout_gp_mask: u16 = 0;
+    var callout_xmm_mask: u16 = 0;
     {
         var needs_callout = false;
         for (t.instrs, 0..) |_, ci| {
@@ -1431,14 +1464,33 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             // not just slot homes but also transient registers that may be live
             // across the callout (e.g. a float hload result from a prior field
             // access in the same iteration, still alive at the second href).
-            // Simplest correct approach: save ALL caller-saved GP and XMM
-            // allocatable registers unconditionally, plus rdi/rsi (SoA bases)
-            // and rdx (*NativeResult out-param, used at side-exits).
+            // We save every caller-saved allocatable register the allocation
+            // placed ANY value in (no per-callout liveness: a register holding
+            // a value somewhere is saved at every callout), plus rdi/rsi (SoA
+            // bases) and rdx (*NativeResult out-param, used at side-exits).
+            var gp_used: u16 = 0;
+            var xmm_used: u16 = 0;
+            const noteLoc = struct {
+                fn f(l: Loc, gp: *u16, xmm: *u16) void {
+                    switch (l) {
+                        .reg => |r| gp.* |= regBit(r),
+                        .xmm => |r| xmm.* |= regBit(r),
+                        .spill, .flags => {},
+                    }
+                }
+            }.f;
+            for (loc) |l| noteLoc(l, &gp_used, &xmm_used);
+            for (slots.items) |s| {
+                if (s.class != .write_only) noteLoc(s.home, &gp_used, &xmm_used);
+                for ([_]?Reg{ s.data_home, s.present_home, s.len_home }) |maybe| {
+                    if (maybe) |r| gp_used |= regBit(r);
+                }
+            }
+            for (CALLOUT_SAVED_GP) |r| callout_gp_mask |= regBit(r) & gp_used;
+            for (XMM_ALLOC_ORDER) |r| callout_xmm_mask |= regBit(r) & xmm_used;
             var count: u32 = 3; // rdi + rsi + rdx
-            // All allocatable caller-saved GPRs: r8, r9, r10, r11.
-            count += 4;
-            // All allocatable XMMs: xmm2–xmm15 (XMM_ALLOC_ORDER, 14 regs).
-            count += XMM_ALLOC_ORDER.len;
+            count += @popCount(callout_gp_mask);
+            count += @popCount(callout_xmm_mask);
             callout_save_count = count;
             // +1 for the alignment padding slot: the JIT body runs with
             // rsp % 16 == 8 (correct for the JIT's own return convention but
@@ -1474,6 +1526,16 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         }
     }
 
+    // --- host-call epoch word (doc 63 §5.6) ---
+    var host_epoch_save: ?u32 = null;
+    for (t.instrs) |ins| {
+        if (ins.op == .call_host) {
+            host_epoch_save = spill_count;
+            spill_count += 1;
+            break;
+        }
+    }
+
     return .{
         .loc = loc,
         .last_use = last_use,
@@ -1483,8 +1545,11 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         .used_callee_saved = used_callee,
         .callout_save_base = callout_save_base,
         .callout_save_count = callout_save_count,
+        .callout_gp_mask = callout_gp_mask,
+        .callout_xmm_mask = callout_xmm_mask,
         .div_save = div_save,
         .tnew_out = tnew_out,
+        .host_epoch_save = host_epoch_save,
     };
 }
 
@@ -1744,6 +1809,13 @@ pub fn opMayExitInBody(
         .guard_sid,
         // Doc 45 D6: tnew exits on a non-.ok Status (OOM → `.precise_error`).
         .tnew,
+        // Doc 63 §5.1: guard_native exits through S_B; call_host on a
+        // failed call; guard_host_epoch when the epoch moved or the budget
+        // is spent; host_result on a tag mismatch.
+        .guard_native,
+        .call_host,
+        .guard_host_epoch,
+        .host_result,
         => true,
         // Doc 25: only the INT lane exits (a zero divisor side-exits so
         // tier-0 raises DivisionByZero; the (minInt, -1) pair is computed
@@ -1898,6 +1970,13 @@ pub const BodyCallout = enum {
     /// side-exit deopt: the emitter routes a non-`.ok` Status through the
     /// precise-error stub (`.precise_error`, execute-once — never retried).
     tnew,
+    /// `Vm.traceHostCallNative` (doc 63 §5.8): the traced host call.
+    /// **may_collect = true**: the host's callbacks run guest code and may
+    /// collect. Heap-φ admission accepts it anyway, by the epoch proof
+    /// (§5.7): every collection moves `heap.host_epoch`, and the site's
+    /// `guard_host_epoch` follows the call before anything reads a pre-call
+    /// value. A failed call exits through the precise-error stub.
+    host_call,
 };
 
 /// The doc-22 capability, renamed for the doc-24 may_allocate/may_collect
@@ -1921,6 +2000,7 @@ pub fn calloutMayCollect(c: BodyCallout) bool {
         // Doc 45 D6: tnew allocates (≤1 link, guard_gc-budgeted) but never
         // collects — see the enum row.
         .tnew => false,
+        .host_call => true,
     };
 }
 
@@ -1970,6 +2050,8 @@ pub fn bodyCalloutOf(
         .sgm_setpos => .sgm_setpos,
         // Doc 45 D6: precise-only table allocation callout.
         .tnew => .tnew,
+        // Doc 63 §5.8: the traced host call.
+        .call_host => .host_call,
         else => null,
     };
 }

@@ -232,6 +232,11 @@ fn inspect(vm: *Vm, mode: TraceMode) anyerror!void {
             return e;
         },
     }
+    // Phase 3: the native leg makes its traced calls from machine code.
+    if (mode == .record_execute_native and !vm.heap.gc_stress and Log.expect_traced) testing.expect(vm.trace.native_host_calls > 0) catch |e| {
+        std.debug.print("leg {s}: no call was made from native code\n", .{@tagName(mode)});
+        return e;
+    };
 }
 
 fn expectRoute(source: [:0]const u8, expected: []const u8, want: usize, at: i64) !void {

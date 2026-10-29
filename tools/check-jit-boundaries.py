@@ -312,6 +312,16 @@ EPISODE_BOUNDARY_ALLOWLIST = frozenset(
         # inline-emitted; the seed fn and the jit-debug assert callout are
         # the only remaining authority-bearing boundary helpers.)
         ("interp.zig", "nativeFrameMotionAssert"),
+        # Doc 63 §5.8: the traced host-call shim. Reachable only from a
+        # precise loop-root page (`recHostCall` records host calls only at
+        # inline depth 0 of a loop-anchored root; `hostPlacementValid`),
+        # which never emits frame motion. The guest code its callback runs
+        # pushes frames only above `depth` and returns with `depth` and
+        # `frames[0..depth]` as they were (a failure comes back as a status
+        # and ends the episode through the precise error exit). What the
+        # shim writes to the trace's own frame is tier-0's call-in-progress
+        # state (`pc`, `in_flight`), not its identity.
+        ("interp.zig", "nativeHostCallFn"),
     }
 )
 

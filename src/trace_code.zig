@@ -312,6 +312,12 @@ pub const NativeSeedCtx = struct {
     /// (normal builds, hand-built test ctxs) emits no callout, so release
     /// pages carry zero cost. Panics on violation; returns nothing.
     frame_motion_assert_fn: ?*const fn (ctx: *const NativeSeedCtx, nreg: u64) callconv(.c) void = null,
+    /// Doc 63 §5.8: the traced host call a native `call_host` makes (interp.zig
+    /// `nativeHostCallFn`): performs the call of site `site` of the executing
+    /// trace and returns its `table_runtime.Status` ordinal. Installed once at
+    /// VM init and never reassigned, so pages bake it. `null` (a hand-built
+    /// test ctx) means a trace with host calls does not compile.
+    host_call_fn: ?*const fn (ctx: *const NativeSeedCtx, site: u32) callconv(.c) u32 = null,
     /// Doc 54 P0: the per-episode descent gate byte — 1 iff the episode may
     /// perform inline native frame motion. Published by
     /// `Vm.prepareNativeEpisode` from `receiptsInert() and !reg_top_pending

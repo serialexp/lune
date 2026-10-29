@@ -1,10 +1,11 @@
 # 63 — Traces call host functions directly — Design
 
-Status: partial — prerequisites, Phases 0, 1, 2a, 2b and 2c landed:
-host calls in precise loop roots record and run in tier-1a behind
-`Config.trace_host_calls`, which stays off until Phase 3 lowers them
-natively (tier-1a is slower than tier-0 on these bodies, §5.10.4).
-Phases 3 and 4 not started. Revision 6, approved by Codex and
+Status: partial — prerequisites, Phases 0, 1, 2a, 2b and 2c landed, and
+Phase 3's native lowering (§5.10.6): host calls in precise loop roots
+record and run natively behind `Config.trace_host_calls`, which stays off
+until the §8 budget is met (`min` is 369 instructions per iteration against
+250) and the shapes native can't compile stop falling to tier-1a.
+Phase 4 not started. Revision 6, approved by Codex and
 Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
 Owner: Bart
@@ -147,21 +148,36 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   (doc 00 Embedding API, doc 02 transparent recording and host-mediated
   suspension, doc 59's "unknown natives are already trace barriers").
 
+- [x] **Phase 3, part 1 — native lowering** (landed 2026-10-29, §5.10.6).
+  The four ops in nativegen: the pre-call materialization reusing the
+  precise materializer, the C-ABI shim (`nativeHostCallFn`) as a body
+  callout, the post-call epoch and budget checks, the `host_result` tag
+  checks and loads, the coherent exits, the call-site rooting rule in
+  `nativegen_alloc` (§5.7).
+  - Admission's refusal of the four ops is lifted (§5.2.1); its rule that
+    only they may take coherent snapshots stays.
+  - The coherent materializer runs end to end: the native leg of every
+    §5.4 route test makes its calls from machine code
+    (`native_host_calls`), and its epoch, result-tag and failure exits
+    store nothing.
+  - `TraceState.executing` is published by the entry routine (from
+    Phase 2b).
+  - The live-only callout save (every body callout, not just this one)
+    and two pre-existing bugs fixed on the way are in §5.10.6.
+
 ### Outstanding
 
-- [ ] **Phase 3 — native lowering.** The same four ops in nativegen: inline
-  pre-call materialization reusing the precise materializer, the C-ABI
-  shim as a body callout, the post-call epoch and budget checks, the
-  `host_result` tag checks and loads, the coherent exits, the call-site
-  rooting rule in `nativegen_alloc` (§5.7). Budget met (§8).
-  - Lift admission's refusal of the four ops (§5.2.1), keeping its rule
-    that only they may take coherent snapshots.
-  - Exercise the coherent materializer end to end: it stores nothing and
-    falls through to the family tail.
-  - Publish `TraceState.executing` for the native shim (from Phase 2b), so
-    the F3 assertion in `invalidateDeadTraceConsts` stops being vacuous.
-  - The §8.1 probe A/B of the entry lease (from Phase 2b), with the flag on.
+- [ ] **Phase 3, part 2 — the budget (§8).** `min` is 369 instructions per
+  iteration with the JIT (budget 250, tier-0 479); `wide` never compiles
+  (below). §5.10.6 splits the cost and lists the options for Bart.
+  - The §8.1 probe A/B of the entry lease (from Phase 2b), with the flag
+    on.
   - Turn `Config.trace_host_calls` on once the budget is met.
+- [ ] **Phase 3 — loops whose carried locals are only moved refuse
+  native** (`w4`/`w8`/`w16`/`wide`, and pure-guest loops of the same
+  shape). The untyped loop-carried φ (§5.10.6). With the flag on such a
+  precise host trace runs on tier-1a at 3–4× tier-0, so this blocks the
+  flag too. Options for Bart in §5.10.6.
 - [ ] **Decision — suspended callbacks run at 2.3× tier-0** (§5.10.5). The
   one disturbing call's callback (`nest`) costs 21.9M instructions against
   9.5M in tier-0: a suspended VM dispatches `.full`, and every back-edge
@@ -1606,6 +1622,136 @@ current 21.9M), for Bart to choose from:
   instantiated with the JIT gates folded to "suspended". Expected about
   10M with zero cost to `.fast`, paid for with one more handler
   instantiation (binary size and compile time). Not built.
+
+### 5.10.6 As landed: Phase 3, part 1 — native lowering (2026-10-29)
+
+**The four ops.** `nativegen_prove` types the callee load a `guard_native`
+covers as `.heap`, `call_host` and `guard_host_epoch` as `.none`, and each
+`host_result` from its recorded type. Admission takes a trace with host
+sites only with the shim bound (`NativeSeedCtx.host_call_fn`) and
+`trace_finalize.hostPlacementValid`. The lowering, per site:
+- `guard_native`: the callee home against the constant header, then the
+  native's `disturbs` byte against the threshold. Then the precise flush of
+  S_B (the pre-call materialization, §5.5).
+- `call_host`: `heap.host_epoch` saved to a reserved frame word
+  (`Alloc.host_epoch_save`), the callout save, `host_call_fn(ctx, site)`,
+  the restore, and an exit through C_B on a nonzero status (the exit stub
+  stores it to `runtime_error`, as for `tnew`).
+- `guard_host_epoch`: the epoch against the saved word, then `guard_gc`'s
+  rule with the remaining bound.
+- `host_result`: a tag check on the slab, then the payload load.
+
+**The shim** (`Vm.nativeHostCallFn`) takes the site by index, not by
+pointer: the page bakes the ctx and the index, and the shim finds the trace
+through the published `executing` borrow and calls `traceHostCall`, the
+same body tier-1a runs. The frame window is rebuilt from the top frame. A
+traced call drops the funnel's recording branch (`callHostNative`'s
+`traced` flag): no recording is active while a trace runs.
+`tools/check-jit-boundaries.py` allowlists the shim with its soundness
+argument (a precise loop-root page never emits frame motion, and a callback
+leaves `frames[0..depth]` as it found them).
+
+**Fixed on the way.**
+- A pre-existing bug in `nativegen_prove.markBodyReads`: a slot-bound φ's
+  `a` (zero when it has no steady association) counted as a read of `%0`,
+  so a precise body whose first window load was dead failed the proof.
+- `nativegen_alloc` accepts an invariant `.heap` slot covered by
+  `guard_native` (it took only `guard_string`'s).
+- The precise flush copies an invariant `.none` load captured for another
+  slot slab to slab, instead of refusing.
+- A doomed host trace (`ct.doomed` with host sites) resolves its own
+  `final_trace_id`.
+- **The callout save is live-only, for every body callout.** It saved all
+  21 lanes. It now saves `rdi`/`rsi`/`rdx` and only the r8–r11 and
+  xmm2–xmm15 the allocation places a value in
+  (`Alloc.callout_gp_mask`/`callout_xmm_mask`): 28 instructions a call off
+  `min`, and on `bench/` (JIT on) str_manip −8.8%, str_find_match −6.0%,
+  array3d −5.0%, scalar −3.6%, nsieve-bit-fp −2.5%, nothing worse.
+
+**The entry alias** (`RecordingSession.bindEntry`). `for i = 1, n do s = s
++ h(i) end` left the visible variable `R[a+3]` an untyped entry load: the
+body only copies it into the argument register, and a precise snapshot
+names it at every exit, so the flush could not store it and native refused
+the trace. LuaJIT binds the visible variable to the index at a for-loop
+root's entry (`rec_for_loop`), and so does the recorder now. Tier-0 makes
+the two equal at both arrivals (`for_prep` and `for_loop`'s back-edge). It
+is limited to precise recordings: on every root it moved `bench/` both ways
+(TODO.md).
+
+**Measured** (§8.1 probe, instructions per iteration, ReleaseFast, flag on
+in a shadow build; the flag-off JIT column is today's):
+
+| Shape | tier-0 | JIT, flag off | JIT, flag on | Budget |
+|---|---:|---:|---:|---:|
+| `min` | 479 | 508 | 369 | ≤ 250 |
+| `minl` | 446 | | 369 | |
+| `a0` / `a4` / `a8` | 447 / 540 / 664 | | 363 / 403 / 447 | |
+| `s1` / `s4` | 539 / 818 | | 375 / 396 | |
+| `w4` / `w8` / `w16` | 607 / 791 / 1159 | | 2431 / 3126 / 4517 | |
+| `wide` | 1100 | 1129 | 1129 | ≤ 320 |
+| `cb` / `tw` | 1095 / 858 | 1124 / 888 | 1124 / 888 | = today |
+| `two` | 1196 | 1226 | 1235 | = today |
+| `fail` | 4221 | | 4251 | = today |
+| `nestq` | 539 | | 447 | |
+
+The slopes: about 10 per argument and about 7 per global read, against
+tier-0's 27 and 93. The disturbing shapes stay at today's numbers except
+`two`, 9 instructions a call over (0.7%; instruction counts, so not
+noise; not yet explained). `w4`–`w16` and `wide` do not compile (below).
+
+**Where `min`'s 369 go** (callgrind, a baseline-CPU build so valgrind runs):
+
+| Cost | instructions |
+|---|---:|
+| the shim: `nativeHostCallFn` and `traceHostCall`, with the funnel inlined | ~192 |
+| `cHostCall` | 71 |
+| the host | 12 |
+| the page: guards, flush (6 slots), callout save/restore (7 lanes), epoch and budget, loop | ~94 |
+
+The shim is 177 straight-line instructions, each run once a call: frame
+bookkeeping, suspension, the gather, the `host_out` reservation, the epoch
+compare, the error union, the result copy, the nil fill, and the
+prologue/epilogue. No one piece dominates, so tightening it in place saves
+little (dropping the recording branch saved 4). §8.1 projected 45 for it.
+The options, for Bart to choose from:
+- **(a) Move the per-call protocol into the page.** The page knows `a`,
+  `nargs`, `nwanted` and where each value lives, so it can set the frame's
+  `pc` and `in_flight`, gather the arguments into the boundary scratch,
+  and copy the results out, each in two or three instructions, leaving
+  the shim suspension and the funnel. A deviation from §5.8 ("argument
+  gathering stays in the shim"). Projected 60–80 less.
+- **(b) A status-returning host binding.** `HostBinding.call` returns a
+  C-ABI count-or-status instead of `anyerror!usize`, so neither the shim
+  nor tier-0's host arm passes an error union through memory and maps it
+  back. Every tier gains. Projected 15–25 less.
+- **(c) Shrink the flush** (§8.1's two ways: skip slots dead at the resume
+  pc, or a sparse snapshot). `min` 4–8 less, `wide` about 20.
+- **(d) Hoist `guard_native`** to once per entry (TODO.md), and drop the
+  loop-top `guard_gc` the post-call budget check already covers. About 11.
+
+(a), (b) and (d) together project to about 270, still over 250; with (c),
+about 262. These are projections from component costs, not measurements.
+
+**Loops whose carried locals are only moved** (`w4`–`w16`, `wide`).
+`a, b, c, d = b, c, d, a + h(i)` guards only `a`. The others are loop-carried
+φs with no type, so their entry loads are neither typed nor boxed
+pass-throughs (that admission is for `.terminal`/`.link` traces), and
+`proveKinds` refuses. This is not host-specific: the same rotation with no
+host call is `native_unsupported` today and gated to tier-0. The flag makes
+it worse: the dispatcher's native safety net skips an unsupported trace only
+when it is not precise, so a precise host trace runs on tier-1a at 3–4×
+tier-0. The options, for Bart:
+- **Typed entry loads.** The recorder type-guards an entry load that feeds
+  a loop-carried φ, as LuaJIT's SLOAD typechecks, so the φ lives in a
+  register. The fastest; one more entry check, and a trace exits if the
+  rotated values' types ever change.
+- **Boxed φs in native.** Carry both lanes, assume no type. No new guards
+  or exits, but every carried value is two words.
+- **Both:** typed where the recording saw a stable type, boxed otherwise.
+
+Separately, the safety net could gate a precise host trace that native
+refuses, as it does an ordinary one, since tier-0 already makes these calls
+at its own cost.
 
 ### 5.11 Tier-1a
 

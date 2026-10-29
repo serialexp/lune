@@ -56,6 +56,7 @@ pub const McodeArena = mcode.McodeArena;
 const Reg = x64.Reg;
 const object = @import("object.zig");
 const function = @import("function.zig");
+const trace_finalize = @import("trace_finalize.zig");
 const bytecode = @import("bytecode.zig");
 // ---------------------------------------------------------------------------
 // Frozen-layout constants + lane helpers live in `nativegen_layout.zig`
@@ -196,6 +197,8 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
                 // (smatch/sgmatch/scap_str). sfindp, str2num_* and sgm_setpos
                 // are heap-free by design and deliberately absent.
                 .smatch, .sgmatch, .scap_int, .scap_str => return null,
+                // Doc 63 §5.6: the epoch and budget checks bake heap addresses.
+                .guard_native, .call_host, .guard_host_epoch, .host_result => return null,
                 else => {},
             }
         }
@@ -224,11 +227,17 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     if (t.deopt_mode == .precise) {
         if (terminal != .loop) return null;
         if (t.peeled) return null;
+        // Doc 63 §5.8: host calls reach the shim through the baked context,
+        // and their runs must keep finalize's placement rule (§5.2), which
+        // the epoch proof the lowering relies on rests on (§5.7).
+        if (t.host_sites.len != 0) {
+            const ctx = seed_ctx orelse return null;
+            if (ctx.host_call_fn == null) return null;
+            if (!trace_finalize.hostPlacementValid(t.instrs, t.snapshots, t.host_sites)) return null;
+        }
         for (t.instrs, 0..) |ins, idx| {
-            // Doc 63 §5.1: host calls are lowered from Phase 3. Until then a
-            // trace containing one stays on tier-1a.
             switch (ins.op) {
-                .guard_native, .call_host, .guard_host_epoch, .host_result => return null,
+                .guard_native, .call_host, .guard_host_epoch, .host_result => if (t.host_sites.len == 0) return null,
                 else => {},
             }
             if (ins.snap != 0) {
@@ -440,7 +449,8 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, link_hit_counters, slot_rowless_ok, metadata_cells, silent_emissions, exit_side_cells, seed_ctx, seed_plan, heap) catch {
+    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, link_hit_counters, slot_rowless_ok, metadata_cells, silent_emissions, exit_side_cells, seed_ctx, seed_plan, heap) catch |e| {
+        if (comptime jitdbg.enabled) dbg_lower_error = e;
         if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
         return null;
@@ -594,6 +604,12 @@ pub const analyze = ngalloc.analyze;
 /// The erroring form, for the jitdbg "unsupported in analyze" probe: its
 /// error-return trace names the exact `error.Bail` site.
 pub const analyzeInner = ngalloc.analyzeInner;
+const jitdbg = @import("jitdbg.zig");
+/// Diagnostic only (`-Djit-debug` builds; `void` otherwise): the error the
+/// last failed `lower` returned, for the "unsupported after analyze" probe.
+/// Read right after the failed compile on the same thread, like
+/// `nativegen_prove.dbg_last_idx`.
+pub threadlocal var dbg_lower_error: if (jitdbg.enabled) ?anyerror else void = if (jitdbg.enabled) null else {};
 const Loc = ngalloc.Loc;
 const SlotInfo = ngalloc.SlotInfo;
 const CALLEE_SAVED_MASK = ngalloc.CALLEE_SAVED_MASK;
@@ -777,8 +793,19 @@ fn emitPreciseSnapshotFlush(a: *x64.Assembler, t: *const Trace, kinds: []const K
             if (sid < 0) return error.Unsupported;
             const s = alloc.slots[@intCast(sid)];
             if (k == .none) {
-                // A `.none` load is only ever captured for its OWN slot.
-                if (s.slot != ss.slot) return error.Unsupported;
+                if (s.slot != ss.slot) {
+                    // A dead load captured for ANOTHER slot: a plain copy the
+                    // body never inspects (a host-call argument). An
+                    // invariant source's slab slot is current (nothing
+                    // writes it), so copy both lanes; no type is needed.
+                    if (s.class != .invariant) return error.Unsupported;
+                    try a.movzxRegMem8(.rax, .rdi, @as(i32, s.slot));
+                    try a.movByteMemReg(.rdi, @as(i32, ss.slot), .rax);
+                    try a.movRegMem(.rax, .rsi, @as(i32, s.slot) * 8);
+                    try a.movMemReg(.rsi, @as(i32, ss.slot) * 8, .rax);
+                    stores += 1;
+                    continue;
+                }
                 // Dead invariant slot: nothing writes it → slab current → skip.
                 if (s.class == .invariant) continue;
                 // WRITE-DOMINATED carried slot (analyze reclassified it to the
@@ -842,6 +869,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     defer if (mat.len > 0) gpa.free(mat);
     var precise_tail_resume: ?x64.Label = null;
     var precise_tail_err: ?x64.Label = null;
+    // Doc 63 §5.5: the stores of the inline host-call preflushes, which count
+    // against the same budget as the exit materializers.
+    var preflush_stores: u32 = 0;
     if (precise) {
         mat = try gpa.alloc(?x64.Label, t.snapshots.len);
         @memset(mat, null);
@@ -1498,6 +1528,106 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.movMemReg(.rsp, d, .rax);
                     },
                     .xmm => unreachable, // .heap never homes in an XMM
+                }
+            },
+            // ---- doc 63 §5.1: host calls ------------------------------------------
+            // guard_native: the callee is exactly the trace's native constant
+            // (the object, so two registrations of one C function differ), and
+            // that native has not disturbed (§5.9). Both are bakeable: the
+            // native is in the trace's weak pool, which retires the trace
+            // before the object can be freed (§5.10). Either miss exits
+            // through S_B, so tier-0 makes the call. On a pass, flush S_B
+            // inline (§5.5): the window tier-0 has at B, with the same
+            // materializer an exit uses.
+            .guard_native => {
+                const k = t.consts[@intCast(ins.aux)];
+                const nat = function.Native.fromHeader(k.asHeap());
+                const creg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(k.asHeap()))));
+                try a.cmpRegReg(creg, .rax);
+                try jccNativeExit(a, exit_labels, i, .ne);
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&nat.disturbs))));
+                try a.cmpByteMemImm(.rax, 0, function.disturb_threshold);
+                try jccNativeExit(a, exit_labels, i, .ae);
+                preflush_stores += try emitPreciseSnapshotFlush(a, t, kinds, alloc, ins.snap);
+            },
+            // call_host: save the epoch (§5.6), then call the shim through the
+            // baked context with the site index, inside the callout bracket.
+            // A non-`.ok` Status exits through C_B (coherent: nothing is
+            // written back) as a precise error, its stub storing the status
+            // from rcx like tnew's.
+            .call_host => {
+                const h = heap.?; // compileImpl bailed heapless host bodies
+                const ctx = seed_ctx.?; // ...and host bodies without the shim
+                std.debug.assert(alloc.callout_save_count != 0); // bodyCalloutOf reserved it
+                const ep: i32 = @as(i32, @intCast(alloc.host_epoch_save.?)) * 8;
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.host_epoch))));
+                try a.movRegMem(.rax, .rax, 0);
+                try a.movMemReg(.rsp, ep, .rax);
+                try emitCalloutSave(a, alloc);
+                try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(ctx))));
+                try a.movRegImm64(.rsi, @intCast(ins.a));
+                try a.subRegImm32(.rsp, 8);
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(ctx.host_call_fn.?))));
+                try a.callReg(.rax);
+                try a.addRegImm32(.rsp, 8);
+                // The u32 Status, zero-extended from al (tnew's reasoning).
+                try a.movzxRegReg8(.rcx, .rax);
+                try emitCalloutRestore(a, alloc);
+                try a.cmpRegImm32(.rcx, 0);
+                try jccNativeExit(a, exit_labels, i, .ne);
+            },
+            // guard_host_epoch: no collection or guest code ran in the call
+            // (the epoch is the one saved before it), and the allocation
+            // budget still covers the rest of the iteration (`guard_gc`'s
+            // rule with `A_rem`). Exits through C_B1, which writes nothing.
+            .guard_host_epoch => {
+                const h = heap.?;
+                const ep: i32 = @as(i32, @intCast(alloc.host_epoch_save.?)) * 8;
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.host_epoch))));
+                try a.movRegMem(.rax, .rax, 0);
+                try a.cmpRegMem(.rax, .rsp, ep);
+                try jccNativeExit(a, exit_labels, i, .ne);
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.gc_stress))));
+                try a.cmpByteMemImm(.rax, 0, 0);
+                try jccNativeExit(a, exit_labels, i, .ne);
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.object_count))));
+                try a.movRegMem(.rcx, .rax, 0);
+                try a.addRegImm32(.rcx, @intCast(ins.aux));
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.next_gc))));
+                try a.cmpRegMem(.rcx, .rax, 0);
+                try jccNativeExit(a, exit_labels, i, .ae);
+            },
+            // host_result: the result the shim wrote to `R[a + aux]`, tag
+            // checked against its recorded type (exit through C_B1 on a
+            // mismatch, before any use), then loaded into its home.
+            .host_result => {
+                const site = t.host_sites[ins.a];
+                const slot: i32 = @as(i32, site.a) + ins.aux;
+                const want_tag: u8 = switch (kinds[i]) {
+                    .int => TAG_INT,
+                    .float => TAG_FLOAT,
+                    .bool => TAG_BOOL,
+                    .nil => TAG_NIL,
+                    .heap => TAG_HEAP,
+                    else => unreachable, // proveKinds admits only these
+                };
+                try a.cmpByteMemImm(.rdi, slot, want_tag);
+                try jccNativeExit(a, exit_labels, i, .ne);
+                if (kinds[i] == .float) {
+                    switch (placeOfRef(alloc, i)) {
+                        .xmm => |x| try a.movsdRegMem(x, .rsi, slot * 8),
+                        .mem => |d| {
+                            try a.movsdRegMem(XMM_SCRATCH0, .rsi, slot * 8);
+                            try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
+                        },
+                        .reg => unreachable, // a float never homes in a GP register
+                    }
+                } else {
+                    // int, bool (canonical 0/1), heap (the *GcHeader) or nil
+                    // (payload 0): the raw 8-byte payload.
+                    try a.movRegMem(.rax, .rsi, slot * 8);
+                    try regToPlace(a, placeOfRef(alloc, i), .rax);
                 }
             },
             // --- hash-part field path (H1) --------------------------------------
@@ -2631,7 +2761,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     // snapshot (finalize's placement rule; admission refuses
                     // the rest).
                     std.debug.assert(!t.snapshots[pins.snap - 1].coherent or trace_ir.isHostCoherentOp(pins.op));
-                    if (pins.op == .tnew or isStrAllocOp(pins.op))
+                    if (pins.op == .tnew or pins.op == .call_host or isStrAllocOp(pins.op))
                         try a.movMemReg32(.rdx, @offsetOf(NativeResult, "runtime_error"), .rcx);
                     const ml = mat[pins.snap - 1] orelse blk: {
                         const nl = try a.label();
@@ -2803,7 +2933,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // total: over budget → compile bail → tier-1a (the selection walk runs
     // precise pages there since increment 4).
     if (precise) {
-        var flush_stores: u32 = 0;
+        var flush_stores: u32 = preflush_stores;
         for (0..t.snapshots.len) |si| {
             if (mat[si]) |ml| {
                 a.bind(ml);

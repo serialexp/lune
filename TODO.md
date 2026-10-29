@@ -2,6 +2,40 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Doc 63 Phase 3 leftovers (noted 2026-10-29)
+
+- [ ] **Untyped loop-carried φs refuse native.** A local that a loop only
+      moves around (`a, b, c = b, c, a + i`) gets no type guard, so its
+      entry `slot_load` is neither typed nor a boxed pass-through (that
+      admission needs a `.terminal`/`.link` trace, not `.loop`), and
+      `proveKinds` bails. Pure-guest loops hit it too: the rotation above
+      with no host call is `native_unsupported` and gated to tier-0.
+      Options for Bart: typed entry loads (LuaJIT's SLOAD typecheck for a
+      load that feeds a φ), boxed φs in native, or both.
+- [ ] **A precise host trace native can't compile runs on tier-1a.** The
+      dispatcher's native safety net skips an unsupported trace only when
+      it is not precise (a precise one would be orphaned). With
+      `trace_host_calls` on, `w4`/`w8`/`w16` run 3–4× tier-0 for it
+      (§8.1 probe). Either the item above or a gate for precise host
+      traces fixes those shapes; the general case wants a decision.
+- [ ] **`min` is 369 instructions per iteration against a budget of
+      250** (doc 63 §5.10.6). Shim 196, `cHostCall` 71, the host 12, the
+      native body ~90. Doc 63 §5.10.6 lists the options.
+- [ ] **The entry alias moves ordinary traces both ways.** Binding the
+      numeric-for visible variable to the index's ref at a root's entry
+      (`bindEntry`) is limited to precise recordings: on all roots it gave
+      nsieve-bit −4.6% but nsieve +3.1%, sieve_int +3.2%, grid_matmul
+      +1.3% (JIT on). Find what the alias changes in nsieve's trace before
+      widening it.
+- [ ] **`two` costs 9 more instructions a call with the flag on** (1235
+      against 1226, §8.1 probe). The design says the disturbing shapes stay
+      at today's numbers; find where the 9 go.
+- [ ] **`guard_native` re-checks loop invariants every iteration.** The
+      callee identity and the disturbance count cannot change while the
+      epoch holds, so both could run once per entry. Hoisting needs the
+      blacklist retirement (`nativeBlacklisted`, keyed on the exit
+      instruction) to work from an entry check too.
+
 ## Small library-message divergences from Lua 5.4.6 (noted 2026-10-27)
 
 - [ ] `file:seek("bogus")` and `file:setvbuf("bogus")` say `invalid option`;
@@ -48,6 +82,12 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       smaller per stack, would lower the floor (doc 73 §5.1). The GC
       weight (`Stack.gc_units`) is that floor, so a lower floor also means
       fewer collections in `co_garbage` (1.35 s vs LuaJIT 34 ms).
+- [ ] **`co_many` peaks at 16 GB in a Debug build** (168 MB ReleaseFast,
+      HEAD `098061a` the same; noted 2026-10-29). Something touches far
+      more of each stack's reservation in Debug, about 1.6 MB a
+      coroutine; Debug filling `undefined` memory is the first suspect.
+      `just hashgate`'s Debug leg gets it OOM-killed (`rc=-9`, a
+      mismatch) when the machine is under memory pressure.
 
 ## opCallFast is inlined into opCall (noted 2026-10-26)
 

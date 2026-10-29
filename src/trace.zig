@@ -1224,6 +1224,8 @@ pub const TraceState = struct {
     /// Doc 63 §5.9 diagnostic: traces retired because a `guard_native` exit
     /// found its native over the disturb threshold. No tiering path reads it.
     host_blacklists: u64 = 0,
+    /// Doc 63 §5.8: host calls made by native code (`nativeHostCallFn`).
+    native_host_calls: u64 = 0,
     /// Doc 64 §11 diagnostics (`--jit-stats` "region closes:" and "dispatch
     /// gates:" lines): region accumulator closes by `CloseReason`, and
     /// `gateAnchor` escalations by `GateReason`. No tiering path reads them.

@@ -3279,7 +3279,8 @@ pub fn nativeFor(self: *TraceState, t: *Trace) ?*const nativegen.CompiledTrace {
                         if (nativegen.analyzeInner(self.gpa, &t.code, kinds, slots, .{ .exit_side = self.exitSideNative() })) |alloc_value| {
                             var alloc = alloc_value;
                             defer alloc.deinit(self.gpa);
-                            self.dbg("native unsupported after analyze: trace={d} anchor={d} spill_count={d}", .{ t.id, t.code.anchor.pc, alloc.spill_count });
+                            self.dbg("native unsupported after analyze: trace={d} anchor={d} spill_count={d} lower={?}", .{ t.id, t.code.anchor.pc, alloc.spill_count, nativegen.dbg_lower_error });
+                            nativegen.dbg_lower_error = null;
                         } else |e| {
                             self.dbg("native unsupported in analyze: trace={d} anchor={d} ({s}; bail site below)", .{ t.id, t.code.anchor.pc, @errorName(e) });
                             // The error-return trace's innermost frame is the

@@ -1597,14 +1597,12 @@ pub fn isCompositeBridgeCandidate(t: *const Trace, instr_idx: usize) bool {
     return t.classifyBridgeCandidate(instr_idx);
 }
 
-/// The caller-saved GPRs every body callout must preserve (rax/rcx are the
-/// JIT's scratch pair and deliberately excluded — a callout result rides
-/// through the restore in one of them).
-pub const CALLOUT_SAVED_GP = [_]Reg{ .r8, .r9, .r10, .r11 };
+pub const CALLOUT_SAVED_GP = ngalloc.CALLOUT_SAVED_GP;
 
 /// Save every SysV caller-saved home the JIT body may keep live across a
-/// mid-body callout — rdi/rsi (SoA bases), rdx (*NativeResult), r8–r11, and
-/// all allocatable XMMs (xmm2–xmm15) — into the pre-reserved
+/// mid-body callout — rdi/rsi (SoA bases), rdx (*NativeResult), and the
+/// r8–r11 / xmm2–xmm15 the allocation placed a value in
+/// (`callout_gp_mask`/`callout_xmm_mask`) — into the pre-reserved
 /// `callout_save_base` frame area. Shared by every `BodyCallout` lowering
 /// (doc 23 D4 generalized this out of the href callout); paired with
 /// `emitCalloutRestore`.
@@ -1618,15 +1616,17 @@ pub fn emitCalloutSave(a: *x64.Assembler, alloc: *const Alloc) !void {
     off += 1;
     try a.movMemReg(.rsp, @intCast(off * 8), .rdx);
     off += 1;
-    // ALL caller-saved GP registers (r8–r11), not just homes — transients in
-    // these registers may be live across the callout.
+    // Every caller-saved GP register (r8–r11) any value lives in, not just
+    // homes — transients in these registers may be live across the callout.
     for (CALLOUT_SAVED_GP) |r| {
+        if (alloc.callout_gp_mask & ngalloc.regBit(r) == 0) continue;
         try a.movMemReg(.rsp, @intCast(off * 8), r);
         off += 1;
     }
-    // ALL allocatable XMMs (xmm2–xmm15): same reasoning — a transient float
+    // Every allocated XMM (xmm2–xmm15): same reasoning — a transient float
     // live across the callout would be clobbered.
     for (XMM_ALLOC_ORDER) |r| {
+        if (alloc.callout_xmm_mask & ngalloc.regBit(r) == 0) continue;
         try a.movsdMemReg(.rsp, @intCast(off * 8), r);
         off += 1;
     }
@@ -1645,6 +1645,7 @@ pub fn emitCalloutRestore(a: *x64.Assembler, alloc: *const Alloc) !void {
         var ri: usize = XMM_ALLOC_ORDER.len;
         while (ri > 0) {
             ri -= 1;
+            if (alloc.callout_xmm_mask & ngalloc.regBit(XMM_ALLOC_ORDER[ri]) == 0) continue;
             off -= 1;
             try a.movsdRegMem(XMM_ALLOC_ORDER[ri], .rsp, @intCast(off * 8));
         }
@@ -1653,6 +1654,7 @@ pub fn emitCalloutRestore(a: *x64.Assembler, alloc: *const Alloc) !void {
         var ri: usize = CALLOUT_SAVED_GP.len;
         while (ri > 0) {
             ri -= 1;
+            if (alloc.callout_gp_mask & ngalloc.regBit(CALLOUT_SAVED_GP[ri]) == 0) continue;
             off -= 1;
             try a.movRegMem(CALLOUT_SAVED_GP[ri], .rsp, @intCast(off * 8));
         }
