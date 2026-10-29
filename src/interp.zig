@@ -3425,6 +3425,15 @@ pub const Vm = struct {
         return .ok;
     }
 
+    /// Doc 63 §5.9: the exit at `exit_instr` is a `guard_native` whose native
+    /// has reached the disturb threshold.
+    fn nativeBlacklisted(t: *const trace.Trace, exit_instr: u32) bool {
+        const ins = t.code.instrs[exit_instr];
+        if (ins.op != .guard_native) return false;
+        const k = t.code.consts[@intCast(ins.aux)];
+        return function.Native.fromHeader(k.asHeap()).disturbs >= function.disturb_threshold;
+    }
+
     /// Doc 63 §5.8: the status a failed host call raises. A host call's failure
     /// set is exactly these four (`capi.zig` stages nothing else).
     fn hostStatus(e: Error) table_runtime.Status {
@@ -3447,21 +3456,36 @@ pub const Vm = struct {
         self.host_out_top = lo + n;
         // Error or not, the host has returned and its range is free again.
         defer self.host_out_top = lo;
+        const buf = self.host_out[lo .. lo + n];
+        // Doc 63 §5.9: a call made while a recording is active runs its
+        // callbacks suspended, so they cannot feed that recording. (A traced
+        // call's shim has raised it already, and no recording is active then.)
+        // Out of line, so the common call keeps no flag live across the host:
+        // inline, the pair cost 20 instructions per pure call (§5.10.5).
+        if (self.trace.isRecording()) return self.callHostRecording(nat, args, buf);
         // Doc 63 §5.9: a call during which the epoch moved disturbs. Counted
         // in a `defer` so a failing call counts the same as a successful one.
         const epoch = self.heap.host_epoch;
         defer if (self.heap.host_epoch != epoch) {
             nat.disturbs +|= 1;
         };
-        const buf = self.host_out[lo .. lo + n];
-        // Doc 63 §5.9: a call made while a recording is active runs its
-        // callbacks suspended, so they cannot feed that recording. (A traced
-        // call's shim has raised it already, and no recording is active then.)
-        const suspend_for_recording = self.trace.isRecording();
-        if (suspend_for_recording) self.trace.raiseSuspend();
-        defer if (suspend_for_recording) self.trace.lowerSuspend();
         const produced = hb.call(hb.ctx, @ptrCast(self), args, buf) catch |e| return narrowError(e);
         return buf[0..@min(produced, n)];
+    }
+
+    /// `callHostNative`'s call while a recording is active: the same call and
+    /// disturbance count, with the JIT suspended around it (§5.9). `buf` is
+    /// the caller's private `host_out` range.
+    noinline fn callHostRecording(self: *Vm, nat: *function.Native, args: []const Value, buf: []Value) Error![]const Value {
+        const hb = nat.host.?;
+        const epoch = self.heap.host_epoch;
+        defer if (self.heap.host_epoch != epoch) {
+            nat.disturbs +|= 1;
+        };
+        self.trace.raiseSuspend();
+        defer self.trace.lowerSuspend();
+        const produced = hb.call(hb.ctx, @ptrCast(self), args, buf) catch |e| return narrowError(e);
+        return buf[0..@min(produced, buf.len)];
     }
 
     /// `callValue`'s native dispatch once `args` are rooted (the caller parked
@@ -5606,6 +5630,11 @@ pub const Vm = struct {
             self.len += 1;
         }
 
+        pub fn has(self: *const WalkDead, t: *const trace.Trace) bool {
+            for (self.items[0..self.len]) |d| if (d == t) return true;
+            return false;
+        }
+
         pub fn retire(self: *WalkDead, ts: *trace.TraceState) void {
             if (self.len == 0) return;
             const batch = self.items[0..self.len];
@@ -6991,6 +7020,15 @@ pub const Vm = struct {
                 self.trace.dbg("precise-resume: trace={d} exit={d} snap={d} resume_pc={d} completed={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, done });
                 self.trace.precise_resumes +|= 1;
                 self.trace.onSideExitReceipt(ct, done, result.exit_instr, done, .deferred, .entered);
+                // Doc 63 §5.9: a `guard_native` exit whose native has
+                // disturbed retires the trace (logically; the entry lease
+                // defers the physical half), so it stops paying an entry and
+                // an exit per iteration. The re-recording declines the native.
+                if (nativeBlacklisted(ct, result.exit_instr) and !wctx.dead.full() and !wctx.dead.has(ct)) {
+                    self.trace.dbg("host-blacklist: trace={d} exit={d}", .{ ct.id, result.exit_instr });
+                    self.trace.host_blacklists +|= 1;
+                    wctx.dead.add(ct);
+                }
                 wctx.dead.retire(&self.trace);
                 if (mode == .full and self.runFastPath()) {
                     return .{ .switch_mode_at = @intCast(snap.resume_pc) };
@@ -12353,6 +12391,7 @@ test {
     _ = @import("interp_task_test.zig");
     _ = @import("interp_aio_test.zig");
     _ = @import("interp_phaseq_test.zig");
+    _ = @import("interp_hosttrace_test.zig");
     _ = @import("interp_trace_test.zig");
     _ = @import("interp_fastblock_test.zig");
     _ = @import("interp_tier1a_test.zig");

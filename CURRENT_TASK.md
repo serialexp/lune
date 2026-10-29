@@ -1,13 +1,9 @@
-DOC 63 PHASE 2c slices 1+2 DONE (2026-10-29, coral-marten), committed, not pushed.
-- Host calls record in precise loop roots behind Config.trace_host_calls (default OFF). Doc 63 §5.10.3–4.
-- Flag on, tier-1a is 3.5x SLOWER than tier-0 on the §8.1 probe (min 1851 vs 498 instr/iter): the IR interpreter itself. Keep off until Phase 3 (native lowering).
-- Next: Phase 3, or the 2c leftovers (ten-leg matrix, disturbs re-measure, doc 00/02 amendments).
-
-DOC 63 PHASE 2b (part 1) DONE (2026-10-28, coral-marten), committed, not pushed.
-- Landed inert: deferred physical retirement (registry.deferred_retire, released at lowerSuspend/lowerLease) and entry leases in enterSelectedTrace/enterHeadNativeQuiet. Doc 63 §5.10.2.
-- Cost: binary-trees +0.35%, co_pingpong_d20 +0.12% (ReleaseFast instr vs the stitching build); spectral-norm +0.43% judged layout noise.
-- Open for Bart: `executing` publication (costs ~0.25% binary-trees; currently deferred to Phase 2c). The F3 assertion in invalidateDeadTraceConsts is vacuous until then.
-- Still open in 2b: F1 test, recording-time collection tests (need Phase 2c's tier-0 suspension), blacklist-through-patched-entry test, §8.1 probe A/B.
+DOC 63 PHASES 2b + 2c DONE (2026-10-29, coral-marten). Doc 63 §5.10.2–5.
+- Host calls record in precise loop roots behind Config.trace_host_calls (default OFF until Phase 3: tier-1a is 3.5x slower than tier-0 on these bodies; breakdown in §5.10.5).
+- Slice 3: exactly-once matrix + §5.10 lifetime tests (src/interp_hosttrace_test.zig), callHostRecording out of line (+20 -> +1 instr per pure host call; recursive-fib -2.2% tier-0), the §5.9 blacklist retirement (was missing), doc 00/02/59 amendments.
+- Moved to Phase 3: publishing TraceState.executing (F3 assert vacuous until then), the lease's §8.1 probe A/B.
+- Open for Bart: suspended callbacks run 2.3x tier-0 (`nest`); options (a)/(b)/(c) with numbers in §5.10.5.
+- Next: Phase 3, native lowering of the four ops.
 
 DOC 44 STITCHING: numeric-for roots DONE (2026-10-28, coral-marten), committed, not pushed.
 - A for_loop root stops at an untagged host call (call_interp), a .cont anchor at call_pc+1 records to the back-edge (backedge_interp). Config.minstitch=48 keeps short bodies in tier-0. -27% instructions on heavy bodies, cycles flat (re-entry stalls). Details: doc 44 Done bullet; open items in its Outstanding + TODO.md.

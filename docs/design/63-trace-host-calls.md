@@ -1,14 +1,12 @@
 # 63 — Traces call host functions directly — Design
 
-Status: partial — prerequisites, Phase 0 (benchmark and budget),
-Phase 1 (epoch, disturbance and suspension, inert), Phase 2a
-(coherent snapshots, the host ops and statuses, inert) and Phase 2b
-part 1 (deferred retirement and entry leases, inert) landed; no host
-call is traced yet. Revision 6, approved by Codex and Antigravity
-(confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
+Status: partial — prerequisites, Phases 0, 1, 2a, 2b and 2c landed:
+host calls in precise loop roots record and run in tier-1a behind
+`Config.trace_host_calls`, which stays off until Phase 3 lowers them
+natively (tier-1a is slower than tier-0 on these bodies, §5.10.4).
+Phases 3 and 4 not started. Revision 6, approved by Codex and
+Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
-Prerequisites A and B, Phase 0, Phase 1 (with the §5.9.2
-region-accounting amendment) and Phase 2a done. Phases 2b–4 not started.
 Owner: Bart
 Last updated: 2026-10-29
 
@@ -110,10 +108,13 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   - Fixed on the way: a pre-existing bug in `nativegen_alloc`'s debug
     check, which read the undefined home of every snapshot-only slot.
 
-- [ ] **Phase 2b — GC lifetime across a callback** (part 1 landed 2026-10-28:
-  the deferred physical retirement and entry leases, §5.10.2; open: `executing`
-  publication, the F1 and recording-time collection tests, the §8.1 probe A/B).
-  Native constants in
+- [x] **Phase 2b — GC lifetime across a callback** (part 1 landed 2026-10-28:
+  the deferred physical retirement and entry leases, §5.10.2; the F1,
+  recording-time collection, doomed-executing-trace and blacklist tests landed
+  with Phase 2c, §5.10.5). Two pieces moved to Phase 3: publishing `executing`
+  (only the native shim needs it; Bart, 2026-10-28: "add it when needed") and
+  the §8.1 probe A/B of the lease (the probe's loops take no trace entry until
+  the flag is on). Native constants in
   the weak pools; Phase Q's transaction split into logical invalidation
   and deferred physical work, released only when no suspension and no
   entry lease remain, at the entry wrapper or at the end of a
@@ -122,11 +123,12 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   `stack_top` with a debug check that they survive an epoch-clean call
   (§5.5). The instruction-count A/B of the entry lease on `bench/` and
   the §8.1 probe (§8).
-- [ ] **Phase 2c — recording and tier-1a** (slices 1–2 landed: tier-1a executes
-  the four ops, §5.10.3; recording behind `Config.trace_host_calls`, default
-  off because tier-1a is 3.5× slower than tier-0 here, §5.10.4. Open: the
-  ten-leg exactly-once matrix, the `disturbs` re-measure, the doc 00/02
-  amendments). `guard_native`, `call_host`,
+- [x] **Phase 2c — recording and tier-1a** (landed 2026-10-29 in three slices:
+  tier-1a executes the four ops, §5.10.3; recording behind
+  `Config.trace_host_calls`, default off because tier-1a is 3.5× slower than
+  tier-0 here, §5.10.4; the exactly-once matrix, the `disturbs` re-measure,
+  the blacklist retirement and the doc 00/02/59 amendments, §5.10.5).
+  `guard_native`, `call_host`,
   `guard_host_epoch`, `host_result` (§5.1); host calls force precise
   recording (§5.3); the tier-1a arms; exactly-once tests across the ten
   equivalence legs and every route in §5.4.
@@ -140,6 +142,13 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
     threshold 1, `disturbs` is a sticky bit; try folding its check into
     the suspension epilogue so the pure path keeps one value live
     across the call, not two.
+- [x] **Docs: doc 00, doc 02 and doc 59 amended with Phase 2c** (2026-10-29):
+  a follow-up paragraph at each "a host call is a trace barrier" commitment
+  (doc 00 Embedding API, doc 02 transparent recording and host-mediated
+  suspension, doc 59's "unknown natives are already trace barriers").
+
+### Outstanding
+
 - [ ] **Phase 3 — native lowering.** The same four ops in nativegen: inline
   pre-call materialization reusing the precise materializer, the C-ABI
   shim as a body callout, the post-call epoch and budget checks, the
@@ -149,11 +158,18 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
     that only they may take coherent snapshots.
   - Exercise the coherent materializer end to end: it stores nothing and
     falls through to the family tail.
+  - Publish `TraceState.executing` for the native shim (from Phase 2b), so
+    the F3 assertion in `invalidateDeadTraceConsts` stops being vacuous.
+  - The §8.1 probe A/B of the entry lease (from Phase 2b), with the flag on.
+  - Turn `Config.trace_host_calls` on once the budget is met.
+- [ ] **Decision — suspended callbacks run at 2.3× tier-0** (§5.10.5). The
+  one disturbing call's callback (`nest`) costs 21.9M instructions against
+  9.5M in tier-0: a suspended VM dispatches `.full`, and every back-edge
+  takes the JIT's slow path. Three measured options are in §5.10.5.
 - [ ] **Phase 4 — leaf host functions** (§5.12; Q3: part of this plan).
-- [ ] **Docs.** Amend doc 00, doc 02 and doc 59 (§3.5, E6) with Phase 2c;
-  doc 45's error contract (the host statuses, the coherent snapshot);
-  doc 61 §1 ("trace code never calls `callValue`") and Phase Q's F1/F3
-  (§5.10); doc 04 if the snapshot record is serialized (§5.2).
+- [ ] **Docs.** Doc 45's error contract (the host statuses, the coherent
+  snapshot); doc 61 §1 ("trace code never calls `callValue`") and Phase Q's
+  F1/F3 (§5.10); doc 04 if the snapshot record is serialized (§5.2).
 - [ ] **Later — host calls in optimized traces.** Depends on doc 45's
   outstanding "optimizer integration" item (precise traces leaving the
   dupe path). Not part of v1 (§7.4).
@@ -1474,6 +1490,122 @@ declined shape).
   (§5.9.1), which costs about 2.3× `.fast` tier-0 here. This is §5.9's accepted
   once-per-native cost, but it is larger than "tier-0 speed" suggests. Phase 3
   should re-measure it.
+
+### 5.10.5 As landed: Phase 2c, slice 3 — exactly-once, the funnel, the blacklist (2026-10-29)
+
+**Exactly-once matrix** (`interp_hosttrace_test.zig`, "doc 63 §5.4"). Each
+host logs its first argument, so a replayed or skipped call shows as a
+repeated or missing entry, and counts the calls a trace made (the shim sets
+`suspended_trace`). Every route runs under all ten legs:
+- the loop-done exit;
+- a guard failing before the call, and one failing after it;
+- a helper exit after the call (`i // d[i]` with a zero divisor);
+- an epoch exit (the host collects);
+- a result-tag exit (the host returns a float once);
+- a raising host under `pcall`.
+
+The executing legs must make some call from a trace, except under GC stress:
+a collection at every safepoint moves the epoch between the call and its
+result, so the recorder refuses the call there (`host_barrier`) and no host
+trace forms. Those legs still check exactly-once. Mutation checks:
+- resuming a coherent exit one bytecode early fails the epoch and result-tag
+  tests;
+- a failing call exiting `.precise_resume` instead of `.precise_error` trips
+  two asserts first (`irinterp`'s status fold, then the dispatcher's
+  `in_flight` check).
+
+§5.4's promised finalize check, that no exit-capable op after `call_host`
+has `snap == 0`, needs no new code. Doc 45's rule already rejects any
+snapshot-less exit-capable op after the prologue's `guard_gc`, and the call
+is always after it.
+
+**The `disturbs` re-measure** (§8.1 probe, tier-0, instructions per call,
+against a build without the disturbance count and the recording-time
+suspension):
+- funnel as slice 2 left it: +20 on a pure call, +27 for `cb`/`tw`;
+- with the recording case moved out of line (`callHostRecording`, taken only
+  while a recording is active), so the common call keeps nothing extra live
+  across the host: **+1** on a pure call, +8 for `cb`/`tw`.
+
+The out-of-line version landed. On `bench/` (no embedder hosts), against
+HEAD:
+- tier-0: recursive-fib −2.2%, co_pingpong_d150 −2.0%, co_pingpong_d20
+  −2.0%; nothing rose more than +0.03%;
+- JIT on: co_pingpong −1.4%; nothing rose more than +0.02%.
+
+The inlined funnel had been costing `opCall`'s ordinary Lua call path
+registers. The doc's sticky-bit idea is not needed.
+
+**The blacklist retirement** (§5.9) was missing from slice 2. A precise exit
+at a `guard_native` whose native is over the threshold now retires the
+trace (`nativeBlacklisted`; `TraceState.host_blacklists` counts it), through
+the entry routine's dead list. The lease defers the physical half. Without it,
+a disturbed native's trace paid an entry and an exit on every iteration.
+
+**Deviation from slice 2:** a disturbed native no longer aborts the
+recording with `host_barrier`. `recHostCall` declines it, so it falls back
+to exactly what the recorder does without doc 63 (stitching, or the
+barrier). That is §5.9's "the anchor falls back to tier-0 as today".
+
+**§5.10 lifetime tests**, all ten legs. The common check is that the
+deferred queue, `suspend_depth` and `entry_leases` are back to zero at the
+end of the run.
+- F1: a host native replaced and collected retires the trace that guards
+  it, and the next run traces the replacement.
+- Blacklist: a native that disturbs from a trace is retired from it, and no
+  host trace remains.
+- Recording-time callbacks collecting once, twice, and then failing: the
+  retirement they cause waits on the deferred queue until the call lowers
+  its suspension. The recording then aborts without entering a trace.
+- A callback collection that dooms the executing trace (the host drops
+  another host native the trace guards), followed by a return and,
+  separately, a raise.
+
+Mutation checks:
+- disabling the blacklist fails its test;
+- physical retirement under suspension fails the three recording-time tests
+  and the Phase 2b unit tests;
+- keeping natives out of `heap_consts` fails F1 and both doomed-trace tests.
+
+**Where tier-1a's 1851 instructions go** (`min`, callgrind, per iteration).
+The trace is 33 IR ops. Precise traces take the dupe finalize path, so the
+ten entry `slot_load`s and the invariant guards re-run every iteration.
+
+| Cost | instructions per iteration |
+|---|---:|
+| `executeCtx` dispatch, including a per-op prologue-skip test (~130) and S_B's flush (~70) | ~1200 |
+| `flushPhiWriteback`, which scans every instruction for φs | ~200 |
+| `evalBinary` and the comparisons | ~170 |
+| the call itself: shim, `cHostCall`, the host | ~270 |
+
+Tier-0's own call path is about 300 (`opCall` 215, `cHostCall` 71, the
+host 12), so the host call is not where tier-1a loses. The loss is the
+generic IR interpreter, which Phase 3 replaces. It is left untuned (Rule
+Z-7: tier-1a is not the end state for these traces).
+
+**Suspended callbacks** (`nest`, flag on: the one disturbing call's guest
+loop, 100k iterations). Callgrind shows two costs:
+- a suspended VM dispatches `.full`, about 50 instructions an iteration;
+- every back-edge takes the JIT's slow path. While suspended, the hot slot
+  stays 0 and nothing arms its skip window, so each one goes through the
+  out-of-line `backEdgeEpilogue` only to be refused. That is about 45
+  instructions an iteration.
+
+Three options, measured on shadow builds (`nest` total, tier-0 9.5M,
+current 21.9M), for Bart to choose from:
+- **(a) Leave it.** It is once per native (threshold 1). Zero cost
+  elsewhere.
+- **(b) The suspension bit stops forcing `.full`.** `jitSuspended` becomes
+  a runtime test in `.fast` too (the gates are all on trace-entry or
+  slow-back-edge paths). A suspended back-edge returns to dispatch after
+  the hot-slot skip. `nest` 11.6M. JIT-on `bench/` cost: binary-trees
+  +0.20%, euler14-bit +0.11%, spectral-norm +0.10%, everything else under
+  +0.1%. Tier-0 is unaffected. The likely source is the runtime test at
+  patched call-head entries.
+- **(c) A third dispatch mode for suspension.** The `.fast` handlers
+  instantiated with the JIT gates folded to "suspended". Expected about
+  10M with zero cost to `.fast`, paid for with one more handler
+  instantiation (binary size and compile time). Not built.
 
 ### 5.11 Tier-1a
 

@@ -4561,10 +4561,10 @@ pub const RecordingSession = struct {
         if (trace_code.anchorKind(self.anchor.pc) != .loop) return false;
         if (instr.b == bytecode.all_results or instr.c == bytecode.all_results or multret != null) return false;
         const probe = self.host_epoch_probe orelse return false;
-        if (nat.disturbs >= function.disturb_threshold) {
-            self.abort(.host_barrier);
-            return true;
-        }
+        // A native that has disturbed (§5.9) is declined like any other
+        // shape, so it falls back to whatever the recorder does without
+        // doc 63: stitching, or the host barrier.
+        if (nat.disturbs >= function.disturb_threshold) return false;
         if (!self.precise) {
             self.abort(.needs_precise);
             return true;

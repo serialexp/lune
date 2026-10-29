@@ -2,7 +2,7 @@
 
 Status: partial — host-effect boundary + record/replay (clock F2d, random F2e, the `io`/`os` host inputs doc 65) + keyframe capture/restore/resume landed; record-once/replay-to-k driver now in the browser (Phase 7 v8); cross-platform-FP guarantee + guard-snapshots outstanding
 Owner: Bart
-Last updated: 2026-10-24
+Last updated: 2026-10-29
 
 Prerequisite for **Phase 3** (the host-effect boundary must exist in the calling
 convention) and **Phase 5** (replay) in `00-architecture.md`. Deterministic
@@ -32,6 +32,18 @@ that for a time-travel debugger it *is* the architecture.
       call is already treated as a **trace barrier** (the recorder aborts with
       `host_barrier`), matching the effect-boundary policy above — when host-effect
       recording lands, that abort becomes the point an effect record is emitted.
+      *Follow-up (2026-10-29, doc 63):* a host function call is no longer always a
+      trace barrier. Behind `Config.trace_host_calls` (off by default until doc 63
+      Phase 3 lowers it to native code), a precise loop trace may contain an
+      embedder host call as an **execute-once effect**: the trace makes the call
+      exactly once per guest `.call`, with the VM state at the call real (frames,
+      registers, roots), and if the host changed anything the trace relied on (a
+      callback, a collection, a table write) the trace leaves for tier-0 right after
+      the call. Callbacks run with the JIT suspended, and a host function that has
+      once changed VM state is never traced again. The effect boundary itself is unchanged:
+      every call still goes through the one funnel (`Vm.callHostNative`), where
+      record/replay (doc 59 E6) will log it, and the stdlib's effect natives
+      (`effect != null`) are still barriers.
 - [x] **Transparent trace *execution*** (Phase 6a, `src/irinterp.zig`). The
       tier-1a IR-interpreter now *runs* hot traces, but it remains output-invariant:
       it calls the **same `arith.zig`** as tier-0 (byte-identical numerics) and
@@ -417,6 +429,12 @@ deterministically for free. The three surface forms — stackless generators,
 host-mediated `await`, host-owned tasks (structured concurrency) — are a later
 language-surface design; v1 only has to **not preclude** a suspending host
 effect.
+
+*Follow-up (2026-10-29, doc 63):* the "trace barrier" half no longer holds for
+every host call: a precise trace may make an embedder host call as an
+execute-once effect (doc 63, behind `Config.trace_host_calls`). Nothing here
+depends on it: coroutines replaced host-mediated suspension (doc 73), and a
+host call that could suspend its caller would still end the trace (doc 63 §6).
 
 *Follow-up (2026-10-27, doc 73):* stackful coroutines came in after all,
 and they need nothing from this section to stay deterministic. A program's

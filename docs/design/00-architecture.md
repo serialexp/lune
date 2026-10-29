@@ -2,7 +2,7 @@
 
 Status: partial — Phases 0–7 landed (Phase 7 through the JIT-trace iteration animation: in-browser deterministic replay + timing + env/args effects + trace-execution animation); Phases 8–9 outstanding
 Owner: Bart
-Last updated: 2026-06-15
+Last updated: 2026-10-29
 
 > Working codename **mahina** (Lua means "moon" in Portuguese; *mahina* is French
 > for moon). Not Lua, doesn't aim to be — see Goals. Rename at will.
@@ -729,6 +729,18 @@ commitments:
 - **Every host call is an effect and a trace barrier.** Inputs/outputs are
   recorded for replay; the JIT does not trace through it; GC roots are registered
   across the call; native code may not retain raw VM pointers.
+  *Follow-up (2026-10-29, doc 63):* a host function call is no longer always a
+  trace barrier. Behind `Config.trace_host_calls` (off by default until doc 63
+  Phase 3 lowers it to native code), a precise loop trace may contain an
+  embedder host call as an **execute-once effect**: the trace makes the call
+  exactly once per guest `.call`, with the VM state at the call real (frames,
+  registers, roots), and if the host changed anything the trace relied on (a
+  callback, a collection, a table write) the trace leaves for tier-0 right after
+  the call. Callbacks run with the JIT suspended, and a host function that has
+  once changed VM state is never traced again. The effect boundary itself is unchanged:
+  every call still goes through the one funnel (`Vm.callHostNative`), where
+  record/replay (doc 59 E6) will log it, and the stdlib's effect natives
+  (`effect != null`) are still barriers.
 - **Buffers cross as leases, not raw pointers.** The zero-copy typed-array / GPU
   path (§Value representation) hands the host a lease with explicit lifetime and
   mutability, over off-heap / pinned storage (`03-gc-memory.md`) — never interior

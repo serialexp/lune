@@ -4,7 +4,7 @@
 tests), E3/E4 (the Rust crates + `just embed-test` gate) and E5 (boundary
 benchmark) landed; E6–E9 deferred by design.
 **Owner:** claude (fable)
-**Last updated:** 2026-10-27
+**Last updated:** 2026-10-29
 
 ## Implementation status
 
@@ -293,6 +293,11 @@ ownership and GC behaviour on both sides of the boundary.
   recorder aborts a `recCall` with `.host_barrier`
   (`trace_recorder.zig:4101`). Host functions get the architecture's "the
   JIT does not trace through it" property for free; no new JIT work in v1.
+  *Follow-up (2026-10-29):* doc 63 lifts this behind
+  `Config.trace_host_calls` (off by default): a precise loop trace may
+  call a host function directly, exactly once per guest `.call`, through
+  the same `callHostNative` funnel. `recorded == null` stays true for
+  host natives; the recorder's host path keys on `host != null`.
 - **`Vm.callValue` is the host→guest entry** (`interp.zig:1998`): takes any
   callable `Value`, contiguous args, writes results. Reentrancy-bounded
   (`max_native_reentry`), works mid-native (it exists for `pcall`/`sort`
