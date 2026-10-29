@@ -1,0 +1,108 @@
+name: CI
+
+# The full gate, one leg per runner so the legs run in parallel (each leg is
+# the CI twin of a local command; see the justfile and CLAUDE.md):
+#   test        zig build test            (just test; the library tests run as
+#                                          parallel shards, build.zig -Dtest-shards)
+#   jit-debug   zig build test -Djit-debug=true
+#   hashgate    just hashgate             (frozen output, ReleaseFast + Debug legs)
+#   lib-wasm    zig build lib, zig build wasm
+# Locally you run the fast subset; this is the whole gate. The benchmark board
+# is not here: it needs the pinned pool and is dispatched with `gt profile`
+# (profile-bench.yml).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned by .zig-version, fetched from the community mirror list (as
+  # ziglang.org asks CI to) at a pinned digest, exactly as profile-bench.yml.
+  # The digest is ziglang.org/download/index.json's shasum for the x86_64-linux
+  # tarball. Update ZIG_VERSION *and* ZIG_SHA256 together with .zig-version.
+  ZIG_VERSION: 0.17.0
+  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+  TOOLS: /home/runner/mahina-ci-tools
+
+jobs:
+  gate:
+    name: ${{ matrix.name }}
+    runs-on: 2xheavy
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: unit tests
+            run: |
+              python3 -m unittest discover -s tools -p test_jit_boundaries.py
+              python3 tools/check-jit-boundaries.py
+              zig build test -Dtest-shards="$(nproc)"
+          - name: unit tests (jit-debug)
+            run: zig build test -Djit-debug=true -Dtest-shards="$(nproc)"
+          - name: frozen-output gate
+            run: |
+              zig build -Doptimize=ReleaseFast
+              zig build --prefix zig-out-debug
+              python3 tools/hashgate.py --also-mahina zig-out-debug/bin/mahina
+          - name: embedding lib and wasm
+            run: |
+              zig build lib
+              zig build wasm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify the toolchain pin matches .zig-version
+        run: |
+          set -eu
+          pinned=$(tr -d '[:space:]' < .zig-version)
+          if [ "$pinned" != "$ZIG_VERSION" ]; then
+            echo "::error::.zig-version says '$pinned' but this workflow pins '$ZIG_VERSION'"
+            echo "Update ZIG_VERSION *and* ZIG_SHA256 together."
+            exit 1
+          fi
+
+      - name: Install Zig
+        run: |
+          set -eu
+          mkdir -p "$TOOLS"
+          tarball="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL -o /tmp/mirrors.txt https://ziglang.org/download/community-mirrors.txt
+          ok=
+          while read -r mirror; do
+            [ -n "$mirror" ] || continue
+            echo "trying $mirror"
+            if curl -fsSL --max-time 180 -o /tmp/zig.tar.xz "$mirror/$tarball"; then
+              if echo "$ZIG_SHA256  /tmp/zig.tar.xz" | sha256sum -c -; then
+                ok=1
+                break
+              fi
+              echo "digest mismatch from $mirror - discarding"
+              rm -f /tmp/zig.tar.xz
+            fi
+          done < /tmp/mirrors.txt
+          if [ -z "$ok" ]; then
+            echo "::error::no mirror served $tarball at the pinned digest"
+            exit 1
+          fi
+          mkdir -p "$TOOLS/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$TOOLS/zig" --strip-components=1
+          test "$("$TOOLS/zig/zig" version)" = "$ZIG_VERSION"
+          echo "$TOOLS/zig" >> "$GITHUB_PATH"
+
+      - name: Record the hardware class
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          echo "cores: $(nproc)"
+          free -m | head -2
+
+      - name: ${{ matrix.name }}
+        run: |
+          set -eu
+          ${{ matrix.run }}
