@@ -2,6 +2,17 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Parser nesting limit vs a bench (noted 2026-10-30)
+
+- [ ] **`bench/compile_multret_chain.lua` fails since d1d32cc.** It
+      `load()`s a 2000-deep `f(f(…))` chain to stress `bc_liveness` near
+      `max_table_words` (doc 61 §5); `parser.max_depth = 200` now refuses
+      it in every mode, so `just hashgate` shows 3 mismatches (jit/t0/trace)
+      on it. Options for Bart: a per-host limit (CLI high, wasm/LSP 200);
+      one higher limit, as high as Debug wasm's 1 MiB stack allows; reshape
+      the bench under 200; or make the passes iterative over chains so long
+      chains are exempt.
+
 ## LSP rename (noted 2026-10-30)
 
 - [ ] **`_G.x` is not the global `x` to the resolver.** The compiler
