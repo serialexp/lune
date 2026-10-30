@@ -2,15 +2,15 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## LSP rename (noted 2026-10-30)
+## Language: declaring a global (noted 2026-10-30)
 
-- [ ] **`_G.x` is not the global `x` to the resolver.** The compiler
-      treats `_G.x = …` / `_G["x"] = …` as a write of the global `x`
-      (`compiler.zig`), but `resolve.zig` sees a field of the global `_G`,
-      so rename and references (one file or many) leave `_G.x` alone and
-      the symbol index's `filesUsing` misses a file that only writes it
-      that way. Doc 74 §6.3 says the resolver owns this rule; it does not
-      yet.
+- [ ] **A `global x` statement.** Bart's direction: a program declares a
+      global on purpose with `global x = …` (as Lua 5.5 and Teal do), and
+      `_G.x` stays for code coming from Lua. Needs a design doc first:
+      the syntax (`global x`, `global function f`, several names), what it
+      does to the undefined-global warning, and whether a plain `x = …`
+      to an undeclared name should then warn. The resolver already treats
+      `_G.x` as the global `x` (doc 74, "Globals across files").
 
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 

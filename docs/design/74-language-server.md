@@ -808,8 +808,21 @@ open documents are renamed, and a warning says so. Bart was away when the
 two choices came up, so they are mine, to revisit: the resolver-exact
 index (over storing every identifier, or scanning every file per
 request), and every workspace folder as one global namespace (as
-`workspace/symbol` searches, over the cursor's folder only). `_G.x` is
-not yet the global `x` to the resolver (TODO.md).
+`workspace/symbol` searches, over the cursor's folder only).
+
+Since 2026-10-30 the resolver also owns the `_G` rule: while `_G` is the
+global, `_G.x`, `_G["x"]`, `_G:x(…)`, `function _G.x()` and
+`function _G:x()` name the global `x`, as reads, writes or `+=`, and are
+marked `qualified`. The compiler's undefined-global warning takes its
+`_G` writes from there instead of its own copy of the rule, which had
+missed `function _G.f()`. A qualified use is found, renamed and indexed
+like a plain one, but no local can capture it, so the rename checks skip
+it (renaming a global into another global's name still merges them, and
+is refused). A key is a name only when its text is: an escaped
+(`_G["\120"]`) or long-bracket key, a keyword, `local g = _G`, `rawset`
+and computed keys stay invisible, as they are to any static tool. Bart's
+direction for declaring a global on purpose is a `global x` statement,
+with `_G.x` kept for Lua code (TODO.md).
 
 Measured (`bench-lsp`, load average ~2; every file calls the global
 `shared_log`, one in 100 writes `shared_total`), at 1k / 10k / 100k files:

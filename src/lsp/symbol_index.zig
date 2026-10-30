@@ -1752,6 +1752,7 @@ test "symbol index: the files using a global, as walked, edited, opened and save
         .{ "/w/a.mah", "counter = 0\nfunction bump() counter = counter + 1 end\n" },
         .{ "/w/b.mah", "local counter = 5\nprint(counter, bump)\n" },
         .{ "/w/c.mah", "local t = {}\nt.counter = 1\nprint(t, counter)\n" },
+        .{ "/w/d.mah", "_G.counter = 3\n" },
     };
     var mem: workspace.MemoryFiles = .{ .entries = &entries };
     var store: workspace.MemoryStore = .{ .gpa = testing.allocator };
@@ -1762,8 +1763,9 @@ test "symbol index: the files using a global, as walked, edited, opened and save
         defer f.deinit();
         try f.idx.setRoots(f.a(), &roots, store.store());
         try f.settle(&mem, store.store());
-        // b's `counter` is a local, and a field is no global.
-        try testing.expectEqualStrings("/w/a.mah /w/c.mah ", try usersOf(&f, "counter"));
+        // b's `counter` is a local, and a field is no global unless it is
+        // one of the globals table.
+        try testing.expectEqualStrings("/w/a.mah /w/c.mah /w/d.mah ", try usersOf(&f, "counter"));
         try testing.expectEqualStrings("/w/a.mah /w/b.mah ", try usersOf(&f, "bump"));
         try testing.expectEqualStrings("/w/b.mah /w/c.mah ", try usersOf(&f, "print"));
         try testing.expectEqualStrings("", try usersOf(&f, "t"));
@@ -1771,7 +1773,7 @@ test "symbol index: the files using a global, as walked, edited, opened and save
         // An open document is read as edited.
         const opened = [_]Open{.{ .uri = "file:///w/b.mah", .path = "/w/b.mah", .text = "counter = 2\n" }};
         try f.idx.setOpen(f.a(), &opened, true);
-        try testing.expectEqualStrings("/w/a.mah /w/b.mah /w/c.mah ", try usersOf(&f, "counter"));
+        try testing.expectEqualStrings("/w/a.mah /w/b.mah /w/c.mah /w/d.mah ", try usersOf(&f, "counter"));
         try testing.expectEqualStrings("/w/a.mah ", try usersOf(&f, "bump"));
         try f.idx.setOpen(f.a(), &.{}, true);
         try f.settle(&mem, store.store());
@@ -1783,7 +1785,7 @@ test "symbol index: the files using a global, as walked, edited, opened and save
     try f.idx.setRoots(f.a(), &roots, store.store());
     try f.settle(&mem, store.store());
     try testing.expectEqual(@as(u64, 0), f.idx.builds);
-    try testing.expectEqualStrings("/w/a.mah /w/c.mah ", try usersOf(&f, "counter"));
+    try testing.expectEqualStrings("/w/a.mah /w/c.mah /w/d.mah ", try usersOf(&f, "counter"));
     try testing.expectEqualStrings("/w/a.mah /w/b.mah ", try usersOf(&f, "bump"));
 }
 

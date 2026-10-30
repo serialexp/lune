@@ -3,7 +3,9 @@
 //! One pass over the AST, before code generation, that owns mahina's scoping
 //! rules (doc 74 §6.3): a `local`'s value is evaluated before its names are
 //! visible, a `local function` sees itself, `repeat … until` sees the body's
-//! locals, a name not found in any enclosing function is a global. The
+//! locals, a name not found in any enclosing function is a global, and so is
+//! `_G.x` (or `_G["x"]`, `_G:x(…)`, `function _G.x()`) while `_G` is the
+//! global: the runtime's `_G` is the globals table. The
 //! compiler asks this table which binding a name is instead of resolving it
 //! by string, and the language server reads the same table for navigation, so
 //! there is exactly one scoping model.
@@ -19,6 +21,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const token = @import("token.zig");
 
 const Span = ast.Span;
 
@@ -74,6 +77,9 @@ pub const Occurrence = struct {
     span: Span,
     binding: BindingId,
     access: Access,
+    /// A global named through the globals table (`_G.x`, `_G["x"]`), not by
+    /// itself: no local can capture it, whatever is in scope.
+    qualified: bool = false,
 };
 
 pub const Resolution = struct {
@@ -252,6 +258,52 @@ const Walker = struct {
         try self.res.occurrences.append(self.gpa, .{ .span = span, .binding = id, .access = access });
     }
 
+    /// Whether `e` is the name `_G` meaning the global: the globals table,
+    /// unless a local of that name is in scope.
+    fn isGlobalTable(self: *const Walker, e: *const ast.Expr) bool {
+        return e.data == .name and std.mem.eql(u8, e.data.name, "_G") and !self.heads.contains("_G");
+    }
+
+    /// Record `name` at `span`, read through the globals table, as a use of the
+    /// global `name`.
+    fn useQualified(self: *Walker, name: []const u8, span: Span, access: Access) std.mem.Allocator.Error!void {
+        const id = try self.global(name);
+        try self.res.occurrences.append(self.gpa, .{ .span = span, .binding = id, .access = access, .qualified = true });
+    }
+
+    /// The global a key of the globals table names: a quoted literal spelled
+    /// like a name, with no escapes, so its text is the name (and a rename can
+    /// rewrite it in place). Its span is the text between the quotes.
+    fn keyName(key: *const ast.Expr) ?struct { name: []const u8, span: Span } {
+        if (key.data != .string_raw) return null;
+        const raw = key.data.string_raw;
+        if (raw.len < 2 or (raw[0] != '"' and raw[0] != '\'')) return null;
+        const name = raw[1 .. raw.len - 1];
+        if (name.len == 0 or token.keywords.has(name)) return null;
+        for (name, 0..) |c, i| {
+            const alpha = std.ascii.isAlphabetic(c) or c == '_';
+            if (!(alpha or (std.ascii.isDigit(c) and i > 0))) return null;
+        }
+        return .{ .name = name, .span = .{ .start = key.span.start + 1, .end = key.span.end - 1 } };
+    }
+
+    /// `obj.name` or `obj[key]`, read or (as a target) written: the table and
+    /// key are evaluated, and through the globals table the field is a global.
+    fn tableAccess(self: *Walker, e: *const ast.Expr, access: Access) std.mem.Allocator.Error!void {
+        switch (e.data) {
+            .field => |f| {
+                try self.expr(f.obj);
+                if (self.isGlobalTable(f.obj)) try self.useQualified(f.name, f.name_span, access);
+            },
+            .index => |ix| {
+                try self.expr(ix.obj);
+                try self.expr(ix.key);
+                if (self.isGlobalTable(ix.obj)) if (keyName(ix.key)) |k| try self.useQualified(k.name, k.span, access);
+            },
+            else => unreachable,
+        }
+    }
+
     // ---- the walk ----
 
     fn block(self: *Walker, list: ast.Block, scope_end: u32) std.mem.Allocator.Error!void {
@@ -334,10 +386,20 @@ const Walker = struct {
             },
             .function_decl => |fd| {
                 // `function f()` assigns `f`; `function a.b()` and `a:m()`
-                // read `a` to reach the table.
-                const first = fd.name.path[0];
-                const plain = fd.name.path.len == 1 and fd.name.method == null;
-                try self.use(first.text, first.span, if (plain) .write else .read);
+                // read `a` to reach the table. Through the globals table the
+                // next name is the global: `function _G.f()` and `_G:f()`
+                // assign it, `function _G.a.b()` reads it.
+                const path = fd.name.path;
+                const plain = path.len == 1 and fd.name.method == null;
+                try self.use(path[0].text, path[0].span, if (plain) .write else .read);
+                if (std.mem.eql(u8, path[0].text, "_G") and !self.heads.contains("_G")) {
+                    if (path.len > 1) {
+                        const last = path.len == 2 and fd.name.method == null;
+                        try self.useQualified(path[1].text, path[1].span, if (last) .write else .read);
+                    } else if (fd.name.method) |m| {
+                        try self.useQualified(m.text, m.span, .write);
+                    }
+                }
                 try self.function(fd.body, fd.name.method != null);
             },
             .return_ => |values| try self.exprList(values),
@@ -347,10 +409,11 @@ const Walker = struct {
     }
 
     /// An assignment target: a name is written, anything else is evaluated
-    /// (`a.b = 1` reads `a`).
+    /// (`a.b = 1` reads `a`), and a field of the globals table is written.
     fn target(self: *Walker, e: *const ast.Expr, access: Access) std.mem.Allocator.Error!void {
         switch (e.data) {
             .name => |n| try self.use(n, e.span, access),
+            .field, .index => try self.tableAccess(e, access),
             else => try self.expr(e),
         }
     }
@@ -366,17 +429,14 @@ const Walker = struct {
                 try self.expr(b.lhs);
                 try self.expr(b.rhs);
             },
-            .field => |f| try self.expr(f.obj),
-            .index => |ix| {
-                try self.expr(ix.obj);
-                try self.expr(ix.key);
-            },
+            .field, .index => try self.tableAccess(e, .read),
             .call => |c| {
                 try self.expr(c.callee);
                 try self.exprList(c.args);
             },
             .method_call => |mc| {
                 try self.expr(mc.obj);
+                if (self.isGlobalTable(mc.obj)) try self.useQualified(mc.name, mc.name_span, .read);
                 try self.exprList(mc.args);
             },
             .function => |body| try self.function(body, false),
@@ -588,6 +648,62 @@ test "resolve: accesses of assignments and compound assignments" {
     // `t.x = …` reads `t`.
     try testing.expectEqual(Access.read, f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "t.x").?)).?.access);
     try testing.expectEqual(Access.declare, f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "t =").?)).?.access);
+}
+
+test "resolve: a name read or written through _G is the global" {
+    const src =
+        \\local x = 0
+        \\_G.x = 1
+        \\_G["x"] += 2
+        \\print(_G:x(), _G['\120'], _G[ [[x]] ], _G["end"])
+        \\function _G.f() end
+        \\function _G:m() end
+        \\function _G.t.n() end
+    ;
+    var f = try Fixture.init(src);
+    defer f.deinit();
+    const local = try f.at("x", 0);
+    const x = try f.at("x", 1);
+    try testing.expect(local != x); // a local `x` does not capture `_G.x`
+    try testing.expectEqual(Kind.global, f.res.binding(x).kind);
+    const write = f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "x = 1").?)).?;
+    try testing.expectEqual(Access.write, write.access);
+    try testing.expect(write.qualified);
+    // The key's text, inside the quotes.
+    const key = f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "x\"] +=").?)).?;
+    try testing.expectEqual(x, key.binding);
+    try testing.expectEqual(Access.read_write, key.access);
+    try testing.expectEqual(@as(u32, 1), key.span.end - key.span.start);
+    try testing.expectEqual(x, try f.at("x", 3)); // `_G:x()` reads it
+    // An escape, a long string or a keyword is not a name in the text.
+    try testing.expect(f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "\\120").?)) == null);
+    try testing.expect(f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "[[x]]").? + 2)) == null);
+    try testing.expect(f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "end\"").?)) == null);
+    // The global is declared at its first write, `_G.x = 1`.
+    try testing.expectEqual(write.span.start, f.res.binding(x).decl_span.start);
+    // `function _G.f()` and `_G:m()` assign; `function _G.t.n()` reads `t`.
+    try testing.expectEqual(Access.write, f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "f()").?)).?.access);
+    // (The implicit `self` sits at `m` too, so ask the binding.)
+    var found = false;
+    for (f.res.bindings.items) |b| {
+        if (b.kind != .global or !std.mem.eql(u8, b.name, "m")) continue;
+        try testing.expectEqual(@as(u32, @intCast(std.mem.find(u8, src, "m()").?)), b.decl_span.start);
+        found = true;
+    }
+    try testing.expect(found);
+    const t = f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "t.n").?)).?;
+    try testing.expectEqual(Access.read, t.access);
+    try testing.expectEqual(Kind.global, f.res.binding(t.binding).kind);
+    try testing.expect(f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "n()").?)) == null);
+}
+
+test "resolve: through a local named _G a field is only a field" {
+    const src = "local _G = {}\n_G.x = 1\nfunction _G.f() end\nprint(_G.y)";
+    var f = try Fixture.init(src);
+    defer f.deinit();
+    try testing.expect(f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "x =").?)) == null);
+    try testing.expect(f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "f()").?)) == null);
+    try testing.expect(f.res.occurrenceAt(@intCast(std.mem.find(u8, src, "y)").?)) == null);
 }
 
 test "resolve: scope extents" {

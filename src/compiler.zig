@@ -889,21 +889,6 @@ const Compiler = struct {
         }
     }
 
-    /// A store into `_G.name` or `_G["name"]`, with `_G` the global, defines
-    /// the global `name` as `name = …` does, for `warnUnknownGlobals`.
-    fn noteGlobalTableWrite(self: *Compiler, tgt: *const ast.Expr) Error!void {
-        const obj, const name = switch (tgt.data) {
-            .field => |f| .{ f.obj, f.name },
-            .index => |ix| switch (ix.key.data) {
-                .string_raw => |raw| .{ ix.obj, try self.decodeString(raw, ix.key.span) },
-                else => return,
-            },
-            else => return,
-        };
-        if (obj.data != .name or !std.mem.eql(u8, obj.data.name, "_G") or !self.isGlobalBinding(self.bindingAt(obj.span))) return;
-        try self.globals_usage.writes.put(name, {});
-    }
-
     /// Emit a warning for every global *read* of a name that is never assigned
     /// anywhere in the chunk and isn't a host builtin. In mahina (Lua/Luau
     /// semantics) such a name is a `nil`-valued global, so it compiles fine and
@@ -914,6 +899,12 @@ const Compiler = struct {
     /// the chunk is freed).
     fn warnUnknownGlobals(self: *Compiler) Error!void {
         const u = self.globals_usage;
+        // A store through the globals table (`_G.x = …`, `function _G.x()`)
+        // defines the global as `x = …` does; the resolver knows which.
+        for (self.res.occurrences.items) |o| {
+            if (!o.qualified or (o.access != .write and o.access != .read_write)) continue;
+            try u.writes.put(self.res.binding(o.binding).name, {});
+        }
         // Names mentioned in text the compiler never saw whole: a global that
         // looks unassigned may be assigned there.
         var hidden: std.StringHashMapUnmanaged(void) = .empty;
@@ -1022,7 +1013,6 @@ const Compiler = struct {
     }
 
     fn compileAssign(self: *Compiler, a: anytype) Error!void {
-        for (a.targets) |tgt| try self.noteGlobalTableWrite(tgt);
         if (a.targets.len == 1 and a.values.len == 1) {
             if (try self.compileSingleAssign(a.targets[0], a.values[0])) return;
         }
@@ -1161,7 +1151,6 @@ const Compiler = struct {
     /// (the parser never produces a short-circuit op here), so `binOpCode` is safe.
     fn compileCompoundAssign(self: *Compiler, ca: anytype) Error!void {
         const tgt = ca.target;
-        try self.noteGlobalTableWrite(tgt);
         const op_span = ast.Span{ .start = tgt.span.start, .end = ca.value.span.end };
         switch (tgt.data) {
             .name => {
@@ -3774,6 +3763,20 @@ test "unknown global: a store through _G defines the global" {
         \\_G.a = 1
         \\_G["b"] = 2
         \\_G.c += 1
+        \\
+    , &.{"_G"}, Probe.check);
+}
+
+test "unknown global: a function declared through _G defines the global" {
+    const Probe = struct {
+        fn check(diags: *const Diagnostics) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), diags.count());
+        }
+    };
+    try checkGlobals(
+        \\function _G.f() return 1 end
+        \\function _G:g() return 2 end
+        \\return f() + g()
         \\
     , &.{"_G"}, Probe.check);
 }

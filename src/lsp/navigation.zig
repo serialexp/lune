@@ -109,7 +109,8 @@ pub fn isIdentifier(s: []const u8) bool {
 /// that spelling, so two things can go wrong: an occurrence of the renamed
 /// binding finds a nearer declaration already called `new_name` (it is
 /// captured), or an occurrence of an outer `new_name` inside the renamed
-/// binding's scope finds the renamed binding first.
+/// binding's scope finds the renamed binding first. A global named through
+/// `_G` is neither: no declaration in scope changes what `_G.x` means.
 pub fn checkRename(
     an: *const Analysis,
     known_globals: []const []const u8,
@@ -136,8 +137,10 @@ pub fn checkRename(
             const mid = lo + (hi - lo) / 2;
             if (occs[mid].span.start < c.visible_from) lo = mid + 1 else hi = mid;
         }
-        if (lo < occs.len and occs[lo].span.start < c.scope_end) {
-            return .{ .refused = .{ .reason = .would_capture, .at = occs[lo].span } };
+        for (occs[lo..]) |o| {
+            if (o.span.start >= c.scope_end) break;
+            if (o.qualified) continue;
+            return .{ .refused = .{ .reason = .would_capture, .at = o.span } };
         }
     }
 
@@ -152,6 +155,8 @@ pub fn checkRename(
     for (all[lo..]) |o| {
         if (o.span.start >= b.scope_end) break;
         if (o.binding == binding) continue;
+        // Renaming a global to the name of another still merges the two.
+        if (o.qualified and b.kind != .global) continue;
         const c = an.res.binding(o.binding);
         if (c.kind != .global and c.visible_from >= b.visible_from) continue; // nested in our scope
         if (std.mem.eql(u8, c.name, new_name)) {
@@ -282,6 +287,32 @@ test "rename: a global conflicts with a local it would run into, and with anothe
     try testing.expectEqual(Refusal.would_capture, (try f.check("g", 0, "t")).refused.reason);
     try testing.expectEqual(Refusal.would_be_captured, (try f.check("g", 0, "h")).refused.reason);
     try testing.expectEqual(Check.ok, try f.check("g", 0, "k"));
+}
+
+test "rename: a global named through _G is found, and no local captures it" {
+    const src =
+        \\_G.count = 0
+        \\local function bump(total) _G["count"] += 1 return count + total end
+        \\print(count)
+    ;
+    var f = try Fixture.init(src);
+    defer f.deinit();
+    const refs = try references(testing.allocator, &f.an, f.occ("count)", 0).binding, true);
+    defer testing.allocator.free(refs);
+    try testing.expectEqual(@as(usize, 4), refs.len);
+    try testing.expectEqual(f.at("count = 0", 0), definition(&f.an, f.occ("count)", 0)).?.start);
+    // `_G["count"]` inside the scope of `total` would stay the global, but
+    // the plain `count` beside it would be captured.
+    try testing.expectEqual(Check.ok, try f.check("count = 0", 0, "tally"));
+    const refused = (try f.check("count = 0", 0, "total")).refused;
+    try testing.expectEqual(Refusal.would_capture, refused.reason);
+    try testing.expectEqual(f.at("count + total", 0), refused.at.?.start);
+    // Renaming the local to the global's name leaves `_G.count` alone, and
+    // still steals the plain `count`.
+    var g = try Fixture.init("local function bump(total) return _G.count + total end");
+    defer g.deinit();
+    try testing.expectEqual(Check.ok, try g.check("total)", 0, "count"));
+    try testing.expectEqual(Refusal.would_be_captured, (try f.check("total)", 0, "count")).refused.reason);
 }
 
 test "rename: a name used by a sibling scope is not a conflict" {
