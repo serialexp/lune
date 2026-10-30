@@ -8,6 +8,7 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       Designed in doc 76 (decisions D1–D4 there: follow 5.5 as written,
       `global` reserved, `<const>` is not a freeze, `table.freeze` as
       Luau's, attributes in the same change). Open questions Q1–Q4 there.
+
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
 - [ ] **A precise host trace native can't compile runs on tier-1a.** The
