@@ -1,7 +1,8 @@
 # 75 — Process spawning, and mahina as a shell — Design
 
 Status: draft, not yet implemented. Review round 1 (Codex, Antigravity,
-2026-10-30) folded in; open questions Q9b and Q11–Q14.
+2026-10-30) folded in; one open question left (Q14b), one note to confirm (§6, Ctrl-C and
+the terminal).
 Owner: Bart
 Last updated: 2026-10-30
 
@@ -36,6 +37,16 @@ land; move whole phases to Done once everything inside them is checked.
   without one, every user wraps spawns in their own coroutine watchdog.
 - [x] **Q10 — phase order** (§Phasing): decided 2026-10-30 — macOS and
   Windows come after the REPL, unless a platform turns out to be easy.
+- [x] **Q9b — default timeout** (§3.4): decided 2026-10-30 — unlimited.
+- [x] **Q11 — handle teardown** (§5.3): decided 2026-10-30 — children still
+  running when the VM closes are killed by default.
+- [x] **Q12 — Ctrl-C** (§6): decided 2026-10-30 — the parent receives Ctrl-C
+  and forwards it to the child. One point to confirm: terminal-owning
+  `inherit` children in the REPL (§6).
+- [x] **Q13 — environment and cwd mutation** (§6): decided 2026-10-30 —
+  `os.setenv` and `os.chdir`, plus REPL shortcuts for the two.
+- [x] **Q14 — macOS floor** (§7): decided 2026-10-30 — 10.15; no legacy
+  support.
 
 ### Outstanding
 
@@ -56,32 +67,27 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Phase 1 — pipelines.** `proc.pipe` (§3.6).
 - [ ] **Phase 3 — `inherit`, handles, background jobs.** Non-recording mode
   only (§5): `inherit` stdio, `proc.spawn` returning a handle (`pid`, `wait`,
-  `kill`). All fatal in record mode. Depends on Q11 and Q12.
+  `kill`). All fatal in record mode. Q11 and Q12 are decided (§5.3, §6).
 - [ ] **Phase 4 — the REPL.** Interactive loop: prompt, line editing,
   history, multi-line chunks, `cd`/env builtins on an authoritative host
-  environment (§6). Never recordable. Depends on Q13.
+  environment (§6). Never recordable. Depends on Phase 4a.
 - [ ] **Phase 5 — shell ergonomics.** Command-position sugar, globbing,
   completion (from the LSP symbol index), job control. Scope decided after
   Phase 4.
 - [ ] **Phase 6 — macOS and Windows spawn backends** (§7). After the REPL
-  (Q10), earlier if a platform is easy. Depends on Q14.
-- [ ] **Q9b — default timeout.** None (unlimited), or a finite default that
-  the caller lifts with `timeout = false` (§3.4).
-- [ ] **Q11 — handle teardown** (§5.3). What happens to a Phase 3 child that
-  was never waited on when the VM closes: kill, wait, or leave it? Handles
-  get the detached-after-keyframe-restore policy doc 65 already gives file
-  handles.
-- [ ] **Q12 — signals and process groups** (§3.4, §6). Who gets Ctrl-C
-  while `proc.run` is waiting; whether a child gets its own process group
-  (needed to kill descendants on timeout, and for REPL foreground
-  ownership) and how that squares with a script run from a terminal.
-- [ ] **Q13 — authoritative host environment and cwd** (§6). `export` and
-  `cd` need `os.setenv`/`os.chdir` (or REPL-only builtins) on top of an
-  owned map in the host; neither exists in real Lua.
-- [ ] **Q14 — platform floor and Windows scripts** (§7). The release script
-  targets macOS 10.12 x86-64 while the pinned Darwin spawn backend needs
-  10.15 for its cwd action; and whether `.bat`/`.cmd` are rejected or
-  explicitly run through `cmd.exe`.
+  (Q10), earlier if a platform is easy. Q14 is decided (macOS 10.15); Q14b is open.
+- [ ] **Phase 4a — `os.setenv`, `os.chdir`, `os.getcwd` and the owned
+  host environment** (§6). One authoritative environment map and working
+  directory in the CLI host; inventory rows (added, `not-started`); the effect
+  kinds for the two mutations are decided with the implementation (replay
+  skips the mutation and feeds back its logged result, as `fs_mutate` does).
+  Also the REPL shortcuts for the two (§6). `os.getcwd` is not something you
+  named: the prompt needs to read the directory, so it is proposed here.
+- [ ] **Phase 6a — raise the macOS release floor to 10.15** in
+  `tools/mahina-cli.sh` (currently 10.12 x86-64), with the Darwin backend.
+- [ ] **Q14b — Windows `.bat`/`.cmd`.** Rejected with an error, or explicitly
+  run through `cmd.exe` with different (shell) semantics (§7). Needs the Zig
+  claim verified first.
 
 ## Why this exists
 
@@ -141,7 +147,7 @@ program, so no quoting and no word splitting.
 **Defaults.** `stdin` omitted: the child's stdin is empty and closed.
 `stdout` and `stderr` omitted: `"capture"`. `max_bytes`: 64 KiB (proposed:
 well under the default 1 MiB log cap, §5.2). `check`: `true`. `timeout`:
-Q9b. `cwd` omitted: the parent's. `env` omitted: the parent's.
+unlimited (Q9b). `cwd` omitted: the parent's. `env` omitted: the parent's.
 
 **`stdin`** is exactly one of: a string (its UTF-8 bytes), a byte array,
 `{file = path}`, or `{inherit = true}`. A string is always data; there is no
@@ -253,11 +259,10 @@ result in every mode.
 
 Killing only the direct child leaves descendants that may still hold the
 capture pipes, so the timeout needs to kill a **process group** (POSIX) or job
-object (Windows). That is the same mechanism Q12 needs; the two are decided
-together. With no `timeout`, the call waits for the child to exit **and** for
+object (Windows). That is the same mechanism Ctrl-C forwarding needs (§6): a child runs
+in its own process group. With no `timeout` (the default, Q9b), the call waits for the child to exit **and** for
 EOF on every captured stream, so a descendant that outlives its parent while
 holding a pipe also blocks the call. That is the case a timeout exists for.
-Default: Q9b.
 
 ### 3.5 Pumping the pipes
 
@@ -382,8 +387,9 @@ reaped before the call returns, including on a start failure, an I/O error or
 a timeout, so no zombies or leaked descriptors escape a failing call. Background
 jobs (Phase 3) would make completion order an input; they are fatal in record
 mode rather than logged. mahina has no GC finalizers (doc 02), so a handle that
-is dropped unwaited is never reaped by the collector: Q11 decides the teardown
-policy, and handles track their own state so `kill` on an already-reaped
+is dropped unwaited is never reaped by the collector: children still running when
+the VM closes are **killed** by default (Q11, decided; their process group, so
+descendants go too), and handles track their own state so `kill` on an already-reaped
 child cannot signal a recycled PID.
 
 ## 6. The REPL and the shell
@@ -397,9 +403,22 @@ detection, result printing, and builtins that must run in the shell's own
 process (`cd`, `export`/env set, `exit`). Before Phase 3 and 4, job control
 cannot wait for Phase 5: Ctrl-C routing, which process group owns the
 terminal, stopped-child behaviour, and cleanup at shell exit are part of
-those phases (Q12), because otherwise Ctrl-C kills the REPL along with its
+those phases, because otherwise Ctrl-C kills the REPL along with its
 child, or a stopped child strands a synchronous wait. Only the ergonomics
 (sugar, globbing, completion) wait for Phase 5.
+
+**Ctrl-C (Q12, decided).** The parent receives Ctrl-C and passes it on to the
+child. A child runs in its own process group, so the terminal's Ctrl-C reaches
+only mahina (the foreground group); mahina's SIGINT handler forwards `SIGINT`
+to the child's group and keeps waiting, since the child may handle it. The
+call then ends as any other signal death does: a result or table with `signal
+= "SIGINT"`. The same group is what the timeout kills (§3.4) and what VM close
+kills (§5.3). *To confirm:* an `inherit` child in the REPL that needs the
+terminal (an editor) cannot sit in a background group, or it is stopped on
+terminal I/O (`SIGTTIN`/`SIGTTOU`). My reading is that such a child is made
+the terminal's foreground group for its lifetime, and then the terminal
+delivers Ctrl-C to it directly, so forwarding applies to captured children
+only. That is an inference from how job control works, not something decided.
 
 `export` and `cd` change the environment and working directory that
 `os.getenv`, `os.environ()` and an omitted `env` all read, so the CLI host
@@ -407,8 +426,15 @@ must own **one authoritative environment map and working directory**,
 initialised from the process, and pass the map to the child explicitly
 rather than relying on the OS's. Today the CLI host reads its initialisation
 map separately (`host_system.zig`), so updating only one place gives stale reads
-or stale children. In the REPL, `cd` and `export` are not yet shell syntax
-(Phase 5): they are meta-commands or `os.chdir`/`os.setenv` (Q13).
+or stale children. The mutations are `os.setenv(name, value)` and `os.chdir(path)` (Q13,
+decided; neither exists in real Lua; inventory rows added, `cli-binding`,
+`not-started`), plus **REPL shortcuts** for the two, since they are done all
+the time: a line starting with `cd <path>` or `export NAME=value` is
+recognised as a shortcut for the corresponding call. The exact recognition
+rule (keyword at line start, how it coexists with a Lua statement) is decided
+with Phase 4 and shares its design with Phase 5's command sugar. Neither
+function is recordable in the REPL, which is never recorded; in a recorded
+script each returns its result through the log like `fs_mutate`.
 
 ## 7. Portability and the host seam
 
@@ -425,7 +451,9 @@ two things it gets wrong for us). macOS and Windows get the same `proc`
 surface (Q6, decided; Phase 6):
 
 - **macOS** uses `posix_spawn`, not `fork`, which is unsafe in a threaded
-  runtime there. Q14: the release floor.
+  runtime there. Q14 (decided): the release
+  floor becomes macOS 10.15, which has the cwd spawn action; the release script
+  moves from 10.12.
 - **Windows** has no `fork`, takes a command line instead of an argv (the
   backend quotes argv for `CreateProcess` correctly), has no signals (`signal`
   is always `nil`; `kill` terminates), keeps the full `DWORD` exit status,
@@ -434,7 +462,7 @@ surface (Q6, decided; Phase 6):
   `env` without `SystemRoot` may fail to start the child at all; that is
   reported, not patched. Review round 1 reports that Zig's backend runs
   `.bat`/`.cmd` through `cmd.exe` (`std/Io/Threaded.zig`; not yet verified
-  here), which would contradict "no shell" (Q14).
+  here), which would contradict "no shell" (Q14b).
 - The wasm VM (playground) gets no `proc` module, because exec makes no sense
   there.
 
@@ -450,7 +478,7 @@ output, to show the pump and ring buffer stay linear and bounded.
 
 ## Open questions for review
 
-Q9b, Q11, Q12, Q13 and Q14 in the checklist above.
+Q14b in the checklist above, and the Ctrl-C/terminal note in §6.
 
 ## References
 
