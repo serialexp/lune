@@ -26,6 +26,7 @@ const library = @import("library.zig");
 const modules = @import("modules.zig");
 const exports = @import("exports.zig");
 const module_cache = @import("module_cache.zig");
+const symbol_index = @import("symbol_index.zig");
 const uri_mod = @import("uri.zig");
 const workspace = @import("workspace.zig");
 const config = @import("config.zig");
@@ -132,6 +133,8 @@ pub const Server = struct {
     watches_files: bool = false,
     /// The exports of the modules `require` reached, per path (P6d).
     module_cache: module_cache.Cache,
+    /// Every folder's functions and methods, for `workspace/symbol` (P6e).
+    symbols: symbol_index.Index,
 
     pub const Error = error{OutOfMemory};
 
@@ -145,6 +148,7 @@ pub const Server = struct {
             .docs = documents.Store.init(gpa),
             .ws = workspace.Workspace.init(gpa),
             .module_cache = module_cache.Cache.init(gpa),
+            .symbols = symbol_index.Index.init(gpa),
         };
     }
 
@@ -152,6 +156,7 @@ pub const Server = struct {
         self.docs.deinit();
         self.ws.deinit();
         self.module_cache.deinit();
+        self.symbols.deinit();
     }
 
     /// Whether the process should now stop (`exit` arrived).
@@ -233,6 +238,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "textDocument/documentSymbol")) return self.documentSymbols(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/foldingRange")) return self.foldingRanges(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/selectionRange")) return self.selectionRanges(a, id, params, out);
+        if (std.mem.eql(u8, method, "workspace/symbol")) return self.workspaceSymbols(a, id, params, out);
         const msg = try std.fmt.allocPrint(a, "method not found: {s}", .{method});
         return out.fail(id, .method_not_found, msg);
     }
@@ -586,6 +592,54 @@ pub const Server = struct {
         try out.result(id, try self.symbolList(a, c.index, c.an.source, syms));
     }
 
+    /// The most `workspace/symbol` answers with; a client narrows the query.
+    pub const max_workspace_symbols = 500;
+
+    fn workspaceSymbols(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const p = jsonrpc.decodeParams(protocol.WorkspaceSymbolParams, a, params) catch |e| return self.badParams(id, e, out);
+        try self.refreshSymbols(a);
+        const hits = try self.symbols.search(a, p.query, max_workspace_symbols);
+        const list = try a.alloc(protocol.SymbolInformation, hits.len);
+        for (hits, list) |h, *slot| slot.* = .{
+            .name = h.symbol.name,
+            .kind = symbolKind(h.symbol.kind),
+            .location = .{ .uri = h.uri, .range = h.symbol.range },
+            .containerName = h.symbol.container,
+        };
+        try out.result(id, list);
+    }
+
+    /// Bring the symbol index up to date with the open documents and every
+    /// folder's files.
+    pub fn refreshSymbols(self: *Server, a: std.mem.Allocator) Error!void {
+        const roots = try a.alloc(symbol_index.Root, self.ws.folders.items.len);
+        for (self.ws.folders.items, roots) |f, *r| r.* = .{
+            .path = f.path,
+            .extensions = try symbol_index.extensionsOf(a, f.config.package_path),
+        };
+        var opened: std.ArrayList(symbol_index.Open) = .empty;
+        var it = self.docs.map.valueIterator();
+        while (it.next()) |d| {
+            const path = try uri_mod.toPath(a, d.*.uri);
+            try opened.append(a, .{
+                .uri = d.*.uri,
+                .path = if (path) |q| try std.fs.path.resolveAllocPosix(a, &.{q}) else null,
+                .text = d.*.text.items,
+            });
+        }
+        try self.symbols.refresh(a, roots, self.files, opened.items, self.encoding);
+    }
+
+    fn symbolKind(kind: syntax.Kind) u8 {
+        return switch (kind) {
+            .function => protocol.SymbolKind.function,
+            .method => protocol.SymbolKind.method,
+            .variable => protocol.SymbolKind.variable,
+            .field => protocol.SymbolKind.field,
+            .object => protocol.SymbolKind.object,
+        };
+    }
+
     fn symbolList(
         self: *Server,
         a: std.mem.Allocator,
@@ -597,13 +651,7 @@ pub const Server = struct {
         for (syms, list) |s, *slot| {
             slot.* = .{
                 .name = s.name,
-                .kind = switch (s.kind) {
-                    .function => protocol.SymbolKind.function,
-                    .method => protocol.SymbolKind.method,
-                    .variable => protocol.SymbolKind.variable,
-                    .field => protocol.SymbolKind.field,
-                    .object => protocol.SymbolKind.object,
-                },
+                .kind = symbolKind(s.kind),
                 .range = index.toRange(text, s.range.start, s.range.end, self.encoding),
                 .selectionRange = index.toRange(text, s.selection.start, s.selection.end, self.encoding),
                 .children = if (s.children.len == 0) null else try self.symbolList(a, index, text, s.children),
@@ -2179,4 +2227,55 @@ test "watched files: a client that cannot watch is told what a config edit needs
     );
     try testing.expectEqual(@as(usize, 1), ready.len);
     try testing.expectEqualStrings("window/logMessage", ready[0].object.get("method").?.string);
+}
+
+test "workspace symbols: every folder's functions, an open document's as edited, the closest first" {
+    var entries = [_][2][]const u8{
+        .{ "/w/lib/util.mah", "local M = {}\nfunction M.add(a, b) end\nfunction M:size() end\nreturn M\n" },
+        .{ "/w/main.mah", "local function adder() end\n" },
+        .{ "/v/tool.lua", "function add() end\n" },
+    };
+    var mem: MemoryFiles = .{ .entries = &entries };
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.files = mem.files();
+    const r = try initWith(&h,
+        \\"workspaceFolders":[{"uri":"file:///w","name":"w"},{"uri":"file:///v","name":"v"}]
+    );
+    try testing.expect(r[0].object.get("result").?.object.get("capabilities").?.object.get("workspaceSymbolProvider").?.bool);
+
+    const q = try h.send(0,
+        \\{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"add"}}
+    );
+    const hits = q[q.len - 1].object.get("result").?.array.items;
+    try testing.expectEqual(@as(usize, 3), hits.len);
+    // `add` exactly, then the prefix `adder`, then `M.add` containing it.
+    try testing.expectEqualStrings("add", hits[0].object.get("name").?.string);
+    try testing.expectEqualStrings("file:///v/tool.lua", hits[0].object.get("location").?.object.get("uri").?.string);
+    try testing.expectEqual(@as(i64, protocol.SymbolKind.function), hits[0].object.get("kind").?.integer);
+    try testing.expectEqualStrings("adder", hits[1].object.get("name").?.string);
+    try testing.expectEqualStrings("M.add", hits[2].object.get("name").?.string);
+    const start = hits[2].object.get("location").?.object.get("range").?.object.get("start").?.object;
+    try testing.expectEqual(@as(i64, 1), start.get("line").?.integer);
+    try testing.expectEqual(@as(i64, 11), start.get("character").?.integer);
+    try testing.expectEqual(@as(u64, 3), h.server.symbols.builds);
+
+    // Asked again, nothing is parsed again; an open document is read as
+    // edited, and a document with no file is searched too.
+    _ = try h.send(1,
+        \\{"jsonrpc":"2.0","id":3,"method":"workspace/symbol","params":{"query":"size"}}
+    );
+    try testing.expectEqual(@as(u64, 3), h.server.symbols.builds);
+    _ = try openDoc(&h, 2, "file:///w/main.mah", "local function subtract() end\n");
+    _ = try openDoc(&h, 2, "untitled:1", "function scratch() end\n");
+    const s = try h.send(3,
+        \\{"jsonrpc":"2.0","id":4,"method":"workspace/symbol","params":{"query":"s"}}
+    );
+    var names: std.ArrayList(u8) = .empty;
+    defer names.deinit(testing.allocator);
+    for (s[s.len - 1].object.get("result").?.array.items) |x| {
+        try names.appendSlice(testing.allocator, x.object.get("name").?.string);
+        try names.append(testing.allocator, ' ');
+    }
+    try testing.expectEqualStrings("scratch subtract M:size ", names.items);
 }

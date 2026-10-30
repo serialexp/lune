@@ -7,7 +7,8 @@
 //! constants, 500-deep nesting, a file broken every 20 lines, an edit burst of
 //! 200 changes, 50 open documents), the cost `require` resolution adds
 //! against the real disk, and member completion on a required module, cold and
-//! from the module cache (doc 74 §7.4).
+//! from the module cache, and `workspace/symbol` over 1k and 10k files on
+//! disk, cold and with every file unchanged (doc 74 §7.4).
 //!
 //! Budget (doc 74 Q12): ≤ 10 ms end to end at 10k lines, ≤ 100 ms at 100k.
 //! Informational, not a gate (global Rule #22): run it deliberately, on a
@@ -324,6 +325,62 @@ fn moduleMembers(gpa: std.mem.Allocator, io: std.Io, reps: usize) !struct { cold
     return .{ .cold = cold, .warm = warm };
 }
 
+const symbols_dir = "/tmp/mahina-bench-lsp-symbols";
+
+/// `files` files of about 100 lines each (8 functions), 100 to a directory,
+/// under `symbols_dir`.
+fn writeWorkspace(gpa: std.mem.Allocator, io: std.Io, files: usize) !void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, symbols_dir) catch {};
+    const text = try realistic(gpa, 100, 0, false);
+    defer gpa.free(text);
+    for (0..files) |k| {
+        var buf: [128]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&buf, symbols_dir ++ "/d_{d}", .{k / 100});
+        if (k % 100 == 0) try cwd.createDirPath(io, dir);
+        var pbuf: [160]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/f_{d}.mah", .{ dir, k });
+        try cwd.writeFile(io, .{ .sub_path = path, .data = text });
+    }
+}
+
+/// `workspace/symbol` over `symbols_dir`: cold (every file read and parsed),
+/// warm (the walk finds every stamp unchanged), best of `reps`; the server's
+/// memory once the index is built, and its peak while building it.
+fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !struct { cold: u64, warm: u64, symbols: usize, live: usize, peak: usize } {
+    var tracker = mahina.mem.TrackingAllocator.init(gpa);
+    const ta = tracker.allocator();
+    var cold: u64 = std.math.maxInt(u64);
+    var warm: u64 = std.math.maxInt(u64);
+    var symbols: usize = 0;
+    var live: usize = 0;
+    for (0..reps) |_| {
+        var core = server.Server.init(ta, .{});
+        defer core.deinit();
+        core.files = lsp.host_stdio.disk;
+        var out = server.Outbox.init(ta);
+        defer out.deinit();
+        try core.handle(0, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{},\"rootUri\":\"file://" ++ symbols_dir ++ "\"}}", &out);
+        try core.handle(0, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}", &out);
+        const body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace/symbol\",\"params\":{\"query\":\"wrk_12\"}}";
+        for ([_]*u64{ &cold, &warm }) |slot| {
+            out.reset();
+            const t0 = now(io);
+            try core.handle(10, body, &out);
+            const t1 = now(io);
+            if (out.messages().len != 1) return error.NoResponse;
+            slot.* = @min(slot.*, @as(u64, @intCast(t1 - t0)));
+        }
+        if (core.symbols.truncated) return error.Truncated;
+        out.reset();
+        live = tracker.stats.live_bytes;
+        symbols = 0;
+        var it = core.symbols.entries.valueIterator();
+        while (it.next()) |e| symbols += e.*.symbols.len;
+    }
+    return .{ .cold = cold, .warm = warm, .symbols = symbols, .live = live, .peak = tracker.stats.peak_bytes };
+}
+
 fn open(gpa: std.mem.Allocator, core: *server.Server, out: *server.Outbox, text: []const u8) !void {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -534,6 +591,32 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
         const got = try moduleMembers(gpa, io, c.reps);
         const stat = try std.Io.Dir.cwd().statFile(io, cross_dir ++ "/big.mah", .{});
         mahina.io.print("{s: <30} {d: >9} {d: >9} {d: >10.2} {d: >10.2}\n", .{ c.name, stat.size, n, ms(got.cold), ms(got.warm) });
+    }
+
+    mahina.io.print(
+        \\
+        \\workspace symbols: `workspace/symbol` over a folder on disk, files of 100 lines (doc 74 §7.4; best of N, ms)
+        \\
+        \\{s: <30} {s: >9} {s: >9} {s: >10} {s: >10} {s: >10} {s: >10}
+        \\
+    , .{ "folder", "files", "symbols", "cold", "warm", "index MiB", "peak MiB" });
+    defer std.Io.Dir.cwd().deleteTree(io, symbols_dir) catch {};
+    const folders = [_]struct { name: []const u8, files: usize, reps: usize }{
+        .{ .name = "1k files", .files = 1_000, .reps = 5 },
+        .{ .name = "10k files", .files = 10_000, .reps = 3 },
+    };
+    for (folders) |f| {
+        try writeWorkspace(gpa, io, f.files);
+        const got = try workspaceSymbols(gpa, io, f.reps);
+        mahina.io.print("{s: <30} {d: >9} {d: >9} {d: >10.2} {d: >10.2} {d: >10.1} {d: >10.1}\n", .{
+            f.name,
+            f.files,
+            got.symbols,
+            ms(got.cold),
+            ms(got.warm),
+            @as(f64, @floatFromInt(got.live)) / (1024.0 * 1024.0),
+            @as(f64, @floatFromInt(got.peak)) / (1024.0 * 1024.0),
+        });
     }
 
     const base = cases.items[1].text;

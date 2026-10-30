@@ -164,6 +164,7 @@ pub const ServerCapabilities = struct {
     documentSymbolProvider: bool = true,
     foldingRangeProvider: bool = true,
     selectionRangeProvider: bool = true,
+    workspaceSymbolProvider: bool = true,
     workspace: WorkspaceServerCapabilities = .{},
 };
 
@@ -358,6 +359,17 @@ pub const DocumentSymbol = struct {
     range: Range,
     selectionRange: Range,
     children: ?[]const DocumentSymbol = null,
+};
+
+pub const WorkspaceSymbolParams = struct {
+    query: []const u8 = "",
+};
+
+pub const SymbolInformation = struct {
+    name: []const u8,
+    kind: u8,
+    location: Location,
+    containerName: ?[]const u8 = null,
 };
 
 pub const FoldingRangeParams = struct {

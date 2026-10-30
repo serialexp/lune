@@ -221,7 +221,7 @@ land; move whole phases to Done once everything inside them is checked.
   it (`string . sub(`). Overloads are not split (one signature per name). Values
   (`math.pi`, `io.stdin`) have no signature. The inventory's descriptions are
   implementation notes, shown verbatim in hover.
-- [ ] **P6 — cross-file** (§7.4): `require` resolution mirroring
+- [x] **P6 — cross-file** (§7.4): `require` resolution mirroring
   `package.searchpath`, `mahina.toml` (with a TOML-subset reader in
   `src/lsp/config.zig`), open-document overlays,
   module exports for `local M = {} … return M`, workspace symbols.
@@ -251,7 +251,7 @@ land; move whole phases to Done once everything inside them is checked.
     `require("x").f` without a local; a typed local
     (`local m: T = require("x")`); a module that is itself a required
     value (`return require("y")`).
-  - [ ] P6e, in four parts:
+  - [x] P6e, in four parts:
     - [x] `system` groups applied: `system = [...]` sets the groups (every
       one when absent, as the CLI gives; none for `[]`). A host global whose
       every native is in a group none of which is on (`aio`) is not known,
@@ -272,7 +272,22 @@ land; move whole phases to Done once everything inside them is checked.
       told once (`window/logMessage`) that a config edit then needs the
       folder re-added or a restart. A refused registration is logged. The
       P6d cache needs no invalidation: it checks the text on each lookup.
-    - [ ] workspace symbols.
+    - [x] workspace symbols (`symbol_index.zig`): `workspace/symbol`
+      over every function and method of every folder's source files at any
+      depth (with the enclosing function or table as `containerName`) and
+      each file's top-level names. A source file is one whose extension a
+      `package_path` template names (`.mah`, `.lua`); hidden directories,
+      `node_modules`, `zig-out` and `target` are not entered, symbolic links
+      are not followed, and at most 20,000 files are indexed. The index is
+      kept per file and brought up to date on each request: the folders are
+      walked and each file's size and modification time
+      (`workspace.Files.stamp`) compared with those it was indexed at, so
+      only a changed file is read and parsed again; open documents are
+      indexed from their text, keyed by its hash, and a document with no
+      file is searched too. Matching ignores case and ranks the whole name,
+      then a prefix, then a substring, then a subsequence; at most 500
+      results. The browser has no `Files.list`, so it searches the open
+      documents only.
 - [ ] **P7 — JIT lenses** (§7.6): extend the `--emit-coverage` artifact
   with source spans and structured abort records; in Zed, a code action
   running the file and inlay hints from the result. The viz already shades
@@ -681,6 +696,17 @@ needed only for `mahina.toml`. Measured (`bench-lsp`, "module members", a
 module exporting one function per 13 lines, load average ~16): completion
 after `m.` costs 0.31 / 4.0 / 64 ms cold and 0.02 / 0.12 / 1.5 ms warm at
 1k / 10k / 100k lines of module. The host reads files up to 16 MiB.
+
+**Workspace symbols, as built in P6e (2026-10-30).** The index is checked
+against the disk on every request (a walk and one stat per file) instead of
+being invalidated by file events: it never relies on a client's watcher
+reporting a deleted directory, and it needs no watcher at all. Each file's
+entry is two allocations sized exactly. Measured (`bench-lsp`, "workspace
+symbols", files of 100 lines with 8 functions each, load average ~2.5):
+28 / 296 ms cold and 0.6 / 11.6 ms warm at 1k / 10k files; the index holds
+0.7 / 7.1 MiB, and building it peaks at 1.1 / 9.1 MiB (each file's text is
+freed once it is indexed). The warm cost at 10k files is the stats; a
+watcher on source files could skip the walk while nothing changes.
 
 **Cost, measured** (`zig build bench-lsp`, cross-file table: a literal
 `require` per 14 lines, half resolving nowhere, real disk): 0.08 ms added

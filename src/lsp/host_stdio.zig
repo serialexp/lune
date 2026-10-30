@@ -52,7 +52,31 @@ pub const Config = struct {
 const max_file_bytes = 16 << 20;
 
 /// The disk, for `mahina.toml`, `require` resolution and module exports.
-pub const disk: workspace.Files = .{ .read = diskRead, .exists = diskExists };
+pub const disk: workspace.Files = .{ .read = diskRead, .exists = diskExists, .list = diskList, .stamp = diskStamp };
+
+fn diskList(_: ?*anyopaque, a: std.mem.Allocator, path: []const u8) ?[]const workspace.Files.DirEntry {
+    const io = io_mod.hostIo();
+    var dir = Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch return null;
+    defer dir.close(io);
+    var out: std.ArrayList(workspace.Files.DirEntry) = .empty;
+    var it = dir.iterateAssumeFirstIteration();
+    while (it.next(io) catch return null) |e| {
+        const kind: @FieldType(workspace.Files.DirEntry, "kind") = switch (e.kind) {
+            .file => .file,
+            .directory => .directory,
+            else => continue,
+        };
+        const name = a.dupe(u8, e.name) catch return null;
+        out.append(a, .{ .name = name, .kind = kind }) catch return null;
+    }
+    return out.items;
+}
+
+fn diskStamp(_: ?*anyopaque, path: []const u8) ?workspace.Files.Stamp {
+    const st = Io.Dir.cwd().statFile(io_mod.hostIo(), path, .{}) catch return null;
+    if (st.kind != .file) return null;
+    return .{ .size = st.size, .mtime_ns = st.mtime.nanoseconds };
+}
 
 fn diskRead(_: ?*anyopaque, a: std.mem.Allocator, path: []const u8) ?[]u8 {
     // Missing, unreadable or too large: no config (the defaults apply), or no

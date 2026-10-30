@@ -16,6 +16,7 @@ pub const config = @import("lsp/config.zig");
 pub const modules = @import("lsp/modules.zig");
 pub const exports = @import("lsp/exports.zig");
 pub const module_cache = @import("lsp/module_cache.zig");
+pub const symbol_index = @import("lsp/symbol_index.zig");
 pub const uri = @import("lsp/uri.zig");
 pub const workspace = @import("lsp/workspace.zig");
 pub const server = @import("lsp/server.zig");
@@ -38,6 +39,7 @@ test {
     _ = modules;
     _ = exports;
     _ = module_cache;
+    _ = symbol_index;
     _ = uri;
     _ = workspace;
     _ = server;

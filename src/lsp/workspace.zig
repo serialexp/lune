@@ -26,6 +26,17 @@ pub const Files = struct {
     read: *const fn (ctx: ?*anyopaque, a: Allocator, path: []const u8) ?[]u8,
     /// Whether `path` is a file that exists.
     exists: *const fn (ctx: ?*anyopaque, path: []const u8) bool,
+    /// The files and directories in the directory `path`, names allocated in
+    /// `a`; symbolic links and anything else are left out, so a walk cannot
+    /// loop. Null when it cannot be read. A host without it has no
+    /// workspace symbols beyond the open documents.
+    list: ?*const fn (ctx: ?*anyopaque, a: Allocator, path: []const u8) ?[]const DirEntry = null,
+    /// What tells a file's new contents from its old without reading it, or
+    /// null when `path` is gone.
+    stamp: ?*const fn (ctx: ?*anyopaque, path: []const u8) ?Stamp = null,
+
+    pub const DirEntry = struct { name: []const u8, kind: enum { file, directory } };
+    pub const Stamp = struct { size: u64, mtime_ns: i96 };
 };
 
 pub const Folder = struct {
@@ -262,7 +273,31 @@ pub const MemoryFiles = struct {
     entries: []const [2][]const u8,
 
     pub fn files(self: *MemoryFiles) Files {
-        return .{ .ctx = self, .read = read, .exists = exists };
+        return .{ .ctx = self, .read = read, .exists = exists, .list = list, .stamp = stamp };
+    }
+
+    /// The direct children of `dir` among the paths held.
+    fn list(ctx: ?*anyopaque, a: Allocator, dir: []const u8) ?[]const Files.DirEntry {
+        const self: *MemoryFiles = @ptrCast(@alignCast(ctx.?));
+        var out: std.ArrayList(Files.DirEntry) = .empty;
+        for (self.entries) |e| {
+            if (!std.mem.startsWith(u8, e[0], dir) or e[0].len <= dir.len + 1 or e[0][dir.len] != '/') continue;
+            const rest = e[0][dir.len + 1 ..];
+            const cut = std.mem.findScalar(u8, rest, '/');
+            const name = rest[0 .. cut orelse rest.len];
+            const dup = for (out.items) |o| {
+                if (std.mem.eql(u8, o.name, name)) break true;
+            } else false;
+            if (!dup) out.append(a, .{ .name = name, .kind = if (cut != null) .directory else .file }) catch return null;
+        }
+        return out.items;
+    }
+
+    /// The length and a hash of the contents stand in for a modification time.
+    fn stamp(ctx: ?*anyopaque, path: []const u8) ?Files.Stamp {
+        const self: *MemoryFiles = @ptrCast(@alignCast(ctx.?));
+        const bytes = self.find(path) orelse return null;
+        return .{ .size = bytes.len, .mtime_ns = @as(u64, @truncate(std.hash.Wyhash.hash(0, bytes))) };
     }
 
     fn find(self: *MemoryFiles, path: []const u8) ?[]const u8 {
