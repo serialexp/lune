@@ -1,6 +1,6 @@
 # 75 — Process spawning, and mahina as a shell — Design
 
-Status: draft, not yet implemented
+Status: draft, not yet implemented (every design question decided 2026-10-30)
 Owner: Bart
 Last updated: 2026-10-30
 
@@ -20,8 +20,13 @@ land; move whole phases to Done once everything inside them is checked.
   or a fatal signal raises by default; `check = false` opts out.
 - [x] **Q4 — `max_bytes` overflow** (§5.2): decided 2026-10-30 — a capture
   keeps the latest `max_bytes` bytes and drops the earlier ones.
-- [x] **Q5 — environment** (§3.1): decided 2026-10-30 — inheritance is
-  manual: a given `env` is the child's whole environment.
+- [x] **Q5 — environment** (§3.1): decided 2026-10-30 — a given `env` is
+  the child's whole environment; an omitted `env` inherits the parent's,
+  which is what a shell is expected to do.
+- [x] **Q5b — listing the parent's environment** (§3.1): decided 2026-10-30
+  — add `os.environ()`.
+- [x] **Q6 — platforms** (§7): decided 2026-10-30 — macOS and Windows get
+  `proc`; wasm does not, because exec makes no sense there.
 
 ### Outstanding
 
@@ -43,12 +48,14 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Phase 5 — shell ergonomics.** Command-position sugar, globbing,
   completion (from the LSP symbol index), job control. Scope decided after
   Phase 4.
-- [ ] **Q5b — listing the parent's environment.** Manual inheritance needs
-  a way to read it all: an `os.environ()` (new inventory row, `getenv`-style
-  effect), or callers compose it from `os.getenv` per name (§3.1).
-- [ ] **Q6 — non-Linux hosts.** Which spawn primitives on macOS and Windows
-  (six release platforms, `tools/mahina-cli.sh`), and whether wasm gets any
-  (§7).
+- [ ] **Phase 0a — `os.environ()`.** Returns a table of the parent's
+  variables (§3.1). New `EffectKind` (`environ`), logged as one result per
+  call like `getenv`; inventory row (`os`, `cli-binding`) in the same change.
+  Lands before `proc` so `env` can be built from it.
+- [ ] **Phase 6 — macOS and Windows spawn backends** (§7). The same `proc`
+  surface on the other release platforms of `tools/mahina-cli.sh`; behaviour
+  differences (signals, `PATH` lookup, argv quoting on Windows) pinned by
+  tests per platform.
 
 ## Why this exists
 
@@ -104,15 +111,25 @@ local r = proc.run{
 argv is an array of strings. There is no shell between mahina and the
 program, so no quoting and no word splitting.
 
-**Environment (Q5, decided).** Inheritance is manual. If `env` is given, it
-is the child's entire environment, nothing else is passed down. If `env` is
-omitted, the child gets the parent's environment unchanged. The lookup of
+**Environment (Q5, decided).** If `env` is omitted, the child gets the
+parent's environment unchanged, as a shell's children do. If `env` is given,
+it is the child's entire environment and nothing else is passed down, so
+inheriting plus changes is written explicitly. The lookup of
 `argv[1]` on `PATH` uses the child's environment (the `PATH` in `env`, when
 given); a bare name with no `PATH` in a given `env` is not found, and an
 absolute or `./` path always works. Building a child environment from the
-parent's is done in Lua, from a listing of the parent's variables (Q5b).
-Reading the parent's environment is already a logged `getenv`-style effect;
-passing it down is not an additional one.
+parent's is done in Lua with `os.environ()` (Q5b, decided):
+
+```lua
+local env = os.environ()          -- { PATH = "...", HOME = "...", ... }
+env.GIT_PAGER = "cat"
+proc.run{"git", "log", env = env}
+```
+
+`os.environ()` is a logged `getenv`-style effect, one result per call: a
+table of name to string. An omitted `env` passes the parent's environment
+down without a Lua-visible read, so it adds no effect of its own; replay
+never spawns, so it never needs the parent's environment at all.
 
 ### 3.2 Result
 
@@ -207,8 +224,12 @@ after Phase 4 has been used.
 Spawning goes through the `HostSystem` vtable (doc 65 §5.1) like every other
 host operation, so replay and embedding can supply their own. The Linux
 implementation is `fork`/`exec` via `std` (verify the pinned toolchain's
-`std.process` API first — Rule Z-1). Other platforms: Q6. The wasm VM
-(playground) gets no `proc` module.
+`std.process` API first — Rule Z-1). macOS and Windows get the same
+`proc` surface (Q6, decided; Phase 6). Windows differs enough to need its own
+backend: no `fork`, a command line instead of an argv (so the backend must
+quote argv for `CreateProcess` correctly), and no signals (`signal` is
+always `nil`; `kill` terminates). The wasm VM (playground) gets no `proc`
+module, because exec makes no sense there.
 
 ## Phasing
 
@@ -218,7 +239,7 @@ nothing would have to be re-audited later. Each phase lands behind
 
 ## Open questions for review
 
-Q5b and Q6 in the checklist above.
+None: every question in the checklist is decided.
 
 ## References
 
