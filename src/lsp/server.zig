@@ -135,6 +135,9 @@ pub const Server = struct {
     module_cache: module_cache.Cache,
     /// Every folder's functions and methods, for `workspace/symbol` (P6e).
     symbols: symbol_index.Index,
+    /// Where the symbol index is kept between sessions. Set by the host after
+    /// `init`; without one, each session indexes from scratch.
+    store: ?workspace.Store = null,
 
     pub const Error = error{OutOfMemory};
 
@@ -227,6 +230,7 @@ pub const Server = struct {
             return out.fail(id, .request_cancelled, "request cancelled");
         }
         if (std.mem.eql(u8, method, "shutdown")) {
+            if (self.store) |st| try self.symbols.saveDirty(a, st);
             self.state = .shutdown;
             return out.result(id, @as(?u8, null));
         }
@@ -605,24 +609,19 @@ pub const Server = struct {
         const hits = try self.symbols.search(a, p.query, max_workspace_symbols);
         const list = try a.alloc(protocol.SymbolInformation, hits.len);
         for (hits, list) |h, *slot| slot.* = .{
-            .name = h.symbol.name,
+            .name = h.name(),
             .kind = symbolKind(h.symbol.kind),
-            .location = .{ .uri = h.uri, .range = h.symbol.range },
-            .containerName = h.symbol.container,
+            .location = .{ .uri = h.uri(), .range = h.range() },
+            .containerName = h.container(),
         };
         try out.result(id, list);
     }
 
-    /// Bring the symbol index up to date with the open documents and every
-    /// folder's files: from the change log the client's watcher feeds, or,
-    /// without one, by walking every folder.
+    /// Bring the symbol index up to date with the open documents and what
+    /// the client's watcher reported; a client that cannot watch has every
+    /// folder walked. A folder's opening walk goes on in `tick`, and is
+    /// searched as far as it got.
     pub fn refreshSymbols(self: *Server, a: std.mem.Allocator) Error!void {
-        if (!self.watches_files) self.symbols.stale = true;
-        const roots = try a.alloc(symbol_index.Root, self.ws.folders.items.len);
-        for (self.ws.folders.items, roots) |f, *r| r.* = .{
-            .path = f.path,
-            .extensions = try symbol_index.extensionsOf(a, f.config.package_path),
-        };
         var opened: std.ArrayList(symbol_index.Open) = .empty;
         var it = self.docs.map.valueIterator();
         while (it.next()) |d| {
@@ -633,7 +632,31 @@ pub const Server = struct {
                 .text = d.*.text.items,
             });
         }
-        try self.symbols.refresh(a, roots, self.files, opened.items, self.encoding);
+        const disk = self.symbolDisk();
+        try self.symbols.setOpen(a, opened.items, disk != null);
+        const fs = disk orelse return;
+        if (!self.watches_files) try self.symbols.rewalk();
+        try self.symbols.work(a, fs, self.store, if (self.watches_files) .change_log else .all);
+    }
+
+    /// The host's disk, if it can be walked: the browser's cannot, and its
+    /// index holds the open documents only.
+    fn symbolDisk(self: *const Server) ?workspace.Files {
+        const fs = self.files orelse return null;
+        if (fs.list == null or fs.stamp == null) return null;
+        return fs;
+    }
+
+    /// Make the symbol index's roots the folders, whenever they change: a
+    /// new folder's saved index is loaded and its walk begins.
+    fn syncSymbolRoots(self: *Server, a: std.mem.Allocator) Error!void {
+        if (self.symbolDisk() == null) return;
+        const roots = try a.alloc(symbol_index.Root, self.ws.folders.items.len);
+        for (self.ws.folders.items, roots) |f, *r| r.* = .{
+            .path = f.path,
+            .extensions = try symbol_index.extensionsOf(a, f.config.package_path),
+        };
+        try self.symbols.setRoots(a, roots, self.store);
     }
 
     fn symbolKind(kind: syntax.Kind) u8 {
@@ -794,6 +817,7 @@ pub const Server = struct {
                 return self.badNotification(a, method, e, out);
             for (p.event.removed) |f| try self.removeFolder(a, f.uri, out);
             for (p.event.added) |f| try self.addFolder(a, f.uri, out);
+            try self.syncSymbolRoots(a);
             // A document may now fall under another folder's config.
             var it = self.docs.map.valueIterator();
             while (it.next()) |d| markDirty(d.*, now_ms);
@@ -804,6 +828,8 @@ pub const Server = struct {
                 return self.badNotification(a, method, e, out);
             try self.noteChanges(a, p.changes);
             if (try self.reloadConfigs(a, p.changes, out)) {
+                // A folder's source extensions may have changed.
+                try self.syncSymbolRoots(a);
                 var it = self.docs.map.valueIterator();
                 while (it.next()) |d| markDirty(d.*, now_ms);
             }
@@ -876,6 +902,8 @@ pub const Server = struct {
         } else if (p.rootUri) |root| {
             try self.addFolder(a, root, out);
         }
+        try self.symbols.setEncoding(self.encoding);
+        try self.syncSymbolRoots(a);
     }
 
     // ---- workspace folders and their config (doc 74 §7.4) ------------------
@@ -940,7 +968,7 @@ pub const Server = struct {
     fn noteChanges(self: *Server, a: std.mem.Allocator, changes: []const protocol.FileEvent) Error!void {
         for (changes) |c| {
             const path = (try uri_mod.toPath(a, c.uri)) orelse continue;
-            const change: symbol_index.Index.Change = switch (c.type) {
+            const change: symbol_index.Change = switch (c.type) {
                 protocol.FileChangeType.created => .created,
                 protocol.FileChangeType.deleted => .deleted,
                 else => .changed,
@@ -1046,8 +1074,9 @@ pub const Server = struct {
     }
 
     /// When the host should next call `tick`, in its own clock; null if nothing
-    /// is waiting.
+    /// is waiting. Symbol indexing waiting makes it now.
     pub fn nextDeadline(self: *const Server) ?u64 {
+        if (self.state == .running and self.symbols.busy() and self.symbolDisk() != null) return 0;
         var best: ?u64 = null;
         var it = self.docs.map.valueIterator();
         while (it.next()) |d| {
@@ -1057,7 +1086,9 @@ pub const Server = struct {
         return best;
     }
 
-    /// Analyse every document whose debounce has run out.
+    /// Analyse every document whose debounce has run out, then do a slice of
+    /// the symbol index's waiting work (a few milliseconds, so a message
+    /// that arrives meanwhile waits no longer than that).
     pub fn tick(self: *Server, now_ms: u64, out: *Outbox) Error!void {
         if (self.state != .running) return;
         var it = self.docs.map.valueIterator();
@@ -1065,6 +1096,11 @@ pub const Server = struct {
             const due = dueAt(d.*) orelse continue;
             if (due <= now_ms) try self.analyse(d.*, out);
         }
+        if (!self.symbols.busy()) return;
+        const fs = self.symbolDisk() orelse return;
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        try self.symbols.work(scratch.allocator(), fs, self.store, .slice);
     }
 
     /// Analyse one document now and publish what it found. A newer edit already
@@ -2322,6 +2358,10 @@ test "workspace symbols: a watching client's changes are the only paths looked a
     );
     const watchers = ready[0].object.get("params").?.object.get("registrations").?.array.items[0].object.get("registerOptions").?.object.get("watchers").?.array.items;
     try testing.expectEqualStrings("**/*", watchers[1].object.get("globPattern").?.string);
+    // The folders are walked in the background, a slice per tick.
+    try testing.expectEqual(@as(?u64, 0), h.server.nextDeadline());
+    _ = try h.tick(1);
+    try testing.expect(h.server.nextDeadline() == null);
 
     const query =
         \\{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"a"}}

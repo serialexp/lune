@@ -44,6 +44,40 @@ pub const Config = struct {
     clock: *const fn () u64 = monotonicMs,
     /// The global names the host installs, which are not flagged as undefined.
     known_globals: []const []const u8 = &.{},
+    /// Where the workspace symbol index is kept between sessions (under the
+    /// user's cache directory); null keeps none.
+    cache_dir: ?[]const u8 = null,
+};
+
+/// The symbol index's store on disk: a file per workspace folder under
+/// `dir`, each written to a temporary file and renamed over the old one, so
+/// a reader never sees half of it (doc 74 §7.4).
+pub const DiskStore = struct {
+    dir: []const u8,
+
+    pub fn store(self: *DiskStore) workspace.Store {
+        return .{ .ctx = self, .load = load, .save = save };
+    }
+
+    fn load(ctx: ?*anyopaque, a: std.mem.Allocator, name: []const u8) ?[]u8 {
+        const self: *DiskStore = @ptrCast(@alignCast(ctx.?));
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ self.dir, name }) catch return null;
+        return Io.Dir.cwd().readFileAlloc(io_mod.hostIo(), path, a, .unlimited) catch null;
+    }
+
+    fn save(ctx: ?*anyopaque, name: []const u8, bytes: []const u8) void {
+        const self: *DiskStore = @ptrCast(@alignCast(ctx.?));
+        const io = io_mod.hostIo();
+        const cwd = Io.Dir.cwd();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ self.dir, name }) catch return;
+        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return;
+        cwd.createDirPath(io, self.dir) catch return;
+        cwd.writeFile(io, .{ .sub_path = tmp, .data = bytes }) catch return;
+        cwd.rename(tmp, cwd, path, io) catch cwd.deleteFile(io, tmp) catch {};
+    }
 };
 
 /// The largest file the server reads: a `mahina.toml`, or a module `require`
@@ -325,6 +359,11 @@ pub fn run(gpa: std.mem.Allocator, transport: Transport, cfg: Config) !u8 {
     defer core.deinit();
     core.known_globals = cfg.known_globals;
     core.files = disk;
+    var disk_store: DiskStore = undefined;
+    if (cfg.cache_dir) |dir| {
+        disk_store = .{ .dir = dir };
+        core.store = disk_store.store();
+    }
     var out = server_mod.Outbox.init(gpa);
     defer out.deinit();
     var wire: std.ArrayList(u8) = .empty;

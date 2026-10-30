@@ -24,7 +24,7 @@ DOC 44 STITCHING: numeric-for roots DONE (2026-10-28, coral-marten), committed, 
 - Known noise: euler14-bit +0.8% instructions with identical traces (interp.zig layout).
 - Next: doc 63 Phase 2b/2c (direct host calls; stitching is its fallback).
 
-DOC 74 LANGUAGE SERVER: P0–P6 DONE (2026-10-27 to 2026-10-30, coral-raven). P6e (2026-10-30): system groups, initializationOptions, watched files (mahina.toml reload), workspace symbols (symbol_index.zig: one walk per folder, then the client's file watcher is the change log; a client that cannot watch walks per request). Next: P7 (JIT lenses) when Bart says so.
+DOC 74 LANGUAGE SERVER: P0–P6 DONE (2026-10-27 to 2026-10-30, coral-raven). P6e (2026-10-30): system groups, initializationOptions, watched files (mahina.toml reload), workspace symbols (symbol_index.zig: a background walk per folder in tick slices, then the client's file watcher is the change log; a client that cannot watch walks per request; symbols in shared columns with mask search; index saved per folder in ~/.cache/mahina/lsp so a restart parses only changed files; 100k files: restart 200 ms, query 2.8 ms). Next: P7 (JIT lenses) when Bart says so.
 - P6d (2026-10-29): module exports (exports.zig: `return M` / `return {..}`
   shapes; the consumer's `local m = require("x")`), module_cache.zig (per
   path, checked against the module's text by hash each time, 64 entries,

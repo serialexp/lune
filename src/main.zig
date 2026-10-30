@@ -497,10 +497,23 @@ fn lspMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
     // allocates message bodies the worker frees.
     return mahina.lsp.host_stdio.run(init.gpa, mahina.lsp.host_stdio.stdioTransport(), .{
         .known_globals = &mahina.interp.builtin_global_names,
+        .cache_dir = lspCacheDir(init.arena.allocator(), init.environ_map),
     }) catch |err| {
         mahina.io.eprint("mahina lsp: error: {s}\n", .{@errorName(err)});
         return 1;
     };
+}
+
+/// Where `mahina lsp` keeps its workspace symbol index between sessions:
+/// `$XDG_CACHE_HOME/mahina/lsp`, else `~/.cache/mahina/lsp`; null (none kept)
+/// when neither is known.
+fn lspCacheDir(a: std.mem.Allocator, env: *const std.process.Environ.Map) ?[]const u8 {
+    if (env.get("XDG_CACHE_HOME")) |x| if (x.len > 0 and x[0] == '/') {
+        return std.fs.path.join(a, &.{ x, "mahina", "lsp" }) catch null;
+    };
+    const home = env.get("HOME") orelse return null;
+    if (home.len == 0) return null;
+    return std.fs.path.join(a, &.{ home, ".cache", "mahina", "lsp" }) catch null;
 }
 
 /// `mahina viz`: parse its options and serve until interrupted.

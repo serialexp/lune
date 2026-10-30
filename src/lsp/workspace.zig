@@ -39,6 +39,18 @@ pub const Files = struct {
     pub const Stamp = struct { size: u64, mtime_ns: i96 };
 };
 
+/// Where the host keeps what the server saves between sessions (the
+/// workspace symbol index), by file name. A host without one (the browser,
+/// or no cache directory) builds the index anew each session.
+pub const Store = struct {
+    ctx: ?*anyopaque = null,
+    /// The bytes saved under `name`, allocated in `a`, or null.
+    load: *const fn (ctx: ?*anyopaque, a: Allocator, name: []const u8) ?[]u8,
+    /// Replace what is saved under `name`, as a whole: a reader never sees
+    /// half of it. A failure is not reported; the next session rebuilds.
+    save: *const fn (ctx: ?*anyopaque, name: []const u8, bytes: []const u8) void,
+};
+
 pub const Folder = struct {
     /// Owns every slice below.
     arena: std.heap.ArenaAllocator,
@@ -276,12 +288,15 @@ pub const MemoryFiles = struct {
         return .{ .ctx = self, .read = read, .exists = exists, .list = list, .stamp = stamp };
     }
 
-    /// The direct children of `dir` among the paths held.
+    /// The direct children of `dir` among the paths held; null when no path
+    /// lies under it, as for a directory that is not there.
     fn list(ctx: ?*anyopaque, a: Allocator, dir: []const u8) ?[]const Files.DirEntry {
         const self: *MemoryFiles = @ptrCast(@alignCast(ctx.?));
         var out: std.ArrayList(Files.DirEntry) = .empty;
+        var any = false;
         for (self.entries) |e| {
             if (!std.mem.startsWith(u8, e[0], dir) or e[0].len <= dir.len + 1 or e[0][dir.len] != '/') continue;
+            any = true;
             const rest = e[0][dir.len + 1 ..];
             const cut = std.mem.findScalar(u8, rest, '/');
             const name = rest[0 .. cut orelse rest.len];
@@ -290,7 +305,7 @@ pub const MemoryFiles = struct {
             } else false;
             if (!dup) out.append(a, .{ .name = name, .kind = if (cut != null) .directory else .file }) catch return null;
         }
-        return out.items;
+        return if (any) out.items else null;
     }
 
     /// The length and a hash of the contents stand in for a modification time.
@@ -316,6 +331,49 @@ pub const MemoryFiles = struct {
     fn exists(ctx: ?*anyopaque, path: []const u8) bool {
         const self: *MemoryFiles = @ptrCast(@alignCast(ctx.?));
         return self.find(path) != null;
+    }
+};
+
+/// A `Store` in memory, by name.
+pub const MemoryStore = struct {
+    gpa: Allocator,
+    saved: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    pub fn deinit(self: *MemoryStore) void {
+        var it = self.saved.iterator();
+        while (it.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.*);
+        }
+        self.saved.deinit(self.gpa);
+    }
+
+    pub fn store(self: *MemoryStore) Store {
+        return .{ .ctx = self, .load = load, .save = save };
+    }
+
+    fn load(ctx: ?*anyopaque, a: Allocator, name: []const u8) ?[]u8 {
+        const self: *MemoryStore = @ptrCast(@alignCast(ctx.?));
+        const bytes = self.saved.get(name) orelse return null;
+        return a.dupe(u8, bytes) catch null;
+    }
+
+    fn save(ctx: ?*anyopaque, name: []const u8, bytes: []const u8) void {
+        const self: *MemoryStore = @ptrCast(@alignCast(ctx.?));
+        const copy = self.gpa.dupe(u8, bytes) catch return;
+        if (self.saved.getPtr(name)) |old| {
+            self.gpa.free(old.*);
+            old.* = copy;
+            return;
+        }
+        const key = self.gpa.dupe(u8, name) catch {
+            self.gpa.free(copy);
+            return;
+        };
+        self.saved.put(self.gpa, key, copy) catch {
+            self.gpa.free(key);
+            self.gpa.free(copy);
+        };
     }
 };
 

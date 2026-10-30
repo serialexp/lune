@@ -278,10 +278,17 @@ land; move whole phases to Done once everything inside them is checked.
       each file's top-level names. A source file is one whose extension a
       `package_path` template names (`.mah`, `.lua`); hidden directories,
       `node_modules`, `zig-out` and `target` are not entered, symbolic links
-      are not followed, and at most 20,000 files are indexed. The index is
-      kept per file. A folder is walked once, when it appears (again when
-      its extensions change, or when a nested folder inside it goes); after
-      that a request looks only at the paths the client's watcher reported
+      are not followed, and at most 200,000 files are indexed. A folder is
+      walked when it appears (again when its extensions change, or when a
+      folder goes), in the background: `tick` takes slices of about 5 ms
+      (`slice_budget`) while the host has no message, so a request is never
+      held up by a walk. The index is saved per folder under
+      `$XDG_CACHE_HOME/mahina/lsp` (else `~/.cache/mahina/lsp`), when a walk
+      ends with something changed and at shutdown; the next session loads
+      it before walking, and the walk parses only the files whose stamps
+      differ, dropping what is gone. A save that does not check out
+      (checksum, format version, encoding, folder, extensions) is ignored
+      and rebuilt. After the walk a request looks only at the paths the client's watcher reported
       since the last one (`**/*` is registered with `**/mahina.toml`; the
       index drops a change to a non-source file, a path in no folder or in
       a directory not walked). A reported directory stands for everything
@@ -290,11 +297,15 @@ land; move whole phases to Done once everything inside them is checked.
       (`workspace.Files.stamp`) differs. A client that cannot watch, or
       refuses the registration, has no change log, so every request walks
       every folder, the stamps still sparing the parsing. A change log
-      longer than 20,000 paths is dropped for a walk. Open documents are
+      longer than 200,000 paths is dropped for a walk. Open documents are
       indexed from their text, keyed by its hash, and a document with no
       file is searched too. Matching ignores case and ranks the whole name,
       then a prefix, then a substring, then a subsequence; at most 500
-      results. The browser has no `Files.list`, so it searches the open
+      results, kept by a bounded heap. All symbols lie in shared columns
+      (a `MultiArrayList` and one name pool): a search scans the 64-bit
+      character-class masks in order and scores only the names whose mask
+      covers the query's; a removed file's symbols are marked dead and
+      compacted away once they outnumber the live. The browser has no `Files.list`, so it searches the open
       documents only.
 - [ ] **P7 — JIT lenses** (§7.6): extend the `--emit-coverage` artifact
   with source spans and structured abort records; in Zed, a code action
@@ -718,6 +729,20 @@ with one file rewritten and reported; warm for a client that cannot watch
 peaks at 1.2 / 9.1 / 18.3 MiB (each file's text is freed once it is
 indexed). A watching client's warm cost is now the search, a scan of every
 symbol: linear in the workspace, the next lever if the cap rises.
+
+Bart then asked for 100k files, a faster search and an index kept between
+sessions; the walk moved into `tick`, the index into columns, and a saved
+index per folder in the cache directory. Measured (load average ~4, files of
+100 lines, 8 symbols each), at 1k / 10k / 100k files: cold (no saved index,
+initialize until the index is idle) 28 / 290 / 3008 ms; restart from the
+saved index 1.0 / 16.6 / 200 ms, with no file parsed; the narrow query
+"w123_4" 0.01 / 0.09 / 2.8 ms and the broad "w" (every name matches) 0.28 /
+0.76 / 4.6 ms; one file rewritten and reported, then the narrow query, 0.01
+/ 0.07 / 2.8 ms; a client that cannot watch 0.46 / 5.2 / 105 ms. The index
+holds 0.7 / 7.5 / 63 MiB, peaks at 1.3 / 13.6 / 126 MiB (the restart's load
+buffer on top of the index), and saves 0.4 / 4.0 / 41.5 MiB. Before the
+columns (one allocation per file) the 100k search took 10.3 / 40.6 ms and
+the peak was 171 MiB.
 
 **Cost, measured** (`zig build bench-lsp`, cross-file table: a literal
 `require` per 14 lines, half resolving nowhere, real disk): 0.08 ms added

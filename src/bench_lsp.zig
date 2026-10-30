@@ -7,8 +7,9 @@
 //! constants, 500-deep nesting, a file broken every 20 lines, an edit burst of
 //! 200 changes, 50 open documents), the cost `require` resolution adds
 //! against the real disk, and member completion on a required module, cold and
-//! from the module cache, and `workspace/symbol` over 1k and 10k files on
-//! disk, cold and with every file unchanged (doc 74 §7.4).
+//! from the module cache, and the workspace symbol index over 1k, 10k and
+//! 100k files on disk: built cold and from its saved copy, and searched
+//! (doc 74 §7.4).
 //!
 //! Budget (doc 74 Q12): ≤ 10 ms end to end at 10k lines, ≤ 100 ms at 100k.
 //! Informational, not a gate (global Rule #22): run it deliberately, on a
@@ -326,9 +327,10 @@ fn moduleMembers(gpa: std.mem.Allocator, io: std.Io, reps: usize) !struct { cold
 }
 
 const symbols_dir = "/tmp/mahina-bench-lsp-symbols";
+const symbols_cache = "/tmp/mahina-bench-lsp-cache";
 
-/// `files` files of about 100 lines each (8 functions), 100 to a directory,
-/// under `symbols_dir`.
+/// `files` files of about 100 lines each, 100 to a directory, under
+/// `symbols_dir`; file `k` defines `w<k>_0` … `w<k>_7`.
 fn writeWorkspace(gpa: std.mem.Allocator, io: std.Io, files: usize) !void {
     const cwd = std.Io.Dir.cwd();
     cwd.deleteTree(io, symbols_dir) catch {};
@@ -340,73 +342,143 @@ fn writeWorkspace(gpa: std.mem.Allocator, io: std.Io, files: usize) !void {
         if (k % 100 == 0) try cwd.createDirPath(io, dir);
         var pbuf: [160]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "{s}/f_{d}.mah", .{ dir, k });
-        try cwd.writeFile(io, .{ .sub_path = path, .data = text });
+        var nbuf: [32]u8 = undefined;
+        const own = try std.mem.replaceOwned(u8, gpa, text, "work_", try std.fmt.bufPrint(&nbuf, "w{d}_", .{k}));
+        defer gpa.free(own);
+        try cwd.writeFile(io, .{ .sub_path = path, .data = own });
     }
 }
 
-const WorkspaceSymbols = struct { cold: u64, warm: u64, changed: u64, unwatched: u64, symbols: usize, live: usize, peak: usize };
+const WorkspaceSymbols = struct {
+    /// Initialize to an idle index: no saved index, then from the saved one.
+    cold: u64,
+    restart: u64,
+    /// `workspace/symbol` for a watching client: a narrow query, a broad one
+    /// (every name matches), and the narrow one after one file is rewritten
+    /// and reported.
+    narrow: u64,
+    broad: u64,
+    changed: u64,
+    /// The narrow query for a client that cannot watch: a walk of every file.
+    unwatched: u64,
+    symbols: usize,
+    live: usize,
+    peak: usize,
+    saved_bytes: u64,
+};
 
-/// `workspace/symbol` over `symbols_dir`, best of `reps`: cold (every file
-/// read and parsed); warm, for a client that watches files (nothing
-/// reported, so only the search); after one file is rewritten and reported;
-/// and warm for a client that cannot watch (a walk finding every stamp
-/// unchanged). Also the server's memory once the index is built, and its
-/// peak while building it.
+fn symbolServer(ta: std.mem.Allocator, store: *lsp.host_stdio.DiskStore, out: *server.Outbox) !server.Server {
+    var core = server.Server.init(ta, .{});
+    core.files = lsp.host_stdio.disk;
+    core.store = store.store();
+    try core.handle(0, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"workspace\":{\"didChangeWatchedFiles\":{\"dynamicRegistration\":true}}},\"rootUri\":\"file://" ++ symbols_dir ++ "\"}}", out);
+    try core.handle(0, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}", out);
+    return core;
+}
+
+/// Tick until the index is idle, as the host does with nothing to read.
+fn settle(core: *server.Server, out: *server.Outbox) !void {
+    while (core.nextDeadline() != null) {
+        out.reset();
+        try core.tick(5, out);
+    }
+}
+
+fn timedRequest(io: std.Io, core: *server.Server, out: *server.Outbox, body: []const u8) !u64 {
+    out.reset();
+    const t0 = now(io);
+    try core.handle(10, body, out);
+    const t1 = now(io);
+    if (out.messages().len != 1) return error.NoResponse;
+    return @intCast(t1 - t0);
+}
+
+fn query(comptime q: []const u8) []const u8 {
+    return "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace/symbol\",\"params\":{\"query\":\"" ++ q ++ "\"}}";
+}
+
+/// `workspace/symbol` over `symbols_dir`, with the index kept under
+/// `symbols_cache` (see `WorkspaceSymbols`); best of `reps`, queries best of
+/// 10 each.
 fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !WorkspaceSymbols {
     var tracker = mahina.mem.TrackingAllocator.init(gpa);
     const ta = tracker.allocator();
-    var cold: u64 = std.math.maxInt(u64);
-    var warm: u64 = std.math.maxInt(u64);
-    var changed: u64 = std.math.maxInt(u64);
-    var unwatched: u64 = std.math.maxInt(u64);
-    var symbols: usize = 0;
-    var live: usize = 0;
-    const body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace/symbol\",\"params\":{\"query\":\"wrk_12\"}}";
+    var store: lsp.host_stdio.DiskStore = .{ .dir = symbols_cache };
+    var r: WorkspaceSymbols = .{
+        .cold = std.math.maxInt(u64),
+        .restart = std.math.maxInt(u64),
+        .narrow = std.math.maxInt(u64),
+        .broad = std.math.maxInt(u64),
+        .changed = std.math.maxInt(u64),
+        .unwatched = std.math.maxInt(u64),
+        .symbols = 0,
+        .live = 0,
+        .peak = 0,
+        .saved_bytes = 0,
+    };
+    const narrow = query("w123_4");
+    const broad = query("w");
     const edited = symbols_dir ++ "/d_0/f_0.mah";
     const report = "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/didChangeWatchedFiles\",\"params\":{\"changes\":[{\"uri\":\"file://" ++ edited ++ "\",\"type\":2}]}}";
     for (0..reps) |rep| {
-        var core = server.Server.init(ta, .{});
-        defer core.deinit();
-        core.files = lsp.host_stdio.disk;
         var out = server.Outbox.init(ta);
         defer out.deinit();
-        try core.handle(0, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"workspace\":{\"didChangeWatchedFiles\":{\"dynamicRegistration\":true}}},\"rootUri\":\"file://" ++ symbols_dir ++ "\"}}", &out);
-        try core.handle(0, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}", &out);
-        for ([_]*u64{ &cold, &warm }) |slot| {
-            out.reset();
+        // No saved index: every file is parsed, and the index saved.
+        std.Io.Dir.cwd().deleteTree(io, symbols_cache) catch {};
+        {
+            tracker.stats.peak_bytes = tracker.stats.live_bytes;
             const t0 = now(io);
-            try core.handle(10, body, &out);
+            var core = try symbolServer(ta, &store, &out);
+            defer core.deinit();
+            try settle(&core, &out);
             const t1 = now(io);
-            if (out.messages().len != 1) return error.NoResponse;
-            slot.* = @min(slot.*, @as(u64, @intCast(t1 - t0)));
+            r.cold = @min(r.cold, @as(u64, @intCast(t1 - t0)));
+            r.peak = @max(r.peak, tracker.stats.peak_bytes);
+            if (core.symbols.truncated) return error.Truncated;
+            if (core.symbols.saves != 1) return error.NotSaved;
         }
-        if (core.symbols.truncated) return error.Truncated;
-
-        var buf: [64]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf, "function edited_{d}() end\n", .{rep});
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = edited, .data = text });
-        const builds = core.symbols.builds;
-        out.reset();
+        // The next session: the saved index loaded, every file stamped, none
+        // parsed.
         const t0 = now(io);
-        try core.handle(20, report, &out);
-        try core.handle(20, body, &out);
+        var core = try symbolServer(ta, &store, &out);
+        defer core.deinit();
+        try settle(&core, &out);
         const t1 = now(io);
-        if (core.symbols.builds != builds + 1) return error.ChangeMissed;
-        changed = @min(changed, @as(u64, @intCast(t1 - t0)));
+        r.restart = @min(r.restart, @as(u64, @intCast(t1 - t0)));
+        if (core.symbols.builds != 0) return error.Reparsed;
+        r.live = tracker.stats.live_bytes;
 
+        for (0..10) |_| {
+            r.narrow = @min(r.narrow, try timedRequest(io, &core, &out, narrow));
+            r.broad = @min(r.broad, try timedRequest(io, &core, &out, broad));
+        }
+        for (0..3) |k| {
+            var buf: [64]u8 = undefined;
+            const text = try std.fmt.bufPrint(&buf, "function edited_{d}_{d}() end\n", .{ rep, k });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = edited, .data = text });
+            const builds = core.symbols.builds;
+            out.reset();
+            const t2 = now(io);
+            try core.handle(20, report, &out);
+            try core.handle(20, narrow, &out);
+            const t3 = now(io);
+            if (core.symbols.builds != builds + 1) return error.ChangeMissed;
+            r.changed = @min(r.changed, @as(u64, @intCast(t3 - t2)));
+        }
         core.watches_files = false;
+        for (0..3) |_| r.unwatched = @min(r.unwatched, try timedRequest(io, &core, &out, narrow));
         out.reset();
-        const t2 = now(io);
-        try core.handle(30, body, &out);
-        const t3 = now(io);
-        unwatched = @min(unwatched, @as(u64, @intCast(t3 - t2)));
-        out.reset();
-        live = tracker.stats.live_bytes;
-        symbols = 0;
-        var it = core.symbols.entries.valueIterator();
-        while (it.next()) |e| symbols += e.*.symbols.len;
+
+        r.symbols = core.symbols.symbolCount();
     }
-    return .{ .cold = cold, .warm = warm, .changed = changed, .unwatched = unwatched, .symbols = symbols, .live = live, .peak = tracker.stats.peak_bytes };
+    var dir = try std.Io.Dir.cwd().openDir(io, symbols_cache, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterateAssumeFirstIteration();
+    while (try it.next(io)) |e| {
+        const st = try dir.statFile(io, e.name, .{});
+        r.saved_bytes += st.size;
+    }
+    return r;
 }
 
 fn open(gpa: std.mem.Allocator, core: *server.Server, out: *server.Outbox, text: []const u8) !void {
@@ -623,31 +695,38 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
 
     mahina.io.print(
         \\
-        \\workspace symbols: `workspace/symbol` over a folder on disk, files of 100 lines (doc 74 §7.4; best of N, ms)
-        \\  warm: a watching client, nothing changed; 1 change: one file rewritten and reported; unwatched: a client that cannot watch
+        \\workspace symbols: a folder on disk, files of 100 lines, the index kept in a cache directory (doc 74 §7.4; best of N, ms)
+        \\  cold / restart: initialize until the index is idle, with no saved index / from the saved one
+        \\  narrow / broad: `workspace/symbol` for a watching client, "w123_4" / "w" (every name matches)
+        \\  1 change: one file rewritten, reported, and the narrow query; unwatched: the narrow query for a client that cannot watch
         \\
-        \\{s: <30} {s: >9} {s: >9} {s: >10} {s: >10} {s: >10} {s: >10} {s: >10} {s: >10}
+        \\{s: <12} {s: >8} {s: >10} {s: >9} {s: >9} {s: >8} {s: >8} {s: >9} {s: >10} {s: >10} {s: >9} {s: >10}
         \\
-    , .{ "folder", "files", "symbols", "cold", "warm", "1 change", "unwatched", "index MiB", "peak MiB" });
+    , .{ "folder", "files", "symbols", "cold", "restart", "narrow", "broad", "1 change", "unwatched", "index MiB", "peak MiB", "saved MiB" });
     defer std.Io.Dir.cwd().deleteTree(io, symbols_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, symbols_cache) catch {};
     const folders = [_]struct { name: []const u8, files: usize, reps: usize }{
         .{ .name = "1k files", .files = 1_000, .reps = 5 },
         .{ .name = "10k files", .files = 10_000, .reps = 3 },
-        .{ .name = "20k files (the cap)", .files = lsp.symbol_index.max_files, .reps = 3 },
+        .{ .name = "100k files", .files = 100_000, .reps = 1 },
     };
+    const mib = 1024.0 * 1024.0;
     for (folders) |f| {
         try writeWorkspace(gpa, io, f.files);
         const got = try workspaceSymbols(gpa, io, f.reps);
-        mahina.io.print("{s: <30} {d: >9} {d: >9} {d: >10.2} {d: >10.2} {d: >10.2} {d: >10.2} {d: >10.1} {d: >10.1}\n", .{
+        mahina.io.print("{s: <12} {d: >8} {d: >10} {d: >9.1} {d: >9.1} {d: >8.2} {d: >8.2} {d: >9.2} {d: >10.2} {d: >10.1} {d: >9.1} {d: >10.1}\n", .{
             f.name,
             f.files,
             got.symbols,
             ms(got.cold),
-            ms(got.warm),
+            ms(got.restart),
+            ms(got.narrow),
+            ms(got.broad),
             ms(got.changed),
             ms(got.unwatched),
-            @as(f64, @floatFromInt(got.live)) / (1024.0 * 1024.0),
-            @as(f64, @floatFromInt(got.peak)) / (1024.0 * 1024.0),
+            @as(f64, @floatFromInt(got.live)) / mib,
+            @as(f64, @floatFromInt(got.peak)) / mib,
+            @as(f64, @floatFromInt(got.saved_bytes)) / mib,
         });
     }
 
