@@ -147,6 +147,14 @@ fn nextStep(comptime by: Stepper, gpa: std.mem.Allocator, t: *Table, ctrl: Value
     return hashStep(by, gpa, t, nctrl);
 }
 
+/// One step of `next` over table `t` for library code that walks a table it was
+/// given (doc 75): the entry after `ctrl` (nil: the first), or null at the end.
+pub fn tableNext(gpa: std.mem.Allocator, t: *Table, ctrl: Value) !?struct { key: Value, val: Value } {
+    const step = try nextStep(.native, gpa, t, ctrl);
+    if (!step.found) return null;
+    return .{ .key = step.key, .val = step.val };
+}
+
 /// `next` over a `row_view` (doc 14): ascending columns `1..stride`, skipping
 /// `nil` holes — a grid row has no hash part. Mirrors the array-part arm of
 /// `nextStep`. Pure (no allocation): cells live in the parent grid's flat buffer.

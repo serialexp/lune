@@ -327,6 +327,12 @@ pub const FakeHost = struct {
     tmp_name: [32]u8 = undefined,
     /// The environment `os.environ` lists: name/value pairs.
     vars: []const [2][]const u8 = &.{},
+    /// What `proc` answers, and a few facts about the last request.
+    proc_result: seam.ProcResult = .{ .fail = .not_found },
+    proc_calls: usize = 0,
+    proc_argc: usize = 0,
+    proc_max_bytes: usize = 0,
+    proc_timeout_ns: ?u64 = null,
 
     pub const FakeFile = struct {
         content: std.ArrayList(u8) = .empty,
@@ -529,6 +535,16 @@ pub const FakeHost = struct {
         return of(ctx).now;
     }
 
+    fn procFn(ctx: *anyopaque, req: seam.ProcRequest) seam.ProcResult {
+        const self = of(ctx);
+        self.calls += 1;
+        self.proc_calls += 1;
+        self.proc_argc = req.argv.len;
+        self.proc_max_bytes = req.max_bytes;
+        self.proc_timeout_ns = req.timeout_ns;
+        return self.proc_result;
+    }
+
     fn environFn(ctx: *anyopaque, visit: seam.EnvVisitFn, visit_ctx: *anyopaque) void {
         const self = of(ctx);
         self.calls += 1;
@@ -573,6 +589,7 @@ pub const FakeHost = struct {
         .wallSeconds = &wallSecondsFn,
         .localZone = &localZoneFn,
         .environ = &environFn,
+        .proc = &procFn,
     };
 
     pub fn system(self: *FakeHost) HostSystem {

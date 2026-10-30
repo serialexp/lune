@@ -1,7 +1,8 @@
 # 75 — Process spawning, and mahina as a shell — Design
 
-Status: partial — Phase 0a (`os.environ`) landed; `proc` itself not yet
-implemented. Review round 1 (Codex, Antigravity,
+Status: partial — Phase 0a (`os.environ`) and Phase 0 (`proc.run` on Linux,
+recorded and replayed) landed; pipelines, handles, the REPL and the other
+platforms not yet. Review round 1 (Codex, Antigravity,
 2026-10-30) folded in; one open question left (Q14b).
 Owner: Bart
 Last updated: 2026-10-30
@@ -61,7 +62,13 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Phase 0 — `proc.run` on Linux, with record/replay.** The call shape
+- [x] **Phase 0 — `proc.run` on Linux, with record/replay.** Landed:
+  `src/proc_host.zig` (spawn, poll pump, TERM→KILL), `src/stdlib/proc.zig`,
+  `EffectKind.proc_run`=20, format v10. The parser has no call sugar
+  (`f{...}`), so examples below that read `proc.run{...}` are written
+  `proc.run({...})` today. The host runs each spawn on a private threadless
+  `Io` over its own allocator, because libmahina's shared `Io` cannot
+  allocate. Original scope: The call shape
   (§3.1), the result (§3.2), failure table (§3.3), `timeout` (§3.4), the
   concurrent pump (§3.5), one new `EffectKind` (`proc_run`), the recording
   rule and budget reservation (§5), a new `proc` host group (§7). Record and

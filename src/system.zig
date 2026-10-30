@@ -37,6 +37,9 @@ pub const Group = enum(u3) {
     /// A host entropy seed for `math.random` (`Vm.random_seed_source`). Off,
     /// `math.random` starts from a fixed seed, so a VM is deterministic.
     random,
+    /// `proc.run` (doc 75): running other programs. Not implied by `files` or
+    /// `env`, and off for an embedder unless it asks.
+    proc,
 };
 
 /// The set of enabled groups. The bit order is the C API's `MH_SYSTEM_*`
@@ -48,10 +51,11 @@ pub const Groups = packed struct(u8) {
     time: bool = false,
     clock: bool = false,
     random: bool = false,
-    _pad: u2 = 0,
+    proc: bool = false,
+    _pad: u1 = 0,
 
     pub const none: Groups = .{};
-    pub const all: Groups = .{ .files = true, .stdio = true, .env = true, .time = true, .clock = true, .random = true };
+    pub const all: Groups = .{ .files = true, .stdio = true, .env = true, .time = true, .clock = true, .random = true, .proc = true };
 
     pub fn has(self: Groups, g: Group) bool {
         return switch (g) {
@@ -61,6 +65,7 @@ pub const Groups = packed struct(u8) {
             .time => self.time,
             .clock => self.clock,
             .random => self.random,
+            .proc => self.proc,
         };
     }
 
@@ -97,6 +102,7 @@ pub const Groups = packed struct(u8) {
                 .time => g.time = true,
                 .clock => g.clock = true,
                 .random => g.random = true,
+                .proc => g.proc = true,
             }
         }
         return g;
@@ -107,7 +113,8 @@ test "Groups.parse" {
     try std.testing.expectEqual(Groups.all, Groups.parse("all").?);
     try std.testing.expectEqual(Groups.none, Groups.parse("none").?);
     const g = Groups.parse("clock,random").?;
-    try std.testing.expect(g.clock and g.random and !g.files and !g.env);
+    try std.testing.expect(g.clock and g.random and !g.files and !g.env and !g.proc);
+    try std.testing.expect(Groups.parse("proc").?.proc);
     try std.testing.expect(Groups.parse("clock,") == null);
     try std.testing.expect(Groups.parse("disk") == null);
     try std.testing.expect(Groups.parse("") == null);
@@ -250,6 +257,11 @@ pub const HostSystem = struct {
         /// this function has an empty environment as far as `os.environ` goes.
         environ: ?*const fn (ctx: *anyopaque, visit: EnvVisitFn, visit_ctx: *anyopaque) void = null,
 
+        // ---- processes ----
+        /// Run a program to completion (doc 75). Blocks. The result's slices
+        /// are valid until the next host call.
+        proc: ?*const fn (ctx: *anyopaque, req: ProcRequest) ProcResult = null,
+
         // ---- time ----
         /// Wall-clock seconds since the Unix epoch.
         wallSeconds: ?*const fn (ctx: *anyopaque) i64 = null,
@@ -257,6 +269,72 @@ pub const HostSystem = struct {
         /// daylight saving. A host without this function is in UTC.
         localZone: ?*const fn (ctx: *anyopaque, utc: i64) LocalZone = null,
     };
+};
+
+/// One variable of a child's environment (doc 75 §3.1).
+pub const ProcEnvPair = struct { name: []const u8, value: []const u8 };
+
+/// What a child's stdin is fed from.
+pub const ProcStdin = union(enum) {
+    /// Empty, and closed.
+    empty,
+    bytes: []const u8,
+    /// A file, opened by the host relative to its own working directory.
+    file: []const u8,
+    /// The parent's stdin (never recordable).
+    inherit,
+};
+
+/// Where a child's stdout or stderr goes.
+pub const ProcOut = enum {
+    /// Captured, keeping the latest `max_bytes`.
+    capture,
+    discard,
+    /// The parent's stream (never recordable).
+    inherit,
+    /// stderr only: into stdout's stream (`2>&1`).
+    merge,
+};
+
+/// One `proc.run` (doc 75 §3.1), resolved: the VM has already checked the
+/// options. The slices are valid for the call.
+pub const ProcRequest = struct {
+    argv: []const []const u8,
+    cwd: ?[]const u8 = null,
+    /// The child's whole environment; null: the host's own.
+    env: ?[]const ProcEnvPair = null,
+    stdin: ProcStdin = .empty,
+    stdout: ProcOut = .capture,
+    stderr: ProcOut = .capture,
+    max_bytes: usize,
+    /// Kill the child's process group after this long; null: never.
+    timeout_ns: ?u64 = null,
+};
+
+/// How a child ended. A signal is its name (`"SIGKILL"`), never its number,
+/// which differs by platform.
+pub const ProcStatus = union(enum) {
+    /// The exit status, full width.
+    exited: u32,
+    signaled: []const u8,
+    /// The call's `timeout` expired and the child was killed.
+    timed_out,
+};
+
+pub const ProcDone = struct {
+    status: ProcStatus,
+    /// The captured bytes (empty when not captured), valid until the next
+    /// host call.
+    stdout: []const u8,
+    stderr: []const u8,
+    /// A captured stream lost earlier bytes to `max_bytes`.
+    truncated: bool,
+};
+
+/// A program that ran, or why it could not be started.
+pub const ProcResult = union(enum) {
+    done: ProcDone,
+    fail: ErrorClass,
 };
 
 /// Called once per variable by `HostSystem.VTable.environ`.

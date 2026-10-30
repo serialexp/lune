@@ -11,6 +11,7 @@ const seam = @import("system.zig");
 const mio = @import("io.zig");
 const datetime = @import("datetime.zig");
 const tzif = @import("tzif.zig");
+const proc_host = @import("proc_host.zig");
 
 const Io = std.Io;
 const HostSystem = seam.HostSystem;
@@ -30,6 +31,8 @@ pub const RealSystem = struct {
     handles: std.AutoHashMapUnmanaged(seam.FileId, *Handle) = .empty,
     /// The local time zone, loaded on the first `localZone` (doc 65 §8).
     zone: ?ZoneSource = null,
+    /// What the last `proc` result points into (doc 75).
+    proc_capture: proc_host.Capture = .{},
 
     /// For the CLI, with the process environment from `Init`.
     pub fn init(gpa: std.mem.Allocator, io: Io, env_map: ?*std.process.Environ.Map) RealSystem {
@@ -38,6 +41,7 @@ pub const RealSystem = struct {
 
     pub fn deinit(self: *RealSystem) void {
         self.dropLast();
+        self.proc_capture.deinit(self.gpa);
         if (self.zone) |*z| z.deinit(self.gpa);
         var it = self.handles.valueIterator();
         while (it.next()) |h| {
@@ -55,6 +59,7 @@ pub const RealSystem = struct {
         .readFile = &readFile,
         .getenv = &getenv,
         .environ = &environ,
+        .proc = if (proc_host.supported) &procRun else null,
         .open = &open,
         .tmpfile = &tmpfile,
         .fill = &fill,
@@ -585,6 +590,18 @@ pub const RealSystem = struct {
         }
     }
 
+    /// `proc.run` (doc 75): the program runs against the CLI's environment map
+    /// when it has one, else the process environment.
+    fn procRun(ctx: *anyopaque, req: seam.ProcRequest) seam.ProcResult {
+        const self = of(ctx);
+        // Starting a child allocates through the Io's own allocator, which the
+        // shared `io` (the C API passes the failing global one) may not have:
+        // so the call runs on a private, threadless Io over this host's gpa.
+        var threaded: std.Io.Threaded = .init(self.gpa, .{ .async_limit = .nothing });
+        defer threaded.deinit();
+        return proc_host.run(self.gpa, threaded.io(), self.env_map, req, &self.proc_capture);
+    }
+
     fn getenv(ctx: *anyopaque, name: []const u8) ?[]const u8 {
         const self = of(ctx);
         if (self.env_map) |m| return m.get(name);
@@ -758,4 +775,54 @@ test "environ lists the environment map" {
     RealSystem.environ(&sys, &Seen.visit, &seen);
     try testing.expectEqual(@as(usize, 2), seen.n);
     try testing.expect(seen.saw_alpha and seen.saw_beta);
+}
+
+test "proc runs a real program: exit code, both streams, stdin, env and cwd" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    const env = [_]seam.ProcEnvPair{.{ .name = "GREETING", .value = "hi" }};
+    const r = RealSystem.procRun(&sys, .{
+        .argv = &.{ "/bin/sh", "-c", "read x; echo \"$x $GREETING $(pwd)\"; echo oops >&2; exit 3" },
+        .cwd = "/",
+        .env = &env,
+        .stdin = .{ .bytes = "line\n" },
+        .max_bytes = 1024,
+    });
+    try testing.expectEqual(@as(u32, 3), r.done.status.exited);
+    try testing.expectEqualStrings("line hi /\n", r.done.stdout);
+    try testing.expectEqualStrings("oops\n", r.done.stderr);
+    try testing.expect(!r.done.truncated);
+}
+
+test "proc keeps the latest bytes, merges stderr, and names a signal" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    const t = RealSystem.procRun(&sys, .{
+        .argv = &.{ "/bin/sh", "-c", "printf 0123456789; printf abc >&2" },
+        .stderr = .merge,
+        .max_bytes = 4,
+    });
+    try testing.expectEqualStrings("9abc", t.done.stdout);
+    try testing.expect(t.done.truncated);
+    const s = RealSystem.procRun(&sys, .{ .argv = &.{ "/bin/sh", "-c", "kill -SEGV $$" }, .max_bytes = 16 });
+    try testing.expectEqualStrings("SIGSEGV", s.done.status.signaled);
+}
+
+test "proc times out a program and everything it started, and reports a missing one" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    const env = [_]seam.ProcEnvPair{.{ .name = "X", .value = "1" }};
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    const t = RealSystem.procRun(&sys, .{
+        .argv = &.{ "/bin/sh", "-c", "sleep 30 & wait" },
+        .env = &env,
+        .stdin = .{ .bytes = "" },
+        .max_bytes = 16,
+        .timeout_ns = 100_000_000,
+    });
+    try testing.expect(t.done.status == .timed_out);
+    const m = RealSystem.procRun(&sys, .{ .argv = &.{"/no/such/program"}, .max_bytes = 16 });
+    try testing.expectEqual(seam.ErrorClass.not_found, m.fail);
 }

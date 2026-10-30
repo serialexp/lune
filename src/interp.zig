@@ -54,6 +54,7 @@ const stdload = @import("stdlib/load.zig");
 const stdpackage = @import("stdlib/package.zig");
 const stdio = @import("stdlib/io.zig");
 const stdos = @import("stdlib/os.zig");
+const stdproc = @import("stdlib/proc.zig");
 const stdcoroutine = @import("stdlib/coroutine.zig");
 const stdaio = @import("stdlib/aio.zig");
 const File = @import("file.zig").File;
@@ -126,6 +127,11 @@ pub const Error = error{
     /// so the same logged results would be observed differently. Fatal like
     /// `UnicodeVersionMismatch`.
     IoErrorModeMismatch,
+    /// Doc 75 §5: a `proc.run` that no recording could replay (stdio the
+    /// program inherits) was called while recording or replaying. Fatal: a
+    /// recording never holds what it cannot replay, and a program that
+    /// caught this would behave differently with and without one.
+    ProcNotRecordable,
     /// Doc 65 §7: `os.exit` ended the program, with `Vm.exit_status`. Not
     /// an error but an unwind no `pcall` may stop; the host that ran the
     /// program turns it into its own ending (the CLI's process status, the
@@ -264,7 +270,7 @@ pub const mahina_version = "mahina 0.0.0";
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
     stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives ++
     stddebug.natives ++ stdload.natives ++ stdpackage.natives ++ stdio.natives ++ stdos.natives ++
-    stdcoroutine.natives ++ stdaio.natives;
+    stdproc.natives ++ stdcoroutine.natives ++ stdaio.natives;
 
 comptime {
     // `pure ⇒ !effect` (doc 17, H-4 / 9-A(i)). `pure` and `effect` are independent
@@ -2742,6 +2748,10 @@ pub const Vm = struct {
                 "the effect log reached its limit of {d} bytes; raise the limit (--effect-log-limit <bytes>, 0 for none)",
                 .{self.effect_log_limit},
             ),
+            .self_located = true,
+        };
+        if (err == Error.ProcNotRecordable) return .{
+            .message = try arena.dupe(u8, "this proc.run inherits the terminal's stdio, which a recording cannot replay; capture or discard it, or run without --emit-effects"),
             .self_located = true,
         };
         if (err == Error.IoErrorModeMismatch) return .{
@@ -11770,6 +11780,7 @@ fn narrowError(e: anyerror) Error {
         error.UnicodeVersionMismatch => Error.UnicodeVersionMismatch,
         error.EffectLogLimit => Error.EffectLogLimit,
         error.IoErrorModeMismatch => Error.IoErrorModeMismatch,
+        error.ProcNotRecordable => Error.ProcNotRecordable,
         error.Exit => Error.Exit,
         else => Error.HostError,
     };
@@ -11801,6 +11812,7 @@ pub fn catchable(e: Error) bool {
         Error.UnicodeVersionMismatch,
         Error.EffectLogLimit,
         Error.IoErrorModeMismatch,
+        Error.ProcNotRecordable,
         Error.Exit,
         // A top-level `run`/`start` contract violation — it can never surface inside
         // a `pcall`/`xpcall` (those don't re-enter top-level), so it is unreachable
@@ -12419,6 +12431,7 @@ test {
     _ = @import("interp_effects_test.zig");
     _ = @import("interp_io_test.zig");
     _ = @import("interp_os_test.zig");
+    _ = @import("interp_proc_test.zig");
     _ = @import("interp_lua_compat_test.zig");
     _ = @import("interp_modules_test.zig");
     _ = @import("interp_replay_test.zig");

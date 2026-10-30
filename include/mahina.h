@@ -119,7 +119,8 @@ typedef uint64_t mh_ref;
 #define MH_SYSTEM_TIME   (1u << 3) /* os.time, os.date */
 #define MH_SYSTEM_CLOCK  (1u << 4) /* os.clock, os.nsclock */
 #define MH_SYSTEM_RANDOM (1u << 5) /* an OS seed for math.random (off: fixed seed) */
-#define MH_SYSTEM_ALL    0x3Fu
+#define MH_SYSTEM_PROC   (1u << 6) /* proc.run: running other programs */
+#define MH_SYSTEM_ALL    0x7Fu
 
 /* VM creation options. Zero-initialize (or pass NULL) for defaults.
  * jit: 0 = default (on), 1 = on, 2 = off.

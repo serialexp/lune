@@ -466,6 +466,9 @@ pub const EffectKind = enum(u8) {
     /// (a count, then length-prefixed name/value pairs sorted by name; see
     /// `stdlib/os.zig`), rebuilt into a fresh table in every mode.
     environ = 19,
+    /// Doc 75 §4: `proc.run`. One byte record (how it ended, whether bytes
+    /// were dropped, the captured stdout and stderr), or a start failure.
+    proc_run = 20,
 };
 
 /// Doc 63 §5.9 (Q4): the disturb count at which a native stops being traced.
