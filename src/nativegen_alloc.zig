@@ -191,6 +191,18 @@ pub const Alloc = struct {
     // site's guard immediately follows its call. Null without host calls.
     host_epoch_save: ?u32 = null,
 
+    // --- const-key arefs (doc 63 §5.10.7 follow-up) ---
+    // The trace this allocation describes, so `refBaseReg` can materialize a
+    // const-key aref's index as an immediate (`prove.arefConstIdx`) — such an
+    // aref has no `loc`. Null in an allocation that never names one.
+    trace: ?*const Trace = null,
+
+    /// The immediate index of `ref` when it is a const-key aref here.
+    pub fn arefImm(self: *const Alloc, ref: usize) ?u32 {
+        const t = self.trace orelse return null;
+        return prove.arefConstIdx(t, ref);
+    }
+
     pub fn deinit(self: *Alloc, gpa: std.mem.Allocator) void {
         gpa.free(self.loc);
         gpa.free(self.last_use);
@@ -863,7 +875,8 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             const ins = t.instrs[i];
             const rd = operandReads(ins);
             if (rd.a and last_use[ins.a] < i) last_use[ins.a] = @intCast(i);
-            if (rd.b and last_use[ins.b] < i) last_use[ins.b] = @intCast(i);
+            // A const-key aref's key is an immediate (`prove.arefConstIdx`).
+            if (rd.b and last_use[ins.b] < i and prove.arefConstIdx(t, i) == null) last_use[ins.b] = @intCast(i);
         }
     }
     // The value feeding ANY φ's back-edge update (slot-bound OR internal) must survive
@@ -1294,6 +1307,9 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // and nothing reads its loc, so it takes no register. Handing it one,
         // even for a single instruction, would shift every later pick.
         if (kinds[i] == .none) continue;
+        // A const-key aref is an immediate wherever it is read (`refBaseReg`
+        // via `Alloc.trace`), so it takes no register either.
+        if (prove.arefConstIdx(t, i) != null) continue;
         // expire GP transients whose last use precedes i
         var w: usize = 0;
         for (active[0..active_len]) |e| {
@@ -1571,6 +1587,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         .div_save = div_save,
         .tnew_out = tnew_out,
         .host_epoch_save = host_epoch_save,
+        .trace = t,
     };
 }
 
@@ -1695,6 +1712,8 @@ pub fn slotHomePlace(s: SlotInfo) Place {
 /// Where ref `r`'s value lives — its linear-scan-assigned register or frame slot.
 /// A `slot_load` ref resolves to its slot home (its `loc` was set to that home).
 pub fn placeOfRef(alloc: *const Alloc, r: usize) Place {
+    // A const-key aref has no loc; its readers go through `refBaseReg`.
+    std.debug.assert(alloc.arefImm(r) == null);
     return locToPlace(alloc.loc[r]);
 }
 

@@ -95,6 +95,12 @@ pub fn regToPlace(a: *x64.Assembler, dst: Place, src: Reg) !void {
 /// that register. A register home is used directly; a spilled home is loaded into
 /// `scratch` (rax). Used for the invariant table pointer at each array op.
 pub fn refBaseReg(a: *x64.Assembler, alloc: *const Alloc, ref: usize, scratch: Reg) !Reg {
+    // A const-key aref: its index is an immediate (the spilled-token load,
+    // with the value baked in).
+    if (alloc.arefImm(ref)) |k| {
+        try a.movRegImm32(scratch, k);
+        return scratch;
+    }
     switch (placeOfRef(alloc, ref)) {
         .reg => |r| return r,
         .mem => |d| {
@@ -103,6 +109,21 @@ pub fn refBaseReg(a: *x64.Assembler, alloc: *const Alloc, ref: usize, scratch: R
         },
         .xmm => unreachable, // array-path operands are int/ptr, never float
     }
+}
+
+/// A constant-key aref's element displacement in a lane of width `w`
+/// (`[data + k*w]`). `k <= prove.AREF_IMM_MAX`, so it fits easily.
+pub fn arefImmDisp(k: u32, w: u8) i32 {
+    return @intCast(@as(i64, k) * w);
+}
+
+/// The presence-bitmap qword holding key `k`'s bit, and the bit within it
+/// (the immediate `bt`/`bts` forms address one qword only).
+pub fn presenceQwordDisp(k: u32) i32 {
+    return @intCast((k >> 6) * 8);
+}
+pub fn presenceBit(k: u32) u6 {
+    return @truncate(k);
 }
 
 /// [Phase 2] The register holding an invariant array base pointer (`data` or
@@ -2480,6 +2501,7 @@ pub fn emitHStore(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, i
 /// so the scalar lanes skip the presence-bit set.
 pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr, presence_proven: bool) !void {
     const aref_ins = t.instrs[ins.a];
+    if (alloc.arefImm(ins.a)) |k| return emitAStoreConst(a, kinds, alloc, aref_ins, ins, k, presence_proven);
     if (ins.aux == VALUE_LANE) {
         // doc 32: `.value`-lane store — write a full tagged Value (tag byte + 8-byte
         // payload) and **no presence bit**; the lane has no bitmap (nil is in-band,
@@ -2547,6 +2569,44 @@ pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc
         const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.btsMemReg(preg, 0, pireg);
     }
+}
+
+/// `emitAStore` at a constant key `k`: every lane addresses `[data + k*w]`
+/// directly and the presence bit is the immediate `bts` form, so neither the
+/// index nor an element address needs a register.
+fn emitAStoreConst(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, aref_ins: trace.IrInstr, ins: trace.IrInstr, k: u32, presence_proven: bool) !void {
+    if (ins.aux == VALUE_LANE) {
+        // The data base goes to rcx (never a home), leaving rax for the value.
+        const off = arefImmDisp(k, 16);
+        if (kinds[ins.b] == .float) {
+            try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rcx);
+            try a.movByteMemImm(datareg, off + VALUE_TAG_OFF, TAG_FLOAT);
+            try a.movsdMemReg(datareg, off + VALUE_PAYLOAD_OFF, XMM_SCRATCH0);
+        } else {
+            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rcx);
+            try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
+            try a.movByteMemImm(datareg, off + VALUE_TAG_OFF, TAG_INT);
+            try a.storeMemReg(datareg, 8, off + VALUE_PAYLOAD_OFF, .rax);
+        }
+        return;
+    }
+    if (ins.aux == F64_LANE) {
+        try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        try a.movsdMemReg(datareg, arefImmDisp(k, 8), XMM_SCRATCH0);
+    } else {
+        // The value goes to rcx: the data base may be the rax fallback.
+        const w: u8 = if (ins.aux == BOOL_LANE) 1 else intLaneWidth(ins.aux);
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
+        if (ins.aux == BOOL_LANE) try a.incReg(.rcx); // 0→1 (false), 1→2 (true)
+        try a.storeMemReg(datareg, w, arefImmDisp(k, w), .rcx);
+        if (ins.aux == BOOL_LANE) return; // presence is in-band
+    }
+    if (presence_proven) return;
+    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+    try a.btsMemImm8(preg, presenceQwordDisp(k), presenceBit(k));
 }
 
 pub fn emitGStore(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, ins: trace.IrInstr) !void {

@@ -247,6 +247,13 @@ pub const Assembler = struct {
 
     /// `mov reg, imm64` — REX.W + B8+rd + imm64 (always the full 10-byte form, so a
     /// negative i64 constant is exact).
+    /// `mov r32, imm32` — B8+r id; zero-extends into the full register.
+    pub fn movRegImm32(self: *Assembler, reg: Reg, v: u32) !void {
+        try self.rex(false, false, false, reg.hi());
+        try self.b(0xB8 + @as(u8, reg.lo()));
+        try self.imm32(@bitCast(v));
+    }
+
     pub fn movRegImm64(self: *Assembler, reg: Reg, v: i64) !void {
         try self.rex(true, false, false, reg.hi());
         try self.b(0xB8 + @as(u8, reg.lo()));
@@ -403,6 +410,39 @@ pub const Assembler = struct {
         try self.modrmMemSib(dst.lo(), base, index, sibScale(lane_width), disp);
     }
 
+    /// `loadRegMemSib` without an index: load `width` bytes at `[base + disp]`,
+    /// extending to the full 64-bit `dst`. Same width encodings. A constant-key
+    /// array read folds its index into `disp`.
+    pub fn loadRegMem(self: *Assembler, dst: Reg, base: Reg, lane_width: u8, signed: bool, disp: i32) !void {
+        switch (lane_width) {
+            1 => {
+                try self.rex(true, dst.hi(), false, base.hi());
+                try self.b(0x0F);
+                try self.b(if (signed) 0xBE else 0xB6);
+            },
+            2 => {
+                try self.rex(true, dst.hi(), false, base.hi());
+                try self.b(0x0F);
+                try self.b(if (signed) 0xBF else 0xB7);
+            },
+            4 => {
+                if (signed) {
+                    try self.rex(true, dst.hi(), false, base.hi());
+                    try self.b(0x63);
+                } else {
+                    try self.rex(false, dst.hi(), false, base.hi());
+                    try self.b(0x8B);
+                }
+            },
+            8 => {
+                try self.rex(true, dst.hi(), false, base.hi());
+                try self.b(0x8B);
+            },
+            else => unreachable,
+        }
+        try self.modrmMem(dst.lo(), base, disp);
+    }
+
     /// `mov <width> [base + index*width + disp], src` — store the low `width`
     /// bytes of `src` into a packed element. Forms:
     ///   1: 88 /r (REX forced when src ∈ rsi/rdi/rbp/rsp so it isn't ah/ch/dh/bh)
@@ -493,6 +533,24 @@ pub const Assembler = struct {
     }
     pub fn btrMemReg(self: *Assembler, base: Reg, disp: i32, idx: Reg) !void {
         try self.btGroup(0xB3, base, disp, idx);
+    }
+
+    /// `bt/bts qword [base + disp], imm8` — REX.W 0F BA /4 (bt) / /5 (bts) ib.
+    /// Unlike the register form, an immediate bit offset is taken modulo 64, so
+    /// it addresses only the one qword at `[base+disp]`: the caller folds the
+    /// qword index into `disp` (`(k >> 6) * 8`) and passes `k & 63`.
+    fn btGroupImm(self: *Assembler, ext: u3, base: Reg, disp: i32, bit: u6) !void {
+        try self.rex(true, false, false, base.hi());
+        try self.b(0x0F);
+        try self.b(0xBA);
+        try self.modrmMem(ext, base, disp);
+        try self.b(bit);
+    }
+    pub fn btMemImm8(self: *Assembler, base: Reg, disp: i32, bit: u6) !void {
+        try self.btGroupImm(4, base, disp, bit);
+    }
+    pub fn btsMemImm8(self: *Assembler, base: Reg, disp: i32, bit: u6) !void {
+        try self.btGroupImm(5, base, disp, bit);
     }
 
     // ---- integer ALU (reg, reg) -------------------------------------------------
@@ -743,6 +801,15 @@ pub const Assembler = struct {
         try self.b(0x83);
         try self.modrmMem(7, base, disp);
         try self.b(@bitCast(v));
+    }
+
+    /// `cmp qword [base + disp], imm32` — REX.W 81 /7 id (imm sign-extended). A
+    /// constant-key `guard_bounds` against the table's `asize` field.
+    pub fn cmpQwordMemImm32(self: *Assembler, base: Reg, disp: i32, v: i32) !void {
+        try self.rex(true, false, false, base.hi());
+        try self.b(0x81);
+        try self.modrmMem(7, base, disp);
+        try self.imm32(v);
     }
 
     /// `cmp dword [base + disp], imm32` — 81 /7 id (32-bit operand, no REX.W). The
@@ -1305,6 +1372,54 @@ test "enc: bt / bts / btr [mem], reg" {
     try expectEnc(&.{ 0x4D, 0x0F, 0xA3, 0x08 }, struct {
         fn f(a: *Assembler) !void {
             try a.btMemReg(.r8, 0, .r9);
+        }
+    }.f);
+}
+
+test "enc: bt / bts qword [mem], imm8" {
+    // bt qword [rdi+8], 5 — REX.W 0F BA /4 ib
+    try expectEnc(&.{ 0x48, 0x0F, 0xBA, 0x67, 0x08, 0x05 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.btMemImm8(.rdi, 8, 5);
+        }
+    }.f);
+    // bts qword [r15], 63 — REX.W+B 0F BA /5 ib
+    try expectEnc(&.{ 0x49, 0x0F, 0xBA, 0x2F, 0x3F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.btsMemImm8(.r15, 0, 63);
+        }
+    }.f);
+}
+
+test "enc: loadRegMem (no index) and cmp qword [mem], imm32" {
+    // movsx rax, byte [r15+3]
+    try expectEnc(&.{ 0x49, 0x0F, 0xBE, 0x47, 0x03 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMem(.rax, .r15, 1, true, 3);
+        }
+    }.f);
+    // movzx rax, word [rdi+0x200]
+    try expectEnc(&.{ 0x48, 0x0F, 0xB7, 0x87, 0x00, 0x02, 0x00, 0x00 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMem(.rax, .rdi, 2, false, 0x200);
+        }
+    }.f);
+    // movsxd rax, dword [rdi]
+    try expectEnc(&.{ 0x48, 0x63, 0x07 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMem(.rax, .rdi, 4, true, 0);
+        }
+    }.f);
+    // mov r9, qword [r13] — base lo=5 forces disp8 0
+    try expectEnc(&.{ 0x4D, 0x8B, 0x4D, 0x00 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMem(.r9, .r13, 8, false, 0);
+        }
+    }.f);
+    // cmp qword [rax+0x28], 7 — REX.W 81 /7 id
+    try expectEnc(&.{ 0x48, 0x81, 0x78, 0x28, 0x07, 0x00, 0x00, 0x00 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.cmpQwordMemImm32(.rax, 0x28, 7);
         }
     }.f);
 }

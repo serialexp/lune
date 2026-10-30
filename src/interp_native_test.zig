@@ -206,6 +206,42 @@ test "aref CSE: a store into a hole sets presence; a store behind a read of its 
     , "10575\t51\tnil\t58\n");
 }
 
+test "native: constant-key reads and writes on a .value-lane array compile and match" {
+    // `t[1]`/`t[3]` address `[data + k*16]` with no index register: the tag
+    // check, the int and float payload loads, and both tagged stores.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const src =
+        \\local t = {1, "x", 2.5}
+        \\local s = 0
+        \\for i = 1, 100 do s = s + t[1] + t[3] t[1] = i t[3] = i * 0.5 end
+        \\print(s, t[1], t[2], t[3])
+    ;
+    const want = "7428.5\t100\tx\t50\n";
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.coverage = true;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa, src, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(want, sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
+    // A misaddressed element fails its tag check and still prints the right
+    // answer through tier-0; the loop must stay on the trace instead.
+    var traced: u64 = 0;
+    var fallback: u64 = 0;
+    var it = vm.trace.coverage.iterator();
+    while (it.next()) |e| {
+        traced +|= e.value_ptr.traced;
+        fallback +|= e.value_ptr.fallback;
+    }
+    try testing.expectEqual(@as(u64, 0), fallback);
+    try testing.expect(traced > 0);
+    try expectProgram(src, want);
+}
+
 test "native: a string rotation compiles (typed carried loads, guard_string)" {
     // A carried string whose write-back is another pinned slot's load.
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;

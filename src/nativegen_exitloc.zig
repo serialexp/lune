@@ -207,6 +207,8 @@ fn row(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ref: usize) Ex
     }
     // Any other non-transient value (a φ, …) has no place the map can name.
     if (!ngalloc.isTransient(ins.op)) return out;
+    // Nor does a const-key aref: it is an immediate (`prove.arefConstIdx`).
+    if (alloc.arefImm(ref) != null) return out;
     setPlace(&out, alloc.loc[ref]);
     var until: usize = alloc.last_use[ref];
     // At its last use the value's register may be handed straight to the

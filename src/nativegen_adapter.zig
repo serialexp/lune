@@ -39,6 +39,7 @@ const trace_code = @import("trace_code.zig");
 const trace_exec = @import("trace_exec.zig");
 const artifact = @import("nativegen_artifact.zig");
 const ngalloc = @import("nativegen_alloc.zig");
+const prove = @import("nativegen_prove.zig");
 const emit = @import("nativegen_emit.zig");
 const mcode = @import("nativegen_mcode.zig");
 const exit_attach = @import("trace_exit_attach.zig");
@@ -215,6 +216,9 @@ fn emitAdapter(
         if (!want) continue;
         const ins = t.instrs[ref];
         const row = map.find(ref);
+        // A const-key aref has no place; `refBaseReg` rebuilds its index from
+        // the trace (the Alloc below carries it), like a konst.
+        if (prove.arefConstIdx(t, ref) != null) continue;
         switch (ins.op) {
             .konst, .uref => {
                 if (next_spill >= mcode.SPILL_MAX) return .at(.spill, ref);
@@ -254,6 +258,7 @@ fn emitAdapter(
         .slots = &.{},
         .spill_count = next_spill,
         .used_callee_saved = 0,
+        .trace = t,
     };
 
     // 1. The earlier bytecodes' sunk stores, in stream order.

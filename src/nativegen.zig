@@ -1779,6 +1779,8 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // The table pointer is reached lazily by each consumer through `aref.a`
             // (the invariant table home), so aref itself touches only the index.
             .aref => {
+                // A const-key aref is an immediate at each reader: no code here.
+                if (alloc.arefImm(i) != null) continue;
                 const dst = placeOfRef(alloc, i);
                 const idxp = placeOfRef(alloc, ins.b);
                 switch (dst) {
@@ -1796,11 +1798,23 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // is shared by bounds/present/aload. [I4] precedes guard_present.
             .guard_bounds => {
                 const aref_ins = t.instrs[ins.a];
-                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                 // [Phase 2] compare against the hoisted `len` register if we have one
                 // (reg-reg), else the per-iteration `[tbreg+len]` load.
                 const sid = alloc.slot_id_of_ref[aref_ins.a];
                 const lenhome: ?Reg = if (sid >= 0) alloc.slots[@intCast(sid)].len_home else null;
+                if (alloc.arefImm(ins.a)) |k| {
+                    // A constant key compares asize against the immediate:
+                    // asize <=u k is the miss.
+                    if (lenhome) |lr| {
+                        try a.cmpRegImm32(lr, @intCast(k));
+                    } else {
+                        const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                        try a.cmpQwordMemImm32(tbreg, ArrLayout.array_base + ArrLayout.asize, @intCast(k));
+                    }
+                    try jccNativeExit(a, exit_labels, i, .be);
+                    continue;
+                }
+                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                 if (lenhome) |lr| {
                     try a.cmpRegReg(ireg, lr);
                 } else {
@@ -1816,9 +1830,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             //   - int/float lanes: a separate presence bitmap — `bt [present], idx0`.
             .guard_present => {
                 const aref_ins = t.instrs[ins.a];
+                const imm = alloc.arefImm(ins.a);
                 if (aref_ins.aux == BOOL_LANE) {
                     // [Phase 2] data base from its hoisted home (or a per-iter load).
                     const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    if (imm) |k| {
+                        try a.cmpByteMemImm(datareg, emit.arefImmDisp(k, 1), 0);
+                        try jccNativeExit(a, exit_labels, i, .e);
+                        continue;
+                    }
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                     try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
                     try a.cmpRegImm32(.rax, 0);
@@ -1826,8 +1846,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 } else {
                     // [Phase 2] present-bitmap base from its hoisted home (or per-iter load).
                     const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
-                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.btMemReg(preg, 0, ireg);
+                    if (imm) |k| {
+                        try a.btMemImm8(preg, emit.presenceQwordDisp(k), emit.presenceBit(k));
+                    } else {
+                        const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                        try a.btMemReg(preg, 0, ireg);
+                    }
                     try jccNativeExit(a, exit_labels, i, .ae); // CF==0 → hole → side-exit
                 }
             },
@@ -1870,12 +1894,21 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     // into scratch rcx FIRST, then fetch the data base, then add: rcx
                     // is never a home (`BASE_HOME_ORDER` starts at r15) so nothing can
                     // alias it, and `arrayFieldReg`'s fallback only writes rax.
-                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.movRegReg(.rcx, ireg); // rcx = idx0
-                    try a.shlRegImm8(.rcx, 4); // rcx = idx0 * 16
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
-                    try a.addRegReg(.rcx, datareg); // rcx = &data[idx0] (Value*)
-                    try a.cmpByteMemImm(.rcx, VALUE_TAG_OFF, want_tag);
+                    // A constant key addresses `[data + k*16]` straight off the
+                    // data base (fetched into rcx, which nothing homes in).
+                    var elem: Reg = .rcx;
+                    var off: i32 = 0;
+                    if (alloc.arefImm(ins.a)) |k| {
+                        elem = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rcx);
+                        off = emit.arefImmDisp(k, 16);
+                    } else {
+                        const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                        try a.movRegReg(.rcx, ireg); // rcx = idx0
+                        try a.shlRegImm8(.rcx, 4); // rcx = idx0 * 16
+                        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                        try a.addRegReg(.rcx, datareg); // rcx = &data[idx0] (Value*)
+                    }
+                    try a.cmpByteMemImm(elem, off + VALUE_TAG_OFF, want_tag);
                     try jccNativeExit(a, exit_labels, i, .ne); // type changed → side-exit
                     if (kinds[i] == .float) {
                         // The payload is the raw 8-byte double — `movsd` it into the
@@ -1884,9 +1917,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         // no FP rounding in a load, so 8-mode parity is inherited and
                         // NaN payloads survive.
                         switch (placeOfRef(alloc, i)) {
-                            .xmm => |x| try a.movsdRegMem(x, .rcx, VALUE_PAYLOAD_OFF),
+                            .xmm => |x| try a.movsdRegMem(x, elem, off + VALUE_PAYLOAD_OFF),
                             .mem => |d| {
-                                try a.movsdRegMem(XMM_SCRATCH0, .rcx, VALUE_PAYLOAD_OFF);
+                                try a.movsdRegMem(XMM_SCRATCH0, elem, off + VALUE_PAYLOAD_OFF);
                                 try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
                             },
                             .reg => unreachable, // a float never homes in a GP register
@@ -1894,12 +1927,33 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     } else {
                         // .heap → the *GcHeader; .int → the i64. Same 8-byte payload
                         // load either way.
-                        try a.movRegMem(.rax, .rcx, VALUE_PAYLOAD_OFF);
+                        try a.movRegMem(.rax, elem, off + VALUE_PAYLOAD_OFF);
                         try regToPlace(a, placeOfRef(alloc, i), .rax);
                     }
                 } else {
                     // Scalar lanes: data base from hoisted home (or per-iter load).
                     const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    if (alloc.arefImm(ins.a)) |k| {
+                        // A constant key: the element is `[data + k*w]`.
+                        if (ins.aux == F64_LANE) {
+                            const off = emit.arefImmDisp(k, 8);
+                            switch (placeOfRef(alloc, i)) {
+                                .xmm => |x| try a.movsdRegMem(x, datareg, off),
+                                .mem => |d| {
+                                    try a.movsdRegMem(XMM_SCRATCH0, datareg, off);
+                                    try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
+                                },
+                                .reg => unreachable,
+                            }
+                        } else {
+                            const w: u8 = if (ins.aux == BOOL_LANE or ins.aux == U8_LANE) 1 else intLaneWidth(ins.aux);
+                            const signed = !(ins.aux == BOOL_LANE or ins.aux == U8_LANE);
+                            try a.loadRegMem(.rax, datareg, w, signed, emit.arefImmDisp(k, w));
+                            if (ins.aux == BOOL_LANE) try a.subRegImm32(.rax, 1);
+                            try regToPlace(a, placeOfRef(alloc, i), .rax);
+                        }
+                        continue;
+                    }
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                     if (ins.aux == F64_LANE) {
                         // f64 lane: load the raw 8-byte double at `[data + idx0*8]` into
@@ -2088,50 +2142,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // as-is; a spilled home is reloaded fresh into rax) for the len bump.
             .astore_append => {
                 const aref_ins = t.instrs[ins.a];
-                if (ins.aux == F64_LANE) {
-                    // f64 lane (doc 47): identical to the in-bounds F64_LANE astore —
-                    // stage the value into XMM_SCRATCH0 FIRST (`arrayFieldReg`/
-                    // `refBaseReg` may hand back rax/rcx, so the float must leave its
-                    // possibly-scratch-backed home before either address helper runs),
-                    // then movsd the data slot and set the presence bit. Like the int
-                    // lanes, f64 keeps a per-slot presence bitmap, so this is two
-                    // stores; both land before the len bump below publishes the slot.
-                    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
-                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, datareg, ireg, 8, 0); // rax = &data[idx0]
-                    try a.movsdMemReg(.rax, 0, XMM_SCRATCH0);
-                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
-                    const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.btsMemReg(preg, 0, pireg);
-                } else if (ins.aux == BOOL_LANE) {
-                    // bool-lane byte store, identical to the in-bounds astore bool path.
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
-                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, datareg, ireg, 1, 0); // rax = &data[idx0]
-                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value 0/1 → rcx
-                    try a.incReg(.rcx); // 0→1 (false), 1→2 (true)
-                    try a.storeMemReg(.rax, 1, 0, .rcx); // mov byte [rax], cl
-                } else {
-                    // int lane (i8…i64): identical to the in-bounds astore int path —
-                    // width-truncating data store (guard_fits proved it fits) followed
-                    // by the presence bit. Unlike the bool byte, the presence bitmap is
-                    // a *separate* write, so this is two stores; both must land before
-                    // the len bump publishes the slot as live.
-                    const w = intLaneWidth(ins.aux);
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
-                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, datareg, ireg, w, 0); // rax = &data[idx0]
-                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
-                    try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
-                    // presence bit: bts [present], idx0. [I5] commit point for the
-                    // absent→present transition (recArraySet refuses nil/out-of-lane,
-                    // so this never clears). Re-materialize present base + idx0 (the
-                    // data store clobbered rax/rcx if they were the fallback homes).
-                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
-                    const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.btsMemReg(preg, 0, pireg);
-                }
+                // The lane store is the in-bounds astore's, presence bit included:
+                // bool's in-band byte, int's width-truncating store (guard_fits
+                // proved it fits) or f64's movsd (doc 47), then `bts [present],
+                // idx0` — [I5] the absent→present commit point (recArraySet refuses
+                // nil/out-of-lane, so it never clears). Every store lands before
+                // the len bump below publishes the slot.
+                try emitAStore(a, t, kinds, alloc, ins, false);
                 // len += 1, in place in the table struct (no len_home for appends). The
                 // table pointer is re-fetched into rax (the value/presence stores above
                 // clobbered it). Bumping len LAST publishes the fully-written slot —

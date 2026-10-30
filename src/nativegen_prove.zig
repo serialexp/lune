@@ -81,7 +81,8 @@ fn markBodyReads(t: *const Trace, body_read: []bool) void {
     for (t.instrs, 0..) |ins, i| {
         const reads = operandReads(ins);
         if (reads.a) markRead(body_read, ins.a, i);
-        if (reads.b) markRead(body_read, ins.b, i);
+        // A const-key aref's key is an immediate, not a read (`arefConstIdx`).
+        if (reads.b and arefConstIdx(t, i) == null) markRead(body_read, ins.b, i);
         // A φ mentioning a ref anywhere (writeback `b`, internal init /
         // steady association `a`) is a use. A slot-bound φ's `a` is zero
         // when it has no steady association (`analyzeInner` reads it the
@@ -102,6 +103,31 @@ fn markBodyReads(t: *const Trace, body_read: []bool) void {
         if ((ins.op == .ssub or ins.op == .scp or ins.op == .sfindp or ins.op == .smatch) and
             ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < n) markRead(body_read, @intCast(ins.aux), i);
     }
+}
+
+/// The largest index a const-key `aref` folds into an immediate. `idx0 * 16`
+/// (the `.value` lane's stride, the widest) plus a field offset stays far
+/// inside a disp32.
+pub const AREF_IMM_MAX: i64 = 1 << 24;
+
+/// The immediate `idx0` of a CONST-KEY `aref` — one whose key is an int konst
+/// in `[0, AREF_IMM_MAX]` — or null. Such an aref has no home: every consumer
+/// reaches its index through `refBaseReg`, which materializes the immediate
+/// (`Alloc.trace`), so the key konst is not a body read either and, with no
+/// other reader, takes no home (`.none`). A pure function of the trace, so
+/// proveKinds, the allocator, lowering, the exit map and the exit adapter all
+/// decide identically. (A negative key stays on the general path: its
+/// unsigned bounds check exits.)
+pub fn arefConstIdx(t: *const Trace, ref: usize) ?u32 {
+    const ins = t.instrs[ref];
+    if (ins.op != .aref or ins.b >= ref) return null;
+    const k = t.instrs[ins.b];
+    if (k.op != .konst or k.aux < 0 or k.aux >= t.consts.len) return null;
+    const v = t.consts[@intCast(k.aux)];
+    if (!v.isInt()) return null;
+    const x = v.asInt();
+    if (x < 0 or x > AREF_IMM_MAX) return null;
+    return @intCast(x);
 }
 
 fn markRead(body_read: []bool, ref: usize, reader: usize) void {
@@ -1120,7 +1146,10 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             // form (below), never the prologue.
             .aref => {
                 if (ins.a >= i or ins.b >= i) return false;
-                if ((kinds[ins.a] != .ptr and kinds[ins.a] != .heap) or kinds[ins.b] != .int) return false;
+                if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
+                // The key is an int value, or a const key folded to an
+                // immediate (`arefConstIdx`; its konst may then be `.none`).
+                if (kinds[ins.b] != .int and arefConstIdx(t, i) == null) return false;
                 if (ins.aux != VALUE_LANE and laneKind(ins.aux) == null) return false;
                 // Task #29: the aref's lane must be the one a DOMINATING
                 // guard_lane on ITS root proved at runtime. An aref may never

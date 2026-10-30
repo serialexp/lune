@@ -604,6 +604,120 @@ test "nativegen: f64-lane astore deopt-replay leaves a deterministic heap (idemp
     try expectTablesEqual(t_replay, t_once, K);
 }
 
+/// Element `i` of the constant-key test table for `lane`: alternating signs on
+/// the signed lanes (exercising sign extension), `bump` pinning the widest value.
+fn constKeyElem(lane: arr.Lane, i: i64) Value {
+    return switch (lane) {
+        .boolean => Value.boolean(@rem(i, 3) != 0),
+        .f64 => Value.float(@as(f64, @floatFromInt(i)) * 0.5),
+        .u8 => Value.int(i + 100),
+        else => Value.int(if (@rem(i, 2) == 0) i else -i),
+    };
+}
+
+fn buildConstKeyTable(gpa: std.mem.Allocator, lane: arr.Lane, bump: i64, K: i64, hole: i64) !*table.Table {
+    const t = try table.Table.create(gpa);
+    errdefer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) try t.set(gpa, Value.int(i), constKeyElem(lane, i));
+    if (bump != 0) try t.set(gpa, Value.int(K), Value.int(bump));
+    try t.set(gpa, Value.int(hole), Value.nil());
+    try testing.expectEqual(lane, t.array.lane);
+    return t;
+}
+
+test "nativegen(doc63 cleanups): constant-key reads and writes lower to immediates and match the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // A dynamic scan `v = t[k]` plus a constant-key read `c = t[KR]` and a
+    // constant-key write `t[KW] = v`, on every scalar lane. KW starts as a hole
+    // past bit 63, so the write's immediate `bts` must hit the second bitmap
+    // qword: the scan only gets past KW if it did. The read's key is moved
+    // onto a hole, onto `asize` itself and past it, to exercise both
+    // constant-key guards.
+    const gpa = testing.allocator;
+    const K: i64 = 80;
+    const KW: i64 = 70;
+    const Cfg = struct { lane: arr.Lane, bump: i64 = 0 };
+    const cfgs = [_]Cfg{
+        .{ .lane = .boolean },
+        .{ .lane = .u8 },
+        .{ .lane = .i8, .bump = 100 },
+        .{ .lane = .i16, .bump = 1000 },
+        .{ .lane = .i32, .bump = 100_000 },
+        .{ .lane = .i64, .bump = 5_000_000_000 },
+        .{ .lane = .f64 },
+    };
+    for (cfgs) |cfg| {
+        const lane: i32 = @intFromEnum(cfg.lane);
+        for ([_]i64{ 3, KW, K + 1, K + 10 }) |KR| {
+            var consts = [_]Value{ Value.int(KR), Value.int(KW), Value.int(1) };
+            var full = [_]I{
+                .{ .op = .slot_load, .aux = 0 }, // 0: table
+                .{ .op = .guard_table, .a = 0 }, // 1
+                .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+                .{ .op = .slot_load, .aux = 1 }, // 3: k
+                .{ .op = .guard_int, .a = 3 }, // 4
+                .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5: &t[k]
+                .{ .op = .guard_bounds, .a = 5 }, // 6
+                .{ .op = .guard_present, .a = 5 }, // 7
+                .{ .op = .aload, .a = 5, .aux = lane }, // 8: v
+                .{ .op = .konst, .aux = 0 }, // 9: KR
+                .{ .op = .aref, .a = 0, .b = 9, .aux = lane }, // 10: &t[KR]
+                .{ .op = .guard_bounds, .a = 10 }, // 11
+                .{ .op = .guard_present, .a = 10 }, // 12
+                .{ .op = .aload, .a = 10, .aux = lane }, // 13: c
+                .{ .op = .konst, .aux = 1 }, // 14: KW
+                .{ .op = .aref, .a = 0, .b = 14, .aux = lane }, // 15: &t[KW]
+                .{ .op = .guard_bounds, .a = 15 }, // 16
+                .{ .op = .guard_fits, .a = 8, .aux = lane }, // 17
+                .{ .op = .astore, .a = 15, .b = 8, .aux = lane }, // 18: t[KW] = v
+                .{ .op = .konst, .aux = 2 }, // 19: 1
+                .{ .op = .add, .a = 3, .b = 19 }, // 20: k + 1
+                .{ .op = .phi, .b = 20, .aux = 1 },
+                .{ .op = .phi, .b = 13, .aux = 2 },
+                .{ .op = .loop }, // 23
+            };
+            var es = [_]u16{};
+            const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+            // The constant keys have no body read: their konsts emit nothing.
+            const kinds = try gpa.alloc(nativegen.Kind, full.len);
+            defer gpa.free(kinds);
+            const slot_of = try gpa.alloc(i32, full.len);
+            defer gpa.free(slot_of);
+            try testing.expect(nativegen.proveKinds(gpa, &tr, kinds, slot_of));
+            try testing.expectEqual(nativegen.Kind.none, kinds[9]);
+            try testing.expectEqual(nativegen.Kind.none, kinds[14]);
+
+            // Separate tables (the trace mutates the heap): native vs the oracle.
+            const t_o = try buildConstKeyTable(gpa, cfg.lane, cfg.bump, K, KW);
+            defer t_o.destroy(gpa);
+            var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2), Value.nil() };
+            const ovals = try gpa.alloc(Value, tr.instrs.len);
+            defer gpa.free(ovals);
+            const oresult = irinterp.executeValues(&tr, &oregs, ovals);
+
+            const t_n = try buildConstKeyTable(gpa, cfg.lane, cfg.bump, K, KW);
+            defer t_n.destroy(gpa);
+            var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2), Value.nil() };
+            var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
+            defer ct.deinit();
+            const nres = try runNative(ct, &nregs);
+
+            try testing.expectEqual(oresult.completed, nres.completed);
+            try testing.expectEqual(oresult.exit_instr, nres.exit_instr);
+            for (oregs[1..], nregs[1..]) |o, n| { // r0: distinct tables
+                try testing.expectEqual(o.tag, n.tag);
+                try testing.expectEqual(o.payload.bits, n.payload.bits);
+            }
+            try expectTablesEqual(t_o, t_n, K);
+            // KR = 3 never exits until the scan runs off the end, which needs
+            // the KW hole filled by the immediate presence bit.
+            if (KR == 3) try testing.expect(oresult.completed >= K - 2);
+        }
+    }
+}
+
 test "nativegen: f64-lane read reduction (aload) matches the strict-FP oracle" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     // while (k in array) { acc = acc + a[k]; k += 1 } over the f64 lane. The f64

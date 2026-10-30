@@ -1848,6 +1848,18 @@ set (~8), constant keys spilled to the stack (~8), and base reloads (~3).
    keep the bit. The rotation went 73 → 65; on `bench/` nsieve-bit −6.6%,
    nbody −1.1%, scalar −0.66%, mean −0.19% (JIT on, instruction counts;
    nothing above +0.04%).
+2. *Constant keys as immediates.* An `aref` whose key is an int constant
+   in `[0, 2^24]` (`prove.arefConstIdx`) gets no register or spill cell,
+   and its key konst, no longer read in the body, proves `.none` and
+   emits nothing. Its consumers fold the key into the address:
+   `[data + k*w]` for loads and stores (16-byte stride on the value
+   lane), `cmp qword [tbl+asize], k` for `guard_bounds`, and the
+   immediate `bt`/`bts qword [present + (k>>6)*8], k&63` for the presence
+   bit. The exit map gets no row for the token, and exit adapters skip
+   placing it. `astore_append` now shares `emitAStore`'s lane stores. The
+   read-and-write rotation went 65 → 55 and the `a[1]` rotation 37 → 35.
+   On `bench/`: nbody −1.6%, scalar −1.0%, binary-trees −0.06%, the rest
+   within ±0.004% (the scimark rows exit at startup).
 
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace

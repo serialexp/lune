@@ -4,7 +4,7 @@ DOC 63 TYPED CARRIED LOADS DONE (2026-10-30, coral-marten). Doc 63 §5.10.7.
 - Tables and strings too (guard_table/guard_string; carried-string takes a pinned copy): table rotation 252 -> 29, string 252 -> 17 instr/iter.
 - Carried tables used as arrays: base-home reservation now skips non-.ptr slots (as the prologue does), bail narrowed to grid roots + pre-marker guard_lane. a[1] rotation 331 (tier-0) -> 37, read+write 561 -> 73.
 - Bools: new IR op 100 guard_bool (type-only; pins regressed compare-fed copies 280 -> 805) + pinCarried (a body pin whose write-back is a non-matching copy unrolls): period-3 rotation 282 -> 9, compare copy 280 -> 36.
-- Array cleanups Bart picked (all three, in order): (1) aref CSE + proven-present astore skips bts — DONE, rotation 73 -> 65, nsieve-bit -6.6%, nbody -1.1%. (2) constant keys as immediates, (3) per-iteration base sharing — next.
+- Array cleanups Bart picked (all three, in order): (1) aref CSE + proven-present astore skips bts — DONE, rotation 73 -> 65, nsieve-bit -6.6%, nbody -1.1%. (2) constant keys as immediates — DONE, rotation 65 -> 55, nbody -1.6%, scalar -1.0%. (3) per-iteration base sharing — next.
 - Still open: the budget (min 368, parked by Bart), `two` +9, nest (a)/(b)/(c).
 
 DOC 63 PHASE 3 PART 1 DONE (2026-10-29, coral-marten): native lowering of the four host ops. Doc 63 §5.10.6.
