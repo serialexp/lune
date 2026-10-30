@@ -1,8 +1,7 @@
 # 75 — Process spawning, and mahina as a shell — Design
 
 Status: draft, not yet implemented. Review round 1 (Codex, Antigravity,
-2026-10-30) folded in; one open question left (Q14b), one note to confirm (§6, Ctrl-C and
-the terminal).
+2026-10-30) folded in; one open question left (Q14b).
 Owner: Bart
 Last updated: 2026-10-30
 
@@ -41,8 +40,8 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Q11 — handle teardown** (§5.3): decided 2026-10-30 — children still
   running when the VM closes are killed by default.
 - [x] **Q12 — Ctrl-C** (§6): decided 2026-10-30 — the parent receives Ctrl-C
-  and forwards it to the child. One point to confirm: terminal-owning
-  `inherit` children in the REPL (§6).
+  and forwards it to the child. A terminal-owning `inherit`
+  child in the REPL becomes the terminal's foreground group (§6, confirmed).
 - [x] **Q13 — environment and cwd mutation** (§6): decided 2026-10-30 —
   `os.setenv` and `os.chdir`, plus REPL shortcuts for the two.
 - [x] **Q14 — macOS floor** (§7): decided 2026-10-30 — 10.15; no legacy
@@ -81,8 +80,9 @@ land; move whole phases to Done once everything inside them is checked.
   directory in the CLI host; inventory rows (added, `not-started`); the effect
   kinds for the two mutations are decided with the implementation (replay
   skips the mutation and feeds back its logged result, as `fs_mutate` does).
-  Also the REPL shortcuts for the two (§6). `os.getcwd` is not something you
-  named: the prompt needs to read the directory, so it is proposed here.
+  Also the REPL shortcuts for the two (§6). `os.getcwd` was added so the prompt
+  can read the directory (accepted 2026-10-30); further small host functions
+  the REPL turns out to need may be added the same way.
 - [ ] **Phase 6a — raise the macOS release floor to 10.15** in
   `tools/mahina-cli.sh` (currently 10.12 x86-64), with the Darwin backend.
 - [ ] **Q14b — Windows `.bat`/`.cmd`.** Rejected with an error, or explicitly
@@ -413,12 +413,11 @@ only mahina (the foreground group); mahina's SIGINT handler forwards `SIGINT`
 to the child's group and keeps waiting, since the child may handle it. The
 call then ends as any other signal death does: a result or table with `signal
 = "SIGINT"`. The same group is what the timeout kills (§3.4) and what VM close
-kills (§5.3). *To confirm:* an `inherit` child in the REPL that needs the
-terminal (an editor) cannot sit in a background group, or it is stopped on
-terminal I/O (`SIGTTIN`/`SIGTTOU`). My reading is that such a child is made
-the terminal's foreground group for its lifetime, and then the terminal
-delivers Ctrl-C to it directly, so forwarding applies to captured children
-only. That is an inference from how job control works, not something decided.
+kills (§5.3). An `inherit` child in the REPL that needs the terminal (an editor) cannot sit
+in a background group, or it is stopped on terminal I/O
+(`SIGTTIN`/`SIGTTOU`). Such a child is made the terminal's foreground group
+for its lifetime (confirmed 2026-10-30), and then the terminal delivers
+Ctrl-C to it directly, so forwarding applies to captured children only.
 
 `export` and `cd` change the environment and working directory that
 `os.getenv`, `os.environ()` and an omitted `env` all read, so the CLI host
@@ -478,7 +477,7 @@ output, to show the pump and ring buffer stay linear and bounded.
 
 ## Open questions for review
 
-Q14b in the checklist above, and the Ctrl-C/terminal note in §6.
+Q14b in the checklist above.
 
 ## References
 
