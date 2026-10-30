@@ -462,6 +462,10 @@ pub const EffectKind = enum(u8) {
     /// How it ended: `nil` (a sleep or write finished), the bytes a read
     /// gave, or a failure.
     aio_result = 18,
+    /// Doc 75 §4: `os.environ()`. The whole environment as one byte record
+    /// (a count, then length-prefixed name/value pairs sorted by name; see
+    /// `stdlib/os.zig`), rebuilt into a fresh table in every mode.
+    environ = 19,
 };
 
 /// Doc 63 §5.9 (Q4): the disturb count at which a native stops being traced.

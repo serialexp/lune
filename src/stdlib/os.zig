@@ -1,5 +1,6 @@
 //! The `os` library's host operations (doc 65 Phase 4): the wall clock and
-//! dates, removing and renaming files, temporary names, and `os.exit`.
+//! dates, removing and renaming files, temporary names, `os.environ`
+//! (doc 75), and `os.exit`.
 //! (`os.clock`, `os.nsclock` and `os.getenv` are interpreter natives;
 //! `os.difftime` is pure, in `basic.zig`.)
 //!
@@ -334,6 +335,140 @@ fn osTmpnameN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize
 }
 
 // ---------------------------------------------------------------------------
+// os.environ
+// ---------------------------------------------------------------------------
+
+/// The environment as the host listed it, copied out of the host's memory:
+/// one blob and the spans into it, in the order the host gave them.
+const EnvCollector = struct {
+    gpa: std.mem.Allocator,
+    blob: std.ArrayList(u8) = .empty,
+    pairs: std.ArrayList(Pair) = .empty,
+    failed: bool = false,
+
+    const Pair = struct { name_start: usize, name_len: usize, val_start: usize, val_len: usize };
+
+    fn deinit(self: *EnvCollector) void {
+        self.blob.deinit(self.gpa);
+        self.pairs.deinit(self.gpa);
+    }
+
+    fn visit(ctx: *anyopaque, name: []const u8, val: []const u8) void {
+        const self: *EnvCollector = @ptrCast(@alignCast(ctx));
+        if (self.failed) return;
+        // Host text must be UTF-8 to become a string (S-B). A variable that
+        // is not cannot be shown to the program, so it is left out, and the
+        // same goes for a name no `NAME=value` could carry.
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '=') != null) return;
+        if (std.mem.indexOfScalar(u8, name, 0) != null) return;
+        if (!std.unicode.utf8ValidateSlice(name) or !std.unicode.utf8ValidateSlice(val)) return;
+        const name_start = self.blob.items.len;
+        self.blob.appendSlice(self.gpa, name) catch return self.fail();
+        const val_start = self.blob.items.len;
+        self.blob.appendSlice(self.gpa, val) catch return self.fail();
+        self.pairs.append(self.gpa, .{ .name_start = name_start, .name_len = name.len, .val_start = val_start, .val_len = val.len }) catch return self.fail();
+    }
+
+    fn fail(self: *EnvCollector) void {
+        self.failed = true;
+    }
+
+    fn nameOf(self: *const EnvCollector, p: Pair) []const u8 {
+        return self.blob.items[p.name_start..][0..p.name_len];
+    }
+
+    fn lessThan(self: *const EnvCollector, a: Pair, b: Pair) bool {
+        return std.mem.lessThan(u8, self.nameOf(a), self.nameOf(b));
+    }
+};
+
+/// Encode the host's environment as the `environ` record: a `u32` count, then
+/// per variable a `u32` name length, the name, a `u32` value length and the
+/// value (little-endian). Sorted by name, so the record, and the table built
+/// from it, do not depend on the order the host listed them in; a name the
+/// host listed twice keeps its first value.
+fn encodeEnviron(vm: *Vm, out: *std.ArrayList(u8)) anyerror!void {
+    var c: EnvCollector = .{ .gpa = vm.gpa };
+    defer c.deinit();
+    if (vm.system) |sys| if (sys.vtable.environ) |list| list(sys.ctx, &EnvCollector.visit, &c);
+    if (c.failed) return error.OutOfMemory;
+    std.sort.block(EnvCollector.Pair, c.pairs.items, &c, struct {
+        fn lt(ctx: *const EnvCollector, a: EnvCollector.Pair, b: EnvCollector.Pair) bool {
+            return ctx.lessThan(a, b);
+        }
+    }.lt);
+    var count: u32 = 0;
+    var prev: ?[]const u8 = null;
+    try out.appendNTimes(vm.gpa, 0, 4);
+    for (c.pairs.items) |p| {
+        const name = c.nameOf(p);
+        if (prev) |q| if (std.mem.eql(u8, q, name)) continue;
+        prev = name;
+        count += 1;
+        try out.appendSlice(vm.gpa, &std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(name.len))));
+        try out.appendSlice(vm.gpa, name);
+        try out.appendSlice(vm.gpa, &std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(p.val_len))));
+        try out.appendSlice(vm.gpa, c.blob.items[p.val_start..][0..p.val_len]);
+    }
+    std.mem.writeInt(u32, out.items[0..4], count, .little);
+}
+
+/// Read one length-prefixed field of the record at `pos.*`, or null when it
+/// runs past the end.
+fn envField(rec: []const u8, pos: *usize) ?[]const u8 {
+    if (rec.len - pos.* < 4) return null;
+    const n = std.mem.readInt(u32, rec[pos.*..][0..4], .little);
+    pos.* += 4;
+    if (rec.len - pos.* < n) return null;
+    const s = rec[pos.*..][0..n];
+    pos.* += n;
+    return s;
+}
+
+/// A fresh table of name to value from an `environ` record. The record came
+/// from this binary's own encoder, or from a log that claims to; a malformed
+/// one is a log that does not match this run.
+fn buildEnvironTable(vm: *Vm, rec: []const u8) anyerror!*Table {
+    if (rec.len < 4) return error.EffectKindMismatch;
+    const count = std.mem.readInt(u32, rec[0..4], .little);
+    // Each pair is at least its two length words.
+    if (count > (rec.len - 4) / 8) return error.EffectKindMismatch;
+    const t = try vm.heap.newTableSized(count);
+    var pos: usize = 4;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const name = envField(rec, &pos) orelse return error.EffectKindMismatch;
+        const val = envField(rec, &pos) orelse return error.EffectKindMismatch;
+        if (!std.unicode.utf8ValidateSlice(name) or !std.unicode.utf8ValidateSlice(val))
+            return error.EffectKindMismatch;
+        try t.set(vm.gpa, try vm.heap.internValue(name), try vm.heap.internValue(val));
+    }
+    if (pos != rec.len) return error.EffectKindMismatch;
+    return t;
+}
+
+/// `os.environ()`: a table of every environment variable, name to value
+/// (doc 75 §3.1). Not in Lua. One `environ` effect per call: the record is
+/// logged in `record` and the table is built from the record in every mode, so
+/// a replay's table has the contents and the insertion order the recording's did.
+fn osEnvironN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    _ = args;
+    const vm = vmOf(ctx);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(vm.gpa);
+    const rec: []const u8 = if (vm.effect_mode == .replay) switch (try interp.replayHost(vm, .environ)) {
+        .bytes => |span| vm.effect_log.bytesOf(span),
+        else => return error.EffectKindMismatch,
+    } else blk: {
+        try encodeEnviron(vm, &scratch);
+        try interp.recordHostBytes(vm, .environ, scratch.items);
+        break :blk scratch.items;
+    };
+    const t = try buildEnvironTable(vm, rec);
+    return io.putResults(out, &.{Value.heap(&t.header)});
+}
+
+// ---------------------------------------------------------------------------
 // os.exit
 // ---------------------------------------------------------------------------
 
@@ -368,4 +503,5 @@ pub const natives = [_]function.BaseNative{
     entry("os.rename", &osRenameN, "rename", .{ .files = true }),
     entry("os.tmpname", &osTmpnameN, "tmpname", .{ .files = true }),
     entry("os.exit", &osExitN, "exit", .{ .env = true }),
+    entry("os.environ", &osEnvironN, "environ", .{ .env = true }),
 };

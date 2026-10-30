@@ -245,6 +245,10 @@ pub const HostSystem = struct {
         // ---- environment ----
         /// An environment variable, or null if unset (`""` if set but empty).
         getenv: ?*const fn (ctx: *anyopaque, name: []const u8) ?[]const u8 = null,
+        /// Every environment variable, one `visit` call each, in any order.
+        /// The slices are valid only during the call to `visit`. A host without
+        /// this function has an empty environment as far as `os.environ` goes.
+        environ: ?*const fn (ctx: *anyopaque, visit: EnvVisitFn, visit_ctx: *anyopaque) void = null,
 
         // ---- time ----
         /// Wall-clock seconds since the Unix epoch.
@@ -254,6 +258,9 @@ pub const HostSystem = struct {
         localZone: ?*const fn (ctx: *anyopaque, utc: i64) LocalZone = null,
     };
 };
+
+/// Called once per variable by `HostSystem.VTable.environ`.
+pub const EnvVisitFn = *const fn (visit_ctx: *anyopaque, name: []const u8, value: []const u8) void;
 
 /// The host side of `aio` (doc 73 §7.6): operations that run while the
 /// program goes on, each awaited as a `pending` task. The VM numbers them

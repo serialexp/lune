@@ -330,3 +330,59 @@ test "os: a group that is off installs none of its functions" {
     defer r.deinit(testing.allocator);
     try testing.expectEqualStrings("nil\tnil\tnil\tnil\tnil\tnil\ttrue\n", r.out);
 }
+
+test "os: os.environ lists the host environment, sorted, as a fresh table each call" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.vars = &.{ .{ "ZED", "last" }, .{ "HOME", "/home/bart" }, .{ "EMPTY", "" }, .{ "HOME", "dup" } };
+    const r = try recordReplay(testing.allocator, &host, .{},
+        \\local e = os.environ()
+        \\local names = {}
+        \\for k in pairs(e) do names[#names + 1] = k end
+        \\table.sort(names)
+        \\print(table.concat(names, ","), e.HOME, e.ZED, e.EMPTY == "", e.NOPE)
+        \\e.HOME = "changed"
+        \\print(os.environ().HOME, os.environ() ~= os.environ())
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("EMPTY,HOME,ZED\t/home/bart\tlast\ttrue\tnil\n/home/bart\ttrue\n", r.out);
+    var n: usize = 0;
+    for (r.kinds) |k| {
+        if (k == .environ) n += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), n);
+}
+
+test "os: os.environ leaves out variables it cannot show as strings" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.vars = &.{ .{ "OK", "fine" }, .{ "BAD", "\xff\xfe" }, .{ "A=B", "x" }, .{ "", "x" } };
+    const r = try recordReplay(testing.allocator, &host, .{},
+        \\local n = 0
+        \\for k, v in pairs(os.environ()) do n = n + 1 print(k, v) end
+        \\print(n)
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("OK\tfine\n1\n", r.out);
+}
+
+test "os: os.environ is empty on a host that lists nothing, and absent without the env group" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    const r = try run(testing.allocator, .{ .host = &host }, "print(next(os.environ()))");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("nil\n", r.out);
+    const none = try run(testing.allocator, .{ .host = &host, .groups = .{} }, "print(os.environ)");
+    defer none.deinit(testing.allocator);
+    try testing.expectEqualStrings("nil\n", none.out);
+}
+
+test "os: a replayed environ record that is malformed refuses the replay" {
+    // One pair promised, the value's length word missing.
+    var log: interp.EffectLog = .{};
+    defer log.deinit(testing.allocator);
+    try log.appendBytes(testing.allocator, .environ, &.{ 1, 0, 0, 0, 1, 0, 0, 0, 'A' });
+    const bad = try effectser.encodeFile(testing.allocator, &log);
+    defer testing.allocator.free(bad);
+    try testing.expectError(error.EffectKindMismatch, run(testing.allocator, .{ .mode = .replay, .log = bad }, "os.environ()"));
+}

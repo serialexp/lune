@@ -1,6 +1,7 @@
 # 75 — Process spawning, and mahina as a shell — Design
 
-Status: draft, not yet implemented. Review round 1 (Codex, Antigravity,
+Status: partial — Phase 0a (`os.environ`) landed; `proc` itself not yet
+implemented. Review round 1 (Codex, Antigravity,
 2026-10-30) folded in; one open question left (Q14b).
 Owner: Bart
 Last updated: 2026-10-30
@@ -46,16 +47,20 @@ land; move whole phases to Done once everything inside them is checked.
   `os.setenv` and `os.chdir`, plus REPL shortcuts for the two.
 - [x] **Q14 — macOS floor** (§7): decided 2026-10-30 — 10.15; no legacy
   support.
+- [x] **Phase 0a — `os.environ()` and the byte-record encoding** (§4).
+  `EffectKind.environ` = 19, logged as one byte record (a count, then
+  length-prefixed name/value pairs sorted by name, a name the host lists
+  twice keeping its first value); the table is built from the record in every
+  mode. `effect_format_version` 9. New `HostSystem.VTable.environ` (a visitor,
+  so no host memory outlives the call); `RealSystem` lists the CLI's
+  environment map, or libc's `environ` when embedded on POSIX. Variables that
+  are not valid UTF-8, and names a `NAME=value` cannot carry, are left out. A
+  malformed record on replay refuses it (`EffectKindMismatch`). Tests:
+  `interp_os_test.zig`, `effectser.zig`, `host_system.zig`. Embedded Windows
+  without a map lists nothing yet (Phase 6).
 
 ### Outstanding
 
-- [ ] **Phase 0a — `os.environ()` and the compound-result encoding.** The
-  effect log carries one scalar, string or byte span per effect and the
-  serializer rejects tables (`effectser.zig`), so a table or a multi-field
-  result is logged as one **encoded byte record** and rebuilt on replay
-  (§4). `os.environ()` is the first user: a new `EffectKind` (`environ`),
-  an inventory row (already added, `not-started`), and a format-version bump
-  of `effect_format_version` if the encoding needs it.
 - [ ] **Phase 0 — `proc.run` on Linux, with record/replay.** The call shape
   (§3.1), the result (§3.2), failure table (§3.3), `timeout` (§3.4), the
   concurrent pump (§3.5), one new `EffectKind` (`proc_run`), the recording

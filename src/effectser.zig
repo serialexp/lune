@@ -53,7 +53,8 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v7 (doc 65 Phase 4): kind 15 is `local_zone`, a byte record (offset,
 /// daylight saving, abbreviation) where v6's `local_offset` was an int.
 /// v8 (doc 73 §7.6): `aio_complete` (17) and `aio_result` (18).
-pub const effect_format_version: u32 = 8;
+/// v9 (doc 75 §4): `environ` (19), the environment as one byte record.
+pub const effect_format_version: u32 = 9;
 
 /// The encoded size of an `EffectFile` with no entries: the `version` word and
 /// the entry count.
@@ -108,6 +109,8 @@ const Shape = enum {
     zone,
     /// How an `aio` operation ended: `nil`, the bytes it read, or a failure.
     nil_bytes_or_fail,
+    /// The environment record (`os.environ`): bytes, never a failure.
+    environ,
 };
 
 fn resultShapeOf(kind: EffectKind) Shape {
@@ -121,6 +124,7 @@ fn resultShapeOf(kind: EffectKind) Shape {
         .fs_tmpname => .string_or_fail,
         .file_read_op => .read_value,
         .aio_result => .nil_bytes_or_fail,
+        .environ => .environ,
     };
 }
 
@@ -131,9 +135,9 @@ fn checkResultShape(kind: EffectKind, result: Effect.Result) DecodeError!void {
     const ok = switch (result) {
         .fail => switch (shape) {
             .int_or_fail, .ok_or_fail, .string_or_fail, .read_value, .nil_bytes_or_fail => true,
-            .int, .number, .string_or_nil, .zone => false,
+            .int, .number, .string_or_nil, .zone, .environ => false,
         },
-        .bytes => |span| shape == .read_value or shape == .nil_bytes_or_fail or (shape == .zone and span.len >= system.local_zone_fixed_len),
+        .bytes => |span| shape == .read_value or shape == .nil_bytes_or_fail or shape == .environ or (shape == .zone and span.len >= system.local_zone_fixed_len),
         .value => |v| switch (shape) {
             .int, .int_or_fail => v.tag == .int,
             .number => v.tag == .int or v.tag == .float,
@@ -141,7 +145,7 @@ fn checkResultShape(kind: EffectKind, result: Effect.Result) DecodeError!void {
             .ok_or_fail, .nil_bytes_or_fail => v.tag == .nil,
             .string_or_fail => isString(v),
             .read_value => v.tag == .nil or v.tag == .int or v.tag == .float or isString(v),
-            .zone => false,
+            .zone, .environ => false,
         },
     };
     if (!ok) return error.MismatchedEffectResult;
@@ -393,6 +397,31 @@ test "a bytes result round-trips into the decoding log's own buffer" {
     try testing.expectEqualSlices(u8, "", back.bytesOf(back.entries.items[3].result.bytes));
 }
 
+test "an environ record round-trips as bytes, is charged exactly, and cannot be a failure" {
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    var log: EffectLog = .{};
+    defer log.deinit(gpa);
+    const rec = [_]u8{ 1, 0, 0, 0, 1, 0, 0, 0, 'A', 1, 0, 0, 0, 'x' };
+    try log.appendBytes(gpa, .environ, &rec);
+    const bytes = try encodeFile(gpa, &log);
+    defer gpa.free(bytes);
+    try testing.expectEqual(file_header_size + encodedEntrySize(log.entries.items[0].result), bytes.len);
+    var back: EffectLog = .{};
+    defer back.deinit(gpa);
+    try decodeInto(&back, gpa, &heap, bytes);
+    try testing.expectEqualSlices(u8, &rec, back.bytesOf(back.entries.items[0].result.bytes));
+
+    var bad = try testLog(&.{.{ .kind = .environ, .result = .{ .fail = .other } }});
+    defer bad.deinit(gpa);
+    const bad_bytes = try encodeFile(gpa, &bad);
+    defer gpa.free(bad_bytes);
+    var sink: EffectLog = .{};
+    defer sink.deinit(gpa);
+    try testing.expectError(error.MismatchedEffectResult, decodeInto(&sink, gpa, &heap, bad_bytes));
+}
+
 test "a string effect result round-trips as inline bytes (getenv/file_read)" {
     const gpa = testing.allocator;
     var heap = gc.Heap.init(gpa);
@@ -504,7 +533,7 @@ test "an unknown effect kind is rejected" {
     var heap = gc.Heap.init(gpa);
     defer heap.deinit();
     // 3 and 4 are the retired argc/argv.
-    for ([_]u8{ 3, 4, 19, 250 }) |kind| {
+    for ([_]u8{ 3, 4, 20, 250 }) |kind| {
         const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{
             .{ .kind = kind, .result = .{ .tag = 2, .body = .{ .ConstInt = .{ .v = 1 } } } },
         } };

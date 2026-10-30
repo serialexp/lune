@@ -54,6 +54,7 @@ pub const RealSystem = struct {
     const vtable: HostSystem.VTable = .{
         .readFile = &readFile,
         .getenv = &getenv,
+        .environ = &environ,
         .open = &open,
         .tmpfile = &tmpfile,
         .fill = &fill,
@@ -563,6 +564,27 @@ pub const RealSystem = struct {
         extern "kernel32" fn SystemTimeToTzSpecificLocalTime(tzi: ?*const TIME_ZONE_INFORMATION, utc: *const SYSTEMTIME, local: *SYSTEMTIME) callconv(.winapi) i32;
     };
 
+    /// Every variable of the process environment (doc 75 §3.1): the CLI's
+    /// map, or, embedded with libc on POSIX, `environ`. Windows without a map
+    /// has none yet (Phase 6).
+    fn environ(ctx: *anyopaque, visit: seam.EnvVisitFn, visit_ctx: *anyopaque) void {
+        const self = of(ctx);
+        if (self.env_map) |m| {
+            var it = m.iterator();
+            while (it.next()) |e| visit(visit_ctx, e.key_ptr.*, e.value_ptr.*);
+            return;
+        }
+        if (comptime builtin.link_libc and builtin.os.tag != .windows) {
+            var p: [*:null]?[*:0]u8 = std.c.environ;
+            while (p[0]) |entry| : (p += 1) {
+                const kv = std.mem.span(entry);
+                // A leading `=` has no name; skip it (a pair needs `NAME=`).
+                const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+                visit(visit_ctx, kv[0..eq], kv[eq + 1 ..]);
+            }
+        }
+    }
+
     fn getenv(ctx: *anyopaque, name: []const u8) ?[]const u8 {
         const self = of(ctx);
         if (self.env_map) |m| return m.get(name);
@@ -712,4 +734,28 @@ test "the wall clock is past 2020" {
     var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
     defer sys.deinit();
     try testing.expect(RealSystem.wallSeconds(&sys) > 1_577_836_800);
+}
+
+test "environ lists the environment map" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("ALPHA", "1");
+    try env.put("BETA", "");
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), &env);
+    defer sys.deinit();
+    const Seen = struct {
+        n: usize = 0,
+        saw_alpha: bool = false,
+        saw_beta: bool = false,
+        fn visit(ctx: *anyopaque, name: []const u8, value: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.n += 1;
+            if (std.mem.eql(u8, name, "ALPHA") and std.mem.eql(u8, value, "1")) self.saw_alpha = true;
+            if (std.mem.eql(u8, name, "BETA") and value.len == 0) self.saw_beta = true;
+        }
+    };
+    var seen: Seen = .{};
+    RealSystem.environ(&sys, &Seen.visit, &seen);
+    try testing.expectEqual(@as(usize, 2), seen.n);
+    try testing.expect(seen.saw_alpha and seen.saw_beta);
 }

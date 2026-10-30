@@ -325,6 +325,8 @@ pub const FakeHost = struct {
     /// How many names `tmpname` has handed out.
     tmp_count: usize = 0,
     tmp_name: [32]u8 = undefined,
+    /// The environment `os.environ` lists: name/value pairs.
+    vars: []const [2][]const u8 = &.{},
 
     pub const FakeFile = struct {
         content: std.ArrayList(u8) = .empty,
@@ -527,6 +529,12 @@ pub const FakeHost = struct {
         return of(ctx).now;
     }
 
+    fn environFn(ctx: *anyopaque, visit: seam.EnvVisitFn, visit_ctx: *anyopaque) void {
+        const self = of(ctx);
+        self.calls += 1;
+        for (self.vars) |kv| visit(visit_ctx, kv[0], kv[1]);
+    }
+
     fn localZoneFn(ctx: *anyopaque, utc: i64) seam.LocalZone {
         const self = of(ctx);
         return if (self.tz) |tz| tz.lookup(utc) else seam.LocalZone.utc;
@@ -564,6 +572,7 @@ pub const FakeHost = struct {
         .tmpname = &tmpnameFn,
         .wallSeconds = &wallSecondsFn,
         .localZone = &localZoneFn,
+        .environ = &environFn,
     };
 
     pub fn system(self: *FakeHost) HostSystem {
