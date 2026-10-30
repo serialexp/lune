@@ -242,6 +242,53 @@ test "native: constant-key reads and writes on a .value-lane array compile and m
     try expectProgram(src, want);
 }
 
+test "native: constant operands lower as immediates and match" {
+    // Konsts that fit a sign-extended imm32 (`Loc.imm`) on either side of
+    // `sub` and a compare, as `imul`'s third operand, as every leg of a
+    // constant shift count (in range, past 63, negative, past -63, `~>>`'s
+    // sign fill), at both ends of the imm32 range (2^31 itself keeps a home),
+    // as a bool store, as a carried φ's back-edge source (`z`), and as a
+    // write-only slot's back-edge commit (`y`), which the `break` exit leaves
+    // as the final value: its replayed iteration never rewrites `y`.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const src =
+        \\local t = {}
+        \\local s, x, b, y, z = 0, 0, 0, 0, 0
+        \\for i = 1, 100 do
+        \\  if i == 99 then break end
+        \\  local d = i - 7
+        \\  local e = 7 - i
+        \\  local m = i * -3
+        \\  local w = (i << 3) ~ (i >> 1) ~ (-i ~>> 2) ~ (i << 70) ~ (i >> -2) ~ (i << -2) ~ (i << -70) ~ (-i ~>> 99) ~ (i << 0)
+        \\  local c = (i & 0xff) | 0x100
+        \\  if i < 50 then s = s + 1 end
+        \\  if 50 < i then x = x + 2147483647 end
+        \\  if i <= -2147483648 then x = x + 1 end
+        \\  b = (b + d + e + m + w + c + x + z - 2147483648) % 1000003
+        \\  z = 5
+        \\  t[i] = true
+        \\  y = 3
+        \\end
+        \\print(s, x, b, y, #t)
+    ;
+    const want = "49\t103079215056\t489587\t3\t98\n";
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.coverage = true;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa, src, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(want, sink.buffered());
+    for (vm.trace.registry.cache.items) |e| try testing.expect(e.native == .compiled);
+    var traced: u64 = 0;
+    var it = vm.trace.coverage.iterator();
+    while (it.next()) |e| traced +|= e.value_ptr.traced;
+    try testing.expect(traced > 0);
+    try expectProgram(src, want);
+}
+
 test "native: a string rotation compiles (typed carried loads, guard_string)" {
     // A carried string whose write-back is another pinned slot's load.
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;

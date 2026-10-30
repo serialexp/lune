@@ -1023,6 +1023,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try a.movRegMem(.rax, .rsi, off);
                 try a.movMemReg(.rsp, d, .rax);
             },
+            .imm => unreachable, // a slot home is a register or a cell
         }
     }
     // [C2-prologue] For each `.ptr` table slot the pointer is now in its home; verify
@@ -1271,6 +1272,8 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.movRegImm64(.rax, @bitCast(bits));
                         try a.movMemReg(.rsp, d, .rax);
                     },
+                    // Each reader takes it as an operand.
+                    .imm => {},
                 }
             },
             .add, .sub, .mul, .div, .band, .bor, .bxor => {
@@ -1310,6 +1313,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         }
                     },
                     .xmm => unreachable, // int neg/bnot only (float-neg is deferred)
+                    .imm => unreachable, // only a konst is an immediate
                 }
             },
             .eq, .ne, .lt, .le => {
@@ -1354,6 +1358,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
+                        .imm => |v| {
+                            try a.movRegImm32Sx(.rax, v);
+                            try a.cmpRegImm32(.rax, 0);
+                        },
                         .xmm => unreachable, // an int is never homed in an XMM
                     }
                     try jccNativeExit(a, exit_labels, i, if (up) .le else .g);
@@ -1372,6 +1380,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 switch (placeOfRef(alloc, ins.b)) {
                     .reg => |r| try a.addRegReg(.rax, r),
                     .mem => |d| try a.addRegMem(.rax, .rsp, d),
+                    .imm => |v| try a.addRegImm32(.rax, v),
                     .xmm => unreachable, // an int is never homed in an XMM
                 }
                 try jccNativeExit(a, exit_labels, i, .o);
@@ -1390,7 +1399,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 switch (placeOfRef(alloc, i)) {
                     .xmm => |x| if (x != XMM_SCRATCH0) try a.movsdRegReg(x, XMM_SCRATCH0),
                     .mem => |d| try a.movsdMemReg(.rsp, d, XMM_SCRATCH0),
-                    .reg => unreachable, // a float result never homes in a GP register
+                    .reg, .imm => unreachable, // a float result never homes in a GP register
                 }
             },
             // fsin/fcos/pow: a mid-body callout into THE shared noinline `fmath`
@@ -1528,7 +1537,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.movRegMem(.rax, .rsp, out_disp);
                         try a.movMemReg(.rsp, d, .rax);
                     },
-                    .xmm => unreachable, // .heap never homes in an XMM
+                    .xmm, .imm => unreachable, // .heap never homes in an XMM
                 }
             },
             // ---- doc 63 §5.1: host calls ------------------------------------------
@@ -1622,7 +1631,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                             try a.movsdRegMem(XMM_SCRATCH0, .rsi, slot * 8);
                             try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
                         },
-                        .reg => unreachable, // a float never homes in a GP register
+                        .reg, .imm => unreachable, // a float never homes in a GP register
                     }
                 } else {
                     // int, bool (canonical 0/1), heap (the *GcHeader) or nil
@@ -1674,7 +1683,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                             try a.movRegMem(.rax, .rsi, off);
                             try a.movMemReg(.rsp, d, .rax);
                         },
-                        .xmm => unreachable, // a cell pointer is an int kind, never an XMM home
+                        .xmm, .imm => unreachable, // a cell pointer is an int kind, never an XMM home
                     }
                 }
             },
@@ -1701,7 +1710,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                             try a.movsdRegMem(XMM_SCRATCH0, creg, VALUE_PAYLOAD_OFF);
                             try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
                         },
-                        .reg => unreachable, // a float never homes in a GP register
+                        .reg, .imm => unreachable, // a float never homes in a GP register
                     }
                 } else {
                     // int, bool, OR heap: raw 8-byte payload load. A bool cell's
@@ -1737,7 +1746,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.movRegMem(.rax, .rsi, off);
                         try a.movMemReg(.rsp, d, .rax);
                     },
-                    .xmm => unreachable, // a cell pointer is an int kind, never an XMM home
+                    .xmm, .imm => unreachable, // a cell pointer is an int kind, never an XMM home
                 }
             },
             // uload: hload minus the `.heap` arm (the recorder never routes a
@@ -1759,7 +1768,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                             try a.movsdRegMem(XMM_SCRATCH0, creg, VALUE_PAYLOAD_OFF);
                             try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
                         },
-                        .reg => unreachable, // a float never homes in a GP register
+                        .reg, .imm => unreachable, // a float never homes in a GP register
                     }
                 } else {
                     // int or bool: raw 8-byte payload load (bool payload is the
@@ -1791,7 +1800,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try placeToReg(a, .rax, idxp);
                         try a.movMemReg(.rsp, D, .rax);
                     },
-                    .xmm => unreachable, // idx0 is an int (aref kind), never an XMM home
+                    .xmm, .imm => unreachable, // idx0 is an int (aref kind), never an XMM home
                 }
             },
             // guard_bounds: idx0 <u asize, else side-exit. [I3] the single idx0 from aref
@@ -1922,7 +1931,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                                 try a.movsdRegMem(XMM_SCRATCH0, elem, off + VALUE_PAYLOAD_OFF);
                                 try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
                             },
-                            .reg => unreachable, // a float never homes in a GP register
+                            .reg, .imm => unreachable, // a float never homes in a GP register
                         }
                     } else {
                         // .heap → the *GcHeader; .int → the i64. Same 8-byte payload
@@ -1943,7 +1952,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                                     try a.movsdRegMem(XMM_SCRATCH0, datareg, off);
                                     try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
                                 },
-                                .reg => unreachable,
+                                .reg, .imm => unreachable,
                             }
                         } else {
                             const w: u8 = if (ins.aux == BOOL_LANE or ins.aux == U8_LANE) 1 else intLaneWidth(ins.aux);
@@ -1969,7 +1978,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                                 try a.movsdRegMem(XMM_SCRATCH0, .rax, 0);
                                 try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
                             },
-                            .reg => unreachable, // a float never homes in a GP register
+                            .reg, .imm => unreachable, // a float never homes in a GP register
                         }
                     } else {
                         if (ins.aux == BOOL_LANE) {
@@ -2174,7 +2183,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         try a.subRegImm32(.rax, 1);
                         try a.movMemReg(.rsp, D, .rax);
                     },
-                    .xmm => unreachable, // row0 is an int (aref kind), never an XMM home
+                    .xmm, .imm => unreachable, // row0 is an int (aref kind), never an XMM home
                 }
             },
             // gcell: materialize the FLAT cell index flat = row0*stride + (col - 1) into
@@ -2239,7 +2248,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                             try a.movsdRegMem(XMM_SCRATCH0, .rax, 0);
                             try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
                         },
-                        .reg => unreachable, // a float never homes in a GP register
+                        .reg, .imm => unreachable, // a float never homes in a GP register
                     }
                 } else if (ins.aux == U8_LANE) {
                     try a.loadRegMemSib(.rax, datareg, flatreg, 1, false, 0); // movzx
@@ -2272,6 +2281,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
+                        .imm => |v| {
+                            try a.movRegImm32Sx(.rax, v);
+                            try a.cmpRegImm32(.rax, 0);
+                        },
                         .xmm => unreachable, // a bool is never homed in an XMM
                     }
                     try jccNativeExit(a, exit_labels, i, .e); // false (0) → side-exit
@@ -2289,6 +2302,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
+                        .imm => |v| {
+                            try a.movRegImm32Sx(.rax, v);
+                            try a.cmpRegImm32(.rax, 0);
+                        },
                         .xmm => unreachable, // a bool is never homed in an XMM
                     }
                     try jccNativeExit(a, exit_labels, i, .ne); // true (≠0) → side-exit
@@ -2310,6 +2327,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, want),
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, want),
+                        .imm => |v| {
+                            try a.movRegImm32Sx(.rax, v);
+                            try a.cmpRegImm32(.rax, want);
+                        },
                         .xmm => unreachable, // a bool is never homed in an XMM
                     }
                     try jccNativeExit(a, exit_labels, i, .ne);

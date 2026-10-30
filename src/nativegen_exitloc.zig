@@ -239,7 +239,8 @@ fn setPlace(out: *ExitLoc, l: Loc) void {
             out.tag = .spill;
             out.payload = idx * 8;
         },
-        // No snapshot names a flags compare (`isFlagsCompare`).
-        .flags => unreachable,
+        // No snapshot names a flags compare (`isFlagsCompare`), and a
+        // konst's row is `.konst` before it gets here.
+        .flags, .imm => unreachable,
     }
 }

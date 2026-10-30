@@ -47,6 +47,11 @@ pub const Loc = union(enum) {
     /// `guard_true`/`guard_false` right after it, which branches on them
     /// (`isFlagsCompare`). It has no home, so nothing but that guard reads it.
     flags,
+    /// An int or bool konst whose payload fits a sign-extended imm32
+    /// (`konstImm`). It has no register or cell: each reader takes it as an
+    /// immediate operand, or materializes it where it needs a register
+    /// (LuaJIT's `asm_isk32` and `ra_rematk`). The konst itself emits nothing.
+    imm: i32,
 };
 
 /// How a slot participates in the loop, deciding its prologue/back-edge/EXIT handling.
@@ -429,8 +434,8 @@ pub fn isCommutative(op: trace_ir.IrOp) bool {
 
 /// Whether two `Loc`s name the same physical home (register or spill slot).
 pub fn locEql(x: Loc, y: Loc) bool {
-    // A flags compare has no home, so it shares one with nothing.
-    if (x == .flags or y == .flags) return false;
+    // A flags compare or an immediate has no home, so it shares one with nothing.
+    if (x == .flags or y == .flags or x == .imm or y == .imm) return false;
     return Place.eql(locToPlace(x), locToPlace(y));
 }
 
@@ -461,6 +466,21 @@ pub fn isStringProducerOp(op: trace_ir.IrOp) bool {
         .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str => true,
         else => false,
     };
+}
+
+/// The immediate konst `i` lowers to (`Loc.imm`), or null when it keeps a
+/// home: an int, bool or nil konst whose payload sign-extends from 32 bits.
+/// A float konst keeps one (its readers want an XMM), as do a heap konst (a
+/// 64-bit pointer) and a `.none` one (no native value at all).
+pub fn konstImm(t: *const Trace, kinds: []const Kind, i: usize) ?i32 {
+    const ins = t.instrs[i];
+    if (ins.op != .konst) return null;
+    switch (kinds[i]) {
+        .int, .bool, .nil => {},
+        else => return null,
+    }
+    const bits: i64 = @bitCast(t.consts[@intCast(ins.aux)].payload.bits);
+    return std.math.cast(i32, bits);
 }
 
 pub fn isCoalescibleOp(op: trace_ir.IrOp) bool {
@@ -1150,12 +1170,34 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     const is_computed = try gpa.alloc(bool, n);
     defer gpa.free(is_computed);
     @memset(is_computed, false);
+    // The konsts a float op reads: an int one promotes to a double at each
+    // use, which from a home is one `cvtsi2sd` but from an immediate is a
+    // `mov` as well, so these keep their homes rather than take `Loc.imm`.
+    var float_read = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
+    defer float_read.deinit(gpa);
+    for (t.instrs, 0..) |ins, j| {
+        if (kinds[j] != .float) continue;
+        const rd = operandReads(ins);
+        if (rd.a and t.instrs[ins.a].op == .konst) float_read.set(ins.a);
+        if (rd.b and t.instrs[ins.b].op == .konst) float_read.set(ins.b);
+    }
+    const imm = struct {
+        fn f(tr: *const Trace, ks: []const Kind, fr: *const std.DynamicBitSetUnmanaged, i: usize) ?i32 {
+            if (fr.isSet(i)) return null;
+            return konstImm(tr, ks, i);
+        }
+    }.f;
     {
         const ms = marker_idx orelse 0;
         for (t.instrs, 0..) |ins, i| {
             const is_pre_val = marker_idx != null and i < ms and isTransient(ins.op);
             const is_int_phi = ins.op == .phi and ins.aux == trace.PHI_INTERNAL;
             if (!is_pre_val and !is_int_phi) continue;
+            // An immediate konst needs no home, run-once or not.
+            if (imm(t, kinds, &float_read, i)) |v| {
+                loc[i] = .{ .imm = v };
+                continue;
+            }
             if (is_int_phi) {
                 // The init must be a run-once value (a < marker), so the prologue
                 // init-move reads a home already materialized before `loop_top`.
@@ -1502,6 +1544,11 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // A const-key aref is an immediate wherever it is read (`refBaseReg`
         // via `Alloc.trace`), so it takes no register either.
         if (prove.arefConstIdx(t, i) != null) continue;
+        // Nor does an immediate konst: each reader takes it as an operand.
+        if (imm(t, kinds, &float_read, i)) |v| {
+            loc[i] = .{ .imm = v };
+            continue;
+        }
         // expire GP transients whose last use precedes i
         var w: usize = 0;
         for (active[0..active_len]) |e| {
@@ -1621,7 +1668,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     seen_xmm |= b;
                 },
                 .spill => {},
-                .flags => unreachable, // a slot home is a register or a cell
+                .flags, .imm => unreachable, // a slot home is a register or a cell
             }
         }
         // Computed homes (preheader values + internal φs) are also register-disjoint
@@ -1640,7 +1687,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     seen_xmm |= b;
                 },
                 .spill => {},
-                .flags => unreachable, // a computed home is a register or a cell
+                .flags, .imm => unreachable, // a computed home is a register or a cell
             }
         }
         // [Phase 2] Invariant array-base homes are register-disjoint from slot homes,
@@ -1664,14 +1711,14 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             switch (loc[i]) {
                 .reg => |r| std.debug.assert(home_reg_mask & regBit(r) == 0),
                 .xmm => |r| std.debug.assert(home_xmm_mask & regBit(r) == 0),
-                .spill, .flags => {},
+                .spill, .flags, .imm => {},
             }
         }
         // every slot-bound φ's back-edge update ref has a concrete location (always does)
         for (t.instrs) |ins| {
             if (ins.op != .phi or ins.aux < 0) continue;
             const l = loc[ins.b];
-            std.debug.assert(l == .reg or l == .xmm or l == .spill);
+            std.debug.assert(l == .reg or l == .xmm or l == .spill or l == .imm);
         }
     }
 
@@ -1704,7 +1751,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     switch (l) {
                         .reg => |r| gp.* |= regBit(r),
                         .xmm => |r| xmm.* |= regBit(r),
-                        .spill, .flags => {},
+                        .spill, .flags, .imm => {},
                     }
                 }
             }.f;
@@ -1845,6 +1892,7 @@ pub const Place = union(enum) {
     xmm: Reg, // an XMM register (float). Distinct tag → a GP reg and the XMM of the
     // same 0..15 index never compare equal (they are physically distinct registers).
     mem: i32, // rsp-relative byte displacement (kind-agnostic 8-B cell)
+    imm: i32, // a constant operand, sign-extended to 64 bits (`Loc.imm`)
 
     // pub for nativegen.zig's emitters (file-split pass).
     pub fn eql(x: Place, y: Place) bool {
@@ -1853,6 +1901,7 @@ pub const Place = union(enum) {
             .reg => x.reg == y.reg,
             .xmm => x.xmm == y.xmm,
             .mem => x.mem == y.mem,
+            .imm => x.imm == y.imm,
         };
     }
 };
@@ -1867,6 +1916,7 @@ pub fn locToPlace(l: Loc) Place {
         // Only its guard reads a flags compare, and that guard branches on
         // the flags without asking for a place.
         .flags => unreachable,
+        .imm => |v| .{ .imm = v },
     };
 }
 

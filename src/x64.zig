@@ -254,6 +254,15 @@ pub const Assembler = struct {
         try self.imm32(@bitCast(v));
     }
 
+    /// `mov r64, imm32` — REX.W C7 /0 id: the immediate sign-extended to 64
+    /// bits (a `Place.imm` operand), in 7 bytes rather than `movRegImm64`'s 10.
+    pub fn movRegImm32Sx(self: *Assembler, reg: Reg, v: i32) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0xC7);
+        try self.modrmReg(0, reg.lo());
+        try self.imm32(v);
+    }
+
     pub fn movRegImm64(self: *Assembler, reg: Reg, v: i64) !void {
         try self.rex(true, false, false, reg.hi());
         try self.b(0xB8 + @as(u8, reg.lo()));
@@ -730,6 +739,13 @@ pub const Assembler = struct {
         try self.modrmReg(4, reg.lo());
         try self.b(imm);
     }
+    /// `shr reg, imm8` — REX.W C1 /5 ib. Logical right shift by a fixed immediate.
+    pub fn shrRegImm8(self: *Assembler, reg: Reg, imm: u8) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0xC1);
+        try self.modrmReg(5, reg.lo());
+        try self.b(imm);
+    }
     /// `not reg` — REX.W F7 /2 (bitwise complement; matches arith.bnot).
     pub fn notReg(self: *Assembler, reg: Reg) !void {
         try self.rex(true, false, false, reg.hi());
@@ -765,6 +781,31 @@ pub const Assembler = struct {
         try self.rex(true, false, false, reg.hi());
         try self.b(0x81);
         try self.modrmReg(5, reg.lo());
+        try self.imm32(v);
+    }
+
+    /// `and reg, imm32` — REX.W 81 /4 id (imm sign-extended to 64).
+    pub fn andRegImm32(self: *Assembler, reg: Reg, v: i32) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0x81);
+        try self.modrmReg(4, reg.lo());
+        try self.imm32(v);
+    }
+
+    /// `or reg, imm32` — REX.W 81 /1 id (imm sign-extended to 64).
+    pub fn orRegImm32(self: *Assembler, reg: Reg, v: i32) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0x81);
+        try self.modrmReg(1, reg.lo());
+        try self.imm32(v);
+    }
+
+    /// `imul dst, src, imm32` — REX.W 69 /r id: reg = dst, rm = src (imm
+    /// sign-extended to 64).
+    pub fn imulRegRegImm32(self: *Assembler, dst: Reg, src: Reg, v: i32) !void {
+        try self.rex(true, dst.hi(), false, src.hi());
+        try self.b(0x69);
+        try self.modrmReg(dst.lo(), src.lo());
         try self.imm32(v);
     }
 
@@ -1387,6 +1428,57 @@ test "enc: bt / bts qword [mem], imm8" {
     try expectEnc(&.{ 0x49, 0x0F, 0xBA, 0x2F, 0x3F }, struct {
         fn f(a: *Assembler) !void {
             try a.btsMemImm8(.r15, 0, 63);
+        }
+    }.f);
+}
+
+test "enc: sign-extended imm32 mov and the imm32 ALU forms" {
+    // mov r13, -1 — REX.W C7 /0 id
+    try expectEnc(&.{ 0x49, 0xC7, 0xC5, 0xFF, 0xFF, 0xFF, 0xFF }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movRegImm32Sx(.r13, -1);
+        }
+    }.f);
+    // mov rax, 5
+    try expectEnc(&.{ 0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movRegImm32Sx(.rax, 5);
+        }
+    }.f);
+    // and rcx, 0xff — REX.W 81 /4 id
+    try expectEnc(&.{ 0x48, 0x81, 0xE1, 0xFF, 0x00, 0x00, 0x00 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.andRegImm32(.rcx, 0xff);
+        }
+    }.f);
+    // and r12, -16
+    try expectEnc(&.{ 0x49, 0x81, 0xE4, 0xF0, 0xFF, 0xFF, 0xFF }, struct {
+        fn f(a: *Assembler) !void {
+            try a.andRegImm32(.r12, -16);
+        }
+    }.f);
+    // or r9, 1 — REX.W 81 /1 id
+    try expectEnc(&.{ 0x49, 0x81, 0xC9, 0x01, 0x00, 0x00, 0x00 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.orRegImm32(.r9, 1);
+        }
+    }.f);
+    // imul rax, r10, 3 — REX.W 69 /r id
+    try expectEnc(&.{ 0x49, 0x69, 0xC2, 0x03, 0x00, 0x00, 0x00 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.imulRegRegImm32(.rax, .r10, 3);
+        }
+    }.f);
+    // imul r12, rax, -2
+    try expectEnc(&.{ 0x4C, 0x69, 0xE0, 0xFE, 0xFF, 0xFF, 0xFF }, struct {
+        fn f(a: *Assembler) !void {
+            try a.imulRegRegImm32(.r12, .rax, -2);
+        }
+    }.f);
+    // shr r9, 7 — REX.W C1 /5 ib
+    try expectEnc(&.{ 0x49, 0xC1, 0xE9, 0x07 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.shrRegImm8(.r9, 7);
         }
     }.f);
 }

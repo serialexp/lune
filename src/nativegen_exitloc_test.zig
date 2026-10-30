@@ -43,6 +43,8 @@ fn expectPlace(row: nativegen.ExitLoc, loc: ngalloc.Loc) !void {
         },
         // No exit materializes a flags compare (`isFlagsCompare`).
         .flags => return error.FlagsCompareAtExit,
+        // A konst's row is `.konst`, never a place.
+        .imm => return error.ImmediateAtExit,
     }
 }
 

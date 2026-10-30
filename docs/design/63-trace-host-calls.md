@@ -1884,6 +1884,28 @@ set (~8), constant keys spilled to the stack (~8), and base reloads (~3).
    once pressure drops. Compile cost on nbody is +~7k instructions per
    trace.
 
+**Register pressure** (the three levers Bart picked after item 3, in
+order: konsts as immediates, homes only the prologue and exits need, the
+pinned GPRs). In the array-of-arrays probe, homes hold 8 of the 9
+allocatable GPRs and each body konst took the ninth for a `movabs`.
+
+1. *Konsts as immediates* (LuaJIT's `asm_isk32` and `ra_rematk`). An int,
+   bool or nil konst whose payload sign-extends from 32 bits gets
+   `Loc.imm`: no register or cell, run-once or not, and the konst emits
+   nothing. `Place.imm` reaches every reader, and the exhaustive switches
+   make each one decide. ALU ops take `op reg, imm32` (`mul` the
+   three-operand `imul`), a compare `cmp reg, imm32`, a shift by a
+   constant count resolves every leg at compile time, and stores, exit
+   flushes and back-edge moves write the immediate. A reader that needs
+   a register materializes it in its scratch. A konst some float op reads
+   keeps its home: from a register its promotion is one `cvtsi2sd`, from
+   an immediate a `mov` as well (partialsums went +0.43% before this
+   rule). On `bench/` (instructions, JIT on): nsieve-bit −15.3%,
+   sieve_int −3.0%, nsieve −2.9%, array3d −2.8%, euler14-bit −2.4%,
+   spectral-norm −1.4%, scalar −0.8%, repack −0.7%, recursive-fib −0.6%,
+   nothing above +0.05%. The probe went 89 → 87 instructions per
+   iteration.
+
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace
 whose prologue fails for that reason is evicted and re-recorded (the
