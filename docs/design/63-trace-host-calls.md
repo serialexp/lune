@@ -1860,6 +1860,29 @@ set (~8), constant keys spilled to the stack (~8), and base reloads (~3).
    read-and-write rotation went 65 → 55 and the `a[1]` rotation 37 → 35.
    On `bench/`: nbody −1.6%, scalar −1.0%, binary-trees −0.06%, the rest
    within ±0.004% (the scimark rows exit at startup).
+3. *Per-iteration base sharing.* A table no hoisted home covers (one read
+   out of another table, or a slot whose base home lost to pressure) had
+   its `data`/`present` loaded by every consumer. Consumers of one
+   (table, field) now share a range, from the first to the last. The first
+   loads the base into a register (`Alloc.sharedBase`), and the rest read
+   that register. `arrayBaseUse` is the one table of which op reads which
+   base, for the home reservation, the ranges and the lowering. A range
+   never spans a body callout or the preheader marker. Exit stubs and
+   adapters never share. A shared base is rematerializable, so a
+   transient evicts one before any value spills. It takes the base with
+   the furthest last consumer, but one the instruction itself reads goes
+   last. The analysis also lost two scans it had: callouts are found once
+   (the GC audit, the ranges and the save area read the one list), and
+   the proven-present stores come from the reservation walk, where
+   `astorePresenceProven` had rescanned the trace before every store
+   (quadratic in trace length). Measured neutral: the suite within
+   ±0.03% (nothing above +0.07%), nbody +0.01%, and the array-of-arrays
+   probe at 89 instructions per iteration either way. Register pressure
+   starves it. In that probe, homes hold 8 of the 9 allocatable GPRs, the
+   element table itself spills, and the one free register goes to
+   `present` until the next transient evicts it. The mechanism pays only
+   once pressure drops. Compile cost on nbody is +~7k instructions per
+   trace.
 
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace

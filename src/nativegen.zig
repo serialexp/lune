@@ -1833,7 +1833,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 const imm = alloc.arefImm(ins.a);
                 if (aref_ins.aux == BOOL_LANE) {
                     // [Phase 2] data base from its hoisted home (or a per-iter load).
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, i);
                     if (imm) |k| {
                         try a.cmpByteMemImm(datareg, emit.arefImmDisp(k, 1), 0);
                         try jccNativeExit(a, exit_labels, i, .e);
@@ -1845,7 +1845,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     try jccNativeExit(a, exit_labels, i, .e); // byte==0 → hole → side-exit
                 } else {
                     // [Phase 2] present-bitmap base from its hoisted home (or per-iter load).
-                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax, i);
                     if (imm) |k| {
                         try a.btMemImm8(preg, emit.presenceQwordDisp(k), emit.presenceBit(k));
                     } else {
@@ -1899,13 +1899,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     var elem: Reg = .rcx;
                     var off: i32 = 0;
                     if (alloc.arefImm(ins.a)) |k| {
-                        elem = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rcx);
+                        elem = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rcx, i);
                         off = emit.arefImmDisp(k, 16);
                     } else {
                         const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                         try a.movRegReg(.rcx, ireg); // rcx = idx0
                         try a.shlRegImm8(.rcx, 4); // rcx = idx0 * 16
-                        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, i);
                         try a.addRegReg(.rcx, datareg); // rcx = &data[idx0] (Value*)
                     }
                     try a.cmpByteMemImm(elem, off + VALUE_TAG_OFF, want_tag);
@@ -1932,7 +1932,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     }
                 } else {
                     // Scalar lanes: data base from hoisted home (or per-iter load).
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, i);
                     if (alloc.arefImm(ins.a)) |k| {
                         // A constant key: the element is `[data + k*w]`.
                         if (ins.aux == F64_LANE) {
@@ -2049,7 +2049,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // astore: write the value into the slot the aref addresses.
             // `idx0` (from the aref) is shared with the dominating guard_bounds [I3].
             .astore => {
-                try emitAStore(a, t, kinds, alloc, ins, ngalloc.astorePresenceProven(t, i));
+                try emitAStore(a, t, kinds, alloc, ins, alloc.astorePresenceProven(i), i);
             },
             // guard_append (B5-grow): the append precondition, the grow analogue of
             // guard_bounds. Three memory-relative checks, no extra register beyond the
@@ -2148,7 +2148,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // idx0` — [I5] the absent→present commit point (recArraySet refuses
                 // nil/out-of-lane, so it never clears). Every store lands before
                 // the len bump below publishes the slot.
-                try emitAStore(a, t, kinds, alloc, ins, false);
+                try emitAStore(a, t, kinds, alloc, ins, false, i);
                 // len += 1, in place in the table struct (no len_home for appends). The
                 // table pointer is re-fetched into rax (the value/presence stores above
                 // clobbered it). Bumping len LAST publishes the fully-written slot —
@@ -2215,7 +2215,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             .guard_gpresent => {
                 const gcell_ins = t.instrs[ins.a];
                 const garow_ins = t.instrs[gcell_ins.a];
-                const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax);
+                const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax, i);
                 const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
                 try a.btMemReg(preg, 0, flatreg);
                 try jccNativeExit(a, exit_labels, i, .ae); // CF==0 → hole → side-exit
@@ -2229,7 +2229,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             .gload => {
                 const gcell_ins = t.instrs[ins.a];
                 const garow_ins = t.instrs[gcell_ins.a];
-                const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
+                const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax, i);
                 const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
                 if (ins.aux == F64_LANE) {
                     try a.leaRegMemSib(.rax, datareg, flatreg, 8, 0); // rax = &data[flat]
@@ -2258,7 +2258,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // `@bitCast`, so the bits commit byte-identically). Mirrors the in-bounds
             // `astore` int / f64 paths.
             .gstore => {
-                try emitGStore(a, t, alloc, ins);
+                try emitGStore(a, t, alloc, ins, i);
             },
             .guard_true => switch (kinds[ins.a]) {
                 .nil => try jmpNativeExit(a, exit_labels, i),

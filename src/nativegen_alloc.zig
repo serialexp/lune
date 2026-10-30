@@ -197,10 +197,42 @@ pub const Alloc = struct {
     // aref has no `loc`. Null in an allocation that never names one.
     trace: ?*const Trace = null,
 
+    // --- shared per-iteration array bases (doc 63 §5.10.7 follow-up) ---
+    // Ranges in order of `first`; `base_of[i]` names the ranges body
+    // instruction `i` reads its bases through (empty outside `analyze`).
+    shared_bases: []const SharedBase = &.{},
+    base_of: []const BaseOf = &.{},
+    // Body `astore`s whose slot is already present, by instruction index;
+    // empty when none is (and outside `analyze`, where every store sets its bit).
+    presence_proven: std.DynamicBitSetUnmanaged = .{},
+
+    /// Does the body `astore` at `idx` find its slot already present? True
+    /// when an earlier `guard_present` checks the same `aref` (tropt's AREF
+    /// CSE makes `t[k] = t[k] + x` share one): that guard ran earlier in the
+    /// same pass, and presence is never cleared on trace (I5), so the store's
+    /// presence-bit set is a no-op. Only for the store's own body position — a
+    /// store emitted at an exit stub (sunk, or a loop-done snapshot) runs where
+    /// a lower-indexed guard may not have, so those paths keep the bit set.
+    pub fn astorePresenceProven(self: *const Alloc, idx: usize) bool {
+        return idx < self.presence_proven.bit_length and self.presence_proven.isSet(idx);
+    }
+
     /// The immediate index of `ref` when it is a const-key aref here.
     pub fn arefImm(self: *const Alloc, ref: usize) ?u32 {
         const t = self.trace orelse return null;
         return prove.arefConstIdx(t, ref);
+    }
+
+    /// The register holding `field` of the table body instruction `at`
+    /// addresses, shared with the other consumers of its range — null when
+    /// `at` loads its own. `at` loads it when it is the range's first.
+    pub fn sharedBase(self: *const Alloc, at: usize, field: ArrayBaseField) ?SharedBase {
+        if (at >= self.base_of.len) return null;
+        const bi = self.base_of[at].get(field);
+        if (bi == NO_BASE) return null;
+        const b = self.shared_bases[bi];
+        // An eviction may have cut the range short of `at`.
+        return if (b.reg != null and at >= b.first and at <= b.last) b else null;
     }
 
     pub fn deinit(self: *Alloc, gpa: std.mem.Allocator) void {
@@ -208,9 +240,84 @@ pub const Alloc = struct {
         gpa.free(self.last_use);
         gpa.free(self.slot_id_of_ref);
         gpa.free(self.slots);
+        gpa.free(self.shared_bases);
+        gpa.free(self.base_of);
+        self.presence_proven.deinit(gpa);
         self.* = undefined;
     }
 };
+
+/// An array base pointer a lowering reads off a table: its element data or
+/// its presence bitmap. (`len` is a compare operand, never a base.)
+pub const ArrayBaseField = enum(u1) { data, present };
+
+/// One table's `field`, loaded once by body instruction `first` and read by
+/// every consumer through `last` from `reg`. `reg` is null when the range
+/// has one consumer, or when no register was free at `first`: each consumer
+/// then loads its own, as it would without sharing.
+pub const SharedBase = struct {
+    root: u32,
+    field: ArrayBaseField,
+    first: u32,
+    last: u32,
+    uses: u32,
+    reg: ?Reg = null,
+};
+
+pub const NO_BASE: u32 = std.math.maxInt(u32);
+
+/// The shared-base ranges an instruction's two fields read through.
+pub const BaseOf = struct {
+    data: u32 = NO_BASE,
+    present: u32 = NO_BASE,
+
+    pub fn get(self: BaseOf, f: ArrayBaseField) u32 {
+        return switch (f) {
+            .data => self.data,
+            .present => self.present,
+        };
+    }
+};
+
+/// The array bases instruction `i`'s lowering reads (`arrayFieldReg`), and
+/// the table they belong to — null for an op that reads none. A scalar op
+/// roots one hop away (`aref.a`), a grid cell op two (`gcell.a` = garow,
+/// `garow.a`). The bool lane keeps presence in-band in its data bytes and
+/// the `.value` lane has no bitmap, so neither reads `present`; nor does a
+/// store whose slot is proven present (`store_proven`, see
+/// `Alloc.astorePresenceProven`). The single table for the base-home
+/// reservation, the shared bases and the lowering.
+pub const ArrayBaseUse = struct { root: usize, data: bool = false, present: bool = false };
+pub fn arrayBaseUse(t: *const Trace, i: usize, store_proven: bool) ?ArrayBaseUse {
+    const ins = t.instrs[i];
+    switch (ins.op) {
+        .guard_present, .aload, .astore, .astore_append => {
+            const aref_ins = t.instrs[ins.a];
+            const in_band = aref_ins.aux == BOOL_LANE or aref_ins.aux == VALUE_LANE;
+            return switch (ins.op) {
+                .guard_present => if (aref_ins.aux == BOOL_LANE)
+                    .{ .root = aref_ins.a, .data = true }
+                else
+                    .{ .root = aref_ins.a, .present = true },
+                .aload => .{ .root = aref_ins.a, .data = true },
+                else => .{
+                    .root = aref_ins.a,
+                    .data = true,
+                    .present = !in_band and !(ins.op == .astore and store_proven),
+                },
+            };
+        },
+        .gload, .gstore, .guard_gpresent => {
+            const garow_ins = t.instrs[t.instrs[ins.a].a];
+            return switch (ins.op) {
+                .gload => .{ .root = garow_ins.a, .data = true },
+                .guard_gpresent => .{ .root = garow_ins.a, .present = true },
+                else => .{ .root = garow_ins.a, .data = true, .present = true },
+            };
+        },
+        else => return null,
+    }
+}
 
 /// 1<<reg as a 16-bit register-set bit.
 pub fn regBit(r: Reg) u16 {
@@ -709,6 +816,15 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             }
         }
     }
+    // Every body callout, in index order. Slot classes and kinds are final
+    // here, so this is the `bodyCalloutOf` answer for the rest of the
+    // analysis: the GC audit below, the shared-base ranges and the callout
+    // save area all read it rather than rescanning the trace.
+    var callouts: std.ArrayList(u32) = .empty;
+    defer callouts.deinit(gpa);
+    for (0..n) |ci| {
+        if (bodyCalloutOf(t, kinds, slots.items, slot_id_of_ref, ci) != null) try callouts.append(gpa, @intCast(ci));
+    }
     // [doc 22 §A.2] Heap-φ GC admission: a `.heap`-kind slot (carried OR
     // write-only) keeps a raw `*GcHeader` unrooted in a register/spill across the
     // body, sound only while no body callout can trigger a collection. Check every
@@ -722,17 +838,16 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             }
         }
         if (has_heap_phi) {
-            for (0..n) |ci| {
-                if (bodyCalloutOf(t, kinds, slots.items, slot_id_of_ref, ci)) |c| {
-                    // Doc 63 §5.7: a host call may collect, but nothing reads
-                    // a pre-call value until its `guard_host_epoch` has
-                    // proven no collection ran (finalize's placement rule).
-                    if (c == .host_call) {
-                        std.debug.assert(ci + 1 < n and t.instrs[ci + 1].op == .guard_host_epoch);
-                        continue;
-                    }
-                    if (calloutMayCollect(c)) return error.Bail;
+            for (callouts.items) |ci| {
+                const c = bodyCalloutOf(t, kinds, slots.items, slot_id_of_ref, ci).?;
+                // Doc 63 §5.7: a host call may collect, but nothing reads
+                // a pre-call value until its `guard_host_epoch` has
+                // proven no collection ran (finalize's placement rule).
+                if (c == .host_call) {
+                    std.debug.assert(ci + 1 < n and t.instrs[ci + 1].op == .guard_host_epoch);
+                    continue;
                 }
+                if (calloutMayCollect(c)) return error.Bail;
             }
         }
     }
@@ -1082,6 +1197,14 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         }
     }
 
+    // Filled by the Phase 2 walk: `Alloc.astorePresenceProven`'s stores, and
+    // every op that reads an array base, in index order (the shared-base
+    // ranges are built from these alone).
+    var presence_proven: std.DynamicBitSetUnmanaged = .{};
+    errdefer presence_proven.deinit(gpa);
+    var base_consumers: std.ArrayList(struct { at: u32, use: ArrayBaseUse }) = .empty;
+    defer base_consumers.deinit(gpa);
+
     // --- Phase 2: reserve invariant array-base homes ---------------------------------
     // For each `.ptr` slot used as an `aref.a`, the array `data`/`present` pointers and
     // `len` are loop-invariant across a native run (B5: the path never reallocates or
@@ -1105,69 +1228,13 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         @memset(need_present, false);
         @memset(need_len, false);
 
-        // Which array base each consuming op needs, attributed to the `.ptr` slot its
-        // address operand roots at. (guard_bounds → len; bool guard_present/aload/astore
-        // → data; int guard_present → present; int astore/astore_append → data + present.)
-        // astore_append also bumps len in memory, but via a re-fetched table pointer in
-        // rax (no len_home for an append trace), so it needs no len reservation here.
+        // Which array base each consuming op needs (`arrayBaseUse`), attributed to
+        // the `.ptr` slot its address operand roots at, plus `len` for guard_bounds.
+        // astore_append also bumps len in memory, but via a re-fetched table pointer
+        // in rax (no len_home for an append trace), so it needs no len reservation.
+        // A grid guard_bounds is on the GAROW, whose `.a` is already the table
+        // slot_load, so it roots one hop away like a scalar one.
         //
-        // A scalar array op roots ONE hop (aref.a == table slot_load); a grid op
-        // (doc 14) roots TWO hops (gcell.a == garow, garow.a == table slot_load). Its
-        // grid guard_bounds is on the GAROW, whose `.a` is already the table slot_load,
-        // so it falls into the one-hop arm below unchanged. The cell ops (gload/gstore/
-        // guard_gpresent) carry the gcell and need the extra hop.
-        for (t.instrs, 0..) |ins, ii| {
-            var sid_signed: i32 = -1;
-            var is_bool = false;
-            var is_value = false;
-            switch (ins.op) {
-                .guard_bounds, .guard_present, .aload, .astore, .astore_append => {
-                    const aref_ins = t.instrs[@intCast(ins.a)];
-                    sid_signed = slot_id_of_ref[aref_ins.a];
-                    is_bool = aref_ins.aux == BOOL_LANE;
-                    is_value = aref_ins.aux == VALUE_LANE;
-                },
-                .gload, .gstore, .guard_gpresent => {
-                    const gcell_ins = t.instrs[@intCast(ins.a)];
-                    const garow_ins = t.instrs[@intCast(gcell_ins.a)];
-                    sid_signed = slot_id_of_ref[garow_ins.a]; // two hops to the table slot
-                },
-                else => continue,
-            }
-            if (sid_signed < 0) continue; // table operand isn't a slot home — leave per-iter
-            const sid: usize = @intCast(sid_signed);
-            switch (ins.op) {
-                .guard_bounds => need_len[sid] = true,
-                .guard_present => if (is_bool) {
-                    need_data[sid] = true;
-                } else {
-                    need_present[sid] = true;
-                },
-                .aload => need_data[sid] = true,
-                .astore, .astore_append => {
-                    need_data[sid] = true;
-                    // The bool lane carries presence in-band (one byte per slot) and the
-                    // `.value` lane has no presence bitmap at all (`present` is null, nil
-                    // is an in-band tag) — reserving a base register for either would be a
-                    // wasted home, and for `.value` a load through a null pointer. A store
-                    // whose slot is proven present sets no bit in the body (an exit-stub
-                    // copy loads the base itself), so it reserves none either.
-                    const proven = ins.op == .astore and astorePresenceProven(t, ii);
-                    if (!is_bool and !is_value and !proven) need_present[sid] = true;
-                },
-                // Grid cells (doc 14) are int-lane only in this cut: a load needs the
-                // data base; a store needs data + the presence bitmap; a presence guard
-                // needs only the bitmap.
-                .gload => need_data[sid] = true,
-                .guard_gpresent => need_present[sid] = true,
-                .gstore => {
-                    need_data[sid] = true;
-                    need_present[sid] = true;
-                },
-                else => unreachable,
-            }
-        }
-
         // An astore_append bumps `len` in memory only (no len_home writeback — see the
         // lowering), so a `len` register hoisted by a sibling guard_bounds on the same
         // table would go stale the moment the append commits. Don't hoist `len` for any
@@ -1175,11 +1242,35 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // table each iteration (always the committed value). A pure append fill has no
         // guard_bounds, so this costs it nothing.
         var has_append = false;
-        for (t.instrs) |ins| {
-            if (ins.op == .astore_append) {
-                has_append = true;
-                break;
+        // The arefs a `guard_present` has checked so far (allocated at the first).
+        var checked: std.DynamicBitSetUnmanaged = .{};
+        defer checked.deinit(gpa);
+        for (t.instrs, 0..) |ins, ii| {
+            var store_proven = false;
+            switch (ins.op) {
+                .guard_bounds => {
+                    const sid = slot_id_of_ref[t.instrs[ins.a].a];
+                    if (sid >= 0) need_len[@intCast(sid)] = true;
+                    continue;
+                },
+                .guard_present => {
+                    if (checked.bit_length == 0) checked = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
+                    checked.set(ins.a);
+                },
+                .astore => if (checked.bit_length != 0 and checked.isSet(ins.a)) {
+                    if (presence_proven.bit_length == 0) presence_proven = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
+                    presence_proven.set(ii);
+                    store_proven = true;
+                },
+                .astore_append => has_append = true,
+                else => {},
             }
+            const u = arrayBaseUse(t, ii, store_proven) orelse continue;
+            try base_consumers.append(gpa, .{ .at = @intCast(ii), .use = u });
+            const sid = slot_id_of_ref[u.root];
+            if (sid < 0) continue; // table operand isn't a slot home — leave per-iter
+            if (u.data) need_data[@intCast(sid)] = true;
+            if (u.present) need_present[@intCast(sid)] = true;
         }
         // Only an invariant `.ptr` table gets base homes — the predicate the
         // prologue's base loads use. A carried-heap slot (`.heap`) holds a
@@ -1286,10 +1377,89 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         }
     }
 
+    // --- shared per-iteration array bases (doc 63 §5.10.7 follow-up) ---
+    // A table with no hoisted base home (a carried table, one read out of
+    // another table, or a slot whose home lost out to register pressure) has
+    // its `data`/`present` loaded by every consumer (`arrayFieldReg`). The
+    // consumers of one (table, field) share one load instead: the first loads
+    // it into a register that stays live through the last. Nothing on the
+    // trace moves those pointers (an append never reallocates: guard_append
+    // exits instead), so only out-of-line code could, and a range never spans
+    // a body callout. Nor does it span the preheader marker, as the run-once
+    // region does not repeat. A trace body is straight-line with side exits,
+    // so the first consumer dominates the rest. A lone consumer keeps its own
+    // load. Exit stubs and adapters, which run at other points, never share.
+    var bases: std.ArrayList(SharedBase) = .empty;
+    defer bases.deinit(gpa);
+    // A base the lowering loads itself: no hoisted home holds it.
+    const unhomed = struct {
+        fn f(sl: []const SlotInfo, sid_of: []const i32, root: usize, field: ArrayBaseField) bool {
+            const sid = sid_of[root];
+            if (sid < 0) return true;
+            const s = sl[@intCast(sid)];
+            return (if (field == .data) s.data_home else s.present_home) == null;
+        }
+    }.f;
+    // Both tables are allocated at the first unhomed consumer: most traces
+    // have none.
+    var base_of: []BaseOf = &.{};
+    errdefer gpa.free(base_of);
+    {
+        // (root, field) → its open range in `bases`.
+        var open: []u32 = &.{};
+        defer gpa.free(open);
+        var open_keys: std.ArrayList(u32) = .empty;
+        defer open_keys.deinit(gpa);
+        var next_callout: usize = 0;
+        // Consumers past this index have not yet been checked for a split.
+        var from: usize = 0;
+        for (base_consumers.items) |c| {
+            const i: usize = c.at;
+            const u = c.use;
+            // A callout or the marker in `from..i` (one at `i` itself
+            // included: it runs before `i`'s own access) closes every range.
+            var split = false;
+            while (next_callout < callouts.items.len and callouts.items[next_callout] <= i) : (next_callout += 1) split = true;
+            if (marker_idx) |m| {
+                if (m >= from and m <= i) split = true;
+            }
+            from = i + 1;
+            if (split and open_keys.items.len != 0) {
+                for (open_keys.items) |k| open[k] = NO_BASE;
+                open_keys.clearRetainingCapacity();
+            }
+            for ([_]ArrayBaseField{ .data, .present }) |f| {
+                if (!(if (f == .data) u.data else u.present)) continue;
+                if (!unhomed(slots.items, slot_id_of_ref, u.root, f)) continue;
+                if (base_of.len == 0) {
+                    base_of = try gpa.alloc(BaseOf, n);
+                    @memset(base_of, .{});
+                    open = try gpa.alloc(u32, 2 * n);
+                    @memset(open, NO_BASE);
+                }
+                const key: u32 = @intCast(2 * u.root + @intFromEnum(f));
+                if (open[key] == NO_BASE) {
+                    open[key] = @intCast(bases.items.len);
+                    try bases.append(gpa, .{ .root = @intCast(u.root), .field = f, .first = @intCast(i), .last = @intCast(i), .uses = 0 });
+                    try open_keys.append(gpa, key);
+                }
+                const bi = open[key];
+                bases.items[bi].last = @intCast(i);
+                bases.items[bi].uses += 1;
+                switch (f) {
+                    .data => base_of[i].data = bi,
+                    .present => base_of[i].present = bi,
+                }
+            }
+        }
+    }
+    var next_base: usize = 0;
+
     // Linear scan over transient defs in index order; active set ≤ pool size. A
     // second, parallel active set tracks the XMM pool (float transients) — the two
     // register files expire independently into `free` / `free_xmm`.
-    var active: [ALLOC_ORDER.len]struct { reg: Reg, last: u32 } = undefined;
+    // `base` names the shared base an entry holds (NO_BASE for a transient).
+    var active: [ALLOC_ORDER.len]struct { reg: Reg, last: u32, base: u32 = NO_BASE } = undefined;
     var active_len: usize = 0;
     var active_xmm: [XMM_ALLOC_ORDER.len]struct { reg: Reg, last: u32 } = undefined;
     var active_xmm_len: usize = 0;
@@ -1301,6 +1471,28 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     for (t.snapshot_slots) |ss| named[ss.ref] = true;
     for (t.exit_snapshot_slots) |ss| named[ss.ref] = true;
     for (t.instrs, 0..) |ins, i| {
+        // A shared base is defined at its first consumer, ahead of that
+        // consumer's own result, and lives like a transient through its last.
+        while (next_base < bases.items.len and bases.items[next_base].first == i) : (next_base += 1) {
+            const b = &bases.items[next_base];
+            if (b.uses < 2) continue;
+            var wb: usize = 0;
+            for (active[0..active_len]) |e| {
+                if (e.last < i) {
+                    free |= regBit(e.reg);
+                } else {
+                    active[wb] = e;
+                    wb += 1;
+                }
+            }
+            active_len = wb;
+            if (pickReg(&free)) |r| {
+                b.reg = r;
+                used_callee |= regBit(r) & CALLEE_SAVED_MASK;
+                active[active_len] = .{ .reg = r, .last = b.last, .base = @intCast(next_base) };
+                active_len += 1;
+            }
+        }
         if (!isTransient(ins.op)) continue;
         // A `.none` value (a konst only an href key or an exit snapshot
         // names — proveKinds) carries no native value: `lower` emits nothing
@@ -1394,6 +1586,13 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             used_callee |= regBit(r) & CALLEE_SAVED_MASK;
             active[active_len] = .{ .reg = r, .last = last_use[i] };
             active_len += 1;
+        } else if (evictSharedBase(active[0..active_len], bases.items, i, if (i < base_of.len) base_of[i] else .{})) |e| {
+            // A shared base is rematerializable (each consumer can reload it
+            // from its table), so it gives up its register before any value
+            // spills: its range now ends before `i`, and the consumers from
+            // `i` on load their own.
+            loc[i] = .{ .reg = e.reg };
+            e.* = .{ .reg = e.reg, .last = last_use[i] };
         } else {
             loc[i] = .{ .spill = spill_count };
             spill_count += 1;
@@ -1481,21 +1680,14 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // dynamically-rooted href's `resolveHashCell`, an fsin/fcos `fmath` kernel
     // call, …), the callout clobbers all SysV caller-saved registers. Reserve
     // frame slots to save/restore live homes. The predicate is `bodyCalloutOf`
-    // itself — the SAME mapping the lowering and the heap-φ GC audit dispatch
-    // on — so a new callout can never silently miss its save area.
+    // itself (via `callouts`) — the SAME mapping the lowering and the heap-φ GC
+    // audit dispatch on — so a new callout can never silently miss its save area.
     var callout_save_base: u32 = 0;
     var callout_save_count: u32 = 0;
     var callout_gp_mask: u16 = 0;
     var callout_xmm_mask: u16 = 0;
     {
-        var needs_callout = false;
-        for (t.instrs, 0..) |_, ci| {
-            if (bodyCalloutOf(t, kinds, slots.items, slot_id_of_ref, ci) != null) {
-                needs_callout = true;
-                break;
-            }
-        }
-        if (needs_callout) {
+        if (callouts.items.len != 0) {
             callout_save_base = spill_count;
             // The callout clobbers ALL SysV caller-saved registers. We must save
             // not just slot homes but also transient registers that may be live
@@ -1573,6 +1765,8 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         }
     }
 
+    const shared_bases = try bases.toOwnedSlice(gpa);
+    errdefer gpa.free(shared_bases);
     return .{
         .loc = loc,
         .last_use = last_use,
@@ -1588,7 +1782,38 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         .tnew_out = tnew_out,
         .host_epoch_save = host_epoch_save,
         .trace = t,
+        .shared_bases = shared_bases,
+        .base_of = base_of,
+        .presence_proven = presence_proven,
     };
+}
+
+/// The active shared base with the furthest last consumer, its range cut to
+/// end before `i` so `i` can take its register; null when none is active. A
+/// base `i` itself reads (`now`) goes last: evicting it costs a load at `i`
+/// as well as later, where any other base's next load is still to come.
+fn evictSharedBase(active: anytype, bases: []SharedBase, i: usize, now: BaseOf) ?*std.meta.Elem(@TypeOf(active)) {
+    var pick: ?*std.meta.Elem(@TypeOf(active)) = null;
+    var pick_now = false;
+    for (active) |*e| {
+        if (e.base == NO_BASE) continue;
+        const is_now = e.base == now.data or e.base == now.present;
+        const better = if (pick == null)
+            true
+        else if (is_now != pick_now)
+            !is_now
+        else
+            e.last > pick.?.last;
+        if (better) {
+            pick = e;
+            pick_now = is_now;
+        }
+    }
+    const e = pick orelse return null;
+    const b = &bases[e.base];
+    // Taken at its own first consumer, it was never used: no range at all.
+    if (i <= b.first) b.reg = null else b.last = @intCast(i - 1);
+    return e;
 }
 
 /// Pop the first free register in `ALLOC_ORDER` preference, clearing its bit. Null if none.
@@ -1728,22 +1953,6 @@ pub fn placeOfRef(alloc: *const Alloc, r: usize) Place {
 // dynamic in-body form (exactly the forms the `.heap`-kind aload roots already
 // use). These predicates are the single decision point, shared by analysis
 // (liveness, coalescing safety, save-area sizing) and lowering.
-
-/// Does an in-body scalar-lane `astore` at `idx` find its slot already present?
-/// True when an earlier `guard_present` checks the same `aref` (tropt's AREF CSE
-/// makes `t[k] = t[k] + x` share one): that guard ran earlier in the same pass,
-/// and presence is never cleared on trace (I5), so the store's presence-bit set
-/// is a no-op. Only for the store's own body position — a store emitted at an
-/// exit stub (sunk, or a loop-done snapshot) runs where a lower-indexed guard
-/// may not have, so those paths keep the bit set.
-pub fn astorePresenceProven(t: *const Trace, idx: usize) bool {
-    const ins = t.instrs[idx];
-    std.debug.assert(ins.op == .astore);
-    for (t.instrs[0..idx]) |g| {
-        if (g.op == .guard_present and g.a == ins.a) return true;
-    }
-    return false;
-}
 
 /// True iff `ref` is the slot_load of a carried-heap slot.
 pub fn isCarriedHeapRoot(slots: []const SlotInfo, slot_id_of_ref: []const i32, ref: u16) bool {

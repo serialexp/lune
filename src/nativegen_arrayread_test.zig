@@ -27,6 +27,7 @@ const VALUE_LANE = nativegen.VALUE_LANE;
 const compile = nativegen.compile;
 const is_x64_linux = nativegen.is_x64_linux;
 
+const ngalloc = @import("nativegen_alloc.zig");
 const util = @import("nativegen_testutil.zig");
 const expectBail = util.expectBail;
 const expectMatch = util.expectMatch;
@@ -714,6 +715,168 @@ test "nativegen(doc63 cleanups): constant-key reads and writes lower to immediat
             // KR = 3 never exits until the scan runs off the end, which needs
             // the KW hole filled by the immediate presence bit.
             if (KR == 3) try testing.expect(oresult.completed >= K - 2);
+        }
+    }
+}
+
+/// How the shared-base test lays out its element reads.
+const SharedBaseMode = enum {
+    /// Three back-to-back reads share each base, until the second read's
+    /// value evicts one.
+    shared,
+    /// A float callout between the second and third reads splits each range.
+    callout,
+    /// Eight values live across the reads leave no register for either
+    /// base at its first consumer: every read loads its own.
+    pressure,
+};
+
+/// `s = s + e[1] + e[2] + e[3]` for `e = container[idx]`, `idx` counting up:
+/// the element table is a per-iteration `aload`, so no hoisted home holds
+/// its bases. `reads` gets the three element `aload`s' indices.
+fn sharedBaseTrace(gpa: std.mem.Allocator, mode: SharedBaseMode, reads: *[3]u16) ![]I {
+    var b: std.ArrayList(I) = .empty;
+    errdefer b.deinit(gpa);
+    const at = struct {
+        fn f(list: *std.ArrayList(I), g: std.mem.Allocator, ins: I) !u16 {
+            try list.append(g, ins);
+            return @intCast(list.items.len - 1);
+        }
+    }.f;
+    const i64_lane: i32 = @intFromEnum(arr.Lane.i64);
+    const container = try at(&b, gpa, .{ .op = .slot_load, .aux = 0 });
+    _ = try at(&b, gpa, .{ .op = .guard_table, .a = container });
+    _ = try at(&b, gpa, .{ .op = .guard_lane, .a = container, .aux = VALUE_LANE });
+    const idx = try at(&b, gpa, .{ .op = .slot_load, .aux = 1 });
+    _ = try at(&b, gpa, .{ .op = .guard_int, .a = idx });
+    const cref = try at(&b, gpa, .{ .op = .aref, .a = container, .b = idx, .aux = VALUE_LANE });
+    _ = try at(&b, gpa, .{ .op = .guard_bounds, .a = cref });
+    const e = try at(&b, gpa, .{ .op = .aload, .a = cref, .aux = VALUE_LANE, .ty = .heap });
+    _ = try at(&b, gpa, .{ .op = .guard_table, .a = e });
+    _ = try at(&b, gpa, .{ .op = .guard_lane, .a = e, .aux = i64_lane });
+    var acc = try at(&b, gpa, .{ .op = .slot_load, .aux = 2 });
+    _ = try at(&b, gpa, .{ .op = .guard_int, .a = acc });
+    var live: [8]u16 = undefined;
+    if (mode == .pressure) for (&live, 0..) |*w, j| {
+        const k = try at(&b, gpa, .{ .op = .konst, .aux = @intCast(j % 3) });
+        w.* = try at(&b, gpa, .{ .op = .add, .a = idx, .b = k, .ty = .int });
+    };
+    for (reads, 0..) |*r, j| {
+        if (mode == .callout and j == 2) {
+            const f = try at(&b, gpa, .{ .op = .konst, .aux = 3 });
+            _ = try at(&b, gpa, .{ .op = .fsin, .a = f, .ty = .float });
+        }
+        const k = try at(&b, gpa, .{ .op = .konst, .aux = @intCast(j) });
+        const ref = try at(&b, gpa, .{ .op = .aref, .a = e, .b = k, .aux = i64_lane });
+        _ = try at(&b, gpa, .{ .op = .guard_bounds, .a = ref });
+        _ = try at(&b, gpa, .{ .op = .guard_present, .a = ref });
+        r.* = try at(&b, gpa, .{ .op = .aload, .a = ref, .aux = i64_lane, .ty = .int });
+        acc = try at(&b, gpa, .{ .op = .add, .a = acc, .b = r.*, .ty = .int });
+    }
+    if (mode == .pressure) for (live) |w| {
+        acc = try at(&b, gpa, .{ .op = .add, .a = acc, .b = w, .ty = .int });
+    };
+    const one = try at(&b, gpa, .{ .op = .konst, .aux = 0 });
+    const next = try at(&b, gpa, .{ .op = .add, .a = idx, .b = one, .ty = .int });
+    _ = try at(&b, gpa, .{ .op = .phi, .b = next, .aux = 1 });
+    _ = try at(&b, gpa, .{ .op = .phi, .b = acc, .aux = 2 });
+    _ = try at(&b, gpa, .{ .op = .loop });
+    return b.toOwnedSlice(gpa);
+}
+
+test "nativegen(doc63 cleanups): an element table's array bases load once per range and match the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // container[i] = { 10i, 20i, BIG + i } (the BIG pins the i64 lane); element
+    // HOLE has no [2], so a scan reaching it exits at a guard_present between
+    // two consumers of one range.
+    const N: usize = 12;
+    const HOLE: usize = 9;
+    const BIG: i64 = 5_000_000_000;
+    var elems: [N]*table.Table = undefined;
+    var built: usize = 0;
+    defer for (elems[0..built]) |el| el.destroy(gpa);
+    const container = try table.Table.create(gpa);
+    defer container.destroy(gpa);
+    for (0..N) |j| {
+        const el = try table.Table.create(gpa);
+        elems[j] = el;
+        built += 1;
+        const v: i64 = @intCast(j + 1);
+        try el.set(gpa, Value.int(1), Value.int(10 * v));
+        try el.set(gpa, Value.int(2), Value.int(20 * v));
+        try el.set(gpa, Value.int(3), Value.int(BIG + v));
+        if (j + 1 == HOLE) try el.set(gpa, Value.int(2), Value.nil());
+        try testing.expectEqual(arr.Lane.i64, el.array.lane);
+        try container.set(gpa, Value.int(@intCast(j + 1)), Value.heap(&el.header));
+    }
+    try testing.expectEqual(arr.Lane.value, container.array.lane);
+
+    var consts = [_]Value{ Value.int(1), Value.int(2), Value.int(3), Value.float(0.5) };
+    for ([_]SharedBaseMode{ .shared, .callout, .pressure }) |mode| {
+        var reads: [3]u16 = undefined;
+        const instrs = try sharedBaseTrace(gpa, mode, &reads);
+        defer gpa.free(instrs);
+        var es = [_]u16{};
+        const tr = Trace{ .anchor = undefined, .instrs = instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+        const kinds = try gpa.alloc(nativegen.Kind, instrs.len);
+        defer gpa.free(kinds);
+        const slot_of = try gpa.alloc(i32, instrs.len);
+        defer gpa.free(slot_of);
+        try testing.expect(nativegen.proveKinds(gpa, &tr, kinds, slot_of));
+        var alloc = nativegen.analyze(gpa, &tr, kinds, slot_of) orelse return error.AnalyzeBailed;
+        defer alloc.deinit(gpa);
+
+        // Each read's consumer of each base: the aload reads `data`, the
+        // guard_present before it `present`. Which loads the base itself
+        // (the range's `first`), and which reuse it.
+        for ([_]ngalloc.ArrayBaseField{ .data, .present }) |field| {
+            var sb: [3]?ngalloc.SharedBase = undefined;
+            var use: [3]u16 = undefined;
+            for (&sb, &use, reads) |*s, *u, r| {
+                u.* = if (field == .data) r else r - 1;
+                s.* = alloc.sharedBase(u.*, field);
+            }
+            switch (mode) {
+                .shared => switch (field) {
+                    // One range, opened by the first read.
+                    .data => {
+                        for (sb) |s| try testing.expect(s != null);
+                        try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
+                        try testing.expectEqual(@as(u32, use[2]), sb[0].?.last);
+                        try testing.expectEqual(@as(u32, 3), sb[0].?.uses);
+                        try testing.expectEqual(sb[0].?.first, sb[2].?.first);
+                    },
+                    // Nine registers hold three homes, `container`'s
+                    // bases, the element and both shared bases, so the
+                    // second read's value takes one: `present`'s, whose
+                    // next load is further off than `data`'s, which that
+                    // read itself consumes. The first two reads share it.
+                    .present => {
+                        for (sb[0..2]) |s| try testing.expect(s != null);
+                        try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
+                        try testing.expectEqual(@as(u32, use[1]), sb[1].?.last);
+                        try testing.expect(sb[2] == null);
+                    },
+                },
+                .callout => {
+                    // The callout clobbers the register: the first two reads
+                    // share one range, and the third, alone, loads its own.
+                    for (sb[0..2]) |s| try testing.expect(s != null);
+                    try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
+                    try testing.expectEqual(@as(u32, use[1]), sb[1].?.last);
+                    try testing.expect(sb[2] == null);
+                },
+                .pressure => for (sb) |s| try testing.expect(s == null),
+            }
+        }
+
+        // A full scan, one starting past the hole, one exiting at the hole,
+        // and one running off the container.
+        for ([_]i64{ 1, HOLE + 1, HOLE, N + 2 }) |start| {
+            try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(start), Value.int(0) });
         }
     }
 }

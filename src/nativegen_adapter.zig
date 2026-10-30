@@ -267,9 +267,9 @@ fn emitAdapter(
         if (!exit_attach.appliesAtExit(t, gi, e)) continue;
         const ins = t.instrs[e];
         switch (ins.op) {
-            .astore => try emit.emitAStore(a, t, kinds, &alloc, ins, false), // exit stub
+            .astore => try emit.emitAStore(a, t, kinds, &alloc, ins, false, null), // exit stub
             .hstore, .ustore => try emit.emitHStore(a, kinds, &alloc, ins),
-            .gstore => try emit.emitGStore(a, t, &alloc, ins),
+            .gstore => try emit.emitGStore(a, t, &alloc, ins, null),
             else => unreachable, // `appliesAtExit` admits only the flush stores
         }
     }

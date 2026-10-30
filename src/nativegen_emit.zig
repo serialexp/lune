@@ -134,8 +134,13 @@ pub fn presenceBit(k: u32) u6 {
 /// `scratch`, returning `scratch`. Either way the returned register is a valid memory
 /// base for the subsequent SIB element access. (`len` is a compare operand, handled
 /// inline at `guard_bounds`.)
-pub const ArrayBaseField = enum { data, present };
-pub fn arrayFieldReg(a: *x64.Assembler, alloc: *const Alloc, aref_a: usize, field: ArrayBaseField, scratch: Reg) !Reg {
+///
+/// `at` is the body instruction being lowered, or null on a path that runs
+/// elsewhere (an exit stub, an adapter). A body consumer may share its load
+/// with the table's other consumers (`Alloc.sharedBase`): the first loads
+/// the shared register, the rest read it.
+pub const ArrayBaseField = ngalloc.ArrayBaseField;
+pub fn arrayFieldReg(a: *x64.Assembler, alloc: *const Alloc, aref_a: usize, field: ArrayBaseField, scratch: Reg, at: ?usize) !Reg {
     const sid = alloc.slot_id_of_ref[aref_a];
     if (sid >= 0) {
         const s = alloc.slots[@intCast(sid)];
@@ -145,11 +150,20 @@ pub fn arrayFieldReg(a: *x64.Assembler, alloc: *const Alloc, aref_a: usize, fiel
         };
         if (home) |r| return r; // hoisted — already in a register, no load
     }
-    const tb = try refBaseReg(a, alloc, aref_a, scratch);
     const fieldoff: i32 = switch (field) {
         .data => ArrLayout.data,
         .present => ArrLayout.present,
     };
+    if (at) |i| if (alloc.sharedBase(i, field)) |sb| {
+        std.debug.assert(sb.root == aref_a);
+        const r = sb.reg.?;
+        if (sb.first == i) {
+            const tb = try refBaseReg(a, alloc, aref_a, scratch);
+            try a.movRegMem(r, tb, ArrLayout.array_base + fieldoff);
+        }
+        return r;
+    };
+    const tb = try refBaseReg(a, alloc, aref_a, scratch);
     try a.movRegMem(scratch, tb, ArrLayout.array_base + fieldoff);
     return scratch;
 }
@@ -2497,11 +2511,11 @@ pub fn emitHStore(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, i
     }
 }
 
-/// `presence_proven`: the slot is known present here (`astorePresenceProven`),
+/// `presence_proven`: the slot is known present here (`Alloc.astorePresenceProven`),
 /// so the scalar lanes skip the presence-bit set.
-pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr, presence_proven: bool) !void {
+pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr, presence_proven: bool, at: ?usize) !void {
     const aref_ins = t.instrs[ins.a];
-    if (alloc.arefImm(ins.a)) |k| return emitAStoreConst(a, kinds, alloc, aref_ins, ins, k, presence_proven);
+    if (alloc.arefImm(ins.a)) |k| return emitAStoreConst(a, kinds, alloc, aref_ins, ins, k, presence_proven, at);
     if (ins.aux == VALUE_LANE) {
         // doc 32: `.value`-lane store — write a full tagged Value (tag byte + 8-byte
         // payload) and **no presence bit**; the lane has no bitmap (nil is in-band,
@@ -2521,7 +2535,7 @@ pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc
             const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
             try a.movRegReg(.rcx, ireg);
             try a.shlRegImm8(.rcx, 4);
-            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, at);
             try a.addRegReg(.rcx, datareg); // rcx = &data[idx0] (Value*)
             try a.movByteMemImm(.rcx, VALUE_TAG_OFF, TAG_FLOAT);
             try a.movsdMemReg(.rcx, VALUE_PAYLOAD_OFF, XMM_SCRATCH0);
@@ -2529,7 +2543,7 @@ pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc
             const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
             try a.movRegReg(.rcx, ireg);
             try a.shlRegImm8(.rcx, 4);
-            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, at);
             try a.addRegReg(.rcx, datareg); // rcx = &data[idx0] (Value*)
             // Load the value into rax only now — the data base is already consumed,
             // and rcx (the address) is scratch so no value home can alias it.
@@ -2541,16 +2555,16 @@ pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc
     }
     if (ins.aux == F64_LANE) {
         try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
-        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, at);
         const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.leaRegMemSib(.rax, datareg, ireg, 8, 0);
         try a.movsdMemReg(.rax, 0, XMM_SCRATCH0);
         if (presence_proven) return;
-        const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+        const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax, at);
         const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.btsMemReg(preg, 0, pireg);
     } else if (ins.aux == BOOL_LANE) {
-        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, at);
         const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.leaRegMemSib(.rax, datareg, ireg, 1, 0);
         try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
@@ -2558,14 +2572,14 @@ pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc
         try a.storeMemReg(.rax, 1, 0, .rcx);
     } else {
         const w = intLaneWidth(ins.aux);
-        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, at);
         const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.leaRegMemSib(.rax, datareg, ireg, w, 0);
         try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
         try a.storeMemReg(.rax, w, 0, .rcx);
 
         if (presence_proven) return;
-        const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+        const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax, at);
         const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.btsMemReg(preg, 0, pireg);
     }
@@ -2574,17 +2588,17 @@ pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc
 /// `emitAStore` at a constant key `k`: every lane addresses `[data + k*w]`
 /// directly and the presence bit is the immediate `bts` form, so neither the
 /// index nor an element address needs a register.
-fn emitAStoreConst(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, aref_ins: trace.IrInstr, ins: trace.IrInstr, k: u32, presence_proven: bool) !void {
+fn emitAStoreConst(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, aref_ins: trace.IrInstr, ins: trace.IrInstr, k: u32, presence_proven: bool, at: ?usize) !void {
     if (ins.aux == VALUE_LANE) {
         // The data base goes to rcx (never a home), leaving rax for the value.
         const off = arefImmDisp(k, 16);
         if (kinds[ins.b] == .float) {
             try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
-            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rcx);
+            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rcx, at);
             try a.movByteMemImm(datareg, off + VALUE_TAG_OFF, TAG_FLOAT);
             try a.movsdMemReg(datareg, off + VALUE_PAYLOAD_OFF, XMM_SCRATCH0);
         } else {
-            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rcx);
+            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rcx, at);
             try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
             try a.movByteMemImm(datareg, off + VALUE_TAG_OFF, TAG_INT);
             try a.storeMemReg(datareg, 8, off + VALUE_PAYLOAD_OFF, .rax);
@@ -2593,40 +2607,40 @@ fn emitAStoreConst(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, 
     }
     if (ins.aux == F64_LANE) {
         try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
-        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, at);
         try a.movsdMemReg(datareg, arefImmDisp(k, 8), XMM_SCRATCH0);
     } else {
         // The value goes to rcx: the data base may be the rax fallback.
         const w: u8 = if (ins.aux == BOOL_LANE) 1 else intLaneWidth(ins.aux);
-        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax, at);
         try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
         if (ins.aux == BOOL_LANE) try a.incReg(.rcx); // 0→1 (false), 1→2 (true)
         try a.storeMemReg(datareg, w, arefImmDisp(k, w), .rcx);
         if (ins.aux == BOOL_LANE) return; // presence is in-band
     }
     if (presence_proven) return;
-    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax, at);
     try a.btsMemImm8(preg, presenceQwordDisp(k), presenceBit(k));
 }
 
-pub fn emitGStore(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, ins: trace.IrInstr) !void {
+pub fn emitGStore(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, ins: trace.IrInstr, at: ?usize) !void {
     const gcell_ins = t.instrs[ins.a];
     const garow_ins = t.instrs[gcell_ins.a];
     if (ins.aux == F64_LANE) {
         try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
-        const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
+        const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax, at);
         const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.leaRegMemSib(.rax, datareg, flatreg, 8, 0);
         try a.movsdMemReg(.rax, 0, XMM_SCRATCH0);
     } else {
         const w = intLaneWidth(ins.aux);
-        const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
+        const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax, at);
         const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.leaRegMemSib(.rax, datareg, flatreg, w, 0);
         try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
         try a.storeMemReg(.rax, w, 0, .rcx);
     }
-    const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax);
+    const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax, at);
     const pflat = try refBaseReg(a, alloc, ins.a, .rcx);
     try a.btsMemReg(preg, 0, pflat);
 
@@ -2680,12 +2694,12 @@ pub fn emitLinkedLoopDoneSnapshot(
     while (si < t.instrs.len) : (si += 1) {
         const p = t.instrs[si];
         switch (p.op) {
-            .astore => try emitAStore(a, t, kinds, alloc, p, false), // exit stub: guards past exit_instr never ran
+            .astore => try emitAStore(a, t, kinds, alloc, p, false, null), // exit stub: guards past exit_instr never ran
             .hstore => try emitHStore(a, kinds, alloc, p),
             // Doc 43 P5: a loop-done-sunk closed-cell store — same Value-cell
             // shape as hstore, same emitter.
             .ustore => try emitHStore(a, kinds, alloc, p),
-            .gstore => try emitGStore(a, t, alloc, p),
+            .gstore => try emitGStore(a, t, alloc, p, null),
             .phi, .loop, .link => break,
             // Defensive belt: the linked branch is only emitted when
             // `loopDoneSnapshotSupported` accepted the range — now a closed
