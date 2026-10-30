@@ -293,16 +293,24 @@ pub const TextEdit = struct {
 /// `{"changes": {uri: edits}}`: the shape every client reads, and the only one
 /// `@codemirror/lsp-client` does. A document's URI is the key, which a Zig
 /// struct cannot name, hence the custom writer. One document until P6.
-pub const WorkspaceEdit = struct {
+/// One document's edits in a `WorkspaceEdit`.
+pub const FileEdits = struct {
     uri: []const u8,
     edits: []const TextEdit,
+};
+
+/// Each uri at most once.
+pub const WorkspaceEdit = struct {
+    files: []const FileEdits,
 
     pub fn jsonStringify(self: WorkspaceEdit, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("changes");
         try jw.beginObject();
-        try jw.objectField(self.uri);
-        try jw.write(self.edits);
+        for (self.files) |f| {
+            try jw.objectField(f.uri);
+            try jw.write(f.edits);
+        }
         try jw.endObject();
         try jw.endObject();
     }

@@ -1,6 +1,8 @@
 //! The workspace symbol index (doc 74 §7.4, P6e): every function and method
 //! of every source file in the workspace folders, at any depth, and each
-//! file's top-level names, for `workspace/symbol`.
+//! file's top-level names, for `workspace/symbol`; and the globals each file
+//! uses, for finding the files a rename or references must read
+//! (`filesUsing`).
 //!
 //! Built in the background. When a folder appears, the index saved for it
 //! last session (the host's `Store`) is loaded and the folder walked, a
@@ -24,6 +26,7 @@ const std = @import("std");
 const diag = @import("../diag.zig");
 const parser = @import("../parser.zig");
 const position = @import("position.zig");
+const resolve = @import("../resolve.zig");
 const syntax = @import("syntax.zig");
 const uri_mod = @import("uri.zig");
 const workspace = @import("workspace.zig");
@@ -32,9 +35,9 @@ const Allocator = std.mem.Allocator;
 
 pub const max_files = 200_000;
 
-/// Bump when what an entry holds changes (`syntax.symbols`, the layout
-/// below): an index saved by another version is not loaded.
-pub const format_version: u32 = 2;
+/// Bump when what an entry holds changes (`syntax.symbols`, `useKey`, the
+/// layout below): an index saved by another version is not loaded.
+pub const format_version: u32 = 3;
 
 /// What one `work` slice may spend: a stat or a directory listing costs one,
 /// a parse one more per 128 bytes of the file. About 5 ms.
@@ -111,6 +114,10 @@ pub const Entry = struct {
     len: u32,
     pool_first: u32,
     pool_len: u32,
+    /// The `useKey` of each global the file reads or writes, owned. A file
+    /// held by a lookup is read: two names sharing a key cost a read, not a
+    /// wrong answer.
+    uses: []u64,
     /// Its slot in `Index.slots`.
     id: u32,
     /// When polling, a file's: when it is next stamped, and the wait after
@@ -308,6 +315,7 @@ pub const Index = struct {
     }
 
     fn free(self: *Index, e: *Entry) void {
+        self.gpa.free(e.uses);
         self.gpa.free(e.strings);
         self.gpa.destroy(e);
     }
@@ -950,17 +958,19 @@ pub const Index = struct {
         }
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
-        const found = try self.symbolsOf(scratch.allocator(), text);
-        try self.insertFound(key, uri, stamp, found, self.pass, document, file);
+        const parsed = try self.parseText(scratch.allocator(), text);
+        try self.insertFound(key, uri, stamp, parsed.found, parsed.uses, self.pass, document, file);
         try self.schedule(self.entries.get(key).?, if (had) .changed else .found);
     }
 
-    /// Add an entry under `key` (none there yet) holding `found`.
-    fn insertFound(self: *Index, key: []const u8, uri: []const u8, stamp: workspace.Files.Stamp, found: []const Found, seen: u32, document: bool, file: bool) Allocator.Error!void {
+    /// Add an entry under `key` (none there yet) holding `found` and `uses`.
+    fn insertFound(self: *Index, key: []const u8, uri: []const u8, stamp: workspace.Files.Stamp, found: []const Found, uses: []const u64, seen: u32, document: bool, file: bool) Allocator.Error!void {
         const e = try self.gpa.create(Entry);
         errdefer self.gpa.destroy(e);
         e.strings = try self.gpa.alloc(u8, key.len + uri.len);
         errdefer self.gpa.free(e.strings);
+        e.uses = try self.gpa.dupe(u64, uses);
+        errdefer self.gpa.free(e.uses);
         @memcpy(e.strings[0..key.len], key);
         @memcpy(e.strings[key.len..], uri);
         e.key_len = @intCast(key.len);
@@ -1029,26 +1039,41 @@ pub const Index = struct {
         return f.name.len > 0 and f.name.len <= limit and (f.container == null or f.container.?.len <= limit);
     }
 
-    /// The symbols of `text`, allocated in `a` (scratch).
-    fn symbolsOf(self: *Index, a: Allocator, text: []const u8) Allocator.Error![]const Found {
+    const Parsed = struct {
+        found: []const Found = &.{},
+        uses: []const u64 = &.{},
+    };
+
+    /// The symbols of `text`, and the globals it uses, allocated in `a`
+    /// (scratch).
+    fn parseText(self: *Index, a: Allocator, text: []const u8) Allocator.Error!Parsed {
         self.builds += 1;
         const source = try a.dupeSentinel(u8, text, 0);
         var diags = diag.Diagnostics.init(self.gpa);
         defer diags.deinit();
         var tree = parser.parse(self.gpa, source, &diags) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.ParseError => return &.{},
+            error.ParseError => return .{},
         };
         defer tree.deinit();
         const outline = try syntax.symbols(a, tree.root);
         var index = position.LineIndex.build(self.gpa, text) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.TextTooLong => return &.{},
+            error.TextTooLong => return .{},
         };
         defer index.deinit(self.gpa);
         var out: std.ArrayList(Found) = .empty;
         try flatten(a, &out, outline, null, &index, text, self.encoding);
-        return out.items;
+
+        // The resolver makes one binding per global name.
+        var res = try resolve.resolve(self.gpa, tree.root, @intCast(source.len));
+        defer res.deinit();
+        var uses: std.ArrayList(u64) = .empty;
+        for (res.bindings.items) |b| {
+            if (b.kind == .global) try uses.append(a, useKey(b.name));
+        }
+
+        return .{ .found = out.items, .uses = uses.items };
     }
 
     // ---- the saved index ------------------------------------------------
@@ -1056,13 +1081,14 @@ pub const Index = struct {
     // One file per root, named by a hash of its path: "MHSI", the format
     // version, a Wyhash of the rest, then the encoding, the root's path and
     // extensions, and each file's entry: lengths, stamp, its strings (key,
-    // uri, names) and its symbols, their name offsets into those strings.
+    // uri, names), its symbols, their name offsets into those strings, and
+    // its uses.
     // Little-endian. Anything that does not check out is ignored whole: the
     // walk rebuilds.
 
     const magic = "MHSI";
     const header_bytes = magic.len + 4 + 8;
-    const entry_bytes = 4 + 4 + 4 + 8 + 16 + 4;
+    const entry_bytes = 4 + 4 + 4 + 8 + 16 + 4 + 4;
     const symbol_bytes = 16 + 4 + 4 + 2 + 2 + 1;
 
     fn storeName(buf: *[32]u8, root: []const u8) []const u8 {
@@ -1084,7 +1110,7 @@ pub const Index = struct {
         var it = self.entries.valueIterator();
         while (it.next()) |ep| {
             const e = ep.*;
-            if (self.savedWith(e, root.path)) size += entry_bytes + e.strings.len + e.pool_len + @as(usize, e.len) * symbol_bytes;
+            if (self.savedWith(e, root.path)) size += entry_bytes + e.strings.len + e.pool_len + @as(usize, e.len) * symbol_bytes + 8 * e.uses.len;
         }
         var out: std.ArrayList(u8) = try .initCapacity(scratch, size);
         out.appendSliceAssumeCapacity(magic);
@@ -1111,6 +1137,7 @@ pub const Index = struct {
             putInt(&out, u64, e.stamp.size);
             putInt(&out, i128, e.stamp.mtime_ns);
             putInt(&out, u32, e.len);
+            putInt(&out, u32, @intCast(e.uses.len));
             out.appendSliceAssumeCapacity(e.strings);
             out.appendSliceAssumeCapacity(self.pool.items[e.pool_first..][0..e.pool_len]);
             for (e.first..e.first + e.len) |k| {
@@ -1125,6 +1152,7 @@ pub const Index = struct {
                 putInt(&out, u16, sym.container_len);
                 putInt(&out, u8, @intFromEnum(sym.kind));
             }
+            for (e.uses) |u| putInt(&out, u64, u);
             n += 1;
         }
         std.debug.assert(out.items.len == size);
@@ -1170,6 +1198,8 @@ pub const Index = struct {
         }
         var found: std.ArrayList(Found) = .empty;
         defer found.deinit(self.gpa);
+        var uses: std.ArrayList(u64) = .empty;
+        defer uses.deinit(self.gpa);
         const n = try r.int(u32);
         for (0..n) |_| {
             const strings_len = try r.int(u32);
@@ -1178,6 +1208,7 @@ pub const Index = struct {
             const size = try r.int(u64);
             const mtime = try r.int(i128);
             const symbol_count = try r.int(u32);
+            const use_count = try r.int(u32);
             if (@as(u64, key_len) + uri_len > strings_len or key_len == 0) return error.Corrupt;
             if (mtime < std.math.minInt(i96) or mtime > std.math.maxInt(i96)) return error.Corrupt;
             const strings = try r.take(strings_len);
@@ -1202,13 +1233,17 @@ pub const Index = struct {
                     .range = range,
                 });
             }
+            if (@as(u64, use_count) * 8 > r.bytes.len - r.at) return error.Corrupt;
+            uses.clearRetainingCapacity();
+            try uses.ensureTotalCapacity(self.gpa, use_count);
+            for (0..use_count) |_| uses.appendAssumeCapacity(try r.int(u64));
             const key = strings[0..key_len];
             const owner = innermost(self.roots.items, key);
             const ours = owner != null and std.mem.eql(u8, owner.?.path, root.path);
             if (!ours or self.entries.contains(key)) continue;
             const stamp: workspace.Files.Stamp = .{ .size = size, .mtime_ns = @intCast(mtime) };
             try added.ensureUnusedCapacity(scratch, 1);
-            try self.insertFound(key, strings[key_len..][0..uri_len], stamp, found.items, 0, false, true);
+            try self.insertFound(key, strings[key_len..][0..uri_len], stamp, found.items, uses.items, 0, false, true);
             const e = self.entries.get(key).?;
             added.appendAssumeCapacity(e.key());
             try self.schedule(e, .found);
@@ -1217,6 +1252,20 @@ pub const Index = struct {
     }
 
     // ---- searching ------------------------------------------------------
+
+    /// The entries of the files and documents that may use the global
+    /// `name`: every one that does, as indexed, and now and then one that
+    /// only shares its `useKey`. Allocated in `a`, valid until the index
+    /// changes. One pass over every entry's keys: a few ms at 100k files.
+    pub fn filesUsing(self: *const Index, a: Allocator, name: []const u8) Allocator.Error![]const *const Entry {
+        const want = useKey(name);
+        var out: std.ArrayList(*const Entry) = .empty;
+        for (self.slots.items) |slot| {
+            const e = slot orelse continue;
+            if (std.mem.indexOfScalar(u64, e.uses, want) != null) try out.append(a, e);
+        }
+        return out.items;
+    }
 
     /// The symbols matching `query` (see `score`), the closest first, at most
     /// `limit` of them; allocated in `a`, and valid until the index changes.
@@ -1289,6 +1338,12 @@ pub const Hit = struct {
         return .eq;
     }
 };
+
+/// What an entry keeps of a global it uses: a hash of the name. Saved, so
+/// changing it means a new `format_version`.
+pub fn useKey(name: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, name);
+}
 
 /// One bit per character class, ignoring case: letters, digits and `_` each
 /// their own, the rest sharing bits. A name lacking a bit the query has
@@ -1673,6 +1728,63 @@ test "symbol index: a saved index spares the next session every parse but a chan
         try f.idx.setRoots(f.a(), &roots, store.store());
         try testing.expectEqualStrings("", try f.names(""));
     }
+}
+
+/// The keys of the entries `filesUsing` gives for `name`, each followed by
+/// a space, in key order.
+fn usersOf(f: *Fixture, name: []const u8) ![]const u8 {
+    const users = try f.a().dupe(*const Entry, try f.idx.filesUsing(f.a(), name));
+    std.mem.sort(*const Entry, users, {}, struct {
+        fn lt(_: void, x: *const Entry, y: *const Entry) bool {
+            return std.mem.order(u8, x.key(), y.key()) == .lt;
+        }
+    }.lt);
+    var out: std.ArrayList(u8) = .empty;
+    for (users) |e| {
+        try out.appendSlice(f.a(), e.key());
+        try out.append(f.a(), ' ');
+    }
+    return out.items;
+}
+
+test "symbol index: the files using a global, as walked, edited, opened and saved" {
+    var entries = [_][2][]const u8{
+        .{ "/w/a.mah", "counter = 0\nfunction bump() counter = counter + 1 end\n" },
+        .{ "/w/b.mah", "local counter = 5\nprint(counter, bump)\n" },
+        .{ "/w/c.mah", "local t = {}\nt.counter = 1\nprint(t, counter)\n" },
+    };
+    var mem: workspace.MemoryFiles = .{ .entries = &entries };
+    var store: workspace.MemoryStore = .{ .gpa = testing.allocator };
+    defer store.deinit();
+    const roots = [_]Root{.{ .path = "/w", .extensions = &.{".mah"} }};
+    {
+        var f = Fixture.init();
+        defer f.deinit();
+        try f.idx.setRoots(f.a(), &roots, store.store());
+        try f.settle(&mem, store.store());
+        // b's `counter` is a local, and a field is no global.
+        try testing.expectEqualStrings("/w/a.mah /w/c.mah ", try usersOf(&f, "counter"));
+        try testing.expectEqualStrings("/w/a.mah /w/b.mah ", try usersOf(&f, "bump"));
+        try testing.expectEqualStrings("/w/b.mah /w/c.mah ", try usersOf(&f, "print"));
+        try testing.expectEqualStrings("", try usersOf(&f, "t"));
+
+        // An open document is read as edited.
+        const opened = [_]Open{.{ .uri = "file:///w/b.mah", .path = "/w/b.mah", .text = "counter = 2\n" }};
+        try f.idx.setOpen(f.a(), &opened, true);
+        try testing.expectEqualStrings("/w/a.mah /w/b.mah /w/c.mah ", try usersOf(&f, "counter"));
+        try testing.expectEqualStrings("/w/a.mah ", try usersOf(&f, "bump"));
+        try f.idx.setOpen(f.a(), &.{}, true);
+        try f.settle(&mem, store.store());
+        try testing.expectEqualStrings("/w/a.mah /w/b.mah ", try usersOf(&f, "bump"));
+    }
+    // The next session has them from the save, with nothing parsed.
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.idx.setRoots(f.a(), &roots, store.store());
+    try f.settle(&mem, store.store());
+    try testing.expectEqual(@as(u64, 0), f.idx.builds);
+    try testing.expectEqualStrings("/w/a.mah /w/c.mah ", try usersOf(&f, "counter"));
+    try testing.expectEqualStrings("/w/a.mah /w/b.mah ", try usersOf(&f, "bump"));
 }
 
 test "symbol index: slices of work, and the best matches kept" {

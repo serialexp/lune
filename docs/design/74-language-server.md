@@ -208,8 +208,10 @@ land; move whole phases to Done once everything inside them is checked.
   so a document-symbol outline nests at most 100 levels (deeper symbols are
   listed flat there) and a selection chain keeps its innermost 199 steps
   and the file.
-- [ ] **P3 follow-ups:** rename of a global renames this file only (the
-  warning says so) until P6 has a workspace; completion after `.`/`:` waits
+- [x] **Cross-file globals (2026-10-30):** rename and references of a
+  global reach every file that uses it (see "Globals across files" under
+  P6e's as-built notes).
+- [ ] **P3 follow-ups:** completion after `.`/`:` waits
   for P5; a `local x =` with a missing value still offers `x` right after
   the `=` (the parser cannot say where the missing value would end);
   `contextAt` now takes its comments from the trivia sink, but still lexes
@@ -634,8 +636,9 @@ Definition, references, document highlight (read/write), and
 prepareRename/rename from the binding index. Rename refuses: an invalid
 identifier or keyword; a new name that would capture or shadow a
 different binding at any occurrence (checked against `visible_from` and
-`scope_span`); a builtin. Globals rename within the open workspace only,
-with a warning that other chunks may use them. Completion here is
+`scope_span`); a builtin. A global renames in every workspace file that
+uses it, each checked the same way (see "Globals across files", §7.4).
+Completion here is
 keywords plus the names visible at the cursor.
 
 ### 7.3 P5 — stdlib knowledge
@@ -778,6 +781,37 @@ ms at 10k / 100k files. Idle, polling 100k files in 1,000 directories costs
 0.69 ms per second (1,331 stamps: the directories, and a 300th of the
 files), averaged over 5 minutes in which a created file and a file edited in
 place both showed.
+
+**Globals across files (2026-10-30).** Rename and references of a global
+reach every file that uses it; definition still looks in the cursor's file
+only. The symbol index also runs the resolver on each file it parses and
+keeps a 64-bit hash (`useKey`) of each global the file reads or writes
+(`Entry.uses`, saved with the entry, format 3); `filesUsing` scans them, a
+shared hash costing only a needless read. Each file it gives, but the
+cursor's, is read (its open document ahead of the disk) and parsed and
+resolved, not compiled (`analysis.analyseNames`). A rename checks every such
+file with its own folder's settings as the cursor's file is checked
+(capture either way, a host global), and is refused when another file
+already uses the new name as a global, which would merge the two; a file
+that cannot be read or parsed is left alone, with a warning. With walks still under way
+the index is incomplete, so a rename is refused until it is idle;
+references answer from what is indexed. The browser has no disk: only the
+open documents are renamed, and a warning says so. Bart was away when the
+two choices came up, so they are mine, to revisit: the resolver-exact
+index (over storing every identifier, or scanning every file per
+request), and every workspace folder as one global namespace (as
+`workspace/symbol` searches, over the cursor's folder only). `_G.x` is
+not yet the global `x` to the resolver (TODO.md).
+
+Measured (`bench-lsp`, load average ~2; every file calls the global
+`shared_log`, one in 100 writes `shared_total`), at 1k / 10k / 100k files:
+references to and a rename of `shared_total` 0.2 / 3.1 / 34 ms (10 / 100 /
+1,000 files read); a lookup that finds no other file, about 1 ms at 100k;
+the resolver adds about 15% to a cold walk (28 / 298 / 3080 ms without it,
+33 / 341 / 3583 ms with). References to `shared_log`, in every file, read
+and parse them all: 31 / 313 / 3307 ms, a cold walk's cost. That is the
+open limit: answering without the reads means keeping every global
+occurrence's position in the index, many times its size.
 
 **Cost, measured** (`zig build bench-lsp`, cross-file table: a literal
 `require` per 14 lines, half resolving nowhere, real disk): 0.08 ms added

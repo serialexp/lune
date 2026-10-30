@@ -122,6 +122,32 @@ pub fn analyse(
     };
 }
 
+/// Parse and resolve `text`, no more: the names, for a file read only to
+/// find a global's uses in it. There are no diagnostics or comments.
+pub fn analyseNames(gpa: std.mem.Allocator, text: []const u8) Error!Analysis {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const source = try arena.allocator().dupeSentinel(u8, text, 0);
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = parser.parse(gpa, source, &diags) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseError => return error.Unparseable,
+    };
+    errdefer tree.deinit();
+    const res = try resolve.resolve(gpa, tree.root, @intCast(source.len));
+    return .{
+        .arena = arena,
+        .source = source,
+        .tree = tree,
+        .res = res,
+        .diagnostics = &.{},
+        .comments = &.{},
+        .incomplete = false,
+    };
+}
+
 // ---- tests ----
 
 const testing = std.testing;
@@ -161,6 +187,17 @@ test "analysis: comments are kept in source order, with their bytes" {
     try testing.expectEqual(@as(usize, 2), an.comments.len);
     try testing.expectEqual(@as(u32, 0), an.comments[0].start);
     try testing.expect(an.comments[1].block and an.comments[1].closed);
+}
+
+test "analysis: names alone resolve as a full analysis does" {
+    const src = "local x = 1\ng = x\nbreak";
+    var full = try analyse(testing.allocator, src, &known, .{});
+    defer full.deinit();
+    var names = try analyseNames(testing.allocator, src);
+    defer names.deinit();
+    try testing.expectEqual(@as(usize, 0), names.diagnostics.len);
+    try testing.expectEqual(full.res.bindings.items.len, names.res.bindings.items.len);
+    try testing.expectEqual(full.res.occurrences.items.len, names.res.occurrences.items.len);
 }
 
 test "analysis: the result owns its text, so the document may change" {

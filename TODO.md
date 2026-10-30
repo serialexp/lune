@@ -2,6 +2,16 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## LSP rename (noted 2026-10-30)
+
+- [ ] **`_G.x` is not the global `x` to the resolver.** The compiler
+      treats `_G.x = …` / `_G["x"] = …` as a write of the global `x`
+      (`compiler.zig`), but `resolve.zig` sees a field of the global `_G`,
+      so rename and references (one file or many) leave `_G.x` alone and
+      the symbol index's `filesUsing` misses a file that only writes it
+      that way. Doc 74 §6.3 says the resolver owns this rule; it does not
+      yet.
+
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
 - [ ] **A precise host trace native can't compile runs on tier-1a.** The

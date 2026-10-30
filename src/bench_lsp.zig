@@ -330,7 +330,9 @@ const symbols_dir = "/tmp/mahina-bench-lsp-symbols";
 const symbols_cache = "/tmp/mahina-bench-lsp-cache";
 
 /// `files` files of about 100 lines each, 100 to a directory, under
-/// `symbols_dir`; file `k` defines `w<k>_0` … `w<k>_7`.
+/// `symbols_dir`; file `k` defines `w<k>_0` … `w<k>_7`. Every file first
+/// calls the global `shared_log`, and one in 100 then writes the global
+/// `shared_total`.
 fn writeWorkspace(gpa: std.mem.Allocator, io: std.Io, files: usize) !void {
     const cwd = std.Io.Dir.cwd();
     cwd.deleteTree(io, symbols_dir) catch {};
@@ -345,7 +347,11 @@ fn writeWorkspace(gpa: std.mem.Allocator, io: std.Io, files: usize) !void {
         var nbuf: [32]u8 = undefined;
         const own = try std.mem.replaceOwned(u8, gpa, text, "work_", try std.fmt.bufPrint(&nbuf, "w{d}_", .{k}));
         defer gpa.free(own);
-        try cwd.writeFile(io, .{ .sub_path = path, .data = own });
+        var hbuf: [96]u8 = undefined;
+        const head = try std.fmt.bufPrint(&hbuf, "shared_log(\"f_{d}\")\n{s}", .{ k, if (k % 100 == 0) "shared_total = (shared_total or 0) + 1\n" else "" });
+        const whole = try std.mem.concat(gpa, u8, &.{ head, own });
+        defer gpa.free(whole);
+        try cwd.writeFile(io, .{ .sub_path = path, .data = whole });
     }
 }
 
@@ -366,6 +372,11 @@ const WorkspaceSymbols = struct {
     unwatched: u64,
     idle: u64,
     idle_stamps: u64,
+    /// From an open file: references to and a rename of the global one in
+    /// 100 files write, and references to the one every file calls.
+    refs_some: u64,
+    rename_some: u64,
+    refs_all: u64,
     symbols: usize,
     live: usize,
     peak: usize,
@@ -405,7 +416,7 @@ fn query(comptime q: []const u8) []const u8 {
 /// `workspace/symbol` over `symbols_dir`, with the index kept under
 /// `symbols_cache` (see `WorkspaceSymbols`); best of `reps`, queries best of
 /// 10 each.
-fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !WorkspaceSymbols {
+fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, files: usize, reps: usize) !WorkspaceSymbols {
     var tracker = mahina.mem.TrackingAllocator.init(gpa);
     const ta = tracker.allocator();
     var store: lsp.host_stdio.DiskStore = .{ .dir = symbols_cache };
@@ -418,6 +429,9 @@ fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !WorkspaceS
         .unwatched = std.math.maxInt(u64),
         .idle = std.math.maxInt(u64),
         .idle_stamps = 0,
+        .refs_some = std.math.maxInt(u64),
+        .rename_some = std.math.maxInt(u64),
+        .refs_all = std.math.maxInt(u64),
         .symbols = 0,
         .live = 0,
         .peak = 0,
@@ -509,6 +523,40 @@ fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !WorkspaceS
         r.idle = @min(r.idle, @as(u64, @intCast(t5 - t4)) / seconds);
         r.idle_stamps = (core.symbols.stamps - stamps) / seconds;
         out.reset();
+
+        // Globals across the files, from one of them, open. `f_0` and
+        // `f_500` were rewritten above without either global.
+        const users = files - 2;
+        const writers = files / 100 - 2;
+        const opened = symbols_dir ++ "/d_1/f_100.mah";
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, opened, gpa, .unlimited);
+        defer gpa.free(text);
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try aw.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file://" ++ opened ++ "\",\"version\":1,\"text\":");
+        try std.json.Stringify.value(text, .{}, &aw.writer);
+        try aw.writer.writeAll("}}}");
+        try core.handle(clock, aw.written(), &out);
+        const at = "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/{s}\",\"params\":{{\"textDocument\":{{\"uri\":\"file://" ++ opened ++ "\"}},\"position\":{{\"line\":{d},\"character\":0}}{s}}}}}";
+        const all = ",\"context\":{\"includeDeclaration\":true}";
+        var qbuf: [512]u8 = undefined;
+        const refs_some = try std.fmt.bufPrint(&qbuf, at, .{ "references", 1, all });
+        out.reset();
+        try core.handle(clock, refs_some, &out); // analyses the document
+        for (0..3) |_| {
+            r.refs_some = @min(r.refs_some, try timedRequest(io, &core, &out, refs_some));
+            if (std.mem.count(u8, out.messages()[0], "\"uri\"") != 2 * writers) return error.ReferencesMissed;
+        }
+        var rbuf: [512]u8 = undefined;
+        const rename_some = try std.fmt.bufPrint(&rbuf, at, .{ "rename", 1, ",\"newName\":\"shared_count\"" });
+        for (0..3) |_| {
+            r.rename_some = @min(r.rename_some, try timedRequest(io, &core, &out, rename_some));
+            if (std.mem.count(u8, out.messages()[0], "\"newText\"") != 2 * writers) return error.RenameMissed;
+        }
+        var abuf: [512]u8 = undefined;
+        const refs_all = try std.fmt.bufPrint(&abuf, at, .{ "references", 0, all });
+        r.refs_all = @min(r.refs_all, try timedRequest(io, &core, &out, refs_all));
+        if (std.mem.count(u8, out.messages()[0], "\"uri\"") != users) return error.ReferencesMissed;
 
 
     }
@@ -741,10 +789,12 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
         \\  narrow / broad: `workspace/symbol` for a watching client, "w123_4" / "w" (every name matches)
         \\  1 change: one file rewritten, reported, and the narrow query
         \\  polling: for a client that cannot watch, the narrow query; idle/s and stamps/s: an idle second's polling, averaged over 5 minutes
+        \\  refs 1% / rename 1%: from an open file, references to and a rename of a global one file in 100 writes
+        \\  refs all: references to a global every file calls
         \\
-        \\{s: <12} {s: >8} {s: >10} {s: >9} {s: >9} {s: >8} {s: >8} {s: >9} {s: >8} {s: >8} {s: >9} {s: >10} {s: >9} {s: >10}
+        \\{s: <12} {s: >8} {s: >10} {s: >9} {s: >9} {s: >8} {s: >8} {s: >9} {s: >8} {s: >8} {s: >9} {s: >8} {s: >10} {s: >9} {s: >10} {s: >9} {s: >10}
         \\
-    , .{ "folder", "files", "symbols", "cold", "restart", "narrow", "broad", "1 change", "polling", "idle/s", "stamps/s", "index MiB", "peak MiB", "saved MiB" });
+    , .{ "folder", "files", "symbols", "cold", "restart", "narrow", "broad", "1 change", "polling", "idle/s", "stamps/s", "refs 1%", "rename 1%", "refs all", "index MiB", "peak MiB", "saved MiB" });
     defer std.Io.Dir.cwd().deleteTree(io, symbols_dir) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, symbols_cache) catch {};
     const folders = [_]struct { name: []const u8, files: usize, reps: usize }{
@@ -755,8 +805,8 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
     const mib = 1024.0 * 1024.0;
     for (folders) |f| {
         try writeWorkspace(gpa, io, f.files);
-        const got = try workspaceSymbols(gpa, io, f.reps);
-        mahina.io.print("{s: <12} {d: >8} {d: >10} {d: >9.1} {d: >9.1} {d: >8.2} {d: >8.2} {d: >9.2} {d: >8.2} {d: >8.2} {d: >9} {d: >10.1} {d: >9.1} {d: >10.1}\n", .{
+        const got = try workspaceSymbols(gpa, io, f.files, f.reps);
+        mahina.io.print("{s: <12} {d: >8} {d: >10} {d: >9.1} {d: >9.1} {d: >8.2} {d: >8.2} {d: >9.2} {d: >8.2} {d: >8.2} {d: >9} {d: >8.1} {d: >10.1} {d: >9.1} {d: >10.1} {d: >9.1} {d: >10.1}\n", .{
             f.name,
             f.files,
             got.symbols,
@@ -768,6 +818,9 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
             ms(got.unwatched),
             ms(got.idle),
             got.idle_stamps,
+            ms(got.refs_some),
+            ms(got.rename_some),
+            ms(got.refs_all),
             @as(f64, @floatFromInt(got.live)) / mib,
             @as(f64, @floatFromInt(got.peak)) / mib,
             @as(f64, @floatFromInt(got.saved_bytes)) / mib,

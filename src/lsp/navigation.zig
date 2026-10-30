@@ -59,6 +59,14 @@ pub fn references(
     return out.toOwnedSlice(a);
 }
 
+/// The global called `name`, if the file uses one.
+pub fn globalNamed(an: *const Analysis, name: []const u8) ?BindingId {
+    for (an.res.bindings.items, 0..) |b, i| {
+        if (b.kind == .global and std.mem.eql(u8, b.name, name)) return @intCast(i);
+    }
+    return null;
+}
+
 // ---- rename ------------------------------------------------------------------
 
 pub const Refusal = enum {
