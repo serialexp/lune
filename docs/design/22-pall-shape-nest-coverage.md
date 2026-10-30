@@ -2,7 +2,7 @@
 
 Status: partial — Phases A + B landed; Phase C through C.5c4 plus the C.5c5 ownership extraction and default-disabled graduation mechanism is correctness-green but remains UNCOMMITTABLE. The focused post-B gate still fails (lu +16.8%, spectral +13.5%, grid twins +3.7–4.6%). Enabled-vs-disabled G=8 measurement is neutral, while an exploratory G=1 threshold regresses sharply, so chronic-success graduation is not enabled by default and requires profiling before Phase D/final landing.
 Owner: Claude (campaign arc 2; Bart 2026-08-20 mandate: every benchmark ≤1.2× LuaJIT)
-Last updated: 2026-08-22
+Last updated: 2026-10-30
 
 ## Implementation status
 
@@ -416,6 +416,15 @@ With that predicate in place:
   land with B.
 - `analyze` still bails (fail closed) if any aref/lane/array-base hoist
   keys on a carried-heap slot.
+
+  *Follow-up (2026-10-30, doc 63 §5.10.7):* the scalar array path through a
+  carried-heap root is now admitted. Doc 43 P3 gave `guard_lane` an in-body
+  lane-byte compare and every aref consumer a per-iteration base load
+  (`arrayFieldReg` with no base home); the base-home reservation now skips
+  non-`.ptr` slots, as the prologue's base loads always did. The bail keeps
+  grid roots (`garow`/`guard_grid`/`guard_stride`, prologue-only checks) and
+  a `guard_lane` before the preheader marker. The §A.3 fail-closed array-op
+  test became a positive oracle match plus those two bails.
 
 Note advance:132 (`.link`) would not expose the stale-cell bug — the φ
 update flushes at the terminal and the body reads only the entry value.

@@ -155,6 +155,27 @@ test "native: a table rotation compiles (typed carried loads, guard_table)" {
     try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
 }
 
+test "native: a table rotation read and written as arrays compiles (carried-heap array path)" {
+    // `a` is indexed through its array part: native re-reads the CURRENT
+    // table's lane, asize and data base every iteration (doc 63 §5.10.7).
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa,
+        \\local a, b, c = {1, 2}, {3, 4}, {5, 6}
+        \\local s = 0
+        \\for i = 1, 100 do a, b, c = b, c, a s = s + a[1] a[2] = a[2] + 1 end
+        \\print(s, a[1], a[2], b[2], c[2])
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("300\t3\t38\t39\t35\n", sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
+}
+
 test "native: a string rotation compiles (typed carried loads, guard_string)" {
     // A carried string whose write-back is another pinned slot's load.
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
@@ -201,6 +222,30 @@ test "typed carried loads: rotated tables and strings byte-identical across all 
         \\end
         \\print(s, a.x, b.x, c.x)
     , "784\t1\t5\t3\n");
+    // Rotated tables read and written as arrays. Mid-run one joins with a
+    // float lane, one with no [2], and a string passes through `c` and `b`
+    // before a table replaces it: the dynamic lane and bounds checks and the
+    // carried guard_table each exit and the run carries on.
+    try expectProgram(
+        \\local a, b, c = {1, 2}, {3, 4}, {5, 6}
+        \\local s = 0
+        \\for i = 1, 100 do a, b, c = b, c, a s = s + a[1] a[2] = a[2] + 1 end
+        \\print(s, a[1], a[2], b[2], c[2])
+    , "300\t3\t38\t39\t35\n");
+    try expectProgram(
+        \\local a, b, c = {1, 2}, {3, 4}, {5, 6}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  a, b, c = b, c, a
+        \\  s = s + (a[2] or 100)
+        \\  a[1] = a[1] + 1
+        \\  if i == 100 then b = {0.5, 1.5} end
+        \\  if i == 150 then c = {7} end
+        \\  if i == 200 then c = "str" end
+        \\  if i == 201 then b = {9, 9} end
+        \\end
+        \\print(s, a[1], a[2], b[1], c[1])
+    , "5988.5\t101\t2\t42\t57\n");
     // A rotated string becomes a table, then a string again.
     try expectProgram(
         \\local a, b, c = "x", "yy", "zzz"

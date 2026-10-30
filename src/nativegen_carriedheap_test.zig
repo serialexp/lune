@@ -27,6 +27,7 @@ const trace_exec = @import("trace_exec.zig");
 const I = trace.IrInstr;
 
 const VALUE_LANE = nativegen.VALUE_LANE;
+const I16_LANE = @import("nativegen_layout.zig").I16_LANE;
 const compile = nativegen.compile;
 const is_x64_linux = nativegen.is_x64_linux;
 
@@ -327,21 +328,154 @@ test "nativegen(doc22 A / Rule 0.5): scalar update before a dynamic table guard 
     try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(@intCast(STR_AT + 1)), Value.int(0) });
 }
 
-test "nativegen(doc22 A): array op rooted at a carried-heap slot bails (fail-closed)" {
+/// The carried-heap ARRAY loop (doc 63 §5.10.7), hand-built:
+///   r0=container, r1=index, r2=bi (CARRIED-HEAP), r3=acc.
+///   per iteration: acc += bi[2] ; bi = container[index] ; index += 1.
+/// Every array fact about `bi` — its lane, `asize`, the data and presence
+/// bases — belongs to the CURRENT table, so native must re-read them each
+/// iteration (the dynamic guard_lane, and `arrayFieldReg`'s per-iteration load
+/// because a carried-heap slot gets no base homes).
+fn carriedArrayIr(full: []I, lane: i32) void {
+    const ir = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: container
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = VALUE_LANE }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 2 }, // 5: bi — carried-heap
+        .{ .op = .guard_table, .a = 5 }, // 6: dynamic
+        .{ .op = .guard_lane, .a = 5, .aux = lane }, // 7: dynamic lane-byte compare
+        .{ .op = .konst, .aux = 0 }, // 8: 2
+        .{ .op = .aref, .a = 5, .b = 8, .aux = lane }, // 9
+        .{ .op = .guard_bounds, .a = 9 }, // 10: the CURRENT table's asize
+        .{ .op = .guard_present, .a = 9 }, // 11: the CURRENT presence bitmap
+        .{ .op = .aload, .a = 9, .aux = lane }, // 12: bi[2]
+        .{ .op = .slot_load, .aux = 3 }, // 13: acc
+        .{ .op = .guard_int, .a = 13 }, // 14
+        .{ .op = .add, .a = 13, .b = 12, .ty = .int }, // 15: acc + bi[2]
+        .{ .op = .aref, .a = 0, .b = 3, .aux = VALUE_LANE }, // 16
+        .{ .op = .guard_bounds, .a = 16 }, // 17
+        .{ .op = .aload, .a = 16, .aux = VALUE_LANE, .ty = .heap }, // 18: next bi
+        .{ .op = .konst, .aux = 1 }, // 19: 1
+        .{ .op = .add, .a = 3, .b = 19, .ty = .int }, // 20: index + 1
+        .{ .op = .phi, .b = 20, .aux = 1 }, // index carry
+        .{ .op = .phi, .b = 15, .aux = 3 }, // acc carry
+        .{ .op = .phi, .b = 18, .aux = 2 }, // bi carry — THE carried-heap φ
+        .{ .op = .loop }, // 24
+    };
+    @memcpy(full, &ir);
+}
+
+const CARRIED_ARRAY_LEN = 25;
+
+/// `src` with a `.preheader` marker inserted at `at`: every ref operand at or
+/// past `at` shifts by one. (Ops with no ref operand leave `a`/`b` at 0, and
+/// `at` is never 0, so they are untouched.)
+fn withMarkerAt(src: []const I, at: usize, out: []I) void {
+    std.debug.assert(at > 0 and out.len == src.len + 1);
+    for (src, 0..) |ins, i| {
+        var x = ins;
+        if (x.a >= at) x.a += 1;
+        if (x.b >= at) x.b += 1;
+        out[if (i < at) i else i + 1] = x;
+    }
+    out[at] = .{ .op = .preheader };
+}
+
+test "nativegen(doc63 §5.10.7): array reads through a carried-heap root match the interpreter" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
 
-    // Phase A supports HASH facts through a carried root, not ARRAY facts: aref/
-    // guard_lane root their hoisted base-pointer analyses at the slot, which for a
-    // per-iteration table would freeze iteration 0's array base. The structural
-    // scan must decline the whole trace. (Test 1 is the positive control that the
-    // carried-heap slot itself compiles — this bail is attributable to the array op.)
+    // container[k] is a small-int table {1 = k, 2 = 10 k, 3 = -k}: a distinct
+    // bi[2] per element, so a first-iteration base (data, presence, asize)
+    // diverges from the oracle on the second iteration. Two elements break the
+    // shape mid-run: SHORT has no key 2 (guard_bounds on ITS asize exits) and
+    // WIDE holds 100000 (a wider lane — the dynamic guard_lane exits).
+    const N: usize = 12;
+    const SHORT: usize = 5;
+    const WIDE: usize = 9;
+    var elems: [N]*table.Table = undefined;
+    var built: usize = 0;
+    defer for (elems[0..built]) |e| e.destroy(gpa);
     const container = try table.Table.create(gpa);
     defer container.destroy(gpa);
-    const inner = try table.Table.create(gpa);
-    defer inner.destroy(gpa);
-    try container.set(gpa, Value.int(1), Value.heap(&inner.header));
+    for (0..N) |i| {
+        const k: i64 = @intCast(i + 1);
+        const e = try table.Table.create(gpa);
+        elems[i] = e;
+        built += 1;
+        // SHORT's lone key holds a value that commits the same lane the
+        // others widen to (u8 → i16 on their `-k`), so only its asize differs.
+        try e.set(gpa, Value.int(1), Value.int(if (i + 1 == SHORT) -200 - k else k));
+        if (i + 1 != SHORT) {
+            try e.set(gpa, Value.int(2), Value.int(10 * k));
+            try e.set(gpa, Value.int(3), Value.int(if (i + 1 == WIDE) 100_000 else -k));
+        }
+        try container.set(gpa, Value.int(k), Value.heap(&e.header));
+    }
+    try testing.expectEqual(arr.Lane.value, container.array.lane);
+    const lane = elems[0].array.lane;
+    try testing.expect(lane.scalarPresenceLane());
+    for (elems, 1..) |e, k| {
+        if (k != WIDE) try testing.expectEqual(lane, e.array.lane);
+    }
+    try testing.expect(elems[WIDE - 1].array.lane != lane);
 
+    var consts = [_]Value{ Value.int(2), Value.int(1) };
+    var full: [CARRIED_ARRAY_LEN]I = undefined;
+    carriedArrayIr(&full, @intFromEnum(lane));
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // From 1: sums bi[2] over the first tables until bi is SHORT, whose
+    // missing key 2 exits on guard_bounds mid-run.
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0) });
+    // Past SHORT: runs until bi is WIDE and the lane-byte compare exits.
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(@intCast(SHORT + 1)), Value.heap(&elems[SHORT].header), Value.int(0) });
+    // Past WIDE: runs to the container's end, exiting on its guard_bounds.
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(@intCast(WIDE + 1)), Value.heap(&elems[WIDE].header), Value.int(7) });
+    // bi enters as an int: the entry tag check exits before the body.
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.int(7), Value.int(0) });
+}
+
+test "nativegen(doc63 §5.10.7): a carried-heap array fact placed before the preheader bails (fail-closed)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    var consts = [_]Value{ Value.int(2), Value.int(1) };
+    var base: [CARRIED_ARRAY_LEN]I = undefined;
+    carriedArrayIr(&base, I16_LANE);
+    var es = [_]u16{};
+
+    // Positive control: a marker before the carried slot_load leaves every
+    // array fact on `bi` in the body, and the trace compiles.
+    var ok: [CARRIED_ARRAY_LEN + 1]I = undefined;
+    withMarkerAt(&base, 5, &ok);
+    const tr_ok = Trace{ .anchor = undefined, .instrs = &ok, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    var ct = compile(testing.allocator, &tr_ok, 0) orelse return error.NativeBailedUnexpectedly;
+    ct.deinit();
+
+    // A marker before bi's guard_table already bails on the guard_table row,
+    // so isolate guard_lane: swap the two guards (both only read bi) and put
+    // the marker between them. The swapped order alone still compiles; with
+    // the marker, the lane check would run once, for iteration 1's table only.
+    var swapped = base;
+    std.mem.swap(I, &swapped[6], &swapped[7]);
+    var swapped_ok: [CARRIED_ARRAY_LEN + 1]I = undefined;
+    withMarkerAt(&swapped, 5, &swapped_ok);
+    const tr_swapped = Trace{ .anchor = undefined, .instrs = &swapped_ok, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    var ct2 = compile(testing.allocator, &tr_swapped, 0) orelse return error.NativeBailedUnexpectedly;
+    ct2.deinit();
+    var lane_early: [CARRIED_ARRAY_LEN + 1]I = undefined;
+    withMarkerAt(&swapped, 7, &lane_early);
+    const tr_lane = Trace{ .anchor = undefined, .instrs = &lane_early, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    try expectBail(&tr_lane);
+}
+
+test "nativegen(doc22 A): a grid op rooted at a carried-heap slot bails (fail-closed)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // A grid root's lane/elem/stride checks exist only in the prologue, so a
+    // per-iteration table has no sound grid form. `bi` is carried-heap (its
+    // φ writes back a VALUE_LANE element) and read as a grid.
+    const gi: i32 = @intFromEnum(arr.Lane.i64);
     var consts = [_]Value{Value.int(1)};
     var full = [_]I{
         .{ .op = .slot_load, .aux = 0 }, // 0: container
@@ -351,18 +485,22 @@ test "nativegen(doc22 A): array op rooted at a carried-heap slot bails (fail-clo
         .{ .op = .guard_int, .a = 3 }, // 4
         .{ .op = .slot_load, .aux = 2 }, // 5: bi — carried-heap
         .{ .op = .guard_table, .a = 5 }, // 6
-        .{ .op = .guard_lane, .a = 5, .aux = VALUE_LANE }, // 7: rooted at carried slot → bail
-        .{ .op = .aref, .a = 5, .b = 3, .aux = VALUE_LANE }, // 8: likewise
-        .{ .op = .guard_bounds, .a = 8 }, // 9
-        .{ .op = .aload, .a = 8, .aux = VALUE_LANE, .ty = .heap }, // 10: bi[index]
-        .{ .op = .aref, .a = 0, .b = 3, .aux = VALUE_LANE }, // 11
-        .{ .op = .guard_bounds, .a = 11 }, // 12
-        .{ .op = .aload, .a = 11, .aux = VALUE_LANE, .ty = .heap }, // 13: next bi
-        .{ .op = .konst, .aux = 0 }, // 14: 1
-        .{ .op = .add, .a = 3, .b = 14, .ty = .int }, // 15: index + 1
-        .{ .op = .phi, .b = 15, .aux = 1 },
-        .{ .op = .phi, .b = 13, .aux = 2 }, // carried-heap φ
-        .{ .op = .loop }, // 18
+        .{ .op = .guard_grid, .a = 5, .aux = gi }, // 7: rooted at carried slot → bail
+        .{ .op = .guard_stride, .a = 5, .aux = 8 }, // 8: likewise
+        .{ .op = .konst, .aux = 0 }, // 9: 1
+        .{ .op = .garow, .a = 5, .b = 9, .aux = gi }, // 10: likewise
+        .{ .op = .guard_bounds, .a = 10 }, // 11
+        .{ .op = .gcell, .a = 10, .b = 9, .aux = gi }, // 12
+        .{ .op = .guard_gcol, .a = 12, .b = 9 }, // 13
+        .{ .op = .gload, .a = 12, .aux = gi }, // 14: bi[1][1]
+        .{ .op = .aref, .a = 0, .b = 3, .aux = VALUE_LANE }, // 15
+        .{ .op = .guard_bounds, .a = 15 }, // 16
+        .{ .op = .aload, .a = 15, .aux = VALUE_LANE, .ty = .heap }, // 17: next bi
+        .{ .op = .add, .a = 3, .b = 9, .ty = .int }, // 18: index + 1
+        .{ .op = .phi, .b = 18, .aux = 1 },
+        .{ .op = .phi, .b = 17, .aux = 2 }, // carried-heap φ
+        .{ .op = .phi, .b = 14, .aux = 3 },
+        .{ .op = .loop }, // 22
     };
     var es = [_]u16{};
     const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };

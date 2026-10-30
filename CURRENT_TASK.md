@@ -1,9 +1,10 @@
 DOC 63 TYPED CARRIED LOADS DONE (2026-10-30, coral-marten). Doc 63 §5.10.7.
 - The recorder type-guards a loop-carried number copy (LuaJIT SLOAD typecheck): w4/w8/w16 392/420/501, wide 476 (tier-0 607/791/1159/1096). Pure-guest 8-local rotation 450 -> 23 instr/iter. bench/ neutral.
 - Precise traces take the widen-eviction probe (the interp.zig hunk landed inside f5479e4 by accident).
-- Tables and strings too (guard_table/guard_string; carried-string takes a pinned copy): table rotation 252 -> 29, string 252 -> 17 instr/iter. Carried tables used as arrays still refuse (TODO.md).
+- Tables and strings too (guard_table/guard_string; carried-string takes a pinned copy): table rotation 252 -> 29, string 252 -> 17 instr/iter.
+- Carried tables used as arrays: base-home reservation now skips non-.ptr slots (as the prologue does), bail narrowed to grid roots + pre-marker guard_lane. a[1] rotation 331 (tier-0) -> 37, read+write 561 -> 73.
 - Bools: new IR op 100 guard_bool (type-only; pins regressed compare-fed copies 280 -> 805) + pinCarried (a body pin whose write-back is a non-matching copy unrolls): period-3 rotation 282 -> 9, compare copy 280 -> 36.
-- Still open: the budget (min 368, parked by Bart), `two` +9, heap/bool carried copies (TODO.md), nest (a)/(b)/(c).
+- Still open: the budget (min 368, parked by Bart), `two` +9, nest (a)/(b)/(c).
 
 DOC 63 PHASE 3 PART 1 DONE (2026-10-29, coral-marten): native lowering of the four host ops. Doc 63 §5.10.6.
 - Host traces compile natively; the shim is Vm.nativeHostCallFn (site by index, trace via the published TraceState.executing). Flag still OFF.

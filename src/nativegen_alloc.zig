@@ -507,7 +507,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 // come from the DYNAMIC forms (per-iteration guard_table/guard_hash, the
                 // resolveHashCell href callout) via `isCarriedHeapRoot`, and both the
                 // entry tag-check and every flush use TAG_HEAP. Structural bails below
-                // refuse anything this cut cannot check per-iteration (array/grid roots).
+                // refuse anything this cut cannot check per-iteration (grid roots).
                 s.kind = .heap;
             } else if (lk == .heap and sk == .heap) {
                 // [doc 30 c4b] Carried STRING: a `guard_string`-covered slot whose φ
@@ -669,13 +669,18 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
 
     // [doc 22 §A.1, fail closed] Structural bails for carried-heap slots. The
     // `.ptr`-keyed lane/grid analyses below skip a carried-heap slot by kind
-    // mismatch — which means an aref/garow rooted at one would otherwise compile
-    // SILENTLY with no lane pin and a first-iteration-only base. Refuse instead:
-    // this cut supports exactly the hash-path ops (href/guard_table/guard_hash),
-    // whose dynamic in-body forms re-check the CURRENT table each iteration. And
-    // those dynamic forms are only per-iteration if they sit in the body — a
-    // placement before the preheader marker would run once, checking iteration
-    // 1's table only, so that too is refused.
+    // mismatch, so no entry-time fact is ever hoisted for one. Supported are the
+    // ops whose dynamic in-body forms re-check the CURRENT table each iteration:
+    // the hash path (href/guard_table/guard_hash) and — doc 63 §5.10.7 — the
+    // scalar array path (guard_lane's inline lane-byte compare; aref consumers
+    // reach data/present/asize through `arrayFieldReg`'s per-iteration load,
+    // because the base-home reservation below skips non-`.ptr` slots exactly as
+    // the prologue does). A grid root has no dynamic form (its lane/elem/stride
+    // checks exist only in the prologue), so garow/guard_grid/guard_stride are
+    // refused. And the dynamic forms are only per-iteration if they sit in the
+    // body — a placement before the preheader marker would run once, checking
+    // iteration 1's table only, so that too is refused. (An aref needs no row:
+    // proveKinds admits one only behind a dominating guard_lane on its root.)
     for (slots.items) |s| {
         if (s.class != .carried or s.kind != .heap) continue;
         const lr: u16 = @intCast(s.load_ref);
@@ -683,10 +688,10 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         for (t.instrs, 0..) |g, gi| {
             switch (g.op) {
                 // No entry-hoisted per-table fact may root at a per-iteration table.
-                .aref, .garow, .guard_lane, .guard_grid, .guard_stride => {
+                .garow, .guard_grid, .guard_stride => {
                     if (g.a == lr) return error.Bail;
                 },
-                .guard_table, .href => if (g.a == lr and gi < ms) return error.Bail,
+                .guard_table, .href, .guard_lane => if (g.a == lr and gi < ms) return error.Bail,
                 .guard_hash => if (t.instrs[g.a].a == lr and gi < ms) return error.Bail,
                 else => {},
             }
@@ -1160,8 +1165,13 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 break;
             }
         }
+        // Only an invariant `.ptr` table gets base homes — the predicate the
+        // prologue's base loads use. A carried-heap slot (`.heap`) holds a
+        // different table each iteration, so a hoisted base would describe
+        // iteration 1's table only (and the prologue never fills it); leaving
+        // its homes null keeps every consumer on the per-iteration load.
         for (slots.items, 0..) |*s, sid| {
-            if (s.class == .write_only) continue;
+            if (s.class == .write_only or s.kind != .ptr) continue;
             if (need_data[sid]) {
                 if (pickRegFrom(&free, &BASE_HOME_ORDER)) |r| {
                     s.data_home = r;

@@ -5,7 +5,8 @@ Phase 3's native lowering (§5.10.6): host calls in precise loop roots
 record and run natively behind `Config.trace_host_calls`, which stays off
 until the §8 budget is met (`min` is 368 instructions per iteration against
 250; parked by Bart 2026-10-30). Loops whose carried locals are only moved
-compile since the typed carried loads (§5.10.7). Phase 4 not started. Revision 6, approved by Codex and
+compile since the typed carried loads (§5.10.7), carried tables used as
+arrays included. Phase 4 not started. Revision 6, approved by Codex and
 Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
 Owner: Bart
@@ -171,7 +172,9 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   Precise traces now take the widen-eviction probe (`wide` needed it).
   Extended the same day to table and string copies (`guard_table`,
   `guard_string`; native's carried-string slot takes a pinned copy), and
-  bool copies (a new type-only `guard_bool`, IR op 100).
+  bool copies (a new type-only `guard_bool`, IR op 100). Then to carried
+  tables used as arrays (`a[1]`, `a[2] = …`): native re-reads the current
+  table's lane, size and bases each iteration.
 
 ### Outstanding
 
@@ -1782,7 +1785,8 @@ before any effect, and the trace re-records.
 have emitted had it used the value (a copy already guarded by the body is
 left alone). Native carries both as heap φs. A carried table is doc 22
 §A.1's carried-heap slot, unchanged: its in-body table checks are the
-per-iteration forms, and an array access rooted at it is still refused.
+per-iteration forms, and an array access rooted at it is still refused
+(lifted the same day, below).
 Native's carried-string slot (doc 30 c4b) took only a string producer as
 its write-back. It now also takes a `guard_string`-pinned `slot_load`. That
 load is a string at entry by its own pin and, if carried, by the same rule,
@@ -1810,6 +1814,21 @@ and a trace recorded there failed its pin every third iteration (901
 instructions per iteration). A write-back that is another slot's load and
 fails the rule now counts as a pin contradiction, so P3 unrolls. A pure
 copy that a compare produced keeps today's behaviour.
+
+**Carried tables used as arrays** (the same day). Doc 22 §A.1 refused an
+`aref` or `guard_lane` rooted at a carried-heap slot, because the base
+registers (`data`, `present`, `asize`) are entry facts. The per-iteration
+forms already existed for doc 43 P3's per-iteration tables: `guard_lane`
+compares the lane byte in the body, and with no base register every
+consumer loads the base from the current table (`arrayFieldReg`). The gap
+was the base-register reservation: it reserved registers for any slot,
+but the prologue fills them only for an invariant `.ptr` table, so a
+carried table's consumers would have read unfilled registers. The
+reservation now uses the prologue's predicate, and the bail is down to
+grid roots (their checks exist only in the prologue) and a `guard_lane`
+placed before the preheader marker. A rotation that reads `a[1]` and
+writes `a[2]` runs natively, and one whose tables change lane, lose a key
+or turn into a string exits at the matching per-iteration check.
 
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace
@@ -1847,13 +1866,16 @@ iteration):
 | tables rotated, `a.x` read | 317 | 346 | 43 |
 | strings rotated, unused | 223 | 252 | 17 |
 | strings rotated, `#a` read | 274 | 303 | 15 |
-| tables rotated, `a[1]` read | 331 | 360 | 360 (refused, §A.1) |
+| tables rotated, `a[1]` read | 331 | 360 | 37 |
+| tables rotated, `a[1]` read, `a[2]` written | 561 | refused | 73 |
 | bools rotated, `if a` (period 3) | 253 | 282 | 9 (unrolled ×3) |
 | `a, b = b, (i % 3 == 0)` | 251 | 280 | 36 |
 | `a, b = b, (i * 7919 % 13 < 6)` | 307 | 337 | 38 |
 
 `bench/` is neutral again (tables and strings: means −0.003%, both tiers;
-bools: +0.001% tier-0, +0.000% JIT).
+bools: +0.001% tier-0, +0.000% JIT; carried arrays: every program within
+±0.01% JIT on, except three scimark rows that exit at startup, ~327k
+instructions, within ±0.06%).
 
 Tests: native rotation tests for ints, floats, tables and strings, and
 8-mode equivalence tests that include type changes (a table with a
@@ -1863,7 +1885,12 @@ a number and a string; a bool swapped with a number), and the period-3
 rotation's unroll from all three starting states (`interp_bool_test.zig`).
 Doc 30 c4b's `w ← w` fixture now compiles and
 matches tier-1a, and a carried string whose write-back is the host callee's
-load fails closed (`nativegen_lowering_test.zig`). Also a precise host trace
+load fails closed (`nativegen_lowering_test.zig`). Array reads through a
+carried table match tier-1a through a size change, a lane change and an
+entry type change; a `guard_lane` before the marker and a grid read
+through a carried table both bail (`nativegen_carriedheap_test.zig`); a
+read-and-write rotation compiles, and an 8-mode test includes a float
+lane, a short table and a string (`interp_native_test.zig`). Also a precise host trace
 whose array lane widens (`interp_hosttrace_test.zig`). Without the new
 code, each test fails.
 

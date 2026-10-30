@@ -1188,8 +1188,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // nothing here.
             .slot_load, .guard_int, .guard_float, .guard_builtin, .guard_grid, .guard_stride, .guard_string => {},
             // guard_lane: hoisted no-op for an invariant `.ptr` root (the prologue
-            // compares the lane byte once). For a per-iteration `.heap` root —
-            // doc 43 P3's hload'd table field — compare `array.lane` inline
+            // compares the lane byte once). For a per-iteration root — doc 43
+            // P3's hload'd table field, or a carried-heap slot (doc 63
+            // §5.10.7) — compare `array.lane` inline
             // against the recorded lane ordinal, side-exiting on mismatch (the
             // loaded table may be a different table each iteration, or the same
             // table rehashed to a different lane).
