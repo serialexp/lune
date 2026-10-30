@@ -6480,10 +6480,13 @@ pub const RecordingSession = struct {
     /// that load around the back-edge, and if nothing in the body inspected
     /// it, the load has no type: the φ is untyped and native refuses the
     /// trace. Guard such a load with the type it delivers, which is the live
-    /// value of the slot it was copied into (the same `Value`). Only numbers
-    /// are typed here; a heap or bool copy stays untyped (TODO.md).
-    /// Native hoists the guard to an entry tag check like any guard on a
-    /// `slot_load`; `loopCloseDefeat`, run next, sees it like the others.
+    /// value of the slot it was copied into (the same `Value`). A number gets
+    /// `guard_int`/`guard_float`, which native hoists to an entry tag check
+    /// like any guard on a `slot_load`. A table with no metatable gets
+    /// `guard_table` and a string `guard_string`, the guards the body would
+    /// have emitted had it used the value; native carries either as a heap
+    /// φ. A bool copy stays untyped: the only bool guards pin the value
+    /// (TODO.md). `loopCloseDefeat`, run next, sees these like the others.
     fn typeCarriedLoads(self: *RecordingSession, regs: RegWindow) !void {
         if (self.inline_depth != 0) return;
         const finalizer = @import("trace_finalize.zig");
@@ -6502,8 +6505,25 @@ pub const RecordingSession = struct {
                 try self.guard(s.ref, .guard_int, .operand_type, .none);
             } else if (v.isFloat()) {
                 try self.guard(s.ref, .guard_float, .operand_type, .none);
+            } else if (v.isHeap()) {
+                const op: IrOp = switch (v.heapType()) {
+                    .table => if (table_mod.Table.fromHeader(v.asHeap()).metatable == null) .guard_table else continue,
+                    .string => .guard_string,
+                    else => continue,
+                };
+                // The body's own heap guards are emitted raw, not through
+                // `guard`, so `guarded_refs` does not see them.
+                if (self.hasGuardOn(s.ref, op)) continue;
+                self.stampProv(try self.emit(.{ .op = op, .a = s.ref }), .operand_type, .none, .neutral);
             }
         }
+    }
+
+    fn hasGuardOn(self: *const RecordingSession, ref: Ref, op: IrOp) bool {
+        for (self.instrs.items[@intCast(ref + 1)..]) |g| {
+            if (g.op == op and g.a == ref) return true;
+        }
+        return false;
     }
 
     /// Doc 40 Phase 1 — commit preflight: would this `.loop` close be

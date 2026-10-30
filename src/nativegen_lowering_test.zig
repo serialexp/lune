@@ -3046,10 +3046,10 @@ fn carriedStringTrace(consts: []Value) Trace {
 }
 
 /// Same shape, but the φ writeback for `w` is the string-guarded slot_load
-/// itself (`w ← w`) — kind `.heap`, yet NOT a static string PRODUCER. The
-/// c4b arm must refuse it: only producer results are strings by construction
-/// on iterations 2+ (a guard proves the value it guarded, not a writeback).
-fn carriedStringBadWritebackTrace(consts: []Value) Trace {
+/// itself (`w ← w`) — kind `.heap`, not a static string producer. The c4b
+/// arm accepts it since doc 63 §5.10.7: the load is pinned at entry and
+/// carried by the same rule, so it is a string on every iteration.
+fn carriedStringSelfWritebackTrace(consts: []Value) Trace {
     const instrs = struct {
         var arr = [_]I{
             .{ .op = .slot_load, .aux = 0 }, // 0: state
@@ -3064,7 +3064,7 @@ fn carriedStringBadWritebackTrace(consts: []Value) Trace {
             .{ .op = .scap_str, .a = 8, .b = 2, .ty = .heap }, // 9 (produced, unused by the φ)
             .{ .op = .scap_int, .a = 8, .b = 35, .ty = .int }, // 10
             .{ .op = .sgm_setpos, .a = 0, .b = 10 }, // 11
-            .{ .op = .phi, .b = 2, .aux = 1 }, // w ← w: NOT a producer
+            .{ .op = .phi, .b = 2, .aux = 1 }, // w ← w: a pinned load, not a producer
             .{ .op = .phi, .b = 7, .aux = 2 },
             .{ .op = .loop },
         };
@@ -3075,7 +3075,36 @@ fn carriedStringBadWritebackTrace(consts: []Value) Trace {
     return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
 }
 
-test "doc 30 c4b: carried-string slot — native compiles, runs, flushes TAG_HEAP; prologue pins the entry; non-producer writeback fails closed" {
+/// The φ writeback for `w` is an UNPINNED slot_load (`w ← u`, no guard on
+/// `u`): nothing proves it a string, so native must refuse the trace.
+fn carriedStringUnpinnedWritebackTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: state
+            .{ .op = .guard_table, .a = 0 }, // 1
+            .{ .op = .slot_load, .aux = 1 }, // 2: w
+            .{ .op = .guard_string, .a = 2 }, // 3
+            .{ .op = .slen, .a = 2, .ty = .int }, // 4
+            .{ .op = .slot_load, .aux = 2 }, // 5: acc
+            .{ .op = .guard_int, .a = 5 }, // 6
+            .{ .op = .add, .a = 5, .b = 4 }, // 7
+            .{ .op = .sgmatch, .a = 0, .aux = 1, .ty = .int }, // 8
+            .{ .op = .scap_str, .a = 8, .b = 2, .ty = .heap }, // 9 (produced, unused by the φ)
+            .{ .op = .scap_int, .a = 8, .b = 35, .ty = .int }, // 10
+            .{ .op = .sgm_setpos, .a = 0, .b = 10 }, // 11
+            .{ .op = .slot_load, .aux = 3 }, // 12: u, unguarded
+            .{ .op = .phi, .b = 12, .aux = 1 }, // w ← u
+            .{ .op = .phi, .b = 7, .aux = 2 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 30 c4b: carried-string slot — native compiles, runs, flushes TAG_HEAP; prologue pins the entry; a pinned copy compiles, an unpinned one fails closed" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
 
@@ -3154,14 +3183,80 @@ test "doc 30 c4b: carried-string slot — native compiles, runs, flushes TAG_HEA
         try util.expectRegsEqual(&regs_init, &xregs);
     }
 
-    // Fail closed: a `.heap` φ writeback that is NOT a static string producer
-    // (`w ← w`, a guard-covered slot_load) is refused by the c4b arm.
+    // A pinned copy (`w ← w`) compiles and matches tier-1a: `w` stays "xx",
+    // so three iterations add 2 each before the subject runs out.
+    {
+        const ostate = try gmatchStateTable(&iheap, &isubj.header, &ipat.header, 0);
+        var oconsts = [_]Value{ Value.int(1), Value.heap(&ipat.header) };
+        const to = carriedStringSelfWritebackTrace(&oconsts);
+        var oregs = [_]Value{ Value.heap(&ostate.header), Value.heap(&iw0.header), Value.int(0) };
+        const ovalues = try gpa.alloc(Value, to.instrs.len);
+        defer gpa.free(ovalues);
+        const oresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &to, &oregs, ovalues);
+
+        const sstate = try gmatchStateTable(&nheap, &nsubj.header, &npat.header, 0);
+        var sconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
+        const ts = carriedStringSelfWritebackTrace(&sconsts);
+        var sct = nativegen.compileWithHeap(gpa, &ts, 0, &nheap) orelse return error.NativeBailedUnexpectedly;
+        defer sct.deinit();
+        var sregs = [_]Value{ Value.heap(&sstate.header), Value.heap(&nw0.header), Value.int(0) };
+        const sresult = try util.runNative(sct, &sregs);
+        try testing.expectEqual(@as(usize, 3), oresult.completed);
+        try testing.expectEqual(oresult.completed, sresult.completed);
+        try testing.expectEqual(oresult.exit_instr, sresult.exit_instr);
+        try testing.expectEqual(Value.int(6).payload.bits, sregs[2].payload.bits);
+        try testing.expectEqual(@intFromPtr(&nw0.header), @intFromPtr(sregs[1].asHeap()));
+    }
+
+    // Fail closed: an unpinned copy (`w ← u`) proves nothing about `u`.
     {
         var bconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
-        const tb = carriedStringBadWritebackTrace(&bconsts);
+        const tb = carriedStringUnpinnedWritebackTrace(&bconsts);
         var arena = McodeArena.init(gpa);
         defer arena.deinit();
         try testing.expect(compileInto(gpa, &arena, &tb, 0, null, &nheap) == null);
+    }
+}
+
+fn nopNative(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = ctx;
+    _ = args;
+    return Value.nil();
+}
+
+test "doc 63 §5.10.7: a carried string whose write-back is a non-string heap load fails closed" {
+    // `w ← h`: `w` is string-pinned at entry, but `h`'s load is the host
+    // callee (`guard_native`, kind `.heap`). Iteration 2 would hold a native
+    // function in a slot the body reads as a string, so analyze must refuse.
+    const gpa = testing.allocator;
+    const nat = try function.Native.create(gpa, &nopNative, "h");
+    defer nat.destroy(gpa);
+    var consts = [_]Value{Value.heap(&nat.header)};
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: w
+        .{ .op = .guard_string, .a = 0 }, // 1
+        .{ .op = .slen, .a = 0, .ty = .int }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: h
+        .{ .op = .guard_native, .a = 3, .aux = 0 }, // 4
+        .{ .op = .slot_load, .aux = 2 }, // 5: acc
+        .{ .op = .guard_int, .a = 5 }, // 6
+        .{ .op = .add, .a = 5, .b = 2 }, // 7
+        .{ .op = .phi, .b = 3, .aux = 0 }, // w ← h
+        .{ .op = .phi, .b = 7, .aux = 2 },
+        .{ .op = .loop },
+    };
+    var t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &.{}, .entry_guards = &.{} };
+    t.deopt_mode = .precise;
+    const kinds = try gpa.alloc(Kind, t.instrs.len);
+    defer gpa.free(kinds);
+    const slot_of = try gpa.alloc(i32, t.instrs.len);
+    defer gpa.free(slot_of);
+    try testing.expect(proveKinds(gpa, &t, kinds, slot_of));
+    try testing.expectEqual(Kind.heap, kinds[3]);
+    if (analyze(gpa, &t, kinds, slot_of)) |al| {
+        var a = al;
+        a.deinit(gpa);
+        return error.TestExpectedBail;
     }
 }
 

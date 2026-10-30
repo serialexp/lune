@@ -318,6 +318,15 @@ pub fn locEql(x: Loc, y: Loc) bool {
 /// Ops whose result can be computed *into* a destination home in place (win 2). A
 /// compare result is Bool, never carried (type-stability bails), and konst has no
 /// operand to anchor the home — so only arithmetic/bitwise + unary qualify.
+/// Whether a `guard_string` covers `ref` (a `slot_load`): the prologue then
+/// pins it to a string.
+fn stringPinned(t: *const Trace, ref: u16) bool {
+    for (t.instrs) |g| {
+        if (g.op == .guard_string and g.a == ref) return true;
+    }
+    return false;
+}
+
 /// [doc 30 c4b] Ops whose result is BY CONSTRUCTION an interned `*String` —
 /// the `is_string[i] = true` PRODUCER arms of proveKinds Pass B (tostr/snew/
 /// case/scap_str classes; NOT the guard-derived sources: a string-guarded
@@ -514,7 +523,11 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 //     check plus `header.type == string`;
                 //   * iterations 2+ (the carried value): the writeback must be a
                 //     producer whose result is a `*String` by construction
-                //     (`isStringProducerOp`), so string-ness holds with no check.
+                //     (`isStringProducerOp`), so string-ness holds with no check,
+                //     or another pinned slot_load (a loop that only moves its
+                //     strings around, doc 63 §5.10.7). That load is a string at
+                //     entry by its own pin and, carried, by this same rule, so
+                //     string-ness holds by induction over the iterations.
                 // The home is a GP register/spill holding the current `*GcHeader`,
                 // refreshed by the back-edge φ shuffle; every flush uses TAG_HEAP
                 // (heap boxing is type-agnostic — the type lives in the header).
@@ -524,15 +537,10 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 // or a non-producer writeback (e.g. a `.ptr` table masquerading
                 // through kind `.heap`) fails closed.
                 const lref: u16 = @intCast(s.load_ref);
-                var pinned = false;
-                for (t.instrs) |g| {
-                    if (g.op == .guard_string and g.a == lref) {
-                        pinned = true;
-                        break;
-                    }
-                }
-                if (!pinned) return error.Bail;
-                if (!isStringProducerOp(t.instrs[@intCast(s.store_ref)].op)) return error.Bail;
+                const sref: u16 = @intCast(s.store_ref);
+                if (!stringPinned(t, lref)) return error.Bail;
+                const sop = t.instrs[sref].op;
+                if (!isStringProducerOp(sop) and !(sop == .slot_load and stringPinned(t, sref))) return error.Bail;
                 s.kind = .heap;
                 s.is_string = true;
             } else if (lk == .boxed and sk == .boxed) {

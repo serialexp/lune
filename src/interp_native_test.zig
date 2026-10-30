@@ -134,6 +134,87 @@ test "typed carried loads: rotated locals byte-identical across all modes, inclu
     , "101\t102.5\t103\n");
 }
 
+test "native: a table rotation compiles (typed carried loads, guard_table)" {
+    // Only `a` is read (through its hash part); `b` and `c` are copies the
+    // recorder types at the close, so native carries all three as heap φs.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa,
+        \\local a, b, c = {x = 1}, {x = 2}, {x = 3}
+        \\local s = 0
+        \\for i = 1, 100 do a, b, c = b, c, a s = s + a.x end
+        \\print(s, a.x, b.x, c.x)
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("200\t2\t3\t1\n", sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
+}
+
+test "native: a string rotation compiles (typed carried loads, guard_string)" {
+    // A carried string whose write-back is another pinned slot's load.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa,
+        \\local a, b, c = "x", "yy", "zzz"
+        \\local s = 0
+        \\for i = 1, 100 do a, b, c = b, c, a s = s + #a end
+        \\print(s, a, b, c)
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("200\tyy\tzzz\tx\n", sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
+}
+
+test "typed carried loads: rotated tables and strings byte-identical across all modes, including type changes" {
+    try expectProgram(
+        \\local a, b, c = {x = 1}, {x = 2}, {x = 3}
+        \\local s = 0
+        \\for i = 1, 100 do a, b, c = b, c, a s = s + a.x end
+        \\print(s, a.x, b.x, c.x)
+    , "200\t2\t3\t1\n");
+    try expectProgram(
+        \\local a, b, c = "x", "yy", "zzz"
+        \\local s = 0
+        \\for i = 1, 100 do a, b, c = b, c, a s = s + #a end
+        \\print(s, a, b, c)
+    , "200\tyy\tzzz\tx\n");
+    // A table with a metatable joins the rotation, then a fresh one: the
+    // carried guard_table fails on the first and the run carries on.
+    try expectProgram(
+        \\local a, b, c = {x = 1}, {x = 2}, {x = 3}
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  a, b, c = b, c, a
+        \\  s = s + a.x
+        \\  if i == 150 then b = setmetatable({x = 7}, {}) end
+        \\  if i == 200 then c = {x = 5} end
+        \\end
+        \\print(s, a.x, b.x, c.x)
+    , "784\t1\t5\t3\n");
+    // A rotated string becomes a table, then a string again.
+    try expectProgram(
+        \\local a, b, c = "x", "yy", "zzz"
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  a, b, c = b, c, a
+        \\  s = s + i
+        \\  if i == 150 then b = {} end
+        \\  if i == 200 then b = "w" end
+        \\end
+        \\print(s, type(a), type(b), type(c))
+    , "45150\tstring\ttable\tstring\n");
+}
+
 test "native: a multi-op for-loop with dropped temporaries lowers and matches tier-0 (task A)" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;

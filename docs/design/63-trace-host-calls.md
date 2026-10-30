@@ -169,7 +169,9 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   SLOAD typecheck: the recorder type-guards a loop-carried number copy.
   `w4`/`w8`/`w16`/`wide` and the pure-guest rotations run natively.
   Precise traces now take the widen-eviction probe (`wide` needed it).
-  Heap and bool copies stay untyped (TODO.md).
+  Extended the same day to table and string copies (`guard_table`,
+  `guard_string`; native's carried-string slot takes a pinned copy).
+  Bool copies stay untyped (TODO.md).
 
 ### Outstanding
 
@@ -1773,8 +1775,21 @@ the loop. It gets `guard_int` or `guard_float` from the live value, which
 is the value the copy holds. Native hoists a guard on a `slot_load` to an
 entry tag check, as it does every other typed entry load, so the φ lives
 in a register. A copy whose type changes fails the entry check, exits
-before any effect, and the trace re-records. Heap and bool copies stay
-untyped, as before (TODO.md).
+before any effect, and the trace re-records.
+
+**Tables and strings** (the same day). A table copy with no metatable gets
+`guard_table`, and a string copy `guard_string`: the guards the body would
+have emitted had it used the value (a copy already guarded by the body is
+left alone). Native carries both as heap φs. A carried table is doc 22
+§A.1's carried-heap slot, unchanged: its in-body table checks are the
+per-iteration forms, and an array access rooted at it is still refused.
+Native's carried-string slot (doc 30 c4b) took only a string producer as
+its write-back. It now also takes a `guard_string`-pinned `slot_load`. That
+load is a string at entry by its own pin and, if carried, by the same rule,
+so every carried value is a string by induction. A `.heap` load that is
+not string-pinned (the host callee's) still refuses. A bool copy stays
+untyped: the only bool guards on a load (`guard_is_true`/`guard_is_false`)
+pin the value, which a rotation changes (TODO.md).
 
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace
@@ -1803,11 +1818,27 @@ build, checksums match; instructions per iteration):
 counts move at most +0.17% (JIT on) and −0.10% (tier-0), with means of
 +0.008% and −0.002% over 47 programs.
 
-Tests: native rotation tests, int and float, and an 8-mode equivalence
-test that includes a type change halfway through
-(`interp_native_test.zig`), and a precise host trace whose array lane
-widens (`interp_hosttrace_test.zig`). Without the new code, each test
-fails.
+Tables and strings, pure-guest, 10M iterations (instructions per
+iteration):
+
+| Shape | tier-0 | JIT before | JIT now |
+|---|---:|---:|---:|
+| tables rotated, unused | 223 | 252 | 29 |
+| tables rotated, `a.x` read | 317 | 346 | 43 |
+| strings rotated, unused | 223 | 252 | 17 |
+| strings rotated, `#a` read | 274 | 303 | 15 |
+| tables rotated, `a[1]` read | 331 | 360 | 360 (refused, §A.1) |
+
+`bench/` is neutral again (means −0.003%, both tiers).
+
+Tests: native rotation tests for ints, floats, tables and strings, and
+8-mode equivalence tests that include type changes (a table with a
+metatable joining the rotation, a string turning into a table)
+(`interp_native_test.zig`). Doc 30 c4b's `w ← w` fixture now compiles and
+matches tier-1a, and a carried string whose write-back is the host callee's
+load fails closed (`nativegen_lowering_test.zig`). Also a precise host trace
+whose array lane widens (`interp_hosttrace_test.zig`). Without the new
+code, each test fails.
 
 ### 5.11 Tier-1a
 
