@@ -114,6 +114,15 @@ pub const SlotInfo = struct {
     /// tag (+ payload) in memory, and an exit that needs the value rebuilds it
     /// from the pin (`pinnedValue`).
     pin_only: bool = false,
+    /// Doc 63 (register pressure, item 2): an invariant slot the per-iteration
+    /// body never reads from its home. Every reader is in the run-once region,
+    /// a guard the prologue hoisted, or an array op that reaches the table only
+    /// through its hoisted bases (`HomeReads`; a table is marked only once
+    /// Phase 2 has seated them all). It takes a register while one is free, and is the
+    /// first to give it up when anything else would spill
+    /// (`evictPrologueOnly`): its home then moves to a frame cell, which only
+    /// the prologue reads.
+    prologue_only: bool = false,
     /// win 2: the store_ref transient was allocated *into* home, so the op updates the
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
@@ -1003,15 +1012,27 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     const last_use = try gpa.alloc(u32, n);
     errdefer gpa.free(last_use);
     for (last_use, 0..) |*lu, i| lu.* = @intCast(i); // live at least at its own def
+    // Doc 63 register pressure, item 2: which refs are read from their
+    // homes, gathered along the liveness walks (`HomeReads`). A one-shot
+    // trace runs its prologue as often as its body, so a slot the body never
+    // reads saves it nothing there: only a looping trace asks.
+    var home_reads: HomeReads = if (t.instrs[n - 1].op == .loop) try .init(gpa, n) else .{};
+    defer home_reads.deinit(gpa);
     {
         var i: usize = n;
         while (i > 0) {
             i -= 1;
             const ins = t.instrs[i];
             const rd = operandReads(ins);
-            if (rd.a and last_use[ins.a] < i) last_use[ins.a] = @intCast(i);
+            if (rd.a) {
+                if (last_use[ins.a] < i) last_use[ins.a] = @intCast(i);
+                home_reads.readA(t, kinds, slots.items, slot_id_of_ref, i);
+            }
             // A const-key aref's key is an immediate (`prove.arefConstIdx`).
-            if (rd.b and last_use[ins.b] < i and prove.arefConstIdx(t, i) == null) last_use[ins.b] = @intCast(i);
+            if (rd.b and prove.arefConstIdx(t, i) == null) {
+                if (last_use[ins.b] < i) last_use[ins.b] = @intCast(i);
+                home_reads.read(ins.b);
+            }
         }
     }
     // The value feeding ANY φ's back-edge update (slot-bound OR internal) must survive
@@ -1020,6 +1041,8 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     for (t.instrs) |ins| {
         if (ins.op != .phi) continue;
         if (last_use[ins.b] < n - 1) last_use[ins.b] = @intCast(n - 1);
+        home_reads.read(ins.b);
+        if (ins.aux == trace.PHI_INTERNAL or ins.a != 0) home_reads.read(ins.a);
     }
     // A dynamically-rooted href reads ins.a (the per-iteration *GcHeader — a
     // VALUE_LANE aload result, or a carried-heap slot_load) but
@@ -1033,6 +1056,10 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     for (t.instrs, 0..) |ins, i| {
         if (ins.op == .href and isDynTableRoot(kinds, slots.items, slot_id_of_ref, ins.a)) {
             if (last_use[ins.a] < i) last_use[ins.a] = @intCast(i);
+        }
+        if (ins.op == .href) {
+            home_reads.read(ins.a);
+            home_reads.read(ins.b);
         }
         if (ins.op == .guard_hash) {
             const href_ins = t.instrs[ins.a];
@@ -1076,6 +1103,24 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             // ref rides `aux` and must survive to the callout staging.
             const ar: usize = @intCast(ins.aux);
             if (last_use[ar] < i) last_use[ar] = @intCast(i);
+            home_reads.read(@intCast(ar));
+        }
+    }
+    // A table is prologue-only only once Phase 2 has seated every base it
+    // needs; until then it must not give up its register, or a base that
+    // then fails to seat would leave the body reloading it from a cell.
+    var pending_table: std.DynamicBitSetUnmanaged = .{};
+    defer pending_table.deinit(gpa);
+    // The `prologue_only` slots that hold a register (`evictPrologueOnly`),
+    // each listed once its home is assigned.
+    var evictable: std.ArrayList(u16) = .empty;
+    defer evictable.deinit(gpa);
+    if (home_reads.on()) {
+        pending_table = try .initEmpty(gpa, slots.items.len);
+        for (slots.items, 0..) |*s, sid| {
+            if (s.class != .invariant or s.kind == .none or s.pin_only or s.load_ref < 0) continue;
+            if (!home_reads.prologueOnly(@intCast(s.load_ref))) continue;
+            if (s.kind == .ptr) pending_table.set(sid) else s.prologue_only = true;
         }
     }
     // Doc 45 D6 (codex point 1): PRECISE snapshot refs are read by the
@@ -1124,7 +1169,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     var home_reg_mask: u16 = 0;
     var home_xmm_mask: u16 = 0;
 
-    for (slots.items) |*s| {
+    for (slots.items, 0..) |*s, sid| {
         if (s.class == .write_only) continue;
         // Doc 45 D6: a snapshot-only load (kind `.none` — a dead anchor-window
         // slot the precise recorder force-loaded so full-window snapshots have
@@ -1135,14 +1180,18 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         if (s.pin_only) continue; // doc 57: checked in memory, never read
         if (s.kind == .float) {
             // Float home: draw from the XMM pool, else a shared 8-byte spill cell.
-            if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER)) |r| {
+            if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER) orelse
+                if (s.prologue_only) null else evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_xmm_mask, .xmm)) |r|
+            {
                 s.home = .{ .xmm = r };
                 home_xmm_mask |= regBit(r);
             } else {
                 s.home = .{ .spill = spill_count };
                 spill_count += 1;
             }
-        } else if (pickReg(&free)) |r| {
+        } else if (pickReg(&free) orelse
+            if (s.prologue_only) null else evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+        {
             s.home = .{ .reg = r };
             home_reg_mask |= regBit(r);
             used_callee |= regBit(r) & CALLEE_SAVED_MASK;
@@ -1150,6 +1199,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             s.home = .{ .spill = spill_count };
             spill_count += 1;
         }
+        if (s.prologue_only and s.home != .spill) try evictable.append(gpa, @intCast(sid));
     }
     // Resolve slot_load refs to their slot home. A `.none` (snapshot-only)
     // slot has no home — its loc stays the value-less placeholder, and every
@@ -1213,7 +1263,9 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             }
             switch (kinds[i]) {
                 .float => {
-                    if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER)) |r| {
+                    if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER) orelse
+                        evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_xmm_mask, .xmm)) |r|
+                    {
                         loc[i] = .{ .xmm = r };
                         home_xmm_mask |= regBit(r);
                     } else {
@@ -1222,7 +1274,9 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     }
                 },
                 .int, .bool => {
-                    if (pickReg(&free)) |r| {
+                    if (pickReg(&free) orelse
+                        evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+                    {
                         loc[i] = .{ .reg = r };
                         home_reg_mask |= regBit(r);
                         used_callee |= regBit(r) & CALLEE_SAVED_MASK;
@@ -1322,25 +1376,41 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         for (slots.items, 0..) |*s, sid| {
             if (s.class == .write_only or s.kind != .ptr) continue;
             if (need_data[sid]) {
-                if (pickRegFrom(&free, &BASE_HOME_ORDER)) |r| {
+                if (pickRegFrom(&free, &BASE_HOME_ORDER) orelse
+                    evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+                {
                     s.data_home = r;
                     home_reg_mask |= regBit(r);
                     used_callee |= regBit(r) & CALLEE_SAVED_MASK;
                 }
             }
             if (need_present[sid]) {
-                if (pickRegFrom(&free, &BASE_HOME_ORDER)) |r| {
+                if (pickRegFrom(&free, &BASE_HOME_ORDER) orelse
+                    evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+                {
                     s.present_home = r;
                     home_reg_mask |= regBit(r);
                     used_callee |= regBit(r) & CALLEE_SAVED_MASK;
                 }
             }
             if (need_len[sid] and !has_append) {
-                if (pickRegFrom(&free, &BASE_HOME_ORDER)) |r| {
+                if (pickRegFrom(&free, &BASE_HOME_ORDER) orelse
+                    evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+                {
                     s.len_home = r;
                     home_reg_mask |= regBit(r);
                     used_callee |= regBit(r) & CALLEE_SAVED_MASK;
                 }
+            }
+            // Doc 63 register pressure, item 2: with every base it needs
+            // seated, the body never reads the table itself.
+            if (pending_table.bit_length != 0 and pending_table.isSet(sid) and
+                (!need_data[sid] or s.data_home != null) and
+                (!need_present[sid] or s.present_home != null) and
+                (!need_len[sid] or s.len_home != null))
+            {
+                s.prologue_only = true;
+                try evictable.append(gpa, @intCast(sid));
             }
         }
     }
@@ -1528,7 +1598,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 }
             }
             active_len = wb;
-            if (pickReg(&free)) |r| {
+            if (pickReg(&free) orelse evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r| {
                 b.reg = r;
                 used_callee |= regBit(r) & CALLEE_SAVED_MASK;
                 active[active_len] = .{ .reg = r, .last = b.last, .base = @intCast(next_base) };
@@ -1586,7 +1656,9 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // (win 1) is disabled for floats (the value always lands in a scratch XMM
         // first — see the win-2 skip above), so allocate a fresh XMM or a spill cell.
         if (kinds[i] == .float) {
-            if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER)) |r| {
+            if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER) orelse
+                evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_xmm_mask, .xmm)) |r|
+            {
                 loc[i] = .{ .xmm = r };
                 active_xmm[active_xmm_len] = .{ .reg = r, .last = last_use[i] };
                 active_xmm_len += 1;
@@ -1628,7 +1700,10 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         }
         if (coalesced) |r| {
             loc[i] = .{ .reg = r };
-        } else if (pickReg(&free)) |r| {
+        } else if (pickReg(&free) orelse evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r| {
+            // A prologue-only slot gives up its register before a shared
+            // base does: it costs one store per entry, the base a load per
+            // consumer per iteration.
             loc[i] = .{ .reg = r };
             used_callee |= regBit(r) & CALLEE_SAVED_MASK;
             active[active_len] = .{ .reg = r, .last = last_use[i] };
@@ -1959,6 +2034,118 @@ fn hasNonPinReader(t: *const Trace, ref: u16) bool {
         if ((ins.op == .ssub or ins.op == .scp or ins.op == .sfindp or ins.op == .smatch) and ins.aux == ref) return true;
     }
     return false;
+}
+
+/// Doc 63 (register pressure, item 2): the refs some instruction reads from
+/// their homes, gathered along `analyzeInner`'s liveness walks, so it costs
+/// no walk of its own. An invariant slot whose load is never read this way is
+/// `prologue_only`. A read in the run-once region counts: that region runs
+/// once per entry, as often as the prologue, and a trace entered often for a
+/// few iterations would pay a cell reload there for every register the body
+/// gained. A read does not count when it is
+///   - a guard the prologue hoisted for an invariant slot (the tag guards,
+///     the table/lane/grid/func/builtin/string identity guards, value pins),
+///     all of which lower to nothing in the body;
+///   - an `aref` on the table: it materializes only the index;
+///   - an array op reaching the table through an `aref` and needing only its
+///     `data`/`present`/`len` bases, which Phase 2 hoists. Whether they all
+///     seat is known only in Phase 2, which holds the table's mark until then.
+/// Any other reader, or an unknown one, keeps the register home: a spilled
+/// home is correct for every reader, so this decides speed only. Empty (and
+/// every method a no-op) when the trace does not loop.
+const HomeReads = struct {
+    hot: std.DynamicBitSetUnmanaged = .{},
+    /// The aref tokens a guard_bounds reads `len` through, and (once the walk
+    /// passes their aref) those tokens' tables.
+    len: std.DynamicBitSetUnmanaged = .{},
+    /// Phase 2 never hoists `len` in a trace that appends, so a guard_bounds
+    /// there loads it from the table.
+    has_append: bool = false,
+
+    fn init(gpa: std.mem.Allocator, n: usize) !HomeReads {
+        var hot = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
+        errdefer hot.deinit(gpa);
+        return .{ .hot = hot, .len = try .initEmpty(gpa, n) };
+    }
+
+    fn deinit(self: *HomeReads, gpa: std.mem.Allocator) void {
+        self.hot.deinit(gpa);
+        self.len.deinit(gpa);
+    }
+
+    fn on(self: *const HomeReads) bool {
+        return self.hot.bit_length != 0;
+    }
+
+    /// Some instruction reads `r` from its home.
+    fn read(self: *HomeReads, r: u16) void {
+        if (self.on()) self.hot.set(r);
+    }
+
+    /// Instruction `i` reads its `a` operand. The walk is backward, so an
+    /// aref is reached after every consumer of its token.
+    fn readA(self: *HomeReads, t: *const Trace, kinds: []const Kind, slots: []const SlotInfo, slot_id_of_ref: []const i32, i: usize) void {
+        if (!self.on()) return;
+        const ins = t.instrs[i];
+        const r = ins.a;
+        switch (ins.op) {
+            // Its consumers' verdicts pass to the table.
+            .aref => {
+                if (self.hot.isSet(i)) self.hot.set(r);
+                if (self.len.isSet(i)) self.len.set(r);
+            },
+            // A token these read reaches the table only for a base.
+            .guard_present, .aload, .astore => {},
+            .guard_bounds => self.len.set(r),
+            .astore_append => {
+                self.has_append = true;
+                self.hot.set(r);
+            },
+            .guard_int, .guard_float, .guard_builtin, .guard_grid, .guard_stride, .guard_string, .guard_is_nil, .guard_bool => {},
+            .guard_is_false, .guard_is_true => if (!pinHoisted(t, slots, slot_id_of_ref, r)) self.hot.set(r),
+            .guard_table, .guard_lane => if (isDynTableRoot(kinds, slots, slot_id_of_ref, r)) self.hot.set(r),
+            .guard_func => if (kinds[r] == .heap) self.hot.set(r),
+            else => self.hot.set(r),
+        }
+    }
+
+    /// The verdict for slot load `lr`, once every walk is done.
+    fn prologueOnly(self: *const HomeReads, lr: u16) bool {
+        return !self.hot.isSet(lr) and !(self.has_append and self.len.isSet(lr));
+    }
+};
+
+/// Doc 63 (register pressure, item 2): hand a value that would otherwise
+/// spill the register of a `prologue_only` slot (`file` picks GP or XMM). The
+/// slot's home moves to a fresh frame cell for the whole trace — the body
+/// never reads it, so the only cost is the prologue's store to the cell — and
+/// leaves `home_mask`, which the caller sets again if the taker is a home.
+/// `loc` of the slot's load follows the home. `evictable` lists the
+/// candidates (an evicted one leaves it). null when there is none to take,
+/// which is most traces: the check is inline at every failed register pick.
+inline fn evictPrologueOnly(evictable: *std.ArrayList(u16), slots: []SlotInfo, loc: []Loc, spill_count: *u32, home_mask: *u16, file: RegFile) ?Reg {
+    if (evictable.items.len == 0) return null;
+    return evictFrom(evictable, slots, loc, spill_count, home_mask, file);
+}
+
+const RegFile = enum { gp, xmm };
+
+fn evictFrom(evictable: *std.ArrayList(u16), slots: []SlotInfo, loc: []Loc, spill_count: *u32, home_mask: *u16, file: RegFile) ?Reg {
+    for (evictable.items, 0..) |sid, k| {
+        const s = &slots[sid];
+        const r = switch (s.home) {
+            .reg => |r| if (file == .gp) r else continue,
+            .xmm => |r| if (file == .xmm) r else continue,
+            else => continue,
+        };
+        s.home = .{ .spill = spill_count.* };
+        spill_count.* += 1;
+        loc[@intCast(s.load_ref)] = s.home;
+        home_mask.* &= ~regBit(r);
+        _ = evictable.swapRemove(k);
+        return r;
+    }
+    return null;
 }
 
 /// Doc 57: true iff a value pin on `ref` is checked once in the prologue and

@@ -242,6 +242,49 @@ test "native: constant-key reads and writes on a .value-lane array compile and m
     try expectProgram(src, want);
 }
 
+test "native: a table read only through hoisted bases gives up its register under pressure" {
+    // Doc 63 register pressure, item 2. `pts` is invariant and every body
+    // read of it goes through its hoisted `data`/`len` bases, so when the
+    // integer `%` and the element reads run out of registers it moves to a
+    // frame cell, which the prologue checks it from. The element hole at 40
+    // takes the `c == nil` side exit from that layout, the `break` the loop
+    // exit, and a second call re-enters the compiled trace.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const src =
+        \\local pts = {}
+        \\for i = 1, 64 do pts[i] = {i, 2 * i, 3 * i} end
+        \\pts[40] = {40, 80}
+        \\local function r(n, cap)
+        \\  local s, h = 0, 0
+        \\  for j = 1, n do
+        \\    local p = pts[(j % 64) + 1]
+        \\    local c = p[3]
+        \\    if c then s = s + p[1] + p[2] + c else h = h + p[2] end
+        \\    if s > cap then break end
+        \\  end
+        \\  return s, h
+        \\end
+        \\print(r(1000, 150000))
+        \\print(r(300, 1e9))
+    ;
+    const want = "150042\t960\n54924\t400\n";
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.coverage = true;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa, src, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(want, sink.buffered());
+    for (vm.trace.registry.cache.items) |e| try testing.expect(e.native == .compiled);
+    var traced: u64 = 0;
+    var it = vm.trace.coverage.iterator();
+    while (it.next()) |e| traced +|= e.value_ptr.traced;
+    try testing.expect(traced > 0);
+    try expectProgram(src, want);
+}
+
 test "native: constant operands lower as immediates and match" {
     // Konsts that fit a sign-extended imm32 (`Loc.imm`) on either side of
     // `sub` and a compare, as `imul`'s third operand, as every leg of a

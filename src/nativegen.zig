@@ -1018,7 +1018,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             .reg => |r| try a.movRegMem(r, .rsi, off),
             .xmm => |x| try a.movsdRegMem(x, .rsi, off), // float slot: load the double
             .mem => |d| {
-                // GP/spill raw 8-byte load (int/bool/ptr, and a spilled float — bits
+                // A table with a cell home is loaded with its checks below.
+                if (s.kind == .ptr) continue;
+                // GP/spill raw 8-byte load (int/bool, and a spilled float — bits
                 // are bits, so a spilled float reuses the raw round-trip).
                 try a.movRegMem(.rax, .rsi, off);
                 try a.movMemReg(.rsp, d, .rax);
@@ -1032,7 +1034,18 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // returns 0 (regs[] untouched). The bool-lane is the only lane proveKinds admits.
     for (alloc.slots) |s| {
         if (s.class == .write_only or s.kind != .ptr) continue;
-        const preg = try refHomeBaseReg(a, s, .rax);
+        const preg: Reg = switch (slotHomePlace(s)) {
+            .reg => |r| r,
+            .mem => |d| blk: {
+                // A cell home (a prologue-only table that gave up its
+                // register, or one spilled under pressure) is loaded here,
+                // so its checks and base loads read it from rax.
+                try a.movRegMem(.rax, .rsi, @as(i32, s.slot) * 8);
+                try a.movMemReg(.rsp, d, .rax);
+                break :blk .rax;
+            },
+            .xmm, .imm => unreachable, // a table is a GP value in a register or a cell
+        };
         try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, TABLE_TYPE);
         try a.jcc(.ne, prologue_fail);
         // [chunk 2a] The table must have NO metatable: recording aborted on a
@@ -1066,7 +1079,19 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             try a.movRegMem(.rax, preg, ArrLayout.array_base + ArrLayout.stride);
             try a.cmpRegImm32(.rax, s.grid_stride);
             try a.jcc(.ne, prologue_fail);
+            // The stride load reused rax; a cell home reloads the pointer.
+            if (preg == .rax) _ = try refHomeBaseReg(a, s, .rax);
         }
+        // [Phase 2] Materialize the invariant array bases ONCE, now that the
+        // slot is proven a table of the recorded lane. `data`/`present`
+        // pointers and `len` are fixed for the whole native run (B5), so they
+        // live in dedicated registers and the body reads them instead of
+        // re-loading `[tbreg+field]` per iteration. Each home is a
+        // callee-saved register (never rax), so the pointer survives the
+        // loads. A slot with no reserved home keeps the per-iteration load.
+        if (s.data_home) |r| try a.movRegMem(r, preg, ArrLayout.array_base + ArrLayout.data);
+        if (s.present_home) |r| try a.movRegMem(r, preg, ArrLayout.array_base + ArrLayout.present);
+        if (s.len_home) |r| try a.movRegMem(r, preg, ArrLayout.array_base + ArrLayout.asize);
     }
 
     // [U1-prologue] For each `.func` slot the callee pointer is now in its home;
@@ -1131,22 +1156,6 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         const preg = try refHomeBaseReg(a, s, .rax);
         try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, STRING_TYPE);
         try a.jcc(.ne, prologue_fail);
-    }
-
-    // [Phase 2] Materialize the invariant array bases ONCE, now that each `.ptr` slot
-    // is proven a table of the recorded lane. `data`/`present` pointers and `len` are
-    // fixed for the whole native run (B5), so they live in dedicated registers and the
-    // body reads them instead of re-loading `[tbreg+field]` per iteration. The table
-    // pointer is fetched into a base register (its home, or rax for a spilled home);
-    // each home is a callee-saved register (never rax), so it survives across the few
-    // loads here. A slot with no reserved home keeps the per-iteration load.
-    for (alloc.slots) |s| {
-        if (s.class == .write_only or s.kind != .ptr) continue;
-        if (s.data_home == null and s.present_home == null and s.len_home == null) continue;
-        const tb = try refHomeBaseReg(a, s, .rax);
-        if (s.data_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.data);
-        if (s.present_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.present);
-        if (s.len_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.asize);
     }
 
     // Phase E1/E2: with a preheader marker the run-once region (instructions before

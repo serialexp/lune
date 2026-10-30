@@ -1905,6 +1905,31 @@ allocatable GPRs and each body konst took the ninth for a `movabs`.
    spectral-norm −1.4%, scalar −0.8%, repack −0.7%, recursive-fib −0.6%,
    nothing above +0.05%. The probe went 89 → 87 instructions per
    iteration.
+2. *Homes only the prologue needs* (`SlotInfo.prologue_only`,
+   `HomeReads`, `evictPrologueOnly` in `nativegen_alloc.zig`). In a
+   `.loop` trace, an invariant slot whose load no body instruction reads
+   from its home is prologue-only. Hoisted guards don't count as reads,
+   and neither do `aref` and the array ops that go through a seated base:
+   they read the base, not the table. Run-once reads count (the run-once
+   region runs per entry), and so does a `len` read when the trace
+   appends. Such a slot still gets a register, but it is the first to
+   give it up: when a slot home, computed home, base home, shared base or
+   transient would spill, the slot's home moves to a frame cell instead.
+   The prologue still loads it into the register and stores it to the
+   cell, and exits read the cell. A table qualifies only once all the
+   bases it needs have seated, because an evicted table whose base then
+   fails to seat would be read from the cell in the body (nbody +0.5%
+   before this rule). The prologue loads a cell-homed table together with
+   its checks and base loads, so they read it from `rax`. One-shot traces
+   don't take part: their prologue runs as often as their body. Spilling
+   every prologue-only slot up front instead of on demand cost nsieve
+   +0.49%. On `bench/` (instructions, JIT on, against item 1):
+   nsieve-bit −9.5%, spectral-norm −7.6%, array3d −1.7%, str_manip
+   −0.8%, scalar −0.7%, partialsums −0.5%, str_find_match −0.3%. The worst
+   regression is nsieve-bit-fp at +0.05%, which grows with N: every
+   chained entry re-runs the prologue, and the cell store is one more
+   instruction per hop. Compile cost is about +27k instructions on nbody.
+   The probe went 87 → 71 instructions per iteration.
 
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace

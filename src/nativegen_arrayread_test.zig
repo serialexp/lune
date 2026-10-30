@@ -721,9 +721,13 @@ test "nativegen(doc63 cleanups): constant-key reads and writes lower to immediat
 
 /// How the shared-base test lays out its element reads.
 const SharedBaseMode = enum {
-    /// Three back-to-back reads share each base, until the second read's
-    /// value evicts one.
+    /// Three back-to-back reads share each base. The container table is read
+    /// only through its hoisted bases, so it is the one to give up its
+    /// register when the second read's value finds none free.
     shared,
+    /// One more value lives across the reads: the container yields its
+    /// register to the first read, so the second read's value evicts a base.
+    tight,
     /// A float callout between the second and third reads splits each range.
     callout,
     /// Eight values live across the reads leave no register for either
@@ -756,11 +760,16 @@ fn sharedBaseTrace(gpa: std.mem.Allocator, mode: SharedBaseMode, reads: *[3]u16)
     _ = try at(&b, gpa, .{ .op = .guard_lane, .a = e, .aux = i64_lane });
     var acc = try at(&b, gpa, .{ .op = .slot_load, .aux = 2 });
     _ = try at(&b, gpa, .{ .op = .guard_int, .a = acc });
-    var live: [8]u16 = undefined;
-    if (mode == .pressure) for (&live, 0..) |*w, j| {
+    var live_buf: [8]u16 = undefined;
+    const live = live_buf[0..switch (mode) {
+        .pressure => 8,
+        .tight => 1,
+        else => 0,
+    }];
+    for (live, 0..) |*w, j| {
         const k = try at(&b, gpa, .{ .op = .konst, .aux = @intCast(j % 3) });
         w.* = try at(&b, gpa, .{ .op = .add, .a = idx, .b = k, .ty = .int });
-    };
+    }
     for (reads, 0..) |*r, j| {
         if (mode == .callout and j == 2) {
             const f = try at(&b, gpa, .{ .op = .konst, .aux = 3 });
@@ -773,9 +782,9 @@ fn sharedBaseTrace(gpa: std.mem.Allocator, mode: SharedBaseMode, reads: *[3]u16)
         r.* = try at(&b, gpa, .{ .op = .aload, .a = ref, .aux = i64_lane, .ty = .int });
         acc = try at(&b, gpa, .{ .op = .add, .a = acc, .b = r.*, .ty = .int });
     }
-    if (mode == .pressure) for (live) |w| {
+    for (live) |w| {
         acc = try at(&b, gpa, .{ .op = .add, .a = acc, .b = w, .ty = .int });
-    };
+    }
     const one = try at(&b, gpa, .{ .op = .konst, .aux = 0 });
     const next = try at(&b, gpa, .{ .op = .add, .a = idx, .b = one, .ty = .int });
     _ = try at(&b, gpa, .{ .op = .phi, .b = next, .aux = 1 });
@@ -814,7 +823,7 @@ test "nativegen(doc63 cleanups): an element table's array bases load once per ra
     try testing.expectEqual(arr.Lane.value, container.array.lane);
 
     var consts = [_]Value{ Value.int(1), Value.int(2), Value.int(3), Value.float(0.5) };
-    for ([_]SharedBaseMode{ .shared, .callout, .pressure }) |mode| {
+    for ([_]SharedBaseMode{ .shared, .tight, .callout, .pressure }) |mode| {
         var reads: [3]u16 = undefined;
         const instrs = try sharedBaseTrace(gpa, mode, &reads);
         defer gpa.free(instrs);
@@ -840,7 +849,15 @@ test "nativegen(doc63 cleanups): an element table's array bases load once per ra
                 s.* = alloc.sharedBase(u.*, field);
             }
             switch (mode) {
-                .shared => switch (field) {
+                // Both bases: one range, opened by the first read.
+                .shared => {
+                    for (sb) |s| try testing.expect(s != null);
+                    try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
+                    try testing.expectEqual(@as(u32, use[2]), sb[0].?.last);
+                    try testing.expectEqual(@as(u32, 3), sb[0].?.uses);
+                    try testing.expectEqual(sb[0].?.first, sb[2].?.first);
+                },
+                .tight => switch (field) {
                     // One range, opened by the first read.
                     .data => {
                         for (sb) |s| try testing.expect(s != null);
@@ -850,10 +867,12 @@ test "nativegen(doc63 cleanups): an element table's array bases load once per ra
                         try testing.expectEqual(sb[0].?.first, sb[2].?.first);
                     },
                     // Nine registers hold three homes, `container`'s
-                    // bases, the element and both shared bases, so the
-                    // second read's value takes one: `present`'s, whose
-                    // next load is further off than `data`'s, which that
-                    // read itself consumes. The first two reads share it.
+                    // bases, the element, the extra value and both shared
+                    // bases. The container gives its register to the first
+                    // read's value, so the second read's takes a base:
+                    // `present`'s, whose next load is further off than
+                    // `data`'s, which that read itself consumes. The first
+                    // two reads share it.
                     .present => {
                         for (sb[0..2]) |s| try testing.expect(s != null);
                         try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
@@ -872,6 +891,14 @@ test "nativegen(doc63 cleanups): an element table's array bases load once per ra
                 .pressure => for (sb) |s| try testing.expect(s == null),
             }
         }
+        // Doc 63 register pressure, item 2: the body reads `container` only
+        // through its hoisted bases, so wherever registers ran out it gave up
+        // its own for a frame cell. The callout splits the ranges, so nothing
+        // there runs short and it keeps its register.
+        const cs = alloc.slots[@intCast(alloc.slot_id_of_ref[0])];
+        try testing.expect(cs.prologue_only);
+        try testing.expect(cs.data_home != null and cs.len_home != null);
+        try testing.expectEqual(mode != .callout, cs.home == .spill);
 
         // A full scan, one starting past the hole, one exiting at the hole,
         // and one running off the container.
