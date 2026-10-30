@@ -43,18 +43,18 @@ jobs:
             run: |
               python3 -m unittest discover -s tools -p test_jit_boundaries.py
               python3 tools/check-jit-boundaries.py
-              zig build test -Dtest-shards="$(nproc)"
+              time zig build test -Dtest-shards="$(nproc)" --summary all
           - name: unit tests (jit-debug)
-            run: zig build test -Djit-debug=true -Dtest-shards="$(nproc)"
+            run: time zig build test -Djit-debug=true -Dtest-shards="$(nproc)" --summary all
           - name: frozen-output gate
             run: |
-              zig build -Doptimize=ReleaseFast
-              zig build --prefix zig-out-debug
-              python3 tools/hashgate.py --also-mahina zig-out-debug/bin/mahina
+              time zig build -Doptimize=ReleaseFast
+              time zig build --prefix zig-out-debug
+              time python3 tools/hashgate.py --also-mahina zig-out-debug/bin/mahina
           - name: embedding lib and wasm
             run: |
-              zig build lib
-              zig build wasm
+              time zig build lib
+              time zig build wasm
     steps:
       - uses: actions/checkout@v5
 
@@ -68,7 +68,17 @@ jobs:
             exit 1
           fi
 
+      # The toolchain is the same bytes every run (pinned version + digest),
+      # so it is restored instead of fetched from a mirror.
+      - name: Restore the Zig toolchain
+        id: zig-toolchain
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/mahina-ci-tools/zig
+          key: zig-${{ env.ZIG_VERSION }}-${{ env.ZIG_SHA256 }}
+
       - name: Install Zig
+        if: steps.zig-toolchain.outputs.cache-hit != 'true'
         run: |
           set -eu
           mkdir -p "$TOOLS"
@@ -93,8 +103,25 @@ jobs:
           fi
           mkdir -p "$TOOLS/zig"
           tar -xJf /tmp/zig.tar.xz -C "$TOOLS/zig" --strip-components=1
+
+      - name: Put Zig on PATH
+        run: |
+          set -eu
           test "$("$TOOLS/zig/zig" version)" = "$ZIG_VERSION"
           echo "$TOOLS/zig" >> "$GITHUB_PATH"
+
+      # Zig's global cache holds what does not depend on mahina's sources
+      # (compiler_rt, libc for the C smoke test, the build runner). One per
+      # leg, since each leg builds a different set; the run's sha keys a fresh
+      # save and the prefix restores the newest earlier one. mahina's own
+      # modules recompile whenever src/ changes, so .zig-cache is not kept.
+      - name: Restore the Zig global cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-global-${{ env.ZIG_VERSION }}-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: |
+            zig-global-${{ env.ZIG_VERSION }}-${{ matrix.name }}-
 
       - name: Record the hardware class
         run: |
@@ -103,6 +130,8 @@ jobs:
           free -m | head -2
 
       - name: ${{ matrix.name }}
+        # bash for the `time` keyword (sh has none).
+        shell: bash
         run: |
           set -eu
           ${{ matrix.run }}
