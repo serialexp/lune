@@ -4,23 +4,21 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
-- [ ] **Untyped loop-carried φs refuse native.** A local that a loop only
-      moves around (`a, b, c = b, c, a + i`) gets no type guard, so its
-      entry `slot_load` is neither typed nor a boxed pass-through (that
-      admission needs a `.terminal`/`.link` trace, not `.loop`), and
-      `proveKinds` bails. Pure-guest loops hit it too: the rotation above
-      with no host call is `native_unsupported` and gated to tier-0.
-      Options for Bart: typed entry loads (LuaJIT's SLOAD typecheck for a
-      load that feeds a φ), boxed φs in native, or both.
+- [ ] **Heap and bool loop-carried copies stay untyped.** Typed carried
+      loads (doc 63 §5.10.7) guard only number copies. A loop that only
+      rotates tables, strings or booleans still has an untyped entry
+      `slot_load` that `proveKinds` refuses. Extending it means `guard_table`/
+      `guard_string`/`guard_bool` (or a boxed pass-through for `.loop`).
 - [ ] **A precise host trace native can't compile runs on tier-1a.** The
       dispatcher's native safety net skips an unsupported trace only when
-      it is not precise (a precise one would be orphaned). With
-      `trace_host_calls` on, `w4`/`w8`/`w16` run 3–4× tier-0 for it
-      (§8.1 probe). Either the item above or a gate for precise host
-      traces fixes those shapes; the general case wants a decision.
-- [ ] **`min` is 369 instructions per iteration against a budget of
+      it is not precise (a precise one would be orphaned). The probe shapes
+      that hit it (`w4`–`w16`, `wide`) compile since doc 63 §5.10.7. Any
+      other shape native refuses still gets there; the general case wants
+      a decision.
+- [ ] **`min` is 368 instructions per iteration against a budget of
       250** (doc 63 §5.10.6). Shim 196, `cHostCall` 71, the host 12, the
-      native body ~90. Doc 63 §5.10.6 lists the options.
+      native body ~90. Doc 63 §5.10.6 lists the options. Parked by Bart
+      (2026-10-30).
 - [ ] **The entry alias moves ordinary traces both ways.** Binding the
       numeric-for visible variable to the index's ref at a root's entry
       (`bindEntry`) is limited to precise recordings: on all roots it gave

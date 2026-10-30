@@ -1,3 +1,8 @@
+DOC 63 TYPED CARRIED LOADS DONE (2026-10-30, coral-marten). Doc 63 §5.10.7.
+- The recorder type-guards a loop-carried number copy (LuaJIT SLOAD typecheck): w4/w8/w16 392/420/501, wide 476 (tier-0 607/791/1159/1096). Pure-guest 8-local rotation 450 -> 23 instr/iter. bench/ neutral.
+- Precise traces take the widen-eviction probe (the interp.zig hunk landed inside f5479e4 by accident).
+- Still open: the budget (min 368, parked by Bart), `two` +9, heap/bool carried copies (TODO.md), nest (a)/(b)/(c).
+
 DOC 63 PHASE 3 PART 1 DONE (2026-10-29, coral-marten): native lowering of the four host ops. Doc 63 §5.10.6.
 - Host traces compile natively; the shim is Vm.nativeHostCallFn (site by index, trace via the published TraceState.executing). Flag still OFF.
 - §8.1 probe, flag on: min 369 instr/iter (budget 250, tier-0 479). Split and options (a)-(d) for Bart in §5.10.6.
@@ -17,7 +22,7 @@ DOC 44 STITCHING: numeric-for roots DONE (2026-10-28, coral-marten), committed, 
 - Known noise: euler14-bit +0.8% instructions with identical traces (interp.zig layout).
 - Next: doc 63 Phase 2b/2c (direct host calls; stitching is its fallback).
 
-DOC 74 LANGUAGE SERVER: P0–P5 DONE, P6a–d DONE (2026-10-27 to 2026-10-29, coral-raven). P6e in progress (2026-10-30): system groups DONE, initializationOptions DONE; next watched files (mahina.toml reload), workspace symbols.
+DOC 74 LANGUAGE SERVER: P0–P5 DONE, P6a–d DONE (2026-10-27 to 2026-10-29, coral-raven). P6e in progress (2026-10-30): system groups, initializationOptions, watched files (mahina.toml reload) DONE; next workspace symbols.
 - P6d (2026-10-29): module exports (exports.zig: `return M` / `return {..}`
   shapes; the consumer's `local m = require("x")`), module_cache.zig (per
   path, checked against the module's text by hash each time, 64 entries,
@@ -29,8 +34,8 @@ DOC 74 LANGUAGE SERVER: P0–P5 DONE, P6a–d DONE (2026-10-27 to 2026-10-29, co
   uri.zig), host disk via workspace.Files (host_stdio.disk), definition on a
   module name, `unresolved-require` information diagnostics. Decisions
   (multi-root, severity, definition files with a type grammar based on the
-  base grammar) are in doc 74 §7.4. A mahina.toml edit is not picked up until
-  P6e (restart or re-add the folder).
+  base grammar) are in doc 74 §7.4. A mahina.toml edit is picked up through
+  watched files since P6e (clients with dynamic registration).
 - Fixed on the way: host_stdio's detached reader could touch the caller's
   allocator after `run` returned (a flaky leak + invalid-free panic in the
   session tests under parallel load). Joinable transports are now joined.

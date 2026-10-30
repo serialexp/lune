@@ -80,6 +80,60 @@ test "native: a hot integer for-loop is lowered to machine code and matches tier
     try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
 }
 
+test "native: a loop that only rotates its locals compiles (typed carried loads) and matches tier-0" {
+    // `a, b, c, d = b, c, d, a + i` inspects only `a`. The other three are
+    // copied into each other's slots, so before the recorder typed the loads
+    // they carry, the loop's φs were untyped and native refused the trace.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa,
+        \\local a, b, c, d = 1, 2, 3, 4
+        \\for i = 1, 100 do a, b, c, d = b, c, d, a + i end
+        \\print(a, b, c, d)
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("1226\t1252\t1278\t1304\n", sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
+}
+
+test "native: a float rotation compiles (typed carried loads, float)" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa,
+        \\local a, b, c = 0.5, 1.5, 2.5
+        \\for i = 1, 100 do a, b, c = b, c, a + 0.25 end
+        \\print(a, b, c)
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("9.75\t10.75\t9\n", sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
+}
+
+test "typed carried loads: rotated locals byte-identical across all modes, including a type change" {
+    try expectProgram(
+        \\local a, b, c, d = 1, 2, 3, 4
+        \\for i = 1, 100 do a, b, c, d = b, c, d, a + i end
+        \\print(a, b, c, d)
+    , "1226\t1252\t1278\t1304\n");
+    // A rotated int becomes a float mid-run: the carried load's guard fails
+    // and the run continues correctly wherever it lands.
+    try expectProgram(
+        \\local a, b, c = 1, 2, 3
+        \\for i = 1, 300 do a, b, c = b, c, a + 1 if i == 150 then b = b + 0.5 end end
+        \\print(a, b, c)
+    , "101\t102.5\t103\n");
+}
+
 test "native: a multi-op for-loop with dropped temporaries lowers and matches tier-0 (task A)" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;

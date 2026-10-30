@@ -3,13 +3,13 @@
 Status: partial — prerequisites, Phases 0, 1, 2a, 2b and 2c landed, and
 Phase 3's native lowering (§5.10.6): host calls in precise loop roots
 record and run natively behind `Config.trace_host_calls`, which stays off
-until the §8 budget is met (`min` is 369 instructions per iteration against
-250) and the shapes native can't compile stop falling to tier-1a.
-Phase 4 not started. Revision 6, approved by Codex and
+until the §8 budget is met (`min` is 368 instructions per iteration against
+250; parked by Bart 2026-10-30). Loops whose carried locals are only moved
+compile since the typed carried loads (§5.10.7). Phase 4 not started. Revision 6, approved by Codex and
 Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
 Owner: Bart
-Last updated: 2026-10-29
+Last updated: 2026-10-30
 
 ## Implementation status
 
@@ -164,20 +164,27 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
     Phase 2b).
   - The live-only callout save (every body callout, not just this one)
     and two pre-existing bugs fixed on the way are in §5.10.6.
+- [x] **Phase 3 — loops whose carried locals are only moved compile**
+  (landed 2026-10-30, §5.10.7). Bart chose typed entry loads, LuaJIT's
+  SLOAD typecheck: the recorder type-guards a loop-carried number copy.
+  `w4`/`w8`/`w16`/`wide` and the pure-guest rotations run natively.
+  Precise traces now take the widen-eviction probe (`wide` needed it).
+  Heap and bool copies stay untyped (TODO.md).
 
 ### Outstanding
 
-- [ ] **Phase 3, part 2 — the budget (§8).** `min` is 369 instructions per
-  iteration with the JIT (budget 250, tier-0 479); `wide` never compiles
-  (below). §5.10.6 splits the cost and lists the options for Bart.
+- [ ] **Phase 3, part 2 — the budget (§8).** `min` is 368 instructions per
+  iteration with the JIT (budget 250, tier-0 479). §5.10.6 splits the cost
+  and lists the options. Parked by Bart (2026-10-30); a hand-written
+  native shim may be revisited if the Zig one is not good enough.
   - The §8.1 probe A/B of the entry lease (from Phase 2b), with the flag
     on.
   - Turn `Config.trace_host_calls` on once the budget is met.
-- [ ] **Phase 3 — loops whose carried locals are only moved refuse
-  native** (`w4`/`w8`/`w16`/`wide`, and pure-guest loops of the same
-  shape). The untyped loop-carried φ (§5.10.6). With the flag on such a
-  precise host trace runs on tier-1a at 3–4× tier-0, so this blocks the
-  flag too. Options for Bart in §5.10.6.
+- [ ] **`two` costs 9 instructions a call more with the flag on**
+  (§5.10.6). Not yet explained.
+- [ ] **A precise host trace native refuses still runs on tier-1a**
+  (§5.10.6, last paragraph). No probe shape reaches it since §5.10.7; a
+  shape that does wants the safety-net gate.
 - [ ] **Decision — suspended callbacks run at 2.3× tier-0** (§5.10.5). The
   one disturbing call's callback (`nest`) costs 21.9M instructions against
   9.5M in tier-0: a suspended VM dispatches `.full`, and every back-edge
@@ -1752,6 +1759,55 @@ tier-0. The options, for Bart:
 Separately, the safety net could gate a precise host trace that native
 refuses, as it does an ordinary one, since tier-0 already makes these calls
 at its own cost.
+
+### 5.10.7 As landed: typed carried loads (2026-10-30)
+
+Bart chose typed entry loads, the first option above.
+
+**The recorder** (`RecordingSession.typeCarriedLoads`, at a `.loop`
+close with no peel, no link target and no inlined frame). It looks at
+each anchor slot whose value at the back-edge is still an unguarded
+anchor-window `slot_load` whose φ write-back is kept
+(`trace_finalize.phiWritebackKept`). That load is a copy carried round
+the loop. It gets `guard_int` or `guard_float` from the live value, which
+is the value the copy holds. Native hoists a guard on a `slot_load` to an
+entry tag check, as it does every other typed entry load, so the φ lives
+in a register. A copy whose type changes fails the entry check, exits
+before any effect, and the trace re-records. Heap and bool copies stay
+untyped, as before (TODO.md).
+
+**Precise traces take the widen-eviction probe.** `wide` stores into an
+array whose lane widens after the trace is recorded. An ordinary trace
+whose prologue fails for that reason is evicted and re-recorded (the
+widen probe on a zero exit). D6 had left the probe out for precise
+traces. A precise trace has no side traces to grow past the narrow lane,
+so it failed its entry check until the anchor gated. The precise
+prologue-exit arm now runs the same probe, on zero iterations only (the
+registers are then entry-coherent). The change was committed by mistake
+in f5479e4 (a parallel commit that took `interp.zig` whole); the code and
+its test are as described here.
+
+**Measured** (`bench/embed/tracecall.py`, N = 1M, flag on in a shadow
+build, checksums match; instructions per iteration):
+
+| Shape | tier-0 | JIT, flag on, §5.10.6 | JIT, flag on, now |
+|---|---:|---:|---:|
+| `min` | 479 | 369 | 368 |
+| `w4` / `w8` / `w16` | 607 / 791 / 1159 | 2431 / 3126 / 4517 | 392 / 420 / 501 |
+| `wide` | 1096 | 1129 | 476 |
+
+`cb`, `tw`, `two` and `fail` are unchanged. The pure-guest rotation
+`a, b, … , k = b, c, … , a + i` over eight locals (10M iterations) took
+450 instructions per iteration with the JIT on (gated to tier-0; tier-0
+421) and now takes 23. On `bench/` the change is neutral: instruction
+counts move at most +0.17% (JIT on) and −0.10% (tier-0), with means of
++0.008% and −0.002% over 47 programs.
+
+Tests: native rotation tests, int and float, and an 8-mode equivalence
+test that includes a type change halfway through
+(`interp_native_test.zig`), and a precise host trace whose array lane
+widens (`interp_hosttrace_test.zig`). Without the new code, each test
+fails.
 
 ### 5.11 Tier-1a
 

@@ -540,3 +540,32 @@ test "doc 63 §5.10: a callback collection that dooms the executing trace, then 
 test "doc 63 §5.10: a callback collection that dooms the executing trace, then a raise" {
     try expectDoomExecuting(true);
 }
+
+test "doc 63: a precise host trace whose array lane widens is retired and re-recorded" {
+    // `t[i % 16 + 1] = i * 10000000` widens `t`'s lane as the stored values
+    // outgrow it. Each recorded trace pins the lane it saw, and once the lane
+    // widens past it the trace fails its entry check every time. A precise
+    // trace has no side traces to recover with, so it must take the
+    // widen-eviction an ordinary one does; without it the anchor gates and
+    // almost every call is made from tier-0.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const source =
+        \\local function fill(n) local h = hid local t = {} local s = 0
+        \\  for i = 1, n do s = s + h(i) t[i % 16 + 1] = i * 10000000 end
+        \\  return s + t[1] end
+        \\print(fill(400))
+        \\
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    try setup(&vm);
+    vm.trace.config.trace_host_calls = true;
+    var buf: [64]u8 = undefined;
+    var sink = @import("io.zig").Writer.fixed(&buf);
+    var chunk = try util.runNativeForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("4000080200\n", sink.buffered());
+    try testing.expectEqual(@as(usize, 400), Log.len);
+    try testing.expect(vm.trace.native_host_calls > 300);
+}

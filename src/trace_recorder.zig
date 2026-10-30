@@ -1282,6 +1282,10 @@ pub const RecordingSession = struct {
         // Peeled closes are legitimately entry≠steady by design; `.link`
         // closes carry no back-edge.
         if (self.peel == null and self.link_target == null) {
+            self.typeCarriedLoads(regs) catch {
+                self.abort(.alloc);
+                return false;
+            };
             switch (self.loopCloseDefeat(regs)) {
                 .none => {},
                 // Doc 57 P3 (LuaJIT `lj_opt_loop` TYPEINS/GFAIL → keep
@@ -6493,6 +6497,37 @@ pub const RecordingSession = struct {
     /// live anchor-return registers. Commit's φ-emission slot filter is
     /// mirrored too: a slot that gets no φ is never written at the back-edge,
     /// so its entry guard cannot be contradicted.
+    /// LuaJIT's typed SLOAD for a loop-carried copy. A slot the body sets to
+    /// another slot's entry value (`a, b = b, a + i` sets `a` to `b`'s) carries
+    /// that load around the back-edge, and if nothing in the body inspected
+    /// it, the load has no type: the φ is untyped and native refuses the
+    /// trace. Guard such a load with the type it delivers, which is the live
+    /// value of the slot it was copied into (the same `Value`). Only numbers
+    /// are typed here; a heap or bool copy stays untyped (TODO.md).
+    /// Native hoists the guard to an entry tag check like any guard on a
+    /// `slot_load`; `loopCloseDefeat`, run next, sees it like the others.
+    fn typeCarriedLoads(self: *RecordingSession, regs: RegWindow) !void {
+        if (self.inline_depth != 0) return;
+        const finalizer = @import("trace_finalize.zig");
+        var live_buf: [finalizer.PHI_LIVE_WORDS]u64 = undefined;
+        const live = finalizer.phiLiveRow(self, &live_buf);
+        var slot: u16 = 0;
+        while (slot < self.anchor_num_registers) : (slot += 1) {
+            const s = self.reg_map[slot];
+            if (s.state != .def) continue;
+            const ins = self.instrs.items[@intCast(s.ref)];
+            if (ins.op != .slot_load or ins.aux < 0 or ins.aux >= self.anchor_num_registers) continue;
+            if (self.guarded_refs.contains(s.ref)) continue;
+            if (!finalizer.phiWritebackKept(self, slot, live)) continue;
+            const v = regs.get(slot);
+            if (v.isInt()) {
+                try self.guard(s.ref, .guard_int, .operand_type, .none);
+            } else if (v.isFloat()) {
+                try self.guard(s.ref, .guard_float, .operand_type, .none);
+            }
+        }
+    }
+
     fn loopCloseDefeat(self: *const RecordingSession, regs: RegWindow) CloseDefeat {
         // The live-value read below indexes the ANCHOR frame; at inline depth
         // the window belongs to a callee. Depth-0 covers every channel the
