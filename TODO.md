@@ -4,33 +4,10 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## Language: declaring a global (noted 2026-10-30)
 
-- [ ] **Lua 5.5 global declarations.** Bart's direction: follow Lua 5.5
-      (manual §3.3.7) as written; `_G.x` stays for code coming from Lua.
-      `global` is a reserved word, with no contextual-keyword escape
-      (Bart: a program using `global` as a name adjusts). The 5.5 shape:
-      `global [attrib] Name [attrib] {, …} [= explist]`, `global [attrib] *`,
-      `global function f`; every chunk starts with an implicit `global *`,
-      and inside the scope of any explicit declaration every free name must
-      be declared (a compile error); `global x = v` and `global function`
-      raise a runtime error when the global is already non-nil; `<const>`
-      applies to globals, `<close>` to locals only. Open before the design
-      doc: whether attributes (`<const>`, `<close>`, which mahina has none
-      of yet, locals included) come in the same change. **Const and
-      frozen are two things (Bart, 2026-10-31, as JS and Luau have them):**
-      `<const>` only forbids assigning the variable again, as in Lua 5.5
-      and JS `const`; `t.x = 1` through it is allowed. Freezing is a
-      separate run-time call, `table.freeze(t)` (with `table.isfrozen`),
-      as Luau's and JS `Object.freeze`: shallow, permanent, for every
-      holder of `t`, and a write to a frozen table is an error (as in
-      Luau). A deep freeze is the program calling it recursively. Costs a
-      frozen bit per table, tested on every table store (the JIT can hoist
-      it). `table.freeze`/`isfrozen` are Luau's, not Lua 5.4's: they get
-      rows in the stdlib inventory when they land (Rule Z-5). In mahina the
-      resolver would own the declarations as scoped bindings (doc 74 §6.3),
-      and the undefined-global warning stays for code outside any
-      declaration. The resolver already treats `_G.x` as the global `x`
-      (doc 74, "Globals across files").
-
+- [ ] **Lua 5.5 global declarations, attributes and frozen tables.**
+      Designed in doc 76 (decisions D1–D4 there: follow 5.5 as written,
+      `global` reserved, `<const>` is not a freeze, `table.freeze` as
+      Luau's, attributes in the same change). Open questions Q1–Q4 there.
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
 - [ ] **A precise host trace native can't compile runs on tier-1a.** The
