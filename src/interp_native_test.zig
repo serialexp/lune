@@ -215,6 +215,56 @@ test "typed carried loads: rotated tables and strings byte-identical across all 
     , "45150\tstring\ttable\tstring\n");
 }
 
+test "native: a bool copy compiles (typed carried loads, guard_bool)" {
+    // `a` takes `b`'s value, which a compare produced: either boolean, so
+    // only a type-only guard holds across iterations (a pin would fail on
+    // every change).
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa,
+        \\local a, b = true, false
+        \\local s = 0
+        \\for i = 1, 100 do a, b = b, (i % 3 == 0) s = s + i end
+        \\print(s, a, b)
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("5050\ttrue\tfalse\n", sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
+}
+
+test "typed carried loads: bool copies byte-identical across all modes, including type changes" {
+    try expectProgram(
+        \\local a, b = true, false
+        \\local s = 0
+        \\for i = 1, 100 do a, b = b, (i % 3 == 0) s = s + i end
+        \\print(s, a, b)
+    , "5050\ttrue\tfalse\n");
+    // A bool copy turns into a number, then a string.
+    try expectProgram(
+        \\local a, b = true, false
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  a, b = b, (i % 3 == 0)
+        \\  s = s + i
+        \\  if i == 150 then b = 7 end
+        \\  if i == 200 then b = "x" end
+        \\end
+        \\print(s, a, b)
+    , "45150\tfalse\ttrue\n");
+    // A bool and a number swapped every iteration.
+    try expectProgram(
+        \\local a, b = true, 1
+        \\local s = 0
+        \\for i = 1, 300 do a, b = b, a s = s + i end
+        \\print(s, a, b)
+    , "45150\ttrue\t1\n");
+}
+
 test "native: a multi-op for-loop with dropped temporaries lowers and matches tier-0 (task A)" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;

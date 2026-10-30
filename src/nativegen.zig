@@ -2284,6 +2284,8 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // prologue check (proveKinds: its operand is a `.nil` slot_load,
             // which is never carried).
             .guard_is_nil => {},
+            // Doc 63 §5.10.7: proven `.bool` (proveKinds), so it cannot fail.
+            .guard_bool => {},
             .guard_is_false, .guard_is_true => {
                 if (!ngalloc.pinHoisted(t, alloc.slots, alloc.slot_id_of_ref, ins.a)) {
                     const want: i8 = @intFromBool(ins.op == .guard_is_true);

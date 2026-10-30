@@ -1885,8 +1885,9 @@ pub const RecordingSession = struct {
             .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .alen => {
                 ins_mut.aux = @intCast(self.cur_pc);
             },
-            // Doc 57: the primitive pins are type guards too.
-            .guard_is_nil, .guard_is_false, .guard_is_true => {
+            // Doc 57: the primitive pins are type guards too, and so is doc
+            // 63 §5.10.7's `guard_bool`.
+            .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => {
                 ins_mut.aux = @intCast(self.cur_pc);
             },
             .guard_step_up, .guard_step_down, .guard_for_nov => ins_mut.aux = @intCast(self.cur_pc),
@@ -6332,6 +6333,7 @@ pub const RecordingSession = struct {
             .guard_is_nil,
             .guard_is_false,
             .guard_is_true,
+            .guard_bool,
             .guard_func,
             .guard_builtin,
             .fsqrt,
@@ -6485,8 +6487,9 @@ pub const RecordingSession = struct {
     /// like any guard on a `slot_load`. A table with no metatable gets
     /// `guard_table` and a string `guard_string`, the guards the body would
     /// have emitted had it used the value; native carries either as a heap
-    /// φ. A bool copy stays untyped: the only bool guards pin the value
-    /// (TODO.md). `loopCloseDefeat`, run next, sees these like the others.
+    /// φ. A bool gets `guard_bool`, either value: a pin (`guard_is_*`) would
+    /// fail every time the copy changes. `loopCloseDefeat`, run next, sees
+    /// these like the others.
     fn typeCarriedLoads(self: *RecordingSession, regs: RegWindow) !void {
         if (self.inline_depth != 0) return;
         const finalizer = @import("trace_finalize.zig");
@@ -6505,6 +6508,8 @@ pub const RecordingSession = struct {
                 try self.guard(s.ref, .guard_int, .operand_type, .none);
             } else if (v.isFloat()) {
                 try self.guard(s.ref, .guard_float, .operand_type, .none);
+            } else if (v.isBool()) {
+                try self.guard(s.ref, .guard_bool, .operand_type, .none);
             } else if (v.isHeap()) {
                 const op: IrOp = switch (v.heapType()) {
                     .table => if (table_mod.Table.fromHeader(v.asHeap()).metatable == null) .guard_table else continue,
@@ -6560,7 +6565,7 @@ pub const RecordingSession = struct {
         const instrs = self.instrs.items;
         for (instrs, 0..) |ins, i| {
             switch (ins.op) {
-                .guard_int, .guard_float, .guard_is_nil, .guard_is_false, .guard_is_true => {},
+                .guard_int, .guard_float, .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => {},
                 else => continue,
             }
             const ref: usize = @intCast(ins.a);
@@ -6583,13 +6588,34 @@ pub const RecordingSession = struct {
                 // 2 fails the pin every time — the flipped bool (`b = not b`).
                 // Whatever produced the carried value, only strict equality
                 // with the pin is stable. P3 unrolls on this kind alone.
-                .guard_is_nil, .guard_is_false, .guard_is_true => if (!trace_ir.primPinPasses(ins.op, v)) {
+                .guard_is_nil, .guard_is_false, .guard_is_true => if (!trace_ir.primPinPasses(ins.op, v) or !self.pinCarried(@intCast(ref), ins.op, s.ref)) {
+                    found = .pins;
+                },
+                // Doc 63 §5.10.7: a bool copy that comes back as something
+                // else (`a, b = b, a` over a bool and a number) is periodic,
+                // like a flipped pin, so it may unroll too.
+                .guard_bool => if (!v.isBool()) {
                     found = .pins;
                 },
                 else => unreachable,
             }
         }
         return found;
+    }
+
+    /// Doc 63 §5.10.7: does the pinned load `ref` get its pin back at the
+    /// back-edge on every iteration, not just the recorded one? The live value
+    /// matching says only the latter. A write-back that is another slot's
+    /// load (a rotation, `a, b, c = b, c, a`) carries whatever that slot held,
+    /// so the pin holds only if that load is pinned to the same value (or is
+    /// `ref` itself). Typed carried loads make such loads `guard_bool`, not
+    /// pins: a period-3 bool rotation otherwise matched on the recorded
+    /// iteration, closed, and failed its pin every third iteration.
+    fn pinCarried(self: *const RecordingSession, ref: Ref, pin: IrOp, writeback: Ref) bool {
+        if (writeback == ref) return true;
+        if (self.instrs.items[@intCast(writeback)].op != .slot_load) return true;
+        const g = self.guarded_refs.get(writeback) orelse return false;
+        return self.instrs.items[g].op == pin;
     }
 
     pub fn deinit(self: *RecordingSession, gpa: std.mem.Allocator) void {

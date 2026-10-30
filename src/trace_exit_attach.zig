@@ -173,6 +173,7 @@ pub fn resumeClass(op: IrOp) ResumeClass {
         .guard_is_nil,
         .guard_is_false,
         .guard_is_true,
+        .guard_bool,
         .guard_step_up,
         .guard_step_down,
         .guard_for_nov,

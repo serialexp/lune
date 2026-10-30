@@ -223,7 +223,9 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     // on an INTERNAL φ whose init is a slot_load types that init `.bool` too
     // (`bool_init`): the doc 40 φ-hoist, one step removed — the init gets a
     // prologue TAG_BOOL check and a home, and the φ's own pin stays a real
-    // per-iteration body check.
+    // per-iteration body check. Doc 63 §5.10.7: a `guard_bool` on a slot_load
+    // (or on an internal φ whose init is one) marks it here too — the same
+    // `.bool` input with a TAG_BOOL prologue check and no payload pin.
     const pin_of = gpa.alloc(?trace_ir.IrOp, n) catch return false;
     defer gpa.free(pin_of);
     @memset(pin_of, null);
@@ -389,6 +391,15 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     if (init < r and t.instrs[init].op == .slot_load) bool_init[init] = true;
                 }
             },
+            .guard_bool => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                if (t.instrs[r].op == .slot_load) bool_init[r] = true;
+                if (t.instrs[r].op == .phi and t.instrs[r].aux == trace.PHI_INTERNAL) {
+                    const init = t.instrs[r].a;
+                    if (init < r and t.instrs[init].op == .slot_load) bool_init[init] = true;
+                }
+            },
             else => {},
         }
     }
@@ -461,7 +472,9 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     // (and, for an invariant bool, the payload).
                     kinds[i] = if (p == .guard_is_nil) .nil else .bool;
                 } else if (bool_init[i]) {
-                    kinds[i] = .bool; // doc 57: init of a pinned internal φ
+                    // Doc 57: init of a pinned internal φ; doc 63 §5.10.7: a
+                    // `guard_bool`-covered load.
+                    kinds[i] = .bool;
                 } else if (boxedPassThroughOnly(t, i)) {
                     // Preserve both lanes without inventing a type. Allocation
                     // keeps payload and tag in their source slots; terminal
@@ -663,6 +676,16 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .guard_is_nil => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .nil or t.instrs[ins.a].op != .slot_load) return false;
+                kinds[i] = .none;
+            },
+            // Doc 63 §5.10.7: on a `.bool` operand the guard cannot fail in
+            // native. A slot_load is TAG_BOOL-checked in the prologue and, if
+            // carried, written back from a `.bool` (`nativegen_alloc`'s RV-3);
+            // every other `.bool` producer is a bool by construction. So it
+            // lowers to nothing.
+            .guard_bool => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .bool) return false;
                 kinds[i] = .none;
             },
             // Doc 57: `not` of a dynamic bool (a compare result or a bool-lane
@@ -1640,7 +1663,7 @@ pub fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
         // Doc 57: `not` reads its bool operand; the value pins read what they
         // check (a body compare for a carried/φ operand, liveness either way).
-        .not, .guard_is_nil, .guard_is_false, .guard_is_true => .{ .a = true, .b = false },
+        .not, .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => .{ .a = true, .b = false },
         // int_of_float reads its sole float operand (a); alen its sole table
         // operand (a).
         .int_of_float, .alen => .{ .a = true, .b = false },

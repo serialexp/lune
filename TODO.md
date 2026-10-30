@@ -4,10 +4,6 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
-- [ ] **Bool loop-carried copies stay untyped.** Typed carried loads (doc
-      63 §5.10.7) guard numbers, tables and strings. The only bool guards on
-      a load pin the value (`guard_is_true`/`guard_is_false`), which a
-      rotation changes, so a bool copy needs a type-only `guard_bool`.
 - [ ] **A carried table used as an array refuses native.** `a, b = b, a
       s = s + a[1]` is doc 22 §A.1's carried-heap slot with an `aref` rooted
       at it, which `nativegen_alloc` refuses (its lane/base facts are

@@ -119,6 +119,7 @@ export const IR_OP_NAMES = [
   "guard_step_up", // 97  numeric-for step counts upward, 0 < a — aux=pc
   "guard_step_down", // 98  numeric-for step counts downward, !(0 < a), NaN included — aux=pc
   "guard_for_nov", // 99  numeric-for int index within bound a can step by b without overflow — aux=pc
+  "guard_bool", // 100 type guard: a is a boolean, either value (doc 63 §5.10.7) — aux=pc
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -182,6 +183,7 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_is_nil",
   "guard_is_false",
   "guard_is_true",
+  "guard_bool",
   "aload",
   "guard_table",
   "guard_lane",

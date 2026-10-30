@@ -340,6 +340,41 @@ test "doc 57 P3: a period-3 nil/false/true cycle unrolls twice" {
     , "100\n", .{ .record_aborts = true, .inspect = Inspect.run });
 }
 
+test "doc 63 §5.10.7: a pinned bool whose write-back is a typed copy unrolls (period-3 rotation)" {
+    // `if a` pins `b`'s load; its write-back is `c`'s load, which typed
+    // carried loads guard with `guard_bool`, not a pin. The values agree on
+    // one of the three rotation states, so only `pinCarried` sees that the
+    // pin can fail; without it the trace closed and failed every third
+    // iteration. All three starting states, so one is recorded in that state.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode == .off) return;
+            try testing.expectEqual(@as(usize, 0), countAborts(vm, .type_instability));
+            if (!executes(mode)) return;
+            const t = mostUnrolled(vm) orelse return error.TestExpectedUnrolledTrace;
+            try testing.expectEqual(@as(u8, 2), t.code.instunrolled);
+        }
+    };
+    try expectProgramTuned(
+        \\local a, b, c = true, false, true
+        \\local s = 0
+        \\for i = 1, 300 do a, b, c = b, c, a if a then s = s + i end end
+        \\print(s, a, b, c)
+    , "30200\ttrue\tfalse\ttrue\n", .{ .record_aborts = true, .inspect = Inspect.run });
+    try expectProgramTuned(
+        \\local a, b, c = false, true, true
+        \\local s = 0
+        \\for i = 1, 300 do a, b, c = b, c, a if a then s = s + i end end
+        \\print(s, a, b, c)
+    , "30000\tfalse\ttrue\ttrue\n", .{ .record_aborts = true, .inspect = Inspect.run });
+    try expectProgramTuned(
+        \\local a, b, c = true, true, false
+        \\local s = 0
+        \\for i = 1, 300 do a, b, c = b, c, a if a then s = s + i end end
+        \\print(s, a, b, c)
+    , "30100\ttrue\ttrue\tfalse\n", .{ .record_aborts = true, .inspect = Inspect.run });
+}
+
 test "doc 57 P3: two flags flipping together unroll once" {
     const Inspect = struct {
         fn run(vm: *Vm, mode: TraceMode) !void {

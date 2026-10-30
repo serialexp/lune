@@ -503,6 +503,13 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     if (record) rec.exit(i, .guard, values[ins.a]);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+                // Doc 63 §5.10.7: either boolean.
+                .guard_bool => if (values[ins.a].isBool()) {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
 
                 // ---- float→int loop-limit specialization ----
                 // Convert the (loop-invariant) float limit to its exact integer

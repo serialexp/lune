@@ -31,6 +31,8 @@ pub const EntryGuardType = enum(u8) {
     nil,
     false_,
     true_,
+    // Doc 63 §5.10.7: `guard_bool`, either boolean.
+    boolean,
 
     /// Does an entry value `v` satisfy this guard? The one definition every
     /// fingerprint check (the dispatcher's `matchesFingerprint` and the
@@ -44,6 +46,7 @@ pub const EntryGuardType = enum(u8) {
             .nil => v.isNil(),
             .false_ => v.isBool() and !v.asBool(),
             .true_ => v.isBool() and v.asBool(),
+            .boolean => v.isBool(),
         };
     }
 };

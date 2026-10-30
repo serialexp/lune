@@ -170,8 +170,8 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   `w4`/`w8`/`w16`/`wide` and the pure-guest rotations run natively.
   Precise traces now take the widen-eviction probe (`wide` needed it).
   Extended the same day to table and string copies (`guard_table`,
-  `guard_string`; native's carried-string slot takes a pinned copy).
-  Bool copies stay untyped (TODO.md).
+  `guard_string`; native's carried-string slot takes a pinned copy), and
+  bool copies (a new type-only `guard_bool`, IR op 100).
 
 ### Outstanding
 
@@ -1787,9 +1787,29 @@ Native's carried-string slot (doc 30 c4b) took only a string producer as
 its write-back. It now also takes a `guard_string`-pinned `slot_load`. That
 load is a string at entry by its own pin and, if carried, by the same rule,
 so every carried value is a string by induction. A `.heap` load that is
-not string-pinned (the host callee's) still refuses. A bool copy stays
-untyped: the only bool guards on a load (`guard_is_true`/`guard_is_false`)
-pin the value, which a rotation changes (TODO.md).
+not string-pinned (the host callee's) still refuses.
+
+**Bools.** The only bool guards on a load were doc 57's value pins
+(`guard_is_true`/`guard_is_false`), LuaJIT's model: it has no bool type, and
+a bool that changes unrolls (`instunroll`, our P3). Pinning bool copies was
+measured first. A period-3 rotation unrolled and went from 282 to 10
+instructions per iteration, but a copy of a compare result
+(`a, b = b, i % 3 == 0`) failed its pin on every change: 280 → 805, and 337
+→ 405 for a less regular one, against tier-0's 251 and 307. So a bool copy
+gets a new type-only guard, `guard_bool` (IR op 100, entry fingerprint
+`.boolean`): either value. Native types the load `.bool` with a TAG_BOOL
+prologue check, and the guard lowers to nothing there (a carried `.bool`
+slot is written back from a `.bool`, RV-3). Tier-1a checks the tag.
+
+With copies no longer pinned, the close's pin check needed one more rule
+(`pinCarried`). A body pin (`if a` pins the load `a` was copied from) is
+stable only if the pinned slot's write-back is the same load or one pinned
+to the same value. The live values matching on the recorded iteration is
+not enough: in a period-3 rotation they match in one of the three states,
+and a trace recorded there failed its pin every third iteration (901
+instructions per iteration). A write-back that is another slot's load and
+fails the rule now counts as a pin contradiction, so P3 unrolls. A pure
+copy that a compare produced keeps today's behaviour.
 
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace
@@ -1828,13 +1848,20 @@ iteration):
 | strings rotated, unused | 223 | 252 | 17 |
 | strings rotated, `#a` read | 274 | 303 | 15 |
 | tables rotated, `a[1]` read | 331 | 360 | 360 (refused, §A.1) |
+| bools rotated, `if a` (period 3) | 253 | 282 | 9 (unrolled ×3) |
+| `a, b = b, (i % 3 == 0)` | 251 | 280 | 36 |
+| `a, b = b, (i * 7919 % 13 < 6)` | 307 | 337 | 38 |
 
-`bench/` is neutral again (means −0.003%, both tiers).
+`bench/` is neutral again (tables and strings: means −0.003%, both tiers;
+bools: +0.001% tier-0, +0.000% JIT).
 
 Tests: native rotation tests for ints, floats, tables and strings, and
 8-mode equivalence tests that include type changes (a table with a
 metatable joining the rotation, a string turning into a table)
-(`interp_native_test.zig`). Doc 30 c4b's `w ← w` fixture now compiles and
+(`interp_native_test.zig`), bool copies with the same (a copy turning into
+a number and a string; a bool swapped with a number), and the period-3
+rotation's unroll from all three starting states (`interp_bool_test.zig`).
+Doc 30 c4b's `w ← w` fixture now compiles and
 matches tier-1a, and a carried string whose write-back is the host callee's
 load fails closed (`nativegen_lowering_test.zig`). Also a precise host trace
 whose array lane widens (`interp_hosttrace_test.zig`). Without the new

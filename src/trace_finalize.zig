@@ -285,6 +285,7 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
             .guard_is_nil => .nil,
             .guard_is_false => .false_,
             .guard_is_true => .true_,
+            .guard_bool => .boolean,
             else => null,
         };
         if (egt) |ty| {
@@ -692,7 +693,7 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
                 std.debug.assert(ins.a < i);
             },
             // Doc 57: the primitive pins read `a` only.
-            .guard_is_nil, .guard_is_false, .guard_is_true => std.debug.assert(ins.a < i),
+            .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => std.debug.assert(ins.a < i),
             // The step-direction guards read the step `a` only.
             .guard_step_up, .guard_step_down => std.debug.assert(ins.a < i),
             // The overflow guard reads its bound `a` and step `b`.

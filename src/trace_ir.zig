@@ -797,6 +797,16 @@ pub const IrOp = enum(u8) {
     // instead, per iteration. Stamps its recording pc in `aux` and is `tropt`
     // kind `.cvt`, like `guard_step_*`. Wire ordinal 99.
     guard_for_nov,
+
+    // ---- doc 63 §5.10.7: a loop-carried bool copy ----
+    //
+    // `a` = value ref → the value is a boolean, either one. Produces nothing.
+    // The type-only counterpart of the doc 57 pins: a carried copy changes
+    // value from iteration to iteration (`a, b = b, i % 3 == 0`), so a pin
+    // would fail on every change, and native carries the copy as a `.bool`
+    // φ instead. Stamps its recording pc in `aux` like the other type guards.
+    // Wire ordinal 100.
+    guard_bool,
 };
 
 /// Doc 63 §5.1: one host call site of a precise trace, indexed by
@@ -975,7 +985,7 @@ pub const IrInstr = struct {
 pub fn guardExitPc(ins: IrInstr) ?u32 {
     return switch (ins.op) {
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .alen => @intCast(ins.aux),
-        .guard_is_nil, .guard_is_false, .guard_is_true => @intCast(ins.aux),
+        .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => @intCast(ins.aux),
         .guard_step_up, .guard_step_down, .guard_for_nov => @intCast(ins.aux),
         else => null,
     };
@@ -988,7 +998,7 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
 pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
         .guard_absent => true,
-        .guard_is_nil, .guard_is_false, .guard_is_true => true,
+        .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => true,
         .guard_step_up, .guard_step_down, .guard_for_nov => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
         else => false,
@@ -1085,6 +1095,7 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_is_nil,
         .guard_is_false,
         .guard_is_true,
+        .guard_bool,
         .aload,
         .guard_table,
         .guard_bounds,
