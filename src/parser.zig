@@ -398,7 +398,8 @@ const Parser = struct {
 
     fn parseExprStatement(self: *Parser) Error!Stmt {
         const start = self.current().start;
-        const first = try self.parseSuffixed();
+        var free = true;
+        const first = try self.parseSuffixed(&free);
 
         // Compound assignment `target OP= value` (single target). Detected before
         // the plain `=`/`,` assignment because `~=` (xor-assign) shares the `ne`
@@ -420,7 +421,8 @@ const Parser = struct {
             var targets: std.ArrayList(*Expr) = .empty;
             try targets.append(self.arena, first);
             while (self.match(.comma)) {
-                try targets.append(self.arena, try self.parseSuffixed());
+                var target_free = true;
+                try targets.append(self.arena, try self.parseSuffixed(&target_free));
             }
             _ = try self.expect(.assign, .expected_assign);
             const values = try self.parseExprList();
@@ -710,14 +712,15 @@ const Parser = struct {
         const base = self.depth;
         defer self.depth = base;
         try self.enter();
-        var lhs = try self.parseUnary();
-        var first = true;
+        // The first operator or suffix node takes this expression's level;
+        // each one after puts the chain so far a level deeper. So `f(f(1))`
+        // costs a level per call, as in LuaJIT.
+        var free = true;
+        var lhs = try self.parseUnary(&free);
         while (infixBp(self.currentTag())) |info| {
             if (info.l < min_bp) break;
-            // The first operator's node takes this expression's level; each
-            // one after puts the chain so far a level deeper.
-            if (!first) try self.enter();
-            first = false;
+            if (!free) try self.enter();
+            free = false;
             _ = self.advance();
             const rhs = try self.parseExpr(info.r);
             lhs = try self.newExpr(
@@ -728,7 +731,8 @@ const Parser = struct {
         return lhs;
     }
 
-    fn parseUnary(self: *Parser) Error!*Expr {
+    /// `free`: see `parseExpr`.
+    fn parseUnary(self: *Parser, free: *bool) Error!*Expr {
         const t = self.current();
         const uop: ?ast.UnaryOp = switch (t.tag) {
             .minus => .neg,
@@ -757,16 +761,20 @@ const Parser = struct {
             args[0] = operand;
             return self.newExpr(span, .{ .call = .{ .callee = callee, .args = args } });
         }
-        return self.parseSuffixed();
+        return self.parseSuffixed(free);
     }
 
-    fn parseSuffixed(self: *Parser) Error!*Expr {
+    /// `free`: see `parseExpr`; a statement's target or call has its own.
+    fn parseSuffixed(self: *Parser, free: *bool) Error!*Expr {
         const base = self.depth;
         defer self.depth = base;
         var e = try self.parsePrimary();
         while (true) {
             switch (self.currentTag()) {
-                .dot, .lbracket, .lparen, .colon => try self.enter(),
+                .dot, .lbracket, .lparen, .colon => {
+                    if (!free.*) try self.enter();
+                    free.* = false;
+                },
                 else => break,
             }
             switch (self.currentTag()) {
@@ -1230,6 +1238,10 @@ test "parser: a tree deeper than max_depth is one diagnostic and a partial tree"
         .{ .prefix = "local t = ", .open = "{", .middle = "", .close = "}", .suffix = "\n" },
         .{ .prefix = "local x = ", .open = "not ", .middle = "true", .close = "", .suffix = "\n" },
         .{ .prefix = "local x = ", .open = "(", .middle = "1", .close = ")+1", .suffix = "\n" },
+        // A call nested in a call's argument is one level, as in LuaJIT.
+        .{ .prefix = "local x = ", .open = "f(", .middle = "1", .close = ")", .suffix = "\n" },
+        .{ .prefix = "local x = ", .open = "f(", .middle = "1", .close = ").a", .suffix = "\n" },
+        .{ .prefix = "local x = ", .open = "f(", .middle = "1", .close = ")+1", .suffix = "\n" },
     };
     for (shapes) |s| {
         // 190 levels parse; many more are one diagnostic, at the level past

@@ -199,12 +199,20 @@ land; move whole phases to Done once everything inside them is checked.
   (`parser.max_depth`, Lua's and LuaJIT's) is one `E0135` and the parse
   ends there; before, 10k nested brackets or blocks, or a 100k-term
   `1+1+…`, overflowed the stack natively and in the browser. Each nested
-  construct is a level, and so is each operator or suffix of a chain after
-  the first, since every later pass recurses once per level of the tree
-  (a flat `a+b+c…` past 200 terms is refused, where Lua, building no tree,
-  takes it). Probed at and past the limit on the Debug wasm build (1 MiB
-  stack) and the Debug CLI with 20 shapes, through every LSP request, check
-  and run. std's JSON writer asserts 256 levels of nesting in a safe build,
+  construct is a level, and so is each operator or suffix of an
+  expression after its first, since every later pass recurses once per
+  level of the tree (a flat `a+b+c…` past 200 terms is refused, where Lua,
+  building no tree, takes it: Bart kept that divergence over making every
+  pass iterate over chains). The first operator or suffix sharing its
+  expression's level makes `f(f(…))` a level per call, as in LuaJIT (199
+  calls; LuaJIT's registers stop it at 123, PUC Lua's C stack at 195); it
+  first cost two, and stopped at 99. That sharing lets a tree run up to
+  about twice the counted depth (`f(…).a` nested), so the probe covers
+  those shapes too. Probed at and past the limit on the Debug wasm build
+  (1 MiB stack, 23 shapes) and the Debug CLI, through every LSP request,
+  check and run. `bench/compile_multret_chain.lua` loaded a 2,000-deep
+  chain, which neither Lua nor LuaJIT loads; it now splits its calls into
+  chains of 190. std's JSON writer asserts 256 levels of nesting in a safe build,
   so a document-symbol outline nests at most 100 levels (deeper symbols are
   listed flat there) and a selection chain keeps its innermost 199 steps
   and the file.

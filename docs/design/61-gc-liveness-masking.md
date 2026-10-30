@@ -986,8 +986,10 @@ successor. So when a row changes, the worklist also requeues the producer
 two pcs before it. A producer's survivors extend those of the chained
 producer above it, which is cached, so a chain costs `O(L · words)` (codex
 Phase 0 should-fix). `bench/compile_multret_chain.lua` holds that: 200
-compiles of a 2,000-deep chain take 0.33 s, where a per-producer chain walk
-spent 0.09 s in liveness for a single 2,800-deep chain. Tests pin the
+compiles of a 2,000-deep chain took 0.33 s, where a per-producer chain walk
+spent 0.09 s in liveness for a single 2,800-deep chain. Since the parser
+takes 200 levels (doc 74, `parser.max_depth`) the bench splits its 2,000
+calls into chains of 190 in one chunk: 0.16 s for the 200 compiles. Tests pin the
 back-edge requeue and a five-deep chain. Exit snapshots (§2 site 3) read
 the same rows, so they now omit these dead registers too. That is sound for
 guest reads: tier-0, resuming at or before the producer, writes them or
