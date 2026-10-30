@@ -6475,28 +6475,6 @@ pub const RecordingSession = struct {
     /// close may unroll), else `.none`.
     const CloseDefeat = enum { none, pins, numeric };
 
-    /// Doc 40 Phase 1 — commit preflight: would this `.loop` close be
-    /// self-defeating? A trace whose entry fingerprint pins a carried slot to
-    /// one numeric kind while its back-edge φ would store the other can never
-    /// take its own back-edge: every entry runs exactly one iteration, exits
-    /// on the entry guard, and the accounting machinery mistakes it for
-    /// healthy forever (`completed > 0` clears the anchor penalty each entry;
-    /// no want channel fires — the doc 40 "failure loop"). Such a close is
-    /// refused BEFORE `commit` mutates anything (codex finding 4), keeping the
-    /// anchor's accounting live and the producing channel retrying under the
-    /// record gate.
-    ///
-    /// Scope (codex finding 6): proven int↔float contradictions —
-    /// `guard_number` matches both numeric kinds and non-numeric carried slots
-    /// have legitimate specialized load/store relationships — plus doc 57's
-    /// value pins, where any carried value other than the pin contradicts
-    /// (the pin is also an entry-fingerprint guard). The ENTRY side
-    /// mirrors the fingerprint-extraction criteria exactly (a guard over a
-    /// `slot_load` of an anchor-window slot — `matchesFingerprint` is what
-    /// makes the contradiction fatal at re-entry); the STORE side reads the
-    /// live anchor-return registers. Commit's φ-emission slot filter is
-    /// mirrored too: a slot that gets no φ is never written at the back-edge,
-    /// so its entry guard cannot be contradicted.
     /// LuaJIT's typed SLOAD for a loop-carried copy. A slot the body sets to
     /// another slot's entry value (`a, b = b, a + i` sets `a` to `b`'s) carries
     /// that load around the back-edge, and if nothing in the body inspected
@@ -6528,6 +6506,28 @@ pub const RecordingSession = struct {
         }
     }
 
+    /// Doc 40 Phase 1 — commit preflight: would this `.loop` close be
+    /// self-defeating? A trace whose entry fingerprint pins a carried slot to
+    /// one numeric kind while its back-edge φ would store the other can never
+    /// take its own back-edge: every entry runs exactly one iteration, exits
+    /// on the entry guard, and the accounting machinery mistakes it for
+    /// healthy forever (`completed > 0` clears the anchor penalty each entry;
+    /// no want channel fires — the doc 40 "failure loop"). Such a close is
+    /// refused BEFORE `commit` mutates anything (codex finding 4), keeping the
+    /// anchor's accounting live and the producing channel retrying under the
+    /// record gate.
+    ///
+    /// Scope (codex finding 6): proven int↔float contradictions —
+    /// `guard_number` matches both numeric kinds and non-numeric carried slots
+    /// have legitimate specialized load/store relationships — plus doc 57's
+    /// value pins, where any carried value other than the pin contradicts
+    /// (the pin is also an entry-fingerprint guard). The ENTRY side
+    /// mirrors the fingerprint-extraction criteria exactly (a guard over a
+    /// `slot_load` of an anchor-window slot — `matchesFingerprint` is what
+    /// makes the contradiction fatal at re-entry); the STORE side reads the
+    /// live anchor-return registers. Commit's φ-emission slot filter is
+    /// mirrored too: a slot that gets no φ is never written at the back-edge,
+    /// so its entry guard cannot be contradicted.
     fn loopCloseDefeat(self: *const RecordingSession, regs: RegWindow) CloseDefeat {
         // The live-value read below indexes the ANCHOR frame; at inline depth
         // the window belongs to a callee. Depth-0 covers every channel the
