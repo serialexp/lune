@@ -4,13 +4,22 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## Language: declaring a global (noted 2026-10-30)
 
-- [ ] **A `global x` statement.** Bart's direction: a program declares a
-      global on purpose with `global x = …` (as Lua 5.5 and Teal do), and
-      `_G.x` stays for code coming from Lua. Needs a design doc first:
-      the syntax (`global x`, `global function f`, several names), what it
-      does to the undefined-global warning, and whether a plain `x = …`
-      to an undeclared name should then warn. The resolver already treats
-      `_G.x` as the global `x` (doc 74, "Globals across files").
+- [ ] **Lua 5.5 global declarations.** Bart's direction: follow Lua 5.5
+      (manual §3.3.7) as written; `_G.x` stays for code coming from Lua.
+      `global` is a reserved word, with no contextual-keyword escape
+      (Bart: a program using `global` as a name adjusts). The 5.5 shape:
+      `global [attrib] Name [attrib] {, …} [= explist]`, `global [attrib] *`,
+      `global function f`; every chunk starts with an implicit `global *`,
+      and inside the scope of any explicit declaration every free name must
+      be declared (a compile error); `global x = v` and `global function`
+      raise a runtime error when the global is already non-nil; `<const>`
+      applies to globals, `<close>` to locals only. Open before the design
+      doc: whether attributes (`<const>`, `<close>`, which mahina has none
+      of yet, locals included) come in the same change. In mahina the
+      resolver would own the declarations as scoped bindings (doc 74 §6.3),
+      and the undefined-global warning stays for code outside any
+      declaration. The resolver already treats `_G.x` as the global `x`
+      (doc 74, "Globals across files").
 
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
