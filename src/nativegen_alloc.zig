@@ -1103,7 +1103,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // grid guard_bounds is on the GAROW, whose `.a` is already the table slot_load,
         // so it falls into the one-hop arm below unchanged. The cell ops (gload/gstore/
         // guard_gpresent) carry the gcell and need the extra hop.
-        for (t.instrs) |ins| {
+        for (t.instrs, 0..) |ins, ii| {
             var sid_signed: i32 = -1;
             var is_bool = false;
             var is_value = false;
@@ -1136,8 +1136,11 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     // The bool lane carries presence in-band (one byte per slot) and the
                     // `.value` lane has no presence bitmap at all (`present` is null, nil
                     // is an in-band tag) — reserving a base register for either would be a
-                    // wasted home, and for `.value` a load through a null pointer.
-                    if (!is_bool and !is_value) need_present[sid] = true;
+                    // wasted home, and for `.value` a load through a null pointer. A store
+                    // whose slot is proven present sets no bit in the body (an exit-stub
+                    // copy loads the base itself), so it reserves none either.
+                    const proven = ins.op == .astore and astorePresenceProven(t, ii);
+                    if (!is_bool and !is_value and !proven) need_present[sid] = true;
                 },
                 // Grid cells (doc 14) are int-lane only in this cut: a load needs the
                 // data base; a store needs data + the presence bitmap; a presence guard
@@ -1706,6 +1709,22 @@ pub fn placeOfRef(alloc: *const Alloc, r: usize) Place {
 // dynamic in-body form (exactly the forms the `.heap`-kind aload roots already
 // use). These predicates are the single decision point, shared by analysis
 // (liveness, coalescing safety, save-area sizing) and lowering.
+
+/// Does an in-body scalar-lane `astore` at `idx` find its slot already present?
+/// True when an earlier `guard_present` checks the same `aref` (tropt's AREF CSE
+/// makes `t[k] = t[k] + x` share one): that guard ran earlier in the same pass,
+/// and presence is never cleared on trace (I5), so the store's presence-bit set
+/// is a no-op. Only for the store's own body position — a store emitted at an
+/// exit stub (sunk, or a loop-done snapshot) runs where a lower-indexed guard
+/// may not have, so those paths keep the bit set.
+pub fn astorePresenceProven(t: *const Trace, idx: usize) bool {
+    const ins = t.instrs[idx];
+    std.debug.assert(ins.op == .astore);
+    for (t.instrs[0..idx]) |g| {
+        if (g.op == .guard_present and g.a == ins.a) return true;
+    }
+    return false;
+}
 
 /// True iff `ref` is the slot_load of a carried-heap slot.
 pub fn isCarriedHeapRoot(slots: []const SlotInfo, slot_id_of_ref: []const i32, ref: u16) bool {

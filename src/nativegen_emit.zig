@@ -2476,7 +2476,9 @@ pub fn emitHStore(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, i
     }
 }
 
-pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr) !void {
+/// `presence_proven`: the slot is known present here (`astorePresenceProven`),
+/// so the scalar lanes skip the presence-bit set.
+pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr, presence_proven: bool) !void {
     const aref_ins = t.instrs[ins.a];
     if (ins.aux == VALUE_LANE) {
         // doc 32: `.value`-lane store — write a full tagged Value (tag byte + 8-byte
@@ -2521,6 +2523,7 @@ pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc
         const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.leaRegMemSib(.rax, datareg, ireg, 8, 0);
         try a.movsdMemReg(.rax, 0, XMM_SCRATCH0);
+        if (presence_proven) return;
         const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
         const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.btsMemReg(preg, 0, pireg);
@@ -2539,6 +2542,7 @@ pub fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc
         try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
         try a.storeMemReg(.rax, w, 0, .rcx);
 
+        if (presence_proven) return;
         const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
         const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
         try a.btsMemReg(preg, 0, pireg);
@@ -2616,7 +2620,7 @@ pub fn emitLinkedLoopDoneSnapshot(
     while (si < t.instrs.len) : (si += 1) {
         const p = t.instrs[si];
         switch (p.op) {
-            .astore => try emitAStore(a, t, kinds, alloc, p),
+            .astore => try emitAStore(a, t, kinds, alloc, p, false), // exit stub: guards past exit_instr never ran
             .hstore => try emitHStore(a, kinds, alloc, p),
             // Doc 43 P5: a loop-done-sunk closed-cell store — same Value-cell
             // shape as hstore, same emitter.

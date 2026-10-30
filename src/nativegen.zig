@@ -1995,7 +1995,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // astore: write the value into the slot the aref addresses.
             // `idx0` (from the aref) is shared with the dominating guard_bounds [I3].
             .astore => {
-                try emitAStore(a, t, kinds, alloc, ins);
+                try emitAStore(a, t, kinds, alloc, ins, ngalloc.astorePresenceProven(t, i));
             },
             // guard_append (B5-grow): the append precondition, the grow analogue of
             // guard_bounds. Three memory-relative checks, no extra register beyond the

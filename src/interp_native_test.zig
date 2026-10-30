@@ -176,6 +176,36 @@ test "native: a table rotation read and written as arrays compiles (carried-heap
     try testing.expect(vm.trace.registry.cache.items[0].native == .compiled);
 }
 
+test "aref CSE: a store into a hole sets presence; a store behind a read of its slot skips it" {
+    // `t[2] = i  s = s + t[2]` shares one aref between the store and the read.
+    // Each outer pass makes t[2] a hole again, so the store's presence bit is
+    // the only thing that makes the read see it: the guard_present after the
+    // store must not count as proof for it.
+    try expectProgram(
+        \\local s = 0
+        \\for j = 1, 60 do
+        \\  local t = {1, 2, 3}
+        \\  t[2] = nil
+        \\  for i = 1, 60 do t[2] = i s = s + t[2] end
+        \\  s = s + #t
+        \\end
+        \\print(s)
+    , "109980\n");
+    // `t[k] = t[k] + 1` over a sparse int array: read, then store to the same
+    // aref; the read's guard_present proves the slot, so no bit is set.
+    try expectProgram(
+        \\local t = {}
+        \\for k = 1, 8 do t[k] = k end
+        \\t[3] = nil
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  local k = i % 8 + 1
+        \\  if t[k] then t[k] = t[k] + 1 s = s + t[k] end
+        \\end
+        \\print(s, t[1], t[3], t[8])
+    , "10575\t51\tnil\t58\n");
+}
+
 test "native: a string rotation compiles (typed carried loads, guard_string)" {
     // A carried string whose write-back is another pinned slot's load.
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;

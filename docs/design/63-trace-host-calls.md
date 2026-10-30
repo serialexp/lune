@@ -1830,6 +1830,25 @@ placed before the preheader marker. A rotation that reads `a[1]` and
 writes `a[2]` runs natively, and one whose tables change lane, lose a key
 or turn into a string exits at the matching per-iteration check.
 
+**Array access cleanups** (follow-ups Bart picked, in order: aref CSE,
+constant keys as immediates, per-iteration base sharing). The
+read-and-write rotation's 73 instructions per iteration (36 for `a[2]`)
+broke down as a duplicate `aref` with its bounds check and presence-bit
+set (~8), constant keys spilled to the stack (~8), and base reloads (~3).
+
+1. *`aref` CSE* (LuaJIT's AREF CSE). An `aref` is the index and reads no
+   memory, so tropt now CSEs two on the same (table, key, lane). Their
+   duplicate `guard_bounds`/`guard_present` then dedup as ordinary
+   guards, which is sound because a table's array facts only grow within
+   a trace (asize never shrinks, presence is never cleared, the lane
+   widens only off-trace, a host call that touches a table moves the
+   epoch). An in-body scalar `astore` whose `aref` an earlier
+   `guard_present` checks skips its presence-bit set and reserves no
+   `present` register (`astorePresenceProven`). Exit-stub copies of a store
+   keep the bit. The rotation went 73 → 65; on `bench/` nsieve-bit −6.6%,
+   nbody −1.1%, scalar −0.66%, mean −0.19% (JIT on, instruction counts;
+   nothing above +0.04%).
+
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace
 whose prologue fails for that reason is evicted and re-recorded (the

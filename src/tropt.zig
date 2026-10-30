@@ -584,7 +584,25 @@ pub fn optimize(
             // read reuse the earlier (pre-store) value — the alias-barrier
             // property holds for free. `astore` is effectful: never folded, never
             // CSE'd, kept as a root by the liveness pass below (I1).
-            .aref, .aload, .astore => {},
+            //
+            // The one exception is `aref` itself (LuaJIT's AREF CSE): it is the
+            // index, `idx0 = key`, and reads no memory — its consumers do. Two
+            // arefs on the same (table, key, lane) are the same address, so the
+            // later one canonicalizes to the earlier, and its guard_bounds /
+            // guard_present then dedup as exact-duplicate guards. That dedup is
+            // sound because a table's array facts only grow within a trace:
+            // `asize` is bumped by `astore_append` and never shrinks (no on-trace
+            // store writes nil), presence is never cleared (I5), the lane widens
+            // only off-trace (`guard_fits` exits first), and a host call that
+            // could touch a table moves the epoch, whose guard exits. `href`,
+            // `uref`, `garow` and `gcell` share the kind and stay uncombined.
+            .aref => if (ins.op == .aref) {
+                const key = CseKey{ .op = ins.op, .a = canon[ins.a], .b = canon[ins.b], .aux = ins.aux, .ty = ins.ty };
+                if (cse.get(key)) |c| {
+                    canon[i] = c;
+                } else try cse.put(gpa, key, @intCast(i));
+            },
+            .aload, .astore => {},
             // `.alloc` ops are effectful roots: canonical to themselves, never
             // folded, never CSE'd (see kindOf). `.gcguard` likewise — and its
             // `a` is NOT an operand, so it must not touch the guard tables.
@@ -1309,6 +1327,43 @@ test "tropt: a repeated subexpression is CSE'd to a single instruction" {
     const last_add = opt.instrs[3];
     try testing.expectEqual(IrOp.add, last_add.op);
     try testing.expectEqual(last_add.a, last_add.b);
+}
+
+test "tropt: an aref on the same (table, key, lane) is CSE'd and its guards dedup; other keys and lanes are kept" {
+    const gpa = testing.allocator;
+    // `t[k] = t[k] + 1` records two arefs on (t, k): the read's and the
+    // store's. A third aref on another key and a fourth on another lane stay.
+    const l: i32 = @intFromEnum(arr.Lane.i64);
+    const l2: i32 = @intFromEnum(arr.Lane.f64);
+    const instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 = t
+        .{ .op = .slot_load, .aux = 1 }, // %1 = k
+        .{ .op = .slot_load, .aux = 2 }, // %2 = j
+        .{ .op = .aref, .a = 0, .b = 1, .aux = l }, // %3
+        .{ .op = .guard_bounds, .a = 3 }, // %4
+        .{ .op = .guard_present, .a = 3 }, // %5
+        .{ .op = .aload, .a = 3, .aux = l, .ty = .int }, // %6 = t[k]
+        .{ .op = .aref, .a = 0, .b = 1, .aux = l }, // %7 → canon to %3
+        .{ .op = .guard_bounds, .a = 7 }, // %8 → duplicate of %4
+        .{ .op = .astore, .a = 7, .b = 6, .aux = l }, // %9: t[k] = t[k]
+        .{ .op = .aref, .a = 0, .b = 2, .aux = l }, // %10: another key — kept
+        .{ .op = .guard_bounds, .a = 10 }, // %11
+        .{ .op = .astore, .a = 10, .b = 6, .aux = l }, // %12
+        .{ .op = .aref, .a = 0, .b = 1, .aux = l2 }, // %13: another lane — kept
+        .{ .op = .guard_bounds, .a = 13 }, // %14
+        .{ .op = .astore, .a = 13, .b = 6, .aux = l2 }, // %15
+        .{ .op = .loop }, // %16
+    };
+    var opt = try optimize(gpa, &instrs, &.{}, .{});
+    defer freeOpt(gpa, &opt);
+
+    try testing.expectEqual(@as(usize, 3), countOp(opt.instrs, .aref));
+    try testing.expectEqual(@as(usize, 3), countOp(opt.instrs, .guard_bounds));
+    try testing.expectEqual(@as(usize, 3), countOp(opt.instrs, .astore));
+    // The first store now addresses the read's aref.
+    const ar = indexOfOp(opt.instrs, .aref).?;
+    const st = indexOfOp(opt.instrs, .astore).?;
+    try testing.expectEqual(@as(Ref, @intCast(ar)), opt.instrs[st].a);
 }
 
 test "tropt doc 51 F3: equal-valued konsts canonicalize to one ref and unlock CSE" {
