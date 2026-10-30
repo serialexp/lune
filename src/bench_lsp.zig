@@ -503,7 +503,9 @@ fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !WorkspaceS
             }
         }
         const t5 = now(io);
-        if (core.symbols.builds != builds + 2) return error.PollMissed;
+        // Each parsed when found changed, and once more a second later
+        // (`Entry.again`); so is `edited`, reported changed above, once more.
+        if (core.symbols.builds != builds + 5) return error.PollMissed;
         r.idle = @min(r.idle, @as(u64, @intCast(t5 - t4)) / seconds);
         r.idle_stamps = (core.symbols.stamps - stamps) / seconds;
         out.reset();

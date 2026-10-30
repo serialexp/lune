@@ -314,7 +314,9 @@ land; move whole phases to Done once everything inside them is checked.
       tick of a coarse clock): a file created, deleted or renamed, an
       editor's save by rename, or a directory gone, shows within a second.
       Each file has its own next stamp: a second after it changed (or
-      appeared after its root's first walk), the wait doubling with each
+      appeared after its root's first walk), when it is parsed once more
+      even if its stamp holds (a same-size rewrite in the same tick of a
+      coarse clock), the wait then doubling with each
       unchanged stamp up to 5 minutes, which bounds how long an edit in
       place to a long-unchanged file goes unseen; a first walk's or saved
       index's files start spread over the 5 minutes, so the stamps come

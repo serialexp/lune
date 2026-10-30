@@ -117,6 +117,10 @@ pub const Entry = struct {
     /// an unchanged stamp is doubled from (see `min_check_ms`).
     check_at: u64,
     check_ms: u32,
+    /// Parsed after a change: at its next stamp it is parsed once more even
+    /// if the stamp holds, since a rewrite of the same size in the same tick
+    /// of a coarse clock as the read leaves the stamp as it was.
+    again: bool,
     /// The last pass that saw it.
     seen: u32,
     /// Indexed from an open document's text.
@@ -477,7 +481,7 @@ pub const Index = struct {
             const key = d.path orelse d.uri;
             try open_keys.put(scratch, key, {});
             const stamp: workspace.Files.Stamp = .{ .size = d.text.len, .mtime_ns = @as(u64, @truncate(std.hash.Wyhash.hash(0, d.text))) };
-            try self.update(key, d.uri, stamp, d.text, true, d.path != null);
+            try self.update(key, d.uri, stamp, d.text, true, d.path != null, .if_changed);
         }
         var closed: std.ArrayList([]const u8) = .empty;
         var it = self.entries.valueIterator();
@@ -533,7 +537,7 @@ pub const Index = struct {
         if (skippedBelow(root.path, path)) return 0;
         self.stamps += 1;
         if (fs.stamp.?(fs.ctx, path)) |stamp| {
-            if (hasExtension(path, root.extensions)) return 1 + try self.indexFile(scratch, fs, path, stamp);
+            if (hasExtension(path, root.extensions)) return 1 + try self.indexFile(scratch, fs, path, stamp, .if_changed);
             self.remove(path);
             return 1;
         }
@@ -664,7 +668,8 @@ pub const Index = struct {
     }
 
     /// Stamp a file that came due: unchanged, its wait doubles; changed, it
-    /// is parsed again; gone, it goes.
+    /// is parsed again; gone, it goes. A file parsed after a change is
+    /// parsed once more at its next stamp (`Entry.again`).
     fn checkFile(self: *Index, scratch: Allocator, fs: workspace.Files, e: *Entry) Allocator.Error!u64 {
         self.stamps += 1;
         const path = try scratch.dupe(u8, e.key());
@@ -673,13 +678,22 @@ pub const Index = struct {
             return 1;
         };
         const changed = !std.meta.eql(stamp, e.stamp);
+        const again = e.again;
         // Changed, it is checked again soon even if it cannot be read now
         // (indexed again, its new entry is scheduled afresh).
         e.check_ms = if (changed) min_check_ms else @min(e.check_ms *| 2, max_check_ms);
         e.check_at = self.now_ms + e.check_ms;
         try self.pushDue(e);
-        if (!changed) return 1;
-        return 1 + try self.indexFile(scratch, fs, path, stamp);
+        if (!changed and !again) return 1;
+        const cost = 1 + try self.indexFile(scratch, fs, path, stamp, if (changed) .if_changed else .always);
+        if (!changed) if (self.entries.get(path)) |n| {
+            // Confirmed: on as a file found unchanged.
+            n.again = false;
+            n.check_ms = 2 * min_check_ms;
+            n.check_at = self.now_ms + n.check_ms;
+            try self.pushDue(n);
+        };
+        return cost;
     }
 
     const Origin = enum { changed, found };
@@ -691,6 +705,7 @@ pub const Index = struct {
     fn schedule(self: *Index, e: *Entry, why: Origin) Allocator.Error!void {
         if (e.document or !e.file) return;
         const new = why == .changed or if (innermostState(self.roots.items, e.key())) |r| r.known else false;
+        e.again = new;
         if (new) {
             e.check_ms = min_check_ms;
             e.check_at = self.now_ms + min_check_ms;
@@ -723,14 +738,16 @@ pub const Index = struct {
         if (self.entries.get(path)) |e| if (e.document or e.seen == self.pass) return 0;
         self.stamps += 1;
         const stamp = fs.stamp.?(fs.ctx, path) orelse return 1;
-        return 1 + try self.indexFile(scratch, fs, path, stamp);
+        return 1 + try self.indexFile(scratch, fs, path, stamp, .if_changed);
     }
 
-    /// Index the file at `path`, unless it is indexed at `stamp` already.
-    /// Returns what the parse cost.
-    fn indexFile(self: *Index, scratch: Allocator, fs: workspace.Files, path: []const u8, stamp: workspace.Files.Stamp) Allocator.Error!u64 {
+    const Parse = enum { if_changed, always };
+
+    /// Index the file at `path`, unless it is indexed at `stamp` already
+    /// (and `parse` is `.if_changed`). Returns what the parse cost.
+    fn indexFile(self: *Index, scratch: Allocator, fs: workspace.Files, path: []const u8, stamp: workspace.Files.Stamp, parse: Parse) Allocator.Error!u64 {
         const old = self.entries.get(path);
-        if (old) |e| if (std.meta.eql(e.stamp, stamp)) {
+        if (old) |e| if (parse == .if_changed and std.meta.eql(e.stamp, stamp)) {
             e.seen = self.pass;
             return 0;
         };
@@ -742,7 +759,7 @@ pub const Index = struct {
         // Freed at once: a first walk reads every file.
         const text = fs.read(fs.ctx, self.gpa, path) orelse return 0;
         defer self.gpa.free(text);
-        try self.update(path, try uri_mod.fromPath(scratch, path), stamp, text, false, true);
+        try self.update(path, try uri_mod.fromPath(scratch, path), stamp, text, false, true, parse);
         return text.len / 128;
     }
 
@@ -919,11 +936,12 @@ pub const Index = struct {
         r.dirty = true;
     }
 
-    /// Index `text` under `key`, unless it is indexed at `stamp` already.
-    fn update(self: *Index, key: []const u8, uri: []const u8, stamp: workspace.Files.Stamp, text: []const u8, document: bool, file: bool) Allocator.Error!void {
+    /// Index `text` under `key`, unless it is indexed at `stamp` already
+    /// (and `parse` is `.if_changed`).
+    fn update(self: *Index, key: []const u8, uri: []const u8, stamp: workspace.Files.Stamp, text: []const u8, document: bool, file: bool, parse: Parse) Allocator.Error!void {
         var had = false;
         if (self.entries.get(key)) |old| {
-            if (old.document == document and std.meta.eql(old.stamp, stamp)) {
+            if (parse == .if_changed and old.document == document and std.meta.eql(old.stamp, stamp)) {
                 old.seen = self.pass;
                 return;
             }
@@ -953,6 +971,7 @@ pub const Index = struct {
         e.file = file;
         e.check_at = 0;
         e.check_ms = max_check_ms;
+        e.again = false;
 
         // A slot: a free one, or a new one with room kept to free it.
         e.id = self.free_slots.pop() orelse blk: {
@@ -1818,6 +1837,51 @@ test "symbol index: polling sees a directory's changes by its stamp, and an edit
     try f.settle(&mem, null);
     try testing.expectEqualStrings("beta ", try f.names(""));
     try testing.expectEqual(@as(usize, 2), f.idx.polled.count());
+}
+
+/// A file's stamp is its size alone, as when a clock is too coarse to tell
+/// two writes apart: a rewrite of the same size looks unchanged.
+fn coarseStamp(ctx: ?*anyopaque, path: []const u8) ?workspace.Files.Stamp {
+    const mem: *workspace.MemoryFiles = @ptrCast(@alignCast(ctx.?));
+    var s = mem.files().stamp.?(ctx, path) orelse return null;
+    s.mtime_ns = 0;
+    return s;
+}
+
+test "symbol index: polling parses a changed file once more, for a rewrite its stamp cannot show" {
+    var entries = [_][2][]const u8{
+        .{ "/w/a.mah", "function aa() end\n" },
+        .{ "/elsewhere/b.mah", "function bb() end\n" },
+    };
+    var mem: workspace.MemoryFiles = .{ .entries = &entries };
+    var fs_coarse = mem.files();
+    fs_coarse.stamp = coarseStamp;
+    var f = Fixture.init();
+    defer f.deinit();
+    const roots = [_]Root{.{ .path = "/w", .extensions = &.{".mah"} }};
+    try f.idx.setRoots(f.a(), &roots, null);
+    try f.idx.setPolling(true);
+    try f.idx.work(f.a(), fs_coarse, null, .all);
+
+    // A new file, then rewritten at the same size before its next stamp.
+    entries[1][0] = "/w/b.mah";
+    f.idx.advance(1000);
+    try f.idx.work(f.a(), fs_coarse, null, .all);
+    try testing.expectEqualStrings("bb ", try f.names("bb"));
+    entries[1][1] = "function cc() end\n";
+    f.idx.advance(2000);
+    try f.idx.work(f.a(), fs_coarse, null, .all);
+    try testing.expectEqualStrings("cc ", try f.names("cc"));
+    try testing.expectEqualStrings("", try f.names("bb"));
+
+    // Once confirmed, it is not parsed again while it holds.
+    const built = f.idx.builds;
+    var t: u64 = 3000;
+    while (t < 60_000) : (t += 1000) {
+        f.idx.advance(t);
+        try f.idx.work(f.a(), fs_coarse, null, .all);
+    }
+    try testing.expectEqual(built, f.idx.builds);
 }
 
 test "symbol index: the closest matches first" {
