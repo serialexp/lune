@@ -24,6 +24,14 @@ const Span = ast.Span;
 
 const Error = error{ ParseError, OutOfMemory };
 
+/// The deepest a syntax tree may go, as in Lua and LuaJIT (200 levels). Each
+/// pass after the parser recurses once per level, and a deeper tree would
+/// overflow the stack, the browser's (1 MiB) first. Every nested statement,
+/// expression and table is a level, and so is each operator or suffix of a
+/// chain (`a + b + c`, `t.a.b`, `f()()`), whose tree is as deep as the chain
+/// is long.
+pub const max_depth = 200;
+
 /// Parse a whole chunk. The returned `Ast` owns an arena holding every node;
 /// call `ast.Ast.deinit` to free it. Syntax errors are reported through
 /// `diags`; check `diags.hasErrors()` — on error the returned tree is partial
@@ -60,6 +68,11 @@ const Parser = struct {
     /// A syntax error has been reported: stray tokens after it are probably
     /// its aftermath, not new mistakes.
     had_error: bool = false,
+    /// The levels the tree has reached here (`max_depth`).
+    depth: u32 = 0,
+    /// The tree went past `max_depth`: the parse ends there. Every enclosing
+    /// construct gives up without a further diagnostic.
+    too_deep: bool = false,
 
     // -- token cursor --
 
@@ -101,6 +114,7 @@ const Parser = struct {
 
     /// `fail`, also pointing at `related` (the construct that is unclosed).
     fn failRelated(self: *Parser, code: diag.Code, related: ?diag.Related) Error {
+        if (self.too_deep) return Error.ParseError;
         const t = self.current();
         self.diags.reportRelated(code, t.start, t.end, t.line, related);
         self.had_error = true;
@@ -117,6 +131,16 @@ const Parser = struct {
     fn expectClosing(self: *Parser, tag: Tag, code: diag.Code, open: Token, label: []const u8) Error!Token {
         if (self.check(tag)) return self.advance();
         return self.failRelated(code, .{ .start = open.start, .end = open.end, .label = label });
+    }
+
+    /// One level deeper (`max_depth`). The caller restores `depth`, on error too.
+    fn enter(self: *Parser) Error!void {
+        if (self.depth >= max_depth) {
+            _ = self.fail(.nesting_too_deep) catch {};
+            self.too_deep = true;
+            return Error.ParseError;
+        }
+        self.depth += 1;
     }
 
     // -- allocation helpers --
@@ -145,6 +169,12 @@ const Parser = struct {
         while (true) {
             try stmts.appendSlice(self.arena, try self.parseBlock());
             if (self.check(.eof)) break;
+            if (self.too_deep) {
+                // What was left unparsed stands as one error node.
+                const rest: Span = .{ .start = self.current().start, .end = @intCast(self.source.len) };
+                try stmts.append(self.arena, .{ .span = rest, .data = .err });
+                break;
+            }
             // A block-closing token with nothing to close. After an earlier
             // error it is usually that error's aftermath (a statement whose
             // header was dropped but whose `end` was not), so it is skipped
@@ -176,6 +206,7 @@ const Parser = struct {
             if (self.check(.keyword_return)) {
                 const ret = self.parseReturn() catch |e| switch (e) {
                     Error.ParseError => {
+                        if (self.too_deep) break;
                         try stmts.append(self.arena, try self.dropped(start_pos, start));
                         continue;
                     },
@@ -186,6 +217,7 @@ const Parser = struct {
             }
             const stmt = self.parseStatement() catch |e| switch (e) {
                 Error.ParseError => {
+                    if (self.too_deep) break;
                     try stmts.append(self.arena, try self.dropped(start_pos, start));
                     continue;
                 },
@@ -253,6 +285,9 @@ const Parser = struct {
     }
 
     fn parseStatement(self: *Parser) Error!Stmt {
+        const base = self.depth;
+        defer self.depth = base;
+        try self.enter();
         return switch (self.currentTag()) {
             .keyword_local => self.parseLocal(),
             .keyword_if => self.parseIf(),
@@ -318,6 +353,7 @@ const Parser = struct {
             const value_start = self.current().start;
             values = self.parseExprList() catch |e| switch (e) {
                 Error.ParseError => blk: {
+                    if (self.too_deep) return e;
                     // The names parsed, so keep the declaration: dropping it
                     // would turn every later use of them into a global.
                     const skipped = self.synchronize(local_pos, value_start);
@@ -671,9 +707,17 @@ const Parser = struct {
     const unary_bp: u8 = 22;
 
     fn parseExpr(self: *Parser, min_bp: u8) Error!*Expr {
+        const base = self.depth;
+        defer self.depth = base;
+        try self.enter();
         var lhs = try self.parseUnary();
+        var first = true;
         while (infixBp(self.currentTag())) |info| {
             if (info.l < min_bp) break;
+            // The first operator's node takes this expression's level; each
+            // one after puts the chain so far a level deeper.
+            if (!first) try self.enter();
+            first = false;
             _ = self.advance();
             const rhs = try self.parseExpr(info.r);
             lhs = try self.newExpr(
@@ -717,8 +761,14 @@ const Parser = struct {
     }
 
     fn parseSuffixed(self: *Parser) Error!*Expr {
+        const base = self.depth;
+        defer self.depth = base;
         var e = try self.parsePrimary();
         while (true) {
+            switch (self.currentTag()) {
+                .dot, .lbracket, .lparen, .colon => try self.enter(),
+                else => break,
+            }
             switch (self.currentTag()) {
                 .dot => {
                     _ = self.advance();
@@ -753,7 +803,7 @@ const Parser = struct {
                         .{ .method_call = .{ .obj = e, .name = name_tok.lexeme(self.source), .name_span = tokSpan(name_tok), .args = args } },
                     );
                 },
-                else => break,
+                else => unreachable,
             }
         }
         return e;
@@ -1151,6 +1201,59 @@ test "doc 74 P1a: the implicit self of a method is a zero-width span at the meth
 /// Parse source that has errors; the caller checks `diags` and frees the tree.
 fn parseBroken(src: [:0]const u8, diags: *Diagnostics) !ast.Ast {
     return parse(testing.allocator, src, diags);
+}
+
+/// `prefix`, `open` n times, `middle`, `close` n times, then `suffix`.
+fn nested(a: std.mem.Allocator, prefix: []const u8, open: []const u8, middle: []const u8, close: []const u8, suffix: []const u8, n: usize) ![:0]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, prefix);
+    for (0..n) |_| try out.appendSlice(a, open);
+    try out.appendSlice(a, middle);
+    for (0..n) |_| try out.appendSlice(a, close);
+    try out.appendSlice(a, suffix);
+    return out.toOwnedSliceSentinel(a, 0);
+}
+
+test "parser: a tree deeper than max_depth is one diagnostic and a partial tree" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const Shape = struct { prefix: []const u8, open: []const u8, middle: []const u8, close: []const u8, suffix: []const u8 };
+    const shapes = [_]Shape{
+        .{ .prefix = "local x = ", .open = "(", .middle = "1", .close = ")", .suffix = "\n" },
+        .{ .prefix = "", .open = "do ", .middle = "\n", .close = "end ", .suffix = "\n" },
+        .{ .prefix = "local x = 1", .open = "+1", .middle = "", .close = "", .suffix = "\n" },
+        .{ .prefix = "local x = 'a'", .open = "..'a'", .middle = "", .close = "", .suffix = "\n" },
+        .{ .prefix = "local x = 2", .open = "^2", .middle = "", .close = "", .suffix = "\n" },
+        .{ .prefix = "local t = {} t", .open = ".a", .middle = "", .close = "", .suffix = " = 1\n" },
+        .{ .prefix = "f", .open = "()", .middle = "", .close = "", .suffix = "\n" },
+        .{ .prefix = "local f = ", .open = "function() return ", .middle = "1", .close = " end", .suffix = "\n" },
+        .{ .prefix = "local t = ", .open = "{", .middle = "", .close = "}", .suffix = "\n" },
+        .{ .prefix = "local x = ", .open = "not ", .middle = "true", .close = "", .suffix = "\n" },
+        .{ .prefix = "local x = ", .open = "(", .middle = "1", .close = ")+1", .suffix = "\n" },
+    };
+    for (shapes) |s| {
+        // 190 levels parse; many more are one diagnostic, at the level past
+        // the limit, and what came before still stands.
+        {
+            var diags = Diagnostics.init(testing.allocator);
+            defer diags.deinit();
+            var tree = try parseBroken(try nested(arena.allocator(), s.prefix, s.open, s.middle, s.close, s.suffix, 190), &diags);
+            defer tree.deinit();
+            try testing.expectEqual(@as(usize, 0), diags.count());
+        }
+        var diags = Diagnostics.init(testing.allocator);
+        defer diags.deinit();
+        const src = try nested(arena.allocator(), "local before = 1\n", "", "", "", "", 0);
+        const deep = try nested(arena.allocator(), s.prefix, s.open, s.middle, s.close, s.suffix, 100_000);
+        const both = try std.mem.concatWithSentinel(arena.allocator(), u8, &.{ src, deep, "local after = 2\n" }, 0);
+        var tree = try parseBroken(both, &diags);
+        defer tree.deinit();
+        try testing.expectEqual(@as(usize, 1), diags.count());
+        try testing.expectEqual(diag.Code.nesting_too_deep, diags.list.items[0].code);
+        try testing.expect(tree.root.len >= 2);
+        try testing.expect(tree.root[0].data == .local);
+        try testing.expect(tree.root[tree.root.len - 1].data == .err);
+    }
 }
 
 test "doc 74 P1b: a dropped statement becomes an error node over the skipped text" {

@@ -60,6 +60,7 @@ pub const Code = enum(u16) {
     expected_rbracket_key = 132,
     expected_assign_after_key = 133,
     expected_rbrace = 134,
+    nesting_too_deep = 135,
 
     // ---- compiler ----
     function_too_large = 201,
@@ -142,6 +143,7 @@ pub const Code = enum(u16) {
             .expected_rbracket_key => "expected ']' in table key",
             .expected_assign_after_key => "expected '=' after table key",
             .expected_rbrace => "expected '}' to close table",
+            .nesting_too_deep => "too deeply nested (more than 200 levels)",
 
             .function_too_large => "function too large (2^31 instruction limit)",
             .too_many_registers => "function needs too many registers",

@@ -600,8 +600,16 @@ pub const Server = struct {
         const p = jsonrpc.decodeParams(protocol.DocumentSymbolParams, a, params) catch |e| return self.badParams(id, e, out);
         const c = (try self.analysed(id, p.textDocument.uri, out)) orelse return;
         const syms = try syntax.symbols(a, c.an.tree.root);
-        try out.result(id, try self.symbolList(a, c.index, c.an.source, syms));
+        try out.result(id, try self.symbolList(a, c.index, c.an.source, syms, 1));
     }
+
+    /// How deep a reply may nest: std's JSON writer asserts at most 256
+    /// levels in a safe build, and a tree the parser allows (`parser.max_depth`)
+    /// could go past it. A document symbol takes two levels (its object and
+    /// its children); a selection range one per step; the reply's wrapping a
+    /// few.
+    pub const max_symbol_depth = 100;
+    pub const max_selection_steps = 200;
 
     /// The most `workspace/symbol` answers with; a client narrows the query.
     pub const max_workspace_symbols = 500;
@@ -677,18 +685,46 @@ pub const Server = struct {
         index: *const position.LineIndex,
         text: []const u8,
         syms: []const syntax.Symbol,
+        depth: u32,
     ) Error![]const protocol.DocumentSymbol {
         const list = try a.alloc(protocol.DocumentSymbol, syms.len);
         for (syms, list) |s, *slot| {
-            slot.* = .{
-                .name = s.name,
-                .kind = symbolKind(s.kind),
-                .range = index.toRange(text, s.range.start, s.range.end, self.encoding),
-                .selectionRange = index.toRange(text, s.selection.start, s.selection.end, self.encoding),
-                .children = if (s.children.len == 0) null else try self.symbolList(a, index, text, s.children),
-            };
+            slot.* = self.documentSymbol(index, text, s);
+            if (s.children.len == 0) continue;
+            if (depth < max_symbol_depth) {
+                slot.children = try self.symbolList(a, index, text, s.children, depth + 1);
+            } else {
+                // At the deepest a reply may go: everything below, in order,
+                // as this symbol's children.
+                var flat: std.ArrayList(protocol.DocumentSymbol) = .empty;
+                try self.flattenSymbols(a, &flat, index, text, s.children);
+                slot.children = flat.items;
+            }
         }
         return list;
+    }
+
+    fn flattenSymbols(
+        self: *Server,
+        a: std.mem.Allocator,
+        flat: *std.ArrayList(protocol.DocumentSymbol),
+        index: *const position.LineIndex,
+        text: []const u8,
+        syms: []const syntax.Symbol,
+    ) Error!void {
+        for (syms) |s| {
+            try flat.append(a, self.documentSymbol(index, text, s));
+            try self.flattenSymbols(a, flat, index, text, s.children);
+        }
+    }
+
+    fn documentSymbol(self: *const Server, index: *const position.LineIndex, text: []const u8, s: syntax.Symbol) protocol.DocumentSymbol {
+        return .{
+            .name = s.name,
+            .kind = symbolKind(s.kind),
+            .range = index.toRange(text, s.range.start, s.range.end, self.encoding),
+            .selectionRange = index.toRange(text, s.selection.start, s.selection.end, self.encoding),
+        };
     }
 
     fn foldingRanges(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
@@ -747,7 +783,9 @@ pub const Server = struct {
     }
 
     /// The chain for one position, innermost first. `spans` holds every range
-    /// around it, in any order; equal ranges collapse to one step.
+    /// around it, in any order; equal ranges collapse to one step. Past
+    /// `max_selection_steps`, the innermost are kept and the whole file
+    /// above them.
     fn selectionChain(
         a: std.mem.Allocator,
         index: *const position.LineIndex,
@@ -764,9 +802,20 @@ pub const Server = struct {
                 return x.start < y.start;
             }
         }.larger);
-        var parent: ?*const protocol.SelectionRange = null;
+        var steps: std.ArrayList(ast.Span) = .empty;
         for (spans, 0..) |s, i| {
             if (i > 0 and s.start == spans[i - 1].start and s.end == spans[i - 1].end) continue;
+            try steps.append(a, s);
+        }
+        var kept = steps.items;
+        if (kept.len > max_selection_steps) {
+            // The file (the largest), then the innermost that fit.
+            const cut = kept.len - (max_selection_steps - 1);
+            kept[cut - 1] = kept[0];
+            kept = kept[cut - 1 ..];
+        }
+        var parent: ?*const protocol.SelectionRange = null;
+        for (kept) |s| {
             const node = try a.create(protocol.SelectionRange);
             node.* = .{ .range = index.toRange(text, s.start, s.end, enc), .parent = parent };
             parent = node;
@@ -1964,6 +2013,49 @@ test "selection ranges: the chain from the name outwards, each range containing 
     }
     // `a.b`, the call `f(a.b)`, and the statement, which is also the file.
     try testing.expectEqual(@as(usize, 3), count);
+}
+
+test "nested replies stay within what JSON can nest: a deep outline flattens, a long selection chain keeps its ends" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const depth = 150;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    for (0..depth) |_| try text.appendSlice(testing.allocator, "local function f() ");
+    try text.appendSlice(testing.allocator, "return 1");
+    for (0..depth) |_| try text.appendSlice(testing.allocator, " end");
+
+    // Every symbol is there; below `max_symbol_depth` they are listed flat.
+    const r = try askWith(&h, text.items, "textDocument/documentSymbol", "");
+    var level = r.object.get("result").?.array.items;
+    var levels: usize = 0;
+    var symbols: usize = 0;
+    while (true) {
+        levels += 1;
+        symbols += level.len;
+        const children = level[0].object.get("children") orelse break;
+        level = children.array.items;
+    }
+    try testing.expectEqual(@as(usize, Server.max_symbol_depth + 1), levels);
+    try testing.expectEqual(@as(usize, depth), symbols);
+
+    // Two ranges a level, `((1)+1)+1`: at the innermost `1`, the innermost
+    // steps, then the whole file.
+    text.clearRetainingCapacity();
+    try text.appendSlice(testing.allocator, "local x = ");
+    for (0..depth) |_| try text.append(testing.allocator, '(');
+    try text.append(testing.allocator, '1');
+    for (0..depth) |_| try text.appendSlice(testing.allocator, ")+1");
+    var buf: [128]u8 = undefined;
+    const tail = try std.fmt.bufPrint(&buf, ",\"positions\":[{{\"line\":0,\"character\":{d}}}]", .{10 + depth});
+    const s = try askWith(&h, text.items, "textDocument/selectionRange", tail);
+    var node = s.object.get("result").?.array.items[0].object;
+    var steps: usize = 1;
+    while (node.get("parent")) |up| : (steps += 1) node = up.object;
+    try testing.expectEqual(@as(usize, Server.max_selection_steps), steps);
+    try testing.expectEqual(@as(i64, 0), node.get("range").?.object.get("start").?.object.get("character").?.integer);
+    try testing.expectEqual(@as(i64, @intCast(text.items.len)), node.get("range").?.object.get("end").?.object.get("character").?.integer);
 }
 
 test "syntax requests answer on damaged text, and for an unopened document" {

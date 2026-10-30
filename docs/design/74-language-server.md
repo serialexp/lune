@@ -194,9 +194,20 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Bench follow-ups:** the 100k-line budget miss (check dominates); the
-  recursive-descent parser has no nesting limit, so the wasm stack (much
-  smaller than native) needs a depth test or a limit.
+- [ ] **Bench follow-ups:** the 100k-line budget miss (check dominates).
+- [x] **Nesting limit (2026-10-30):** a tree deeper than 200 levels
+  (`parser.max_depth`, Lua's and LuaJIT's) is one `E0135` and the parse
+  ends there; before, 10k nested brackets or blocks, or a 100k-term
+  `1+1+…`, overflowed the stack natively and in the browser. Each nested
+  construct is a level, and so is each operator or suffix of a chain after
+  the first, since every later pass recurses once per level of the tree
+  (a flat `a+b+c…` past 200 terms is refused, where Lua, building no tree,
+  takes it). Probed at and past the limit on the Debug wasm build (1 MiB
+  stack) and the Debug CLI with 20 shapes, through every LSP request, check
+  and run. std's JSON writer asserts 256 levels of nesting in a safe build,
+  so a document-symbol outline nests at most 100 levels (deeper symbols are
+  listed flat there) and a selection chain keeps its innermost 199 steps
+  and the file.
 - [ ] **P3 follow-ups:** rename of a global renames this file only (the
   warning says so) until P6 has a workspace; completion after `.`/`:` waits
   for P5; a `local x =` with a missing value still offers `x` right after
