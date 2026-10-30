@@ -16,6 +16,12 @@ land; move whole phases to Done once everything inside them is checked.
   A recording never contains something unreplayable.
 - [x] **Q2 — replay never spawns** (§5): decided 2026-10-30, following doc 65
   D2 — replay feeds back the logged result; the child does not run again.
+- [x] **Q3 — failure policy** (§3.3): decided 2026-10-30 — a nonzero exit
+  or a fatal signal raises by default; `check = false` opts out.
+- [x] **Q4 — `max_bytes` overflow** (§5.2): decided 2026-10-30 — a capture
+  keeps the latest `max_bytes` bytes and drops the earlier ones.
+- [x] **Q5 — environment** (§3.1): decided 2026-10-30 — inheritance is
+  manual: a given `env` is the child's whole environment.
 
 ### Outstanding
 
@@ -25,7 +31,7 @@ land; move whole phases to Done once everything inside them is checked.
   Inventory rows (Rule Z-5) for every new function.
 - [ ] **Phase 1 — record/replay for `proc.run`.** Log
   `(code, signal, stdout bytes, stderr bytes)`; fatal on unrecordable
-  arguments (§5); `max_bytes` on captures; the doc 65 §4.5 cap applies.
+  arguments (§5); `max_bytes` keeps the latest bytes; the doc 65 §4.5 cap applies.
 - [ ] **Phase 2 — pipelines.** `proc.pipe{a, b, ...}` runs spawns connected
   stdout→stdin; the final stage is captured; intermediate bytes are not
   logged.
@@ -37,12 +43,9 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Phase 5 — shell ergonomics.** Command-position sugar, globbing,
   completion (from the LSP symbol index), job control. Scope decided after
   Phase 4.
-- [ ] **Q3 — failure policy.** Does a nonzero exit raise, or return? Default
-  and the `check=` option (§3.3).
-- [ ] **Q4 — `max_bytes` overflow.** Fatal in both modes, or truncate when
-  not recording (§5.2).
-- [ ] **Q5 — environment.** Is `env` a full replacement or a delta over the
-  parent's? Which `getenv` effects does a spawn imply (§3.1)?
+- [ ] **Q5b — listing the parent's environment.** Manual inheritance needs
+  a way to read it all: an `os.environ()` (new inventory row, `getenv`-style
+  effect), or callers compose it from `os.getenv` per name (§3.1).
 - [ ] **Q6 — non-Linux hosts.** Which spawn primitives on macOS and Windows
   (six release platforms, `tools/mahina-cli.sh`), and whether wasm gets any
   (§7).
@@ -89,17 +92,27 @@ shell strings, and sets the rules under which it stays replayable.
 local r = proc.run{
   "git", "log", "--oneline",       -- argv; argv[1] is looked up on PATH
   cwd    = "/home/bart/Projects/lune",
-  env    = { LANG = "C" },         -- see Q5
+  env    = { LANG = "C", PATH = "/usr/bin" },  -- the child's WHOLE environment
   stdin  = "text to feed",         -- string | {file = path} | "null"
   stdout = "capture",              -- "capture" | "null" | "inherit" | "pipe"
   stderr = "capture",              -- as stdout, plus "merge" (2>&1)
   max_bytes = 1 << 20,             -- per captured stream
-  check  = false,                  -- raise on nonzero exit (Q3)
+  check  = true,                   -- default; false = don't raise on nonzero exit
 }
 ```
 
 argv is an array of strings. There is no shell between mahina and the
 program, so no quoting and no word splitting.
+
+**Environment (Q5, decided).** Inheritance is manual. If `env` is given, it
+is the child's entire environment, nothing else is passed down. If `env` is
+omitted, the child gets the parent's environment unchanged. The lookup of
+`argv[1]` on `PATH` uses the child's environment (the `PATH` in `env`, when
+given); a bare name with no `PATH` in a given `env` is not found, and an
+absolute or `./` path always works. Building a child environment from the
+parent's is done in Lua, from a listing of the parent's variables (Q5b).
+Reading the parent's environment is already a logged `getenv`-style effect;
+passing it down is not an additional one.
 
 ### 3.2 Result
 
@@ -109,16 +122,19 @@ program, so no quoting and no word splitting.
 | `signal` | terminating signal number, or `nil` |
 | `stdout`, `stderr` | captured bytes as a string, `nil` if not captured |
 | `ok` | `code == 0` |
+| `truncated` | `stdout` or `stderr` lost earlier bytes to `max_bytes` (Q4) |
 
 A program that cannot be started (not found, not executable) raises, with
 the OS error class. It is not a result with a code.
 
-### 3.3 Failure policy (Q3)
+### 3.3 Failure policy (Q3, decided)
 
-Open. Options: (a) never raise on exit status, callers test `r.ok`;
-(b) raise by default, `check=false` to opt out; (c) a separate
-`proc.check{...}` that raises. Bash ignores failure by default, which is a
-large part of the complaint, so this default is worth deciding on purpose.
+A nonzero exit, or death by a signal, raises by default. The error carries
+the result (`code`, `signal`, captured `stdout`/`stderr`) so a `pcall`
+handler can read it. `check = false` returns the result instead and the
+caller tests `r.ok`. Record and replay behave identically: the raise
+happens after the result is logged or read back, so replay raises the same
+error at the same call.
 
 ## 4. Effect kind
 
@@ -155,9 +171,18 @@ the invariant simple: a recording that exists, replays.
 ### 5.2 Size
 
 Captured bytes go in the log, so they count against the doc 65 §4.5 cap
-(`--effect-log-limit`, default 1 MiB). `max_bytes` bounds one stream
-independently. Overflow is fatal in record mode, because a recording never
-drops an input. Outside record mode: Q4.
+(`--effect-log-limit`, default 1 MiB), which stays fatal when exceeded: a
+recording never drops an input.
+
+`max_bytes` bounds one captured stream and is part of the call's semantics,
+not a recording limit (Q4, decided): the stream is read to its end, the
+child never blocks on a full pipe, and the result keeps the **latest**
+`max_bytes` bytes. `r.truncated` is true when earlier bytes were dropped.
+Because the program sees the same truncated string in every mode, record,
+replay and off agree; what the log stores is what the program was given.
+Truncation is by bytes, so it can split a UTF-8 sequence at the front of the
+kept tail (doc 06: the string is the raw bytes; callers that need text
+validate it).
 
 ### 5.3 Concurrency
 
@@ -193,7 +218,7 @@ nothing would have to be re-audited later. Each phase lands behind
 
 ## Open questions for review
 
-Q3–Q6 in the checklist above.
+Q5b and Q6 in the checklist above.
 
 ## References
 
