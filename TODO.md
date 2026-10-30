@@ -2,6 +2,18 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## LSP workspace symbols (noted 2026-10-30)
+
+- [ ] **A same-tick, same-size rewrite of a file can go unseen.** A file
+      stamped and read, then rewritten within the same tick of the
+      filesystem's mtime clock at the same size, keeps its stamp, so
+      neither polling nor a walk parses it again until it next changes (a
+      watching client's watcher reports the second write, so only the
+      polling path is exposed). Directories already get one extra listing
+      after a change for this; files could get the same (one more parse
+      after a change), or a content hash on the stamp that comes due.
+      Options for Bart.
+
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
 - [ ] **A carried table used as an array refuses native.** `a, b = b, a

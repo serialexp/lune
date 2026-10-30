@@ -34,6 +34,10 @@ pub const Files = struct {
     /// What tells a file's new contents from its old without reading it, or
     /// null when `path` is gone.
     stamp: ?*const fn (ctx: ?*anyopaque, path: []const u8) ?Stamp = null,
+    /// The same for the directory `path`, moving when an entry in it is
+    /// created, deleted or renamed (its modification time); null when it is
+    /// not a directory. A walk needs all three of `list`, `stamp` and this.
+    dir_stamp: ?*const fn (ctx: ?*anyopaque, path: []const u8) ?Stamp = null,
 
     pub const DirEntry = struct { name: []const u8, kind: enum { file, directory } };
     pub const Stamp = struct { size: u64, mtime_ns: i96 };
@@ -285,7 +289,7 @@ pub const MemoryFiles = struct {
     entries: []const [2][]const u8,
 
     pub fn files(self: *MemoryFiles) Files {
-        return .{ .ctx = self, .read = read, .exists = exists, .list = list, .stamp = stamp };
+        return .{ .ctx = self, .read = read, .exists = exists, .list = list, .stamp = stamp, .dir_stamp = dirStamp };
     }
 
     /// The direct children of `dir` among the paths held; null when no path
@@ -306,6 +310,36 @@ pub const MemoryFiles = struct {
             if (!dup) out.append(a, .{ .name = name, .kind = if (cut != null) .directory else .file }) catch return null;
         }
         return if (any) out.items else null;
+    }
+
+    /// The names in `dir` stand in for its modification time: their count,
+    /// and the sum of their hashes, each counted once. Null when no path lies
+    /// under it.
+    fn dirStamp(ctx: ?*anyopaque, dir: []const u8) ?Files.Stamp {
+        const self: *MemoryFiles = @ptrCast(@alignCast(ctx.?));
+        var count: u64 = 0;
+        var sum: u64 = 0;
+        for (self.entries, 0..) |e, i| {
+            const name = childOf(dir, e[0]) orelse continue;
+            const seen = for (self.entries[0..i]) |o| {
+                const other = childOf(dir, o[0]) orelse continue;
+                if (std.mem.eql(u8, other, name)) break true;
+            } else false;
+            if (seen) continue;
+            count += 1;
+            sum +%= std.hash.Wyhash.hash(0, name);
+        }
+        if (count == 0) return null;
+        return .{ .size = count, .mtime_ns = sum };
+    }
+
+    /// The name of the entry in `dir` that `path` is, or lies under (with a
+    /// trailing `/` for a directory).
+    fn childOf(dir: []const u8, path: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, path, dir) or path.len <= dir.len + 1 or path[dir.len] != '/') return null;
+        const rest = path[dir.len + 1 ..];
+        const cut = std.mem.findScalar(u8, rest, '/') orelse return rest;
+        return rest[0 .. cut + 1];
     }
 
     /// The length and a hash of the contents stand in for a modification time.

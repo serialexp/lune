@@ -359,8 +359,13 @@ const WorkspaceSymbols = struct {
     narrow: u64,
     broad: u64,
     changed: u64,
-    /// The narrow query for a client that cannot watch: a walk of every file.
+    /// For a client that cannot watch, so the index polls: the narrow
+    /// query, and what an idle second costs on average over `max_check_ms`
+    /// (a round of directory stamps and the files that came due), in time
+    /// and in stamps.
     unwatched: u64,
+    idle: u64,
+    idle_stamps: u64,
     symbols: usize,
     live: usize,
     peak: usize,
@@ -411,6 +416,8 @@ fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !WorkspaceS
         .broad = std.math.maxInt(u64),
         .changed = std.math.maxInt(u64),
         .unwatched = std.math.maxInt(u64),
+        .idle = std.math.maxInt(u64),
+        .idle_stamps = 0,
         .symbols = 0,
         .live = 0,
         .peak = 0,
@@ -447,6 +454,8 @@ fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !WorkspaceS
         r.restart = @min(r.restart, @as(u64, @intCast(t1 - t0)));
         if (core.symbols.builds != 0) return error.Reparsed;
         r.live = tracker.stats.live_bytes;
+        // Before this bench's own edits below.
+        if (rep == 0) r.symbols = core.symbols.symbolCount();
 
         for (0..10) |_| {
             r.narrow = @min(r.narrow, try timedRequest(io, &core, &out, narrow));
@@ -465,11 +474,41 @@ fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !WorkspaceS
             if (core.symbols.builds != builds + 1) return error.ChangeMissed;
             r.changed = @min(r.changed, @as(u64, @intCast(t3 - t2)));
         }
-        core.watches_files = false;
+        // The client takes back its watcher: the folder is walked once more
+        // to record its directories, then polled.
+        out.reset();
+        try core.handle(30, "{\"jsonrpc\":\"2.0\",\"id\":\"mahina/watch-files\",\"error\":{\"code\":-32601,\"message\":\"unsupported\"}}", &out);
+        while (core.symbols.busy()) {
+            out.reset();
+            try core.tick(30, &out);
+        }
         for (0..3) |_| r.unwatched = @min(r.unwatched, try timedRequest(io, &core, &out, narrow));
+        // Idle for `max_check_ms`, ticked as the host would; meanwhile a
+        // file is created (its directory's stamp moves) and a long-unchanged
+        // one edited in place (it does not), and both must show.
+        const created = symbols_dir ++ "/d_0/created.mah";
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = created, .data = "function created_here() end\n" });
+        defer std.Io.Dir.cwd().deleteFile(io, created) catch {};
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = symbols_dir ++ "/d_5/f_500.mah", .data = "function edited_in_place() end\n" });
+        const builds = core.symbols.builds;
+        const stamps = core.symbols.stamps;
+        const seconds = lsp.symbol_index.max_check_ms / 1000;
+        const t4 = now(io);
+        var clock: u64 = 1000;
+        while (clock <= 1000 * @as(u64, seconds)) : (clock += 1000) {
+            while (core.nextDeadline()) |due| {
+                if (due > clock) break;
+                out.reset();
+                try core.tick(clock, &out);
+            }
+        }
+        const t5 = now(io);
+        if (core.symbols.builds != builds + 2) return error.PollMissed;
+        r.idle = @min(r.idle, @as(u64, @intCast(t5 - t4)) / seconds);
+        r.idle_stamps = (core.symbols.stamps - stamps) / seconds;
         out.reset();
 
-        r.symbols = core.symbols.symbolCount();
+
     }
     var dir = try std.Io.Dir.cwd().openDir(io, symbols_cache, .{ .iterate = true });
     defer dir.close(io);
@@ -698,11 +737,12 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
         \\workspace symbols: a folder on disk, files of 100 lines, the index kept in a cache directory (doc 74 §7.4; best of N, ms)
         \\  cold / restart: initialize until the index is idle, with no saved index / from the saved one
         \\  narrow / broad: `workspace/symbol` for a watching client, "w123_4" / "w" (every name matches)
-        \\  1 change: one file rewritten, reported, and the narrow query; unwatched: the narrow query for a client that cannot watch
+        \\  1 change: one file rewritten, reported, and the narrow query
+        \\  polling: for a client that cannot watch, the narrow query; idle/s and stamps/s: an idle second's polling, averaged over 5 minutes
         \\
-        \\{s: <12} {s: >8} {s: >10} {s: >9} {s: >9} {s: >8} {s: >8} {s: >9} {s: >10} {s: >10} {s: >9} {s: >10}
+        \\{s: <12} {s: >8} {s: >10} {s: >9} {s: >9} {s: >8} {s: >8} {s: >9} {s: >8} {s: >8} {s: >9} {s: >10} {s: >9} {s: >10}
         \\
-    , .{ "folder", "files", "symbols", "cold", "restart", "narrow", "broad", "1 change", "unwatched", "index MiB", "peak MiB", "saved MiB" });
+    , .{ "folder", "files", "symbols", "cold", "restart", "narrow", "broad", "1 change", "polling", "idle/s", "stamps/s", "index MiB", "peak MiB", "saved MiB" });
     defer std.Io.Dir.cwd().deleteTree(io, symbols_dir) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, symbols_cache) catch {};
     const folders = [_]struct { name: []const u8, files: usize, reps: usize }{
@@ -714,7 +754,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
     for (folders) |f| {
         try writeWorkspace(gpa, io, f.files);
         const got = try workspaceSymbols(gpa, io, f.reps);
-        mahina.io.print("{s: <12} {d: >8} {d: >10} {d: >9.1} {d: >9.1} {d: >8.2} {d: >8.2} {d: >9.2} {d: >10.2} {d: >10.1} {d: >9.1} {d: >10.1}\n", .{
+        mahina.io.print("{s: <12} {d: >8} {d: >10} {d: >9.1} {d: >9.1} {d: >8.2} {d: >8.2} {d: >9.2} {d: >8.2} {d: >8.2} {d: >9} {d: >10.1} {d: >9.1} {d: >10.1}\n", .{
             f.name,
             f.files,
             got.symbols,
@@ -724,6 +764,8 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
             ms(got.broad),
             ms(got.changed),
             ms(got.unwatched),
+            ms(got.idle),
+            got.idle_stamps,
             @as(f64, @floatFromInt(got.live)) / mib,
             @as(f64, @floatFromInt(got.peak)) / mib,
             @as(f64, @floatFromInt(got.saved_bytes)) / mib,

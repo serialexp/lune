@@ -40,6 +40,17 @@ pub const format_version: u32 = 2;
 /// a parse one more per 128 bytes of the file. About 5 ms.
 pub const slice_budget = 4096;
 
+/// Polling, for a client that cannot watch (`Index.setPolling`): a file is
+/// stamped again this long after it changed, the wait doubling with each
+/// stamp that finds it unchanged, up to `max_check_ms`, which is then how
+/// long an edit made in place to a long-unchanged file can go unseen. Every
+/// directory the walks entered is stamped each `dir_round_ms`, and listed
+/// again when its stamp moved: a file created, deleted or renamed (and so
+/// an editor's save by rename) shows by the next round.
+pub const min_check_ms: u32 = 1000;
+pub const max_check_ms: u32 = 300_000;
+pub const dir_round_ms: u32 = 1000;
+
 /// Directories a walk does not enter, besides the hidden ones (`.git`).
 pub const skipped_dirs = [_][]const u8{ "node_modules", "zig-out", "target" };
 
@@ -102,6 +113,10 @@ pub const Entry = struct {
     pool_len: u32,
     /// Its slot in `Index.slots`.
     id: u32,
+    /// When polling, a file's: when it is next stamped, and the wait after
+    /// an unchanged stamp is doubled from (see `min_check_ms`).
+    check_at: u64,
+    check_ms: u32,
     /// The last pass that saw it.
     seen: u32,
     /// Indexed from an open document's text.
@@ -126,6 +141,8 @@ const RootState = struct {
     dirty: bool = false,
     /// A walk of the whole root is in this pass: it is saved when the pass ends.
     walking: bool = false,
+    /// A walk of the whole root has ended: a file found from here on is new.
+    known: bool = false,
 
     fn view(r: *const RootState) Root {
         return .{ .path = r.path, .extensions = @ptrCast(r.extensions) };
@@ -133,6 +150,26 @@ const RootState = struct {
 };
 
 pub const Change = enum { created, changed, deleted };
+
+/// A directory being polled: its stamp when last listed (null for a root
+/// that is not there), and whether to list it once more though the stamp
+/// holds, since a change in the same tick of a coarse clock as the listing
+/// leaves the stamp as it was.
+const Polled = struct {
+    stamp: ?workspace.Files.Stamp,
+    again: bool = false,
+};
+
+/// A file entry's next stamp, by its slot. Stale when the slot is empty or
+/// its entry's `check_at` differs: skipped when it comes up.
+const Due = struct {
+    at: u64,
+    id: u32,
+
+    fn order(_: void, x: Due, y: Due) std.math.Order {
+        return std.math.order(x.at, y.at);
+    }
+};
 
 pub const Index = struct {
     gpa: Allocator,
@@ -170,6 +207,21 @@ pub const Index = struct {
     stopped: bool = false,
     /// Counts passes; a pass ends when no work is left.
     pass: u32 = 1,
+    /// Polling the disk, for a client that cannot watch: `setPolling`.
+    polling: bool = false,
+    /// The host's clock, as `advance` last said.
+    now_ms: u64 = 0,
+    /// Every directory the walks entered while polling, keys owned.
+    polled: std.StringArrayHashMapUnmanaged(Polled) = .empty,
+    /// The round of directory stamps: the next one to stamp, and when the
+    /// next round begins (at or before `now_ms`: one is under way).
+    dir_cursor: usize = 0,
+    dir_round_at: u64 = 0,
+    /// The file entries by when they are next stamped.
+    due: std.PriorityQueue(Due, void, Due.order) = .empty,
+    /// The directories listed again in this pass, keys owned: a file entry
+    /// directly in one that this pass did not see is gone.
+    relisted: std.StringHashMapUnmanaged(void) = .empty,
     encoding: position.Encoding = .utf16,
     /// Files parsed, files stamped, and indexes saved so far: what an
     /// unchanged stamp, the change log and the store save, for tests and
@@ -208,6 +260,15 @@ pub const Index = struct {
         self.walk_files.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.scopes.deinit(self.gpa);
+        self.relisted.deinit(self.gpa);
+        self.freePolled();
+        self.polled.deinit(self.gpa);
+        self.due.deinit(self.gpa);
+    }
+
+    fn freePolled(self: *Index) void {
+        for (self.polled.keys()) |k| self.gpa.free(k);
+        self.polled.clearRetainingCapacity();
     }
 
     fn freeRoot(self: *Index, r: *RootState) void {
@@ -226,6 +287,7 @@ pub const Index = struct {
         self.dead_pool = 0;
         self.slots.clearRetainingCapacity();
         self.free_slots.clearRetainingCapacity();
+        self.due.clearRetainingCapacity();
         var dit = self.dirs.keyIterator();
         while (dit.next()) |k| self.gpa.free(k.*);
         self.dirs.clearRetainingCapacity();
@@ -238,6 +300,7 @@ pub const Index = struct {
         self.walk_files.clearRetainingCapacity();
         freeKeys(self.gpa, &self.pending);
         freeKeys(self.gpa, &self.scopes);
+        freeKeys(self.gpa, &self.relisted);
     }
 
     fn free(self: *Index, e: *Entry) void {
@@ -261,11 +324,43 @@ pub const Index = struct {
         if (encoding == self.encoding) return;
         self.encoding = encoding;
         self.clearEntries();
+        for (self.roots.items) |*r| r.known = false;
         try self.rewalk();
     }
 
-    /// Walk every root again: what a client that cannot watch needs before
-    /// each request.
+    /// The host's clock is now `now_ms`: what polling is due by, and what
+    /// a new entry is scheduled from.
+    pub fn advance(self: *Index, now_ms: u64) void {
+        self.now_ms = @max(self.now_ms, now_ms);
+    }
+
+    /// Poll the disk, for a client that cannot watch: the walks record each
+    /// directory's stamp, and `work` stamps the directories each round and
+    /// the files as they come due (see `min_check_ms`). Turned on, every root
+    /// is walked again to record its directories (the stamps spare the
+    /// parsing).
+    pub fn setPolling(self: *Index, on: bool) Allocator.Error!void {
+        if (on == self.polling) return;
+        self.polling = on;
+        self.freePolled();
+        self.due.clearRetainingCapacity();
+        if (!on) return;
+        try self.rebuildDue();
+        self.dir_cursor = 0;
+        self.dir_round_at = self.now_ms + dir_round_ms;
+        try self.rewalk();
+    }
+
+    /// When `work` next has polling to do, in the host's clock; null when
+    /// there is none to come.
+    pub fn nextPoll(self: *const Index) ?u64 {
+        if (!self.polling) return null;
+        var at: ?u64 = if (self.polled.count() > 0) self.dir_round_at else null;
+        if (self.due.peek()) |d| at = if (at) |x| @min(x, d.at) else d.at;
+        return at;
+    }
+
+    /// Walk every root again.
     pub fn rewalk(self: *Index) Allocator.Error!void {
         for (self.roots.items) |*r| try self.queueWalk(r);
     }
@@ -324,6 +419,7 @@ pub const Index = struct {
                 .extensions = xs,
                 .dirty = if (old) |o| o.dirty else false,
                 .walking = if (old) |o| o.walking else false,
+                .known = if (old) |o| o.known else false,
             });
             if (old == null) try fresh.append(scratch, i);
         }
@@ -421,6 +517,8 @@ pub const Index = struct {
             } else if (self.walk_dirs.pop()) |dir| {
                 defer self.gpa.free(dir);
                 spent += try self.walkDir(scratch, fs, dir);
+            } else if (try self.pollOne(scratch, fs)) |cost| {
+                spent += cost;
             } else break;
         }
         try self.endPassIfIdle(scratch, store);
@@ -455,22 +553,169 @@ pub const Index = struct {
 
     fn walkDir(self: *Index, scratch: Allocator, fs: workspace.Files, dir: []const u8) Allocator.Error!u64 {
         if (self.stopped) return 0;
-        const root = innermost(self.roots.items, dir) orelse return 0;
-        const listing = fs.list.?(fs.ctx, scratch, dir) orelse return 1;
+        // Stamped before it is listed: a change while listing shows next round.
+        const stamp = if (self.polling) fs.dir_stamp.?(fs.ctx, dir) else null;
+        const cost = try self.listDir(scratch, fs, dir, .all) orelse return 1;
+        if (self.polling) {
+            const slot = try self.polled.getOrPut(self.gpa, dir);
+            if (!slot.found_existing) {
+                slot.key_ptr.* = self.gpa.dupe(u8, dir) catch |err| {
+                    self.polled.swapRemoveAt(slot.index);
+                    return err;
+                };
+            }
+            slot.value_ptr.* = .{ .stamp = stamp };
+        }
+        return cost;
+    }
+
+    /// Queue `dir`'s source files for the walk, and its directories: all of
+    /// them, or only those not polled yet (`relist`). Null when it cannot be
+    /// listed; else what the listing cost.
+    fn listDir(self: *Index, scratch: Allocator, fs: workspace.Files, dir: []const u8, comptime dirs: enum { all, new }) Allocator.Error!?u64 {
+        const root = innermost(self.roots.items, dir) orelse return null;
+        const listing = fs.list.?(fs.ctx, scratch, dir) orelse return null;
         for (listing) |e| {
             if (isSkipped(e.name)) continue;
             const path = try std.fs.path.resolveAllocPosix(scratch, &.{ dir, e.name });
             switch (e.kind) {
                 .directory => {
-                    const nested = for (self.roots.items) |r| {
-                        if (std.mem.eql(u8, r.path, path)) break true;
-                    } else false;
-                    if (!nested) try self.pushOwned(&self.walk_dirs, path);
+                    if (isRoot(self.roots.items, path)) continue;
+                    if (dirs == .new and self.polled.contains(path)) continue;
+                    try self.pushOwned(&self.walk_dirs, path);
+                    // A new directory under a polled one: what was indexed
+                    // under it before it went is swept.
+                    if (dirs == .new) try putKey(self.gpa, &self.scopes, path);
                 },
                 .file => if (hasExtension(e.name, root.extensions)) try self.pushOwned(&self.walk_files, path),
             }
         }
         return 1 + listing.len / 16;
+    }
+
+    // ---- polling --------------------------------------------------------
+
+    /// One piece of the polling that is due: the next directory of a round
+    /// under way, else the next file. Null when nothing is due.
+    fn pollOne(self: *Index, scratch: Allocator, fs: workspace.Files) Allocator.Error!?u64 {
+        if (!self.polling) return null;
+        if (self.polled.count() > 0 and self.dir_round_at <= self.now_ms) {
+            if (self.dir_cursor < self.polled.count()) return try self.checkDir(scratch, fs);
+            self.dir_cursor = 0;
+            self.dir_round_at = self.now_ms + dir_round_ms;
+        }
+        while (self.due.peek()) |d| {
+            if (d.at > self.now_ms) return null;
+            _ = self.due.pop();
+            const e = self.slots.items[d.id] orelse continue;
+            if (e.check_at != d.at or e.document or !e.file) continue;
+            return try self.checkFile(scratch, fs, e);
+        }
+        return null;
+    }
+
+    /// Stamp the round's next directory. Moved, it is listed again; gone,
+    /// its files and the directories under it go (a root stays polled, to be
+    /// walked when it is back).
+    fn checkDir(self: *Index, scratch: Allocator, fs: workspace.Files) Allocator.Error!u64 {
+        const i = self.dir_cursor;
+        self.dir_cursor += 1;
+        const dir = try scratch.dupe(u8, self.polled.keys()[i]);
+        const was = self.polled.values()[i];
+        self.stamps += 1;
+        const stamp = fs.dir_stamp.?(fs.ctx, dir);
+        const moved = !optionalEql(stamp, was.stamp);
+        if (!moved and !was.again) return 1;
+        if (stamp == null) {
+            try self.removeUnder(scratch, dir);
+            self.dropPolledUnder(dir);
+            // What was swapped into this place is stamped next.
+            self.dir_cursor = @min(i, self.polled.count());
+            return 1;
+        }
+        self.polled.values()[i] = .{ .stamp = stamp, .again = moved };
+        if (was.stamp == null) {
+            // Back (a root, or a directory that was briefly not one): walked whole.
+            try self.pushOwned(&self.walk_dirs, dir);
+            try putKey(self.gpa, &self.scopes, dir);
+            return 1;
+        }
+        const cost = try self.listDir(scratch, fs, dir, .new) orelse return 1;
+        try putKey(self.gpa, &self.relisted, dir);
+        return cost;
+    }
+
+    /// Stop polling `dir` and every directory under it, but a root, which
+    /// is kept with no stamp.
+    fn dropPolledUnder(self: *Index, dir: []const u8) void {
+        var k: usize = 0;
+        while (k < self.polled.count()) {
+            const key = self.polled.keys()[k];
+            if (!within(dir, key)) {
+                k += 1;
+            } else if (isRoot(self.roots.items, key)) {
+                self.polled.values()[k] = .{ .stamp = null };
+                k += 1;
+            } else {
+                self.gpa.free(key);
+                self.polled.swapRemoveAt(k);
+            }
+        }
+    }
+
+    /// Stamp a file that came due: unchanged, its wait doubles; changed, it
+    /// is parsed again; gone, it goes.
+    fn checkFile(self: *Index, scratch: Allocator, fs: workspace.Files, e: *Entry) Allocator.Error!u64 {
+        self.stamps += 1;
+        const path = try scratch.dupe(u8, e.key());
+        const stamp = fs.stamp.?(fs.ctx, path) orelse {
+            self.remove(path);
+            return 1;
+        };
+        const changed = !std.meta.eql(stamp, e.stamp);
+        // Changed, it is checked again soon even if it cannot be read now
+        // (indexed again, its new entry is scheduled afresh).
+        e.check_ms = if (changed) min_check_ms else @min(e.check_ms *| 2, max_check_ms);
+        e.check_at = self.now_ms + e.check_ms;
+        try self.pushDue(e);
+        if (!changed) return 1;
+        return 1 + try self.indexFile(scratch, fs, path, stamp);
+    }
+
+    const Origin = enum { changed, found };
+
+    /// Give a file entry its first stamp when polling: soon after a change,
+    /// or for a file found once its root's walk has ended (a new file);
+    /// else (a first walk's, or a saved index's) at a point spread over
+    /// `max_check_ms` by its path, so the stamps do not come in one burst.
+    fn schedule(self: *Index, e: *Entry, why: Origin) Allocator.Error!void {
+        if (e.document or !e.file) return;
+        const new = why == .changed or if (innermostState(self.roots.items, e.key())) |r| r.known else false;
+        if (new) {
+            e.check_ms = min_check_ms;
+            e.check_at = self.now_ms + min_check_ms;
+        } else {
+            e.check_ms = max_check_ms;
+            e.check_at = self.now_ms + std.hash.Wyhash.hash(1, e.key()) % max_check_ms;
+        }
+        if (self.polling) try self.pushDue(e);
+    }
+
+    /// Queue `e`'s next stamp; the queue is rebuilt once stale items (from
+    /// entries gone or rescheduled) outnumber the entries.
+    fn pushDue(self: *Index, e: *const Entry) Allocator.Error!void {
+        if (self.due.count() > 2 * @as(usize, self.entries.count()) + 4096) return self.rebuildDue();
+        try self.due.push(self.gpa, .{ .at = e.check_at, .id = e.id });
+    }
+
+    fn rebuildDue(self: *Index) Allocator.Error!void {
+        self.due.clearRetainingCapacity();
+        try self.due.ensureTotalCapacity(self.gpa, self.entries.count());
+        var it = self.entries.valueIterator();
+        while (it.next()) |ep| {
+            const e = ep.*;
+            if (!e.document and e.file) try self.due.push(self.gpa, .{ .at = e.check_at, .id = e.id });
+        }
     }
 
     fn walkFile(self: *Index, scratch: Allocator, fs: workspace.Files, path: []const u8) Allocator.Error!u64 {
@@ -506,19 +751,21 @@ pub const Index = struct {
     fn endPassIfIdle(self: *Index, scratch: Allocator, store: ?workspace.Store) Allocator.Error!void {
         try self.compactIfWasteful();
         if (self.busy()) return;
-        if (!self.stopped and self.scopes.count() > 0) try self.sweep(scratch);
+        if (!self.stopped and (self.scopes.count() > 0 or self.relisted.count() > 0)) try self.sweep(scratch);
         for (self.roots.items) |*r| {
             if (r.walking and r.dirty) if (store) |st| try self.save(scratch, r, st);
+            if (r.walking and !self.stopped) r.known = true;
             r.walking = false;
         }
         freeKeys(self.gpa, &self.scopes);
+        freeKeys(self.gpa, &self.relisted);
         self.stopped = false;
         self.pass +%= 1;
     }
 
-    /// Drop each entry from a file that this pass did not see, if it lies in
-    /// a walked scope under the scope's own root (a nested root's files are
-    /// its own).
+    /// Drop each entry from a file that this pass did not see, if it lies
+    /// directly in a directory listed again, or in a walked scope under the
+    /// scope's own root (a nested root's files are its own).
     fn sweep(self: *Index, scratch: Allocator) Allocator.Error!void {
         var gone: std.ArrayList([]const u8) = .empty;
         var it = self.entries.valueIterator();
@@ -527,6 +774,10 @@ pub const Index = struct {
             if (e.seen == self.pass or e.document or !e.file) continue;
             const key = e.key();
             const root = innermost(self.roots.items, key) orelse {
+                try gone.append(scratch, try scratch.dupe(u8, key));
+                continue;
+            };
+            if (std.fs.path.dirnamePosix(key)) |parent| if (self.relisted.contains(parent)) {
                 try gone.append(scratch, try scratch.dupe(u8, key));
                 continue;
             };
@@ -670,17 +921,20 @@ pub const Index = struct {
 
     /// Index `text` under `key`, unless it is indexed at `stamp` already.
     fn update(self: *Index, key: []const u8, uri: []const u8, stamp: workspace.Files.Stamp, text: []const u8, document: bool, file: bool) Allocator.Error!void {
+        var had = false;
         if (self.entries.get(key)) |old| {
             if (old.document == document and std.meta.eql(old.stamp, stamp)) {
                 old.seen = self.pass;
                 return;
             }
+            had = true;
             self.remove(key);
         }
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const found = try self.symbolsOf(scratch.allocator(), text);
         try self.insertFound(key, uri, stamp, found, self.pass, document, file);
+        try self.schedule(self.entries.get(key).?, if (had) .changed else .found);
     }
 
     /// Add an entry under `key` (none there yet) holding `found`.
@@ -697,6 +951,8 @@ pub const Index = struct {
         e.seen = seen;
         e.document = document;
         e.file = file;
+        e.check_at = 0;
+        e.check_ms = max_check_ms;
 
         // A slot: a free one, or a new one with room kept to free it.
         e.id = self.free_slots.pop() orelse blk: {
@@ -934,7 +1190,9 @@ pub const Index = struct {
             const stamp: workspace.Files.Stamp = .{ .size = size, .mtime_ns = @intCast(mtime) };
             try added.ensureUnusedCapacity(scratch, 1);
             try self.insertFound(key, strings[key_len..][0..uri_len], stamp, found.items, 0, false, true);
-            added.appendAssumeCapacity(self.entries.get(key).?.key());
+            const e = self.entries.get(key).?;
+            added.appendAssumeCapacity(e.key());
+            try self.schedule(e, .found);
         }
         if (r.at != bytes.len) return error.Corrupt;
     }
@@ -1102,6 +1360,18 @@ fn within(dir: []const u8, path: []const u8) bool {
     if (!std.mem.startsWith(u8, path, dir)) return false;
     if (path.len == dir.len) return true;
     return std.mem.endsWith(u8, dir, "/") or path[dir.len] == '/';
+}
+
+fn isRoot(roots: []const RootState, path: []const u8) bool {
+    for (roots) |r| {
+        if (std.mem.eql(u8, r.path, path)) return true;
+    }
+    return false;
+}
+
+fn optionalEql(x: ?workspace.Files.Stamp, y: ?workspace.Files.Stamp) bool {
+    if (x == null or y == null) return x == null and y == null;
+    return std.meta.eql(x.?, y.?);
 }
 
 fn isSkipped(name: []const u8) bool {
@@ -1475,6 +1745,79 @@ test "symbol index: removed symbols are compacted away, and what is left still r
         try f.settle(&mem, store.store());
         try testing.expectEqual(@as(u64, 0), f.idx.builds);
     }
+}
+
+test "symbol index: polling sees a directory's changes by its stamp, and an edit in place when the file comes due" {
+    var entries = [_][2][]const u8{
+        .{ "/w/a.mah", "function alpha() end\n" },
+        .{ "/w/sub/b.mah", "function beta() end\n" },
+        .{ "/elsewhere/c.mah", "function gamma() end\n" },
+    };
+    var mem: workspace.MemoryFiles = .{ .entries = &entries };
+    var f = Fixture.init();
+    defer f.deinit();
+    const roots = [_]Root{.{ .path = "/w", .extensions = &.{".mah"} }};
+    try f.idx.setRoots(f.a(), &roots, null);
+    try f.idx.setPolling(true);
+    try f.settle(&mem, null);
+    try testing.expectEqualStrings("alpha beta ", try f.names(""));
+    try testing.expectEqual(@as(usize, 2), f.idx.polled.count());
+    try testing.expectEqual(@as(?u64, dir_round_ms), f.idx.nextPoll());
+
+    // A file created shows at the next round of directory stamps, and is
+    // checked again a second later.
+    entries[2][0] = "/w/sub/c.mah";
+    f.idx.advance(1000);
+    try f.settle(&mem, null);
+    try testing.expectEqualStrings("gamma ", try f.names("gamma"));
+    const c = f.idx.entries.get("/w/sub/c.mah").?;
+    try testing.expectEqual(@as(u64, 2000), c.check_at);
+
+    // An edit in place does not move its directory's stamp: it shows when
+    // the file comes due, within `max_check_ms` for a file never changed.
+    entries[0][1] = "function delta() end\n";
+    f.idx.advance(2000);
+    try f.settle(&mem, null);
+    try testing.expectEqualStrings("", try f.names("delta"));
+    f.idx.advance(2000 + max_check_ms);
+    try f.settle(&mem, null);
+    try testing.expectEqualStrings("delta ", try f.names("delta"));
+
+    // Left alone, a file's wait doubles up to the most; a round of
+    // directories is one stamp each.
+    var t: u64 = 2000 + max_check_ms;
+    while (t < 2000 + 3 * max_check_ms) : (t += 1000) {
+        f.idx.advance(t);
+        try f.settle(&mem, null);
+    }
+    try testing.expectEqual(max_check_ms, f.idx.entries.get("/w/sub/c.mah").?.check_ms);
+    const stamped = f.idx.stamps;
+    f.idx.advance(t);
+    try f.settle(&mem, null);
+    try testing.expect(f.idx.stamps - stamped <= 2 + 3);
+
+    // A file deleted goes at the next round; a directory deleted takes its
+    // files, and is no longer polled.
+    entries[0][0] = "/elsewhere/a.mah";
+    t += 1000;
+    f.idx.advance(t);
+    try f.settle(&mem, null);
+    try testing.expectEqualStrings("beta gamma ", try f.names(""));
+    entries[1][0] = "/elsewhere/b.mah";
+    entries[2][0] = "/elsewhere/c2.mah";
+    t += 1000;
+    f.idx.advance(t);
+    try f.settle(&mem, null);
+    try testing.expectEqualStrings("", try f.names(""));
+    try testing.expectEqual(@as(usize, 1), f.idx.polled.count());
+
+    // The directory back: walked whole at the next round of its parent.
+    entries[1][0] = "/w/sub/b.mah";
+    t += 1000;
+    f.idx.advance(t);
+    try f.settle(&mem, null);
+    try testing.expectEqualStrings("beta ", try f.names(""));
+    try testing.expectEqual(@as(usize, 2), f.idx.polled.count());
 }
 
 test "symbol index: the closest matches first" {

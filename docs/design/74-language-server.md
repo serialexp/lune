@@ -295,8 +295,19 @@ land; move whole phases to Done once everything inside them is checked.
       under it: deleted, its files go; created, it is walked. A looked-at
       file is parsed again only when its size or modification time
       (`workspace.Files.stamp`) differs. A client that cannot watch, or
-      refuses the registration, has no change log, so every request walks
-      every folder, the stamps still sparing the parsing. A change log
+      refuses the registration, has no change log, so the index polls in
+      `tick` (`Index.setPolling`, `nextDeadline` the next poll) and a
+      request only searches. Every directory the walks entered is stamped
+      each second (`Files.dir_stamp`, its modification time) and, moved,
+      listed again (and once more the round after, for a change in the same
+      tick of a coarse clock): a file created, deleted or renamed, an
+      editor's save by rename, or a directory gone, shows within a second.
+      Each file has its own next stamp: a second after it changed (or
+      appeared after its root's first walk), the wait doubling with each
+      unchanged stamp up to 5 minutes, which bounds how long an edit in
+      place to a long-unchanged file goes unseen; a first walk's or saved
+      index's files start spread over the 5 minutes, so the stamps come
+      evenly. A change log
       longer than 200,000 paths is dropped for a walk. Open documents are
       indexed from their text, keyed by its hash, and a document with no
       file is searched too. Matching ignores case and ranks the whole name,
@@ -738,11 +749,22 @@ initialize until the index is idle) 28 / 290 / 3008 ms; restart from the
 saved index 1.0 / 16.6 / 200 ms, with no file parsed; the narrow query
 "w123_4" 0.01 / 0.09 / 2.8 ms and the broad "w" (every name matches) 0.28 /
 0.76 / 4.6 ms; one file rewritten and reported, then the narrow query, 0.01
-/ 0.07 / 2.8 ms; a client that cannot watch 0.46 / 5.2 / 105 ms. The index
+/ 0.07 / 2.8 ms; a client that cannot watch (each request a walk, since
+replaced by polling, below) 0.46 / 5.2 / 105 ms. The index
 holds 0.7 / 7.5 / 63 MiB, peaks at 1.3 / 13.6 / 126 MiB (the restart's load
 buffer on top of the index), and saves 0.4 / 4.0 / 41.5 MiB. Before the
 columns (one allocation per file) the 100k search took 10.3 / 40.6 ms and
 the peak was 171 MiB.
+
+A client that cannot watch then walked every folder on each request (105 ms
+at 100k files). Bart asked for files that change to be checked often and
+files that never do seldom; with directory stamps for creations and
+deletions (his choice, as was a background timer over checking on each
+request, and the 5-minute cap), the request is the search alone: 0.07 / 2.7
+ms at 10k / 100k files. Idle, polling 100k files in 1,000 directories costs
+0.69 ms per second (1,331 stamps: the directories, and a 300th of the
+files), averaged over 5 minutes in which a created file and a file edited in
+place both showed.
 
 **Cost, measured** (`zig build bench-lsp`, cross-file table: a literal
 `require` per 14 lines, half resolving nowhere, real disk): 0.08 ms added

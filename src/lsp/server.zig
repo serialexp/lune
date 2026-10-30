@@ -177,6 +177,7 @@ pub const Server = struct {
 
     /// Handle one message body. `now_ms` is the host's monotonic clock.
     pub fn handle(self: *Server, now_ms: u64, body: []const u8, out: *Outbox) Error!void {
+        self.symbols.advance(now_ms);
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -192,9 +193,11 @@ pub const Server = struct {
         const method = msg.method orelse {
             if (msg.failure) |why| {
                 try out.log(protocol.MessageType.warning, try std.fmt.allocPrint(a, "the client refused a request: {s}", .{why}));
-                // No watcher: workspace symbols have no change log to go by.
+                // No watcher: workspace symbols have no change log to go by,
+                // and poll the folders instead.
                 if (msg.id) |id| if (id == .string and std.mem.eql(u8, id.string, watch_registration)) {
                     self.watches_files = false;
+                    if (self.symbolDisk() != null) try self.symbols.setPolling(true);
                 };
             }
             return;
@@ -618,9 +621,9 @@ pub const Server = struct {
     }
 
     /// Bring the symbol index up to date with the open documents and what
-    /// the client's watcher reported; a client that cannot watch has every
-    /// folder walked. A folder's opening walk goes on in `tick`, and is
-    /// searched as far as it got.
+    /// the client's watcher reported. The walks, and the polling for a client
+    /// that cannot watch, go on in `tick`: a request searches the index as
+    /// it stands.
     pub fn refreshSymbols(self: *Server, a: std.mem.Allocator) Error!void {
         var opened: std.ArrayList(symbol_index.Open) = .empty;
         var it = self.docs.map.valueIterator();
@@ -635,15 +638,14 @@ pub const Server = struct {
         const disk = self.symbolDisk();
         try self.symbols.setOpen(a, opened.items, disk != null);
         const fs = disk orelse return;
-        if (!self.watches_files) try self.symbols.rewalk();
-        try self.symbols.work(a, fs, self.store, if (self.watches_files) .change_log else .all);
+        try self.symbols.work(a, fs, self.store, .change_log);
     }
 
     /// The host's disk, if it can be walked: the browser's cannot, and its
     /// index holds the open documents only.
     fn symbolDisk(self: *const Server) ?workspace.Files {
         const fs = self.files orelse return null;
-        if (fs.list == null or fs.stamp == null) return null;
+        if (fs.list == null or fs.stamp == null or fs.dir_stamp == null) return null;
         return fs;
     }
 
@@ -904,6 +906,7 @@ pub const Server = struct {
         }
         try self.symbols.setEncoding(self.encoding);
         try self.syncSymbolRoots(a);
+        if (self.symbolDisk() != null) try self.symbols.setPolling(!self.watches_files);
     }
 
     // ---- workspace folders and their config (doc 74 §7.4) ------------------
@@ -950,7 +953,7 @@ pub const Server = struct {
     fn watchFiles(self: *Server, out: *Outbox) Error!void {
         if (!self.watches_files) {
             if (self.files == null or self.ws.folders.items.len == 0) return;
-            return out.log(protocol.MessageType.info, "the client cannot watch files: an edit to mahina.toml takes effect when its folder is re-added or the server restarts, and workspace symbols look at every file on each request");
+            return out.log(protocol.MessageType.info, "the client cannot watch files: an edit to mahina.toml takes effect when its folder is re-added or the server restarts, and workspace symbols poll the folders (each directory every second; a file soon after it changed, and at least every 5 minutes)");
         }
         const watchers = [_]protocol.FileSystemWatcher{
             .{ .globPattern = "**/" ++ workspace.config_name },
@@ -1074,10 +1077,14 @@ pub const Server = struct {
     }
 
     /// When the host should next call `tick`, in its own clock; null if nothing
-    /// is waiting. Symbol indexing waiting makes it now.
+    /// is waiting. Symbol indexing waiting makes it now; polling for a client
+    /// that cannot watch makes it the next poll.
     pub fn nextDeadline(self: *const Server) ?u64 {
-        if (self.state == .running and self.symbols.busy() and self.symbolDisk() != null) return 0;
         var best: ?u64 = null;
+        if (self.state == .running and self.symbolDisk() != null) {
+            if (self.symbols.busy()) return 0;
+            best = self.symbols.nextPoll();
+        }
         var it = self.docs.map.valueIterator();
         while (it.next()) |d| {
             const due = dueAt(d.*) orelse continue;
@@ -1091,12 +1098,14 @@ pub const Server = struct {
     /// that arrives meanwhile waits no longer than that).
     pub fn tick(self: *Server, now_ms: u64, out: *Outbox) Error!void {
         if (self.state != .running) return;
+        self.symbols.advance(now_ms);
         var it = self.docs.map.valueIterator();
         while (it.next()) |d| {
             const due = dueAt(d.*) orelse continue;
             if (due <= now_ms) try self.analyse(d.*, out);
         }
-        if (!self.symbols.busy()) return;
+        const poll_due = if (self.symbols.nextPoll()) |at| at <= now_ms else false;
+        if (!self.symbols.busy() and !poll_due) return;
         const fs = self.symbolDisk() orelse return;
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
@@ -2304,6 +2313,11 @@ test "workspace symbols: every folder's functions, an open document's as edited,
         \\"workspaceFolders":[{"uri":"file:///w","name":"w"},{"uri":"file:///v","name":"v"}]
     );
     try testing.expect(r[0].object.get("result").?.object.get("capabilities").?.object.get("workspaceSymbolProvider").?.bool);
+    // The folders are walked in the background; this client cannot watch,
+    // so the index then polls them.
+    while (h.server.symbols.busy()) _ = try h.tick(0);
+    try testing.expect(h.server.symbols.polling);
+    try testing.expect(h.server.nextDeadline() != null);
 
     const q = try h.send(0,
         \\{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"add"}}
@@ -2341,7 +2355,7 @@ test "workspace symbols: every folder's functions, an open document's as edited,
     try testing.expectEqualStrings("scratch subtract M:size ", names.items);
 }
 
-test "workspace symbols: a watching client's changes are the only paths looked at again; a refusal walks every time" {
+test "workspace symbols: a watching client's changes are the only paths looked at again; a refusal polls" {
     var entries = [_][2][]const u8{
         .{ "/w/a.mah", "function alpha() end\n" },
         .{ "/w/b.mah", "function beta() end\n" },
@@ -2383,13 +2397,23 @@ test "workspace symbols: a watching client's changes are the only paths looked a
     try testing.expectEqual(@as(usize, 1), after[after.len - 1].object.get("result").?.array.items.len);
     try testing.expectEqual(stamped + 1, h.server.symbols.stamps);
 
-    // The client refuses to watch: each request walks every folder.
+    // The client refuses to watch: the index polls. A request only
+    // searches; an edit in place shows once its file comes due, within
+    // `max_check_ms`.
+    try testing.expect(!h.server.symbols.polling);
     _ = try h.send(5,
         \\{"jsonrpc":"2.0","id":"mahina/watch-files","error":{"code":-32601,"message":"unsupported"}}
     );
+    try testing.expect(h.server.symbols.polling);
+    while (h.server.symbols.busy()) _ = try h.tick(5);
     entries[0][1] = "function delta() end\n";
-    const walked = try h.send(6,
+    const delta =
         \\{"jsonrpc":"2.0","id":4,"method":"workspace/symbol","params":{"query":"delta"}}
-    );
-    try testing.expectEqual(@as(usize, 1), walked[walked.len - 1].object.get("result").?.array.items.len);
+    ;
+    const unseen = try h.send(6, delta);
+    try testing.expectEqual(@as(usize, 0), unseen[unseen.len - 1].object.get("result").?.array.items.len);
+    const later = 6 + symbol_index.max_check_ms;
+    while (h.server.nextDeadline().? <= later) _ = try h.tick(later);
+    const polled = try h.send(later, delta);
+    try testing.expectEqual(@as(usize, 1), polled[polled.len - 1].object.get("result").?.array.items.len);
 }

@@ -86,7 +86,7 @@ pub const DiskStore = struct {
 const max_file_bytes = 16 << 20;
 
 /// The disk, for `mahina.toml`, `require` resolution and module exports.
-pub const disk: workspace.Files = .{ .read = diskRead, .exists = diskExists, .list = diskList, .stamp = diskStamp };
+pub const disk: workspace.Files = .{ .read = diskRead, .exists = diskExists, .list = diskList, .stamp = diskStamp, .dir_stamp = diskDirStamp };
 
 fn diskList(_: ?*anyopaque, a: std.mem.Allocator, path: []const u8) ?[]const workspace.Files.DirEntry {
     const io = io_mod.hostIo();
@@ -109,6 +109,12 @@ fn diskList(_: ?*anyopaque, a: std.mem.Allocator, path: []const u8) ?[]const wor
 fn diskStamp(_: ?*anyopaque, path: []const u8) ?workspace.Files.Stamp {
     const st = Io.Dir.cwd().statFile(io_mod.hostIo(), path, .{}) catch return null;
     if (st.kind != .file) return null;
+    return .{ .size = st.size, .mtime_ns = st.mtime.nanoseconds };
+}
+
+fn diskDirStamp(_: ?*anyopaque, path: []const u8) ?workspace.Files.Stamp {
+    const st = Io.Dir.cwd().statFile(io_mod.hostIo(), path, .{}) catch return null;
+    if (st.kind != .directory) return null;
     return .{ .size = st.size, .mtime_ns = st.mtime.nanoseconds };
 }
 
