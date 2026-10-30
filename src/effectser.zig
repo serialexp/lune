@@ -56,7 +56,10 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v9 (doc 75 §4): `environ` (19), the environment as one byte record.
 /// v10 (doc 75 §4): `proc_run` (20), a finished program as one byte record,
 /// or a start failure.
-pub const effect_format_version: u32 = 10;
+/// v11 (doc 75 §3.6): the `proc_run` record covers a pipeline: a tag, the
+/// stage count and each stage's status and stderr; a start failure names its
+/// stage.
+pub const effect_format_version: u32 = 11;
 
 /// The encoded size of an `EffectFile` with no entries: the `version` word and
 /// the entry count.

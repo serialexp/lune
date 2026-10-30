@@ -296,45 +296,68 @@ pub const ProcOut = enum {
     merge,
 };
 
-/// One `proc.run` (doc 75 §3.1), resolved: the VM has already checked the
-/// options. The slices are valid for the call.
+/// The most stages one `proc.pipe` has.
+pub const proc_max_stages: usize = 64;
+
+/// One `proc.run` or `proc.pipe` (doc 75 §3.1, §3.6), resolved: the VM has
+/// already checked the options. The slices are valid for the call.
 pub const ProcRequest = struct {
-    argv: []const []const u8,
+    /// The programs, in pipeline order: each stage's stdout feeds the next
+    /// one's stdin. `proc.run` is one stage. Never empty.
+    stages: []const []const []const u8,
     cwd: ?[]const u8 = null,
-    /// The child's whole environment; null: the host's own.
+    /// The children's whole environment; null: the host's own.
     env: ?[]const ProcEnvPair = null,
+    /// The first stage's stdin.
     stdin: ProcStdin = .empty,
+    /// The last stage's stdout.
     stdout: ProcOut = .capture,
+    /// Every stage's stderr; `merge` sends each stage's into where its own
+    /// stdout goes (the next stage's stdin, or the captured stdout).
     stderr: ProcOut = .capture,
+    /// Per captured stream.
     max_bytes: usize,
-    /// Kill the child's process group after this long; null: never.
+    /// Kill the children's process group after this long; null: never.
     timeout_ns: ?u64 = null,
 };
 
-/// How a child ended. A signal is its name (`"SIGKILL"`), never its number,
-/// which differs by platform.
+/// How a stage ended. A signal is its name (`"SIGKILL"`), never its number,
+/// which differs by platform. A stage the `timeout` killed reads as signalled.
 pub const ProcStatus = union(enum) {
     /// The exit status, full width.
     exited: u32,
     signaled: []const u8,
-    /// The call's `timeout` expired and the child was killed.
-    timed_out,
 };
 
-pub const ProcDone = struct {
+pub const ProcStage = struct {
     status: ProcStatus,
     /// The captured bytes (empty when not captured), valid until the next
     /// host call.
-    stdout: []const u8,
     stderr: []const u8,
+};
+
+pub const ProcDone = struct {
+    /// One per stage, in order.
+    stages: []const ProcStage,
+    /// The last stage's stdout (empty when not captured).
+    stdout: []const u8,
+    /// The `timeout` expired and the children were killed.
+    timed_out: bool,
     /// A captured stream lost earlier bytes to `max_bytes`.
     truncated: bool,
 };
 
-/// A program that ran, or why it could not be started.
+/// Why a stage could not be started.
+pub const ProcFail = struct {
+    /// Which stage (0-based).
+    stage: u32 = 0,
+    class: ErrorClass,
+};
+
+/// The programs ran, or one could not be started (the others were ended).
 pub const ProcResult = union(enum) {
     done: ProcDone,
-    fail: ErrorClass,
+    fail: ProcFail,
 };
 
 /// Called once per variable by `HostSystem.VTable.environ`.

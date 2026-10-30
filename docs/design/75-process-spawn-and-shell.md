@@ -75,7 +75,15 @@ land; move whole phases to Done once everything inside them is checked.
   replay land in the same phase: a spawn that records nothing would have to
   be re-audited later. Inventory rows (Rule Z-5) for every new function;
   update doc 02's "Process spawning: forbid" row.
-- [ ] **Phase 1 — pipelines.** `proc.pipe` (§3.6).
+- [x] **Phase 1 — pipelines.** `proc.pipe` (§3.6). Landed: `proc_host.run` is
+  the n-stage runner and `proc.run` its one-stage case; the `proc_run` record
+  (format v11) holds every stage. Written `proc.pipe({{...}, {...}, ...})`
+  until the parser has call sugar. Decisions made in the implementation:
+  `r.code`/`r.signal` are the last stage's and `r.ok` is the pipefail verdict
+  (a timeout leaves out `code`/`signal`); `stderr = "merge"` sends each stage's
+  stderr down the pipe (`|&`); every stage is in one process group, so a
+  timeout ends them all; all programs are found on `PATH` before the first
+  starts; a pipeline has at most 64 stages; a stage table is just its argv.
 - [ ] **Phase 3 — `inherit`, handles, background jobs.** Non-recording mode
   only (§5): `inherit` stdio, `proc.spawn` returning a handle (`pid`, `wait`,
   `kill`). All fatal in record mode. Q11 and Q12 are decided (§5.3, §6).

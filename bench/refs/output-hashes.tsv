@@ -1,5 +1,5 @@
 # mahina frozen benchmark output digests — see tools/hashgate.py
-# generated from zig-out/bin/mahina at rev 7a982de
+# generated from zig-out/bin/mahina at rev 7f34b75
 # name	mode	argv	rc	sha256(stdout)
 array3d	jit	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
 array3d	t0	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
@@ -85,6 +85,12 @@ pcall_faults	trace	300000	0	2d5c043a952d70ef9564858b25a01a30613abfb3d1562f67ef8d
 pi_leibniz	jit	5000000	0	6d2c6267459bf99b7bda15185eb58eee858b8c8ce71328aefe21f9d00fb9ed8d
 pi_leibniz	t0	5000000	0	6d2c6267459bf99b7bda15185eb58eee858b8c8ce71328aefe21f9d00fb9ed8d
 pi_leibniz	trace	5000000	0	6d2c6267459bf99b7bda15185eb58eee858b8c8ce71328aefe21f9d00fb9ed8d
+proc_capture	jit	64	0	9ae349df9e28830ba2019c3bd47e4194dd0f57a15d2344bfba4de13a3477f2c6
+proc_capture	t0	64	0	9ae349df9e28830ba2019c3bd47e4194dd0f57a15d2344bfba4de13a3477f2c6
+proc_capture	trace	64	0	9ae349df9e28830ba2019c3bd47e4194dd0f57a15d2344bfba4de13a3477f2c6
+proc_pipe	jit	64	0	3a6f36d70c456ba9b4ebc6fdbdacd7d36db8c67a1fb0e57c7d910e0166b579e3
+proc_pipe	t0	64	0	3a6f36d70c456ba9b4ebc6fdbdacd7d36db8c67a1fb0e57c7d910e0166b579e3
+proc_pipe	trace	64	0	3a6f36d70c456ba9b4ebc6fdbdacd7d36db8c67a1fb0e57c7d910e0166b579e3
 recursive-fib	jit	31	0	d859e2c4777348ecc48661fe3657d9f4022ef516365ff4ec07b397685d657fb4
 recursive-fib	t0	31	0	d859e2c4777348ecc48661fe3657d9f4022ef516365ff4ec07b397685d657fb4
 recursive-fib	trace	31	0	d859e2c4777348ecc48661fe3657d9f4022ef516365ff4ec07b397685d657fb4

@@ -68,7 +68,12 @@ fn recordReplay(host: *FakeHost, source: [:0]const u8) !Run {
     return rec;
 }
 
-const done_ok: system.ProcResult = .{ .done = .{ .status = .{ .exited = 0 }, .stdout = "hello\n", .stderr = "", .truncated = false } };
+const stage_ok = [_]system.ProcStage{.{ .status = .{ .exited = 0 }, .stderr = "" }};
+const stage_exit3 = [_]system.ProcStage{.{ .status = .{ .exited = 3 }, .stderr = "err" }};
+const stage_segv = [_]system.ProcStage{.{ .status = .{ .signaled = "SIGSEGV" }, .stderr = "" }};
+const stage_term = [_]system.ProcStage{.{ .status = .{ .signaled = "SIGTERM" }, .stderr = "" }};
+
+const done_ok: system.ProcResult = .{ .done = .{ .stages = &stage_ok, .stdout = "hello\n", .timed_out = false, .truncated = false } };
 
 test "proc: a finished program is a table of how it ended and what it wrote" {
     var host = FakeHost.init(testing.allocator);
@@ -101,7 +106,7 @@ test "proc: each call hands back fresh byte arrays" {
 test "proc: a failed exit raises a table that reads as a message" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
-    host.proc_result = .{ .done = .{ .status = .{ .exited = 3 }, .stdout = "out", .stderr = "err", .truncated = false } };
+    host.proc_result = .{ .done = .{ .stages = &stage_exit3, .stdout = "out", .timed_out = false, .truncated = false } };
     const r = try recordReplay(&host,
         \\local ok, e = pcall(proc.run, {"tool", "arg"})
         \\print(ok, type(e), e.kind, e.code, e.program, string.decode(e.stdout), string.decode(e.stderr), e.ok)
@@ -121,7 +126,7 @@ test "proc: a failed exit raises a table that reads as a message" {
 test "proc: a signal and a timeout are results too, and raise by default" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
-    host.proc_result = .{ .done = .{ .status = .{ .signaled = "SIGSEGV" }, .stdout = "", .stderr = "", .truncated = false } };
+    host.proc_result = .{ .done = .{ .stages = &stage_segv, .stdout = "", .timed_out = false, .truncated = false } };
     const sig = try recordReplay(&host,
         \\local r = proc.run({"x", check = false})
         \\print(r.ok, r.code, r.signal, r.timed_out)
@@ -131,7 +136,7 @@ test "proc: a signal and a timeout are results too, and raise by default" {
     defer sig.deinit(testing.allocator);
     try testing.expectEqualStrings("false\tnil\tSIGSEGV\tfalse\nsignal\tSIGSEGV\tcommand 'x' was killed by SIGSEGV\n", sig.out);
 
-    host.proc_result = .{ .done = .{ .status = .timed_out, .stdout = "part", .stderr = "", .truncated = true } };
+    host.proc_result = .{ .done = .{ .stages = &stage_term, .stdout = "part", .timed_out = true, .truncated = true } };
     const t = try recordReplay(&host,
         \\local r = proc.run({"x", timeout = 2.5, check = false})
         \\print(r.ok, r.code, r.signal, r.timed_out, r.truncated, string.decode(r.stdout))
@@ -146,7 +151,7 @@ test "proc: a signal and a timeout are results too, and raise by default" {
 test "proc: streams that are not captured are absent" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
-    host.proc_result = .{ .done = .{ .status = .{ .exited = 0 }, .stdout = "", .stderr = "", .truncated = false } };
+    host.proc_result = .{ .done = .{ .stages = &stage_ok, .stdout = "", .timed_out = false, .truncated = false } };
     const r = try recordReplay(&host,
         \\local r = proc.run({"x", stdout = "null", stderr = "merge"})
         \\print(r.stdout, r.stderr)
@@ -160,7 +165,7 @@ test "proc: streams that are not captured are absent" {
 test "proc: a program that cannot be started raises, whatever check says, and replays the same" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
-    host.proc_result = .{ .fail = .not_found };
+    host.proc_result = .{ .fail = .{ .class = .not_found } };
     const r = try recordReplay(&host,
         \\print(pcall(proc.run, {"nope"}))
         \\print(pcall(proc.run, {"nope", check = false}))
@@ -279,4 +284,148 @@ test "proc: a host without proc cannot start anything" {
     const r = try run(testing.allocator, .{}, "print(pcall(proc.run, {'x'}))");
     defer r.deinit(testing.allocator);
     try testing.expect(std.mem.endsWith(u8, r.out, "cannot run 'x': input/output error\n"));
+}
+
+const pipe_exits_ok = [_]system.ProcStage{
+    .{ .status = .{ .exited = 0 }, .stderr = "e1" },
+    .{ .status = .{ .exited = 0 }, .stderr = "" },
+    .{ .status = .{ .exited = 0 }, .stderr = "e3" },
+};
+const pipe_exits_mid = [_]system.ProcStage{
+    .{ .status = .{ .exited = 1 }, .stderr = "e1" },
+    .{ .status = .{ .exited = 0 }, .stderr = "" },
+    .{ .status = .{ .exited = 3 }, .stderr = "e3" },
+};
+const pipe_last_fails = [_]system.ProcStage{
+    .{ .status = .{ .exited = 0 }, .stderr = "" },
+    .{ .status = .{ .exited = 0 }, .stderr = "" },
+    .{ .status = .{ .exited = 2 }, .stderr = "" },
+};
+const pipe_sigpipe_first = [_]system.ProcStage{
+    .{ .status = .{ .signaled = "SIGPIPE" }, .stderr = "" },
+    .{ .status = .{ .exited = 0 }, .stderr = "" },
+};
+const pipe_sigpipe_last = [_]system.ProcStage{
+    .{ .status = .{ .exited = 0 }, .stderr = "" },
+    .{ .status = .{ .signaled = "SIGPIPE" }, .stderr = "" },
+};
+
+test "proc.pipe: a pipeline is one result with the last stdout and each stage's story" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.proc_result = .{ .done = .{ .stages = &pipe_exits_ok, .stdout = "42\n", .timed_out = false, .truncated = false } };
+    const r = try recordReplay(&host,
+        \\local r = proc.pipe({{"cat", "f"}, {"grep", "E"}, {"wc", "-l"}})
+        \\print(r.ok, r.code, string.decode(r.stdout), #r.stages, r.stderr)
+        \\print(r.stages[1].code, string.decode(r.stages[1].stderr), r.stages[1].ok, string.decode(r.stages[3].stderr))
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("true\t0\t42\n\t3\tnil\n0\te1\ttrue\te3\n", r.out);
+    try testing.expectEqual(@as(usize, 1), host.proc_calls);
+    try testing.expectEqual(@as(usize, 3), host.proc_stages);
+}
+
+test "proc.pipe: it fails like pipefail, on the rightmost failing stage" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.proc_result = .{ .done = .{ .stages = &pipe_exits_mid, .stdout = "out", .timed_out = false, .truncated = false } };
+    const r = try recordReplay(&host,
+        \\local ok, e = pcall(proc.pipe, {{"a"}, {"b"}, {"c", "x"}})
+        \\print(ok, e.kind, e.code, e.program, string.decode(e.stderr), string.decode(e.stdout), #e.stages)
+        \\print(tostring(e))
+        \\local r = proc.pipe({{"a"}, {"b"}, {"c"}, check = false})
+        \\print(r.ok, r.code, r.stages[1].ok, r.stages[1].code, r.stages[3].ok)
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        "false\texit\t3\tc\te3\tout\t3\n" ++
+            "command 'c' exited with status 3\n" ++
+            "false\t3\tfalse\t1\tfalse\n",
+        r.out,
+    );
+}
+
+test "proc.pipe: a reader that stopped early is not a failure, but SIGPIPE at the end is" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.proc_result = .{ .done = .{ .stages = &pipe_sigpipe_first, .stdout = "y\n", .timed_out = false, .truncated = false } };
+    const a = try recordReplay(&host,
+        \\local r = proc.pipe({{"yes"}, {"head", "-n", "1"}})
+        \\print(r.ok, r.code, r.stages[1].signal, r.stages[1].ok)
+    );
+    defer a.deinit(testing.allocator);
+    try testing.expectEqualStrings("true\t0\tSIGPIPE\ttrue\n", a.out);
+
+    host.proc_result = .{ .done = .{ .stages = &pipe_sigpipe_last, .stdout = "", .timed_out = false, .truncated = false } };
+    const b = try recordReplay(&host,
+        \\local ok, e = pcall(proc.pipe, {{"a"}, {"b"}})
+        \\print(e.kind, e.signal, tostring(e))
+    );
+    defer b.deinit(testing.allocator);
+    try testing.expectEqualStrings("signal\tSIGPIPE\tcommand 'b' was killed by SIGPIPE\n", b.out);
+}
+
+test "proc.pipe: a timeout names the whole pipeline" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.proc_result = .{ .done = .{ .stages = &pipe_last_fails, .stdout = "", .timed_out = true, .truncated = false } };
+    const r = try recordReplay(&host,
+        \\local ok, e = pcall(proc.pipe, {{"a"}, {"b"}, {"c"}, timeout = 3})
+        \\print(e.kind, e.program, e.code, tostring(e))
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("timeout\ta | b | c\tnil\tcommand 'a | b | c' timed out after 3 seconds\n", r.out);
+}
+
+test "proc.pipe: a stage that cannot start names itself, and a record of another shape refuses" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.proc_result = .{ .fail = .{ .stage = 1, .class = .permission_denied } };
+    const r = try recordReplay(&host, "print(pcall(proc.pipe, {{'a'}, {'locked'}, {'c'}}))");
+    defer r.deinit(testing.allocator);
+    try testing.expect(std.mem.endsWith(u8, r.out, "cannot run 'locked': permission denied\n"));
+
+    // A recording of a one-program call is not a two-stage pipeline's.
+    host.proc_result = done_ok;
+    const rec = try run(testing.allocator, .{ .host = &host, .mode = .record }, "proc.run({'x'})");
+    defer rec.deinit(testing.allocator);
+    try testing.expectError(error.EffectKindMismatch, run(testing.allocator, .{ .mode = .replay, .log = rec.log }, "proc.pipe({{'x'}, {'y'}})"));
+}
+
+test "proc.pipe: the table is checked, and the shared rules apply to every stage" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.proc_result = done_ok;
+    const r = try run(testing.allocator, .{ .host = &host },
+        \\local function bad(t) local ok, e = pcall(proc.pipe, t) print(e) end
+        \\bad({})
+        \\bad({{"a"}, "b"})
+        \\bad({{"a"}, {}})
+        \\bad({{"a"}, {"b", 5}})
+        \\bad({{"a"}, {"b", cwd = "/"}})
+        \\bad({{"a"}, {"b"}, chekc = 1})
+        \\bad(7)
+    );
+    defer r.deinit(testing.allocator);
+    const expected =
+        "bad argument #1 to '?' (no stages: the table needs a table of argv for each stage at [1])\n" ++
+        "bad argument #1 to '?' (stage 2 must be a table of strings, got string)\n" ++
+        "bad argument #1 to '?' (stage 2 has no program: it needs the program name at [1])\n" ++
+        "bad argument #1 to '?' (stage 2[2] must be a string, got number)\n" ++
+        "bad argument #1 to '?' (stage 2 has an unexpected key; a stage is just its argv)\n" ++
+        "bad argument #1 to '?' (unknown option 'chekc')\n" ++
+        "bad argument #1 to '?' (table expected, got number)\n";
+    var got = std.mem.splitScalar(u8, r.out, '\n');
+    var want = std.mem.splitScalar(u8, expected, '\n');
+    while (want.next()) |w| {
+        const g = got.next() orelse return error.TestExpectedEqual;
+        try testing.expect(std.mem.endsWith(u8, g, w));
+    }
+    try testing.expectEqual(@as(usize, 0), host.proc_calls);
+
+    // Inherited stdio is fatal for the pipeline as a whole, before anything runs.
+    try testing.expectError(error.ProcNotRecordable, run(testing.allocator, .{ .host = &host, .mode = .record }, "proc.pipe({{'a'}, {'b'}, stderr = 'inherit'})"));
+    // The worst case grows with the stages: three stderr captures of 64 KiB.
+    try testing.expectError(error.EffectLogLimit, run(testing.allocator, .{ .host = &host, .mode = .record, .limit = 3 * 1024 }, "proc.pipe({{'a'}, {'b'}, {'c'}, max_bytes = 1024, stdout = 'null'})"));
+    try testing.expectEqual(@as(usize, 0), host.proc_calls);
 }

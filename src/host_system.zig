@@ -783,15 +783,15 @@ test "proc runs a real program: exit code, both streams, stdin, env and cwd" {
     defer sys.deinit();
     const env = [_]seam.ProcEnvPair{.{ .name = "GREETING", .value = "hi" }};
     const r = RealSystem.procRun(&sys, .{
-        .argv = &.{ "/bin/sh", "-c", "read x; echo \"$x $GREETING $(pwd)\"; echo oops >&2; exit 3" },
+        .stages = &.{&.{ "/bin/sh", "-c", "read x; echo \"$x $GREETING $(pwd)\"; echo oops >&2; exit 3" }},
         .cwd = "/",
         .env = &env,
         .stdin = .{ .bytes = "line\n" },
         .max_bytes = 1024,
     });
-    try testing.expectEqual(@as(u32, 3), r.done.status.exited);
+    try testing.expectEqual(@as(u32, 3), r.done.stages[0].status.exited);
     try testing.expectEqualStrings("line hi /\n", r.done.stdout);
-    try testing.expectEqualStrings("oops\n", r.done.stderr);
+    try testing.expectEqualStrings("oops\n", r.done.stages[0].stderr);
     try testing.expect(!r.done.truncated);
 }
 
@@ -800,14 +800,14 @@ test "proc keeps the latest bytes, merges stderr, and names a signal" {
     var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
     defer sys.deinit();
     const t = RealSystem.procRun(&sys, .{
-        .argv = &.{ "/bin/sh", "-c", "printf 0123456789; printf abc >&2" },
+        .stages = &.{&.{ "/bin/sh", "-c", "printf 0123456789; printf abc >&2" }},
         .stderr = .merge,
         .max_bytes = 4,
     });
     try testing.expectEqualStrings("9abc", t.done.stdout);
     try testing.expect(t.done.truncated);
-    const s = RealSystem.procRun(&sys, .{ .argv = &.{ "/bin/sh", "-c", "kill -SEGV $$" }, .max_bytes = 16 });
-    try testing.expectEqualStrings("SIGSEGV", s.done.status.signaled);
+    const s = RealSystem.procRun(&sys, .{ .stages = &.{&.{ "/bin/sh", "-c", "kill -SEGV $$" }}, .max_bytes = 16 });
+    try testing.expectEqualStrings("SIGSEGV", s.done.stages[0].status.signaled);
 }
 
 test "proc times out a program and everything it started, and reports a missing one" {
@@ -816,13 +816,76 @@ test "proc times out a program and everything it started, and reports a missing 
     var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
     defer sys.deinit();
     const t = RealSystem.procRun(&sys, .{
-        .argv = &.{ "/bin/sh", "-c", "sleep 30 & wait" },
+        .stages = &.{&.{ "/bin/sh", "-c", "sleep 30 & wait" }},
         .env = &env,
         .stdin = .{ .bytes = "" },
         .max_bytes = 16,
         .timeout_ns = 100_000_000,
     });
-    try testing.expect(t.done.status == .timed_out);
-    const m = RealSystem.procRun(&sys, .{ .argv = &.{"/no/such/program"}, .max_bytes = 16 });
-    try testing.expectEqual(seam.ErrorClass.not_found, m.fail);
+    try testing.expect(t.done.timed_out);
+    const m = RealSystem.procRun(&sys, .{ .stages = &.{&.{"/no/such/program"}}, .max_bytes = 16 });
+    try testing.expectEqual(seam.ErrorClass.not_found, m.fail.class);
+    try testing.expectEqual(@as(u32, 0), m.fail.stage);
+}
+
+test "proc pipes each stage's stdout into the next, with every stage's stderr kept apart" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    const r = RealSystem.procRun(&sys, .{
+        .stages = &.{
+            &.{ "/bin/sh", "-c", "echo one >&2; printf 'b\\na\\nc\\n'" },
+            &.{ "/bin/sh", "-c", "echo two >&2; sort" },
+            &.{ "/bin/sh", "-c", "echo three >&2; tr a-z A-Z; exit 4" },
+        },
+        .max_bytes = 1024,
+    });
+    try testing.expectEqualStrings("A\nB\nC\n", r.done.stdout);
+    try testing.expectEqual(@as(usize, 3), r.done.stages.len);
+    try testing.expectEqualStrings("one\n", r.done.stages[0].stderr);
+    try testing.expectEqualStrings("two\n", r.done.stages[1].stderr);
+    try testing.expectEqualStrings("three\n", r.done.stages[2].stderr);
+    try testing.expectEqual(@as(u32, 0), r.done.stages[1].status.exited);
+    try testing.expectEqual(@as(u32, 4), r.done.stages[2].status.exited);
+}
+
+test "proc pipeline: stdin feeds the first stage, merge follows the pipe, an early reader ends the writer" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    const m = RealSystem.procRun(&sys, .{
+        .stages = &.{
+            &.{ "/bin/sh", "-c", "cat; echo warn >&2" },
+            &.{ "/bin/sh", "-c", "cat" },
+        },
+        .stdin = .{ .bytes = "in\n" },
+        .stderr = .merge,
+        .max_bytes = 1024,
+    });
+    try testing.expectEqualStrings("in\nwarn\n", m.done.stdout);
+    // `yes` writes until its reader goes; `head` reads one line and goes.
+    const y = RealSystem.procRun(&sys, .{
+        .stages = &.{ &.{ "/bin/sh", "-c", "yes" }, &.{ "/bin/sh", "-c", "head -n 1" } },
+        .max_bytes = 1024,
+    });
+    try testing.expectEqualStrings("y\n", y.done.stdout);
+    try testing.expect(!y.done.timed_out);
+}
+
+test "proc pipeline: a stage that cannot start ends the ones before it, and a timeout ends them all" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    const f = RealSystem.procRun(&sys, .{
+        .stages = &.{ &.{ "/bin/sh", "-c", "sleep 30" }, &.{"/no/such/program"} },
+        .max_bytes = 16,
+    });
+    try testing.expectEqual(@as(u32, 1), f.fail.stage);
+    try testing.expectEqual(seam.ErrorClass.not_found, f.fail.class);
+    const t = RealSystem.procRun(&sys, .{
+        .stages = &.{ &.{ "/bin/sh", "-c", "sleep 30" }, &.{ "/bin/sh", "-c", "cat" } },
+        .max_bytes = 16,
+        .timeout_ns = 100_000_000,
+    });
+    try testing.expect(t.done.timed_out);
 }

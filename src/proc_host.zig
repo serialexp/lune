@@ -100,15 +100,33 @@ pub const Tail = struct {
     }
 };
 
+/// The most stages a pipeline has (`proc_max_stages`): up to three
+/// descriptors a stage while it runs.
+pub const max_stages = seam.proc_max_stages;
+
 /// What a call leaves behind for its result to point into.
 pub const Capture = struct {
     out: Tail = .{},
-    err: Tail = .{},
-    sig: [24]u8 = undefined,
+    /// One per stage.
+    errs: std.ArrayList(Tail) = .empty,
+    sigs: std.ArrayList([24]u8) = .empty,
+    stages: std.ArrayList(seam.ProcStage) = .empty,
 
     pub fn deinit(self: *Capture, gpa: Allocator) void {
         self.out.deinit(gpa);
-        self.err.deinit(gpa);
+        for (self.errs.items) |*t| t.deinit(gpa);
+        self.errs.deinit(gpa);
+        self.sigs.deinit(gpa);
+        self.stages.deinit(gpa);
+    }
+
+    /// Room for `n` stages, every stream empty and capped at `cap`.
+    fn prepare(self: *Capture, gpa: Allocator, n: usize, cap: usize) Allocator.Error!void {
+        self.out.reset(cap);
+        while (self.errs.items.len < n) try self.errs.append(gpa, .{});
+        for (self.errs.items[0..n]) |*t| t.reset(cap);
+        try self.sigs.resize(gpa, n);
+        try self.stages.resize(gpa, n);
     }
 };
 
@@ -235,19 +253,30 @@ const Deadline = struct {
 const Pipes = struct {
     stdin: ?posix.fd_t = null,
     out: ?posix.fd_t = null,
-    err: ?posix.fd_t = null,
+    errs: [max_stages]?posix.fd_t = @splat(null),
 
     fn closeAll(self: *Pipes) void {
-        inline for (.{ &self.stdin, &self.out, &self.err }) |p| {
+        if (self.stdin) |fd| closeFd(fd);
+        self.stdin = null;
+        if (self.out) |fd| closeFd(fd);
+        self.out = null;
+        for (&self.errs) |*p| {
             if (p.*) |fd| closeFd(fd);
             p.* = null;
         }
     }
+
+    fn open(self: *const Pipes) bool {
+        if (self.stdin != null or self.out != null) return true;
+        for (self.errs) |p| if (p != null) return true;
+        return false;
+    }
 };
 
 /// Service the pipes until they have all closed (or the deadline gave up on
-/// them): feed `input`, drain stdout and stderr into the tails.
-fn pump(gpa: Allocator, pipes: *Pipes, input: []const u8, cap: *Capture, pid: posix.pid_t, dl: *Deadline) !void {
+/// them): feed `input`, drain the last stage's stdout and every stage's
+/// stderr into the tails.
+fn pump(gpa: Allocator, pipes: *Pipes, input: []const u8, cap: *Capture, pgid: posix.pid_t, dl: *Deadline) !void {
     var fed: usize = 0;
     if (pipes.stdin) |fd| {
         if (input.len == 0) {
@@ -256,77 +285,76 @@ fn pump(gpa: Allocator, pipes: *Pipes, input: []const u8, cap: *Capture, pid: po
         } else setNonblocking(fd);
     }
     var scratch: [64 * 1024]u8 = undefined;
-    while (pipes.stdin != null or pipes.out != null or pipes.err != null) {
+    // Which descriptor each poll entry is: 0 stdin, 1 stdout, 2 + i the
+    // stderr of stage i.
+    var fds: [max_stages + 2]posix.pollfd = undefined;
+    var which: [max_stages + 2]u8 = undefined;
+    while (pipes.open()) {
         const now = nowNs();
-        dl.step(pid, now);
+        dl.step(pgid, now);
         if (dl.give_up) return;
-        var fds: [3]posix.pollfd = undefined;
-        var which: [3]u2 = undefined;
         var n: usize = 0;
         if (pipes.stdin) |fd| {
-            fds[n] = .{ .fd = fd, .events = posix.POLL.OUT };
+            fds[n] = .{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 };
             which[n] = 0;
             n += 1;
         }
         if (pipes.out) |fd| {
-            fds[n] = .{ .fd = fd, .events = posix.POLL.IN };
+            fds[n] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
             which[n] = 1;
             n += 1;
         }
-        if (pipes.err) |fd| {
-            fds[n] = .{ .fd = fd, .events = posix.POLL.IN };
-            which[n] = 2;
+        for (pipes.errs, 0..) |p, i| {
+            const fd = p orelse continue;
+            fds[n] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
+            which[n] = @intCast(2 + i);
             n += 1;
         }
         _ = try posix.poll(fds[0..n], dl.pollTimeout(now));
         for (fds[0..n], which[0..n]) |pf, w| {
             if (pf.revents == 0) continue;
-            switch (w) {
-                0 => {
-                    const fd = pipes.stdin.?;
-                    if (pf.revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) {
-                        // The child closed its stdin early: not an error.
-                        closeFd(fd);
-                        pipes.stdin = null;
-                        continue;
-                    }
-                    const rc = posix.system.write(fd, input[fed..].ptr, input.len - fed);
-                    switch (posix.errno(rc)) {
-                        .SUCCESS => {
-                            fed += @intCast(rc);
-                            if (fed == input.len) {
-                                closeFd(fd);
-                                pipes.stdin = null;
-                            }
-                        },
-                        .AGAIN, .INTR => {},
-                        else => {
+            if (w == 0) {
+                const fd = pipes.stdin.?;
+                if (pf.revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) {
+                    // The child closed its stdin early: not an error.
+                    closeFd(fd);
+                    pipes.stdin = null;
+                    continue;
+                }
+                const rc = posix.system.write(fd, input[fed..].ptr, input.len - fed);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => {
+                        fed += @intCast(rc);
+                        if (fed == input.len) {
                             closeFd(fd);
                             pipes.stdin = null;
-                        },
-                    }
+                        }
+                    },
+                    .AGAIN, .INTR => {},
+                    else => {
+                        closeFd(fd);
+                        pipes.stdin = null;
+                    },
+                }
+                continue;
+            }
+            const slot = if (w == 1) &pipes.out else &pipes.errs[w - 2];
+            const tail = if (w == 1) &cap.out else &cap.errs.items[w - 2];
+            const fd = slot.*.?;
+            const rc = posix.system.read(fd, &scratch, scratch.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    const got: usize = @intCast(rc);
+                    if (got == 0) {
+                        closeFd(fd);
+                        slot.* = null;
+                    } else try tail.push(gpa, scratch[0..got]);
                 },
-                1, 2 => {
-                    const slot = if (w == 1) &pipes.out else &pipes.err;
-                    const tail = if (w == 1) &cap.out else &cap.err;
-                    const fd = slot.*.?;
-                    const rc = posix.system.read(fd, &scratch, scratch.len);
-                    switch (posix.errno(rc)) {
-                        .SUCCESS => {
-                            const got: usize = @intCast(rc);
-                            if (got == 0) {
-                                closeFd(fd);
-                                slot.* = null;
-                            } else try tail.push(gpa, scratch[0..got]);
-                        },
-                        .AGAIN, .INTR => {},
-                        else => {
-                            closeFd(fd);
-                            slot.* = null;
-                        },
-                    }
+                .AGAIN, .INTR => {},
+                else => {
+                    closeFd(fd);
+                    slot.* = null;
                 },
-                else => unreachable,
             }
         }
     }
@@ -335,8 +363,9 @@ fn pump(gpa: Allocator, pipes: *Pipes, input: []const u8, cap: *Capture, pid: po
 const Reaped = union(enum) { exited: u32, signaled: u32 };
 
 /// Wait for the child to end. With no deadline pending this blocks; with one
-/// it polls, escalating when the deadline passes.
-fn reap(pid: posix.pid_t, dl: *Deadline) Reaped {
+/// it polls, escalating when the deadline passes. `pgid` is the group the
+/// deadline signals.
+fn reap(pid: posix.pid_t, pgid: posix.pid_t, dl: *Deadline) Reaped {
     while (true) {
         const blocking = dl.at == null and !dl.timed_out;
         var status: if (builtin.link_libc) c_int else i32 = undefined;
@@ -352,136 +381,217 @@ fn reap(pid: posix.pid_t, dl: *Deadline) Reaped {
             .CHILD => return .{ .exited = 0 },
             else => return .{ .exited = 0 },
         }
-        dl.step(pid, nowNs());
+        dl.step(pgid, nowNs());
         _ = posix.poll(&.{}, 5) catch {};
     }
 }
 
-/// Run `req` to completion. `host_env` is the environment an omitted
-/// `req.env` means; null: the process environment.
+/// Run `req` to completion: every stage is started before any is waited on,
+/// all in one process group. `host_env` is the environment an omitted
+/// `req.env` means; null: the process environment. A stage that cannot be
+/// started ends the ones before it and fails the call.
 pub fn run(gpa: Allocator, io: Io, host_env: ?*const std.process.Environ.Map, req: seam.ProcRequest, cap: *Capture) seam.ProcResult {
-    if (comptime !supported) return .{ .fail = .other };
-    if (req.argv.len == 0) return .{ .fail = .not_found };
+    if (comptime !supported) return .{ .fail = .{ .class = .other } };
+    const n = req.stages.len;
+    if (n == 0 or n > max_stages) return .{ .fail = .{ .class = .other } };
+    for (req.stages, 0..) |argv, i| {
+        if (argv.len == 0) return .{ .fail = .{ .stage = @intCast(i), .class = .not_found } };
+    }
 
-    // The child's whole environment.
+    // The children's whole environment.
     var own_env: ?std.process.Environ.Map = null;
     defer if (own_env) |*m| m.deinit();
     const env: *const std.process.Environ.Map = blk: {
         if (req.env) |pairs| {
             own_env = std.process.Environ.Map.init(gpa);
-            for (pairs) |kv| own_env.?.put(kv.name, kv.value) catch return .{ .fail = .other };
+            for (pairs) |kv| own_env.?.put(kv.name, kv.value) catch return .{ .fail = .{ .class = .other } };
             break :blk &own_env.?;
         }
         if (host_env) |m| break :blk m;
-        own_env = processEnviron(gpa) catch return .{ .fail = .other };
+        own_env = processEnviron(gpa) catch return .{ .fail = .{ .class = .other } };
         break :blk &own_env.?;
     };
 
-    // The program: a name with a slash is used as given (relative to the
+    // The programs: a name with a slash is used as given (relative to the
     // child's cwd, as exec does); a bare name is searched for on its PATH.
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const prog = req.argv[0];
-    const exe_path: []const u8 = if (std.mem.indexOfScalar(u8, prog, '/') != null) prog else blk: {
+    // All of them are found before any is started.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var exes: [max_stages][]const u8 = undefined;
+    for (req.stages, 0..) |argv, i| {
+        const prog = argv[0];
+        if (std.mem.indexOfScalar(u8, prog, '/') != null) {
+            exes[i] = prog;
+            continue;
+        }
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         var denied = false;
-        break :blk searchPath(io, env.get("PATH") orelse "", prog, req.cwd, &path_buf, &denied) orelse
-            return .{ .fail = if (denied) .permission_denied else .not_found };
-    };
+        const found = searchPath(io, env.get("PATH") orelse "", prog, req.cwd, &path_buf, &denied) orelse
+            return .{ .fail = .{ .stage = @intCast(i), .class = if (denied) .permission_denied else .not_found } };
+        exes[i] = arena.dupe(u8, found) catch return .{ .fail = .{ .class = .other } };
+    }
 
-    // stdin.
+    // The first stage's stdin.
     var stdin_file: ?Io.File = null;
     defer if (stdin_file) |f| f.close(io);
     const input: []const u8 = switch (req.stdin) {
         .bytes => |b| b,
         else => "",
     };
-    const stdin_mode: std.process.SpawnOptions.StdIo = switch (req.stdin) {
+    const first_stdin: std.process.SpawnOptions.StdIo = switch (req.stdin) {
         .empty => .ignore,
         .bytes => .pipe,
         .inherit => .inherit,
         .file => |path| blk: {
-            stdin_file = Io.Dir.cwd().openFile(io, path, .{}) catch |e| return .{ .fail = startClass(e) };
+            stdin_file = Io.Dir.cwd().openFile(io, path, .{}) catch |e| return .{ .fail = .{ .class = startClass(e) } };
             break :blk .{ .file = stdin_file.? };
         },
     };
 
-    // stderr merged into stdout shares one pipe (the child's two ends are the
-    // same file), which this file reads.
+    cap.prepare(gpa, n, req.max_bytes) catch return .{ .fail = .{ .class = .other } };
+
+    var pipes: Pipes = .{};
+    var pids: [max_stages]posix.pid_t = undefined;
+    var started: usize = 0;
+    var pgid: posix.pid_t = 0;
+    // The read end that feeds the next stage, and (for stderr merged into a
+    // captured stdout) the pipe the last stage writes both streams to.
+    var prev_r: ?posix.fd_t = null;
     var merged: ?[2]posix.fd_t = null;
-    const out_mode: std.process.SpawnOptions.StdIo = switch (req.stdout) {
-        .capture => .pipe,
-        .discard => .ignore,
-        .inherit => .inherit,
-        .merge => unreachable,
-    };
-    var err_mode: std.process.SpawnOptions.StdIo = switch (req.stderr) {
-        .capture => .pipe,
-        .discard => .ignore,
-        .inherit => .inherit,
-        .merge => .ignore,
-    };
-    var out_spawn = out_mode;
-    if (req.stderr == .merge and req.stdout == .capture) {
-        var fds: [2]posix.fd_t = undefined;
-        if (posix.errno(posix.system.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return .{ .fail = .other };
-        merged = fds;
-        out_spawn = .{ .file = .{ .handle = fds[1], .flags = .{ .nonblocking = false } } };
-        err_mode = .{ .file = .{ .handle = fds[1], .flags = .{ .nonblocking = false } } };
-    } else if (req.stderr == .merge) {
-        // stdout is not captured: stderr goes where stdout goes.
-        err_mode = out_mode;
+    var failure: ?seam.ProcFail = null;
+
+    for (req.stages, 0..) |argv, i| {
+        const last = i == n - 1;
+        const stdin_mode: std.process.SpawnOptions.StdIo = if (i == 0)
+            first_stdin
+        else
+            .{ .file = .{ .handle = prev_r.?, .flags = .{ .nonblocking = false } } };
+
+        var next_r: ?posix.fd_t = null;
+        var w: ?posix.fd_t = null;
+        var out_spawn: std.process.SpawnOptions.StdIo = undefined;
+        var err_mode: std.process.SpawnOptions.StdIo = switch (req.stderr) {
+            .capture => .pipe,
+            .discard => .ignore,
+            .inherit => .inherit,
+            .merge => .ignore,
+        };
+        if (!last) {
+            // This stage's stdout is the next one's stdin.
+            var fds: [2]posix.fd_t = undefined;
+            if (posix.errno(posix.system.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) {
+                failure = .{ .stage = @intCast(i), .class = .other };
+                break;
+            }
+            next_r = fds[0];
+            w = fds[1];
+            out_spawn = .{ .file = .{ .handle = fds[1], .flags = .{ .nonblocking = false } } };
+            if (req.stderr == .merge) err_mode = out_spawn;
+        } else {
+            const out_mode: std.process.SpawnOptions.StdIo = switch (req.stdout) {
+                .capture => .pipe,
+                .discard => .ignore,
+                .inherit => .inherit,
+                .merge => unreachable,
+            };
+            out_spawn = out_mode;
+            if (req.stderr == .merge and req.stdout == .capture) {
+                // One pipe, both streams: this file reads it.
+                var fds: [2]posix.fd_t = undefined;
+                if (posix.errno(posix.system.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) {
+                    failure = .{ .stage = @intCast(i), .class = .other };
+                    break;
+                }
+                merged = fds;
+                out_spawn = .{ .file = .{ .handle = fds[1], .flags = .{ .nonblocking = false } } };
+                err_mode = out_spawn;
+            } else if (req.stderr == .merge) {
+                // stdout is not captured: stderr goes where stdout goes.
+                err_mode = out_mode;
+            }
+        }
+
+        const child = std.process.spawn(io, .{
+            .argv = argv,
+            .exe = .{ .explicit = .{ .dir = Io.Dir.cwd(), .path = exes[i] } },
+            .cwd = if (req.cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = env,
+            .stdin = stdin_mode,
+            .stdout = out_spawn,
+            .stderr = err_mode,
+            .pgid = pgid,
+        }) catch |e| {
+            if (next_r) |fd| closeFd(fd);
+            if (w) |fd| closeFd(fd);
+            if (merged) |m| {
+                closeFd(m[0]);
+                closeFd(m[1]);
+                merged = null;
+            }
+            failure = .{ .stage = @intCast(i), .class = startClass(e) };
+            break;
+        };
+        // Only the children hold these ends now; a read end reaches EOF when
+        // its writer and that writer's descendants let go.
+        if (w) |fd| closeFd(fd);
+        if (merged) |m| closeFd(m[1]);
+        if (prev_r) |fd| closeFd(fd);
+        prev_r = next_r;
+
+        const pid: posix.pid_t = child.id.?;
+        pids[i] = pid;
+        if (i == 0) {
+            pgid = pid;
+            if (child.stdin) |f| pipes.stdin = f.handle;
+        }
+        if (child.stderr) |f| pipes.errs[i] = f.handle;
+        if (last) {
+            if (child.stdout) |f| pipes.out = f.handle;
+            if (merged) |m| pipes.out = m[0];
+        }
+        started += 1;
     }
 
-    const child = std.process.spawn(io, .{
-        .argv = req.argv,
-        .exe = .{ .explicit = .{ .dir = Io.Dir.cwd(), .path = exe_path } },
-        .cwd = if (req.cwd) |p| .{ .path = p } else .inherit,
-        .environ_map = env,
-        .stdin = stdin_mode,
-        .stdout = out_spawn,
-        .stderr = err_mode,
-        .pgid = 0,
-    }) catch |e| {
-        if (merged) |m| {
-            closeFd(m[0]);
-            closeFd(m[1]);
-        }
-        return .{ .fail = startClass(e) };
-    };
-    // Only the child holds the write end now; the read end reaches EOF when
-    // it and its descendants let go.
-    if (merged) |m| closeFd(m[1]);
-    const pid: posix.pid_t = child.id.?;
-
-    cap.out.reset(req.max_bytes);
-    cap.err.reset(req.max_bytes);
-    var pipes: Pipes = .{
-        .stdin = if (child.stdin) |f| f.handle else null,
-        .out = if (child.stdout) |f| f.handle else null,
-        .err = if (child.stderr) |f| f.handle else null,
-    };
-    if (merged) |m| pipes.out = m[0];
-    // The child was reaped by hand below; the pipes are ours.
+    // The children are ours to reap by hand; the pipes are ours to close.
     var dl: Deadline = .{ .at = if (req.timeout_ns) |t| nowNs() +| t else null };
 
-    pump(gpa, &pipes, input, cap, pid, &dl) catch {
-        // Out of memory or a poll fault: end the child rather than leak it.
-        _ = posix.system.kill(-pid, .KILL);
+    if (failure) |f| {
+        if (prev_r) |fd| closeFd(fd);
         pipes.closeAll();
-        _ = reap(pid, &dl);
-        return .{ .fail = .other };
+        if (started > 0) _ = posix.system.kill(-pgid, .KILL);
+        for (pids[0..started]) |pid| _ = reap(pid, pgid, &dl);
+        return .{ .fail = f };
+    }
+
+    pump(gpa, &pipes, input, cap, pgid, &dl) catch {
+        // Out of memory or a poll fault: end the children rather than leak them.
+        _ = posix.system.kill(-pgid, .KILL);
+        pipes.closeAll();
+        for (pids[0..n]) |pid| _ = reap(pid, pgid, &dl);
+        return .{ .fail = .{ .class = .other } };
     };
     pipes.closeAll();
-    const reaped = reap(pid, &dl);
 
-    const status: seam.ProcStatus = if (dl.timed_out) .timed_out else switch (reaped) {
-        .exited => |c| .{ .exited = c },
-        .signaled => |s| .{ .signaled = signalName(s, &cap.sig) },
-    };
+    var truncated = req.stdout == .capture and cap.out.dropped;
+    for (0..n) |i| {
+        const stderr_bytes: []const u8 = if (req.stderr == .capture) blk: {
+            if (cap.errs.items[i].dropped) truncated = true;
+            break :blk cap.errs.items[i].finish();
+        } else "";
+        cap.stages.items[i] = .{
+            .status = switch (reap(pids[i], pgid, &dl)) {
+                .exited => |c| .{ .exited = c },
+                .signaled => |sig| .{ .signaled = signalName(sig, &cap.sigs.items[i]) },
+            },
+            .stderr = stderr_bytes,
+        };
+    }
     return .{ .done = .{
-        .status = status,
+        .stages = cap.stages.items,
         .stdout = if (req.stdout == .capture) cap.out.finish() else "",
-        .stderr = if (req.stderr == .capture) cap.err.finish() else "",
-        .truncated = (req.stdout == .capture and cap.out.dropped) or (req.stderr == .capture and cap.err.dropped),
+        .timed_out = dl.timed_out,
+        .truncated = truncated,
     } };
 }
 
