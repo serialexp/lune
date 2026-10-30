@@ -27,8 +27,10 @@ fn analyzed(gpa: std.mem.Allocator, t: *const Trace, kinds: []nativegen.Kind, sl
     return nativegen.analyze(gpa, t, kinds, slot_of) orelse error.AnalyzeBailed;
 }
 
-fn expectPlace(row: nativegen.ExitLoc, loc: ngalloc.Loc) !void {
-    switch (loc) {
+/// `row` names where an exit finds the value the body keeps at `loc`
+/// (`Alloc.exitLoc`: a given-up ABI register is read in its shadow cell).
+fn expectPlace(row: nativegen.ExitLoc, alloc: *const ngalloc.Alloc, loc: ngalloc.Loc) !void {
+    switch (alloc.exitLoc(loc)) {
         .reg => |r| {
             try testing.expectEqual(nativegen.ExitLoc.Tag.reg, row.tag);
             try testing.expectEqual(@as(u32, @intFromEnum(r)), row.payload);
@@ -130,11 +132,11 @@ test "doc 56 exit locations: each needed value gets the allocator's place and it
     // Slot homes: the allocator's home, all body long. Only the invariant
     // one may skip its own slot.
     const i_row = m.find(0).?;
-    try expectPlace(i_row, alloc.loc[0]);
+    try expectPlace(i_row, &alloc, alloc.loc[0]);
     try testing.expectEqual(nativegen.ExitLoc.LIVE_WHOLE_BODY, i_row.live_until);
     try testing.expectEqual(nativegen.ExitLoc.NO_SLOT, i_row.invariant_slot);
     const lim_row = m.find(1).?;
-    try expectPlace(lim_row, alloc.loc[1]);
+    try expectPlace(lim_row, &alloc, alloc.loc[1]);
     try testing.expectEqual(@as(u16, 1), lim_row.invariant_slot);
     for ([_]usize{ 5, 10, 13 }) |e| {
         try testing.expect(m.at(0, e) != null);
@@ -155,7 +157,7 @@ test "doc 56 exit locations: each needed value gets the allocator's place and it
 
     // u (%8) lives to the φ, so both later exits hold it.
     const u_row = m.find(8).?;
-    try expectPlace(u_row, alloc.loc[8]);
+    try expectPlace(u_row, &alloc, alloc.loc[8]);
     try testing.expect(m.at(8, 10) != null);
     try testing.expect(m.at(8, 13) != null);
     try testing.expect(m.at(8, 5) == null); // not yet defined
@@ -456,9 +458,9 @@ test "doc 56 exit locations: a float home is an XMM row" {
     const acc = m.find(4).?;
     try testing.expectEqual(nativegen.ExitLoc.Tag.xmm, acc.tag);
     try testing.expectEqual(nativegen.Kind.float, acc.kind);
-    try expectPlace(acc, alloc.loc[4]);
+    try expectPlace(acc, &alloc, alloc.loc[4]);
     try testing.expect(m.at(4, 7) != null);
-    try expectPlace(m.find(0).?, alloc.loc[0]);
+    try expectPlace(m.find(0).?, &alloc, alloc.loc[0]);
 }
 
 test "doc 56 exit locations: homes past the register pool are spill rows with frame displacements" {
@@ -503,7 +505,7 @@ test "doc 56 exit locations: homes past the register pool are spill rows with fr
     var spills: usize = 0;
     for (0..N) |r| {
         const row = m.find(r).?;
-        try expectPlace(row, alloc.loc[r]);
+        try expectPlace(row, &alloc, alloc.loc[r]);
         try testing.expect(row.holdsAt(exit_ref));
         if (row.tag == .spill) spills += 1;
     }

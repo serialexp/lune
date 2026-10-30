@@ -725,8 +725,9 @@ const SharedBaseMode = enum {
     /// only through its hoisted bases, so it is the one to give up its
     /// register when the second read's value finds none free.
     shared,
-    /// One more value lives across the reads: the container yields its
-    /// register to the first read, so the second read's value evicts a base.
+    /// Four more values live across the reads. Three take rdi/rsi/rdx (doc
+    /// 63 register pressure item 3), the container yields its register to
+    /// the first read, so the second read's value evicts a base.
     tight,
     /// A float callout between the second and third reads splits each range.
     callout,
@@ -763,7 +764,7 @@ fn sharedBaseTrace(gpa: std.mem.Allocator, mode: SharedBaseMode, reads: *[3]u16)
     var live_buf: [8]u16 = undefined;
     const live = live_buf[0..switch (mode) {
         .pressure => 8,
-        .tight => 1,
+        .tight => 4,
         else => 0,
     }];
     for (live, 0..) |*w, j| {
@@ -838,67 +839,74 @@ test "nativegen(doc63 cleanups): an element table's array bases load once per ra
         var alloc = nativegen.analyze(gpa, &tr, kinds, slot_of) orelse return error.AnalyzeBailed;
         defer alloc.deinit(gpa);
 
-        // Each read's consumer of each base: the aload reads `data`, the
-        // guard_present before it `present`. Which loads the base itself
-        // (the range's `first`), and which reuse it.
-        for ([_]ngalloc.ArrayBaseField{ .data, .present }) |field| {
-            var sb: [3]?ngalloc.SharedBase = undefined;
-            var use: [3]u16 = undefined;
-            for (&sb, &use, reads) |*s, *u, r| {
-                u.* = if (field == .data) r else r - 1;
-                s.* = alloc.sharedBase(u.*, field);
-            }
-            switch (mode) {
-                // Both bases: one range, opened by the first read.
-                .shared => {
-                    for (sb) |s| try testing.expect(s != null);
-                    try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
-                    try testing.expectEqual(@as(u32, use[2]), sb[0].?.last);
-                    try testing.expectEqual(@as(u32, 3), sb[0].?.uses);
-                    try testing.expectEqual(sb[0].?.first, sb[2].?.first);
-                },
-                .tight => switch (field) {
-                    // One range, opened by the first read.
-                    .data => {
+        // `-Dabi-stress` hands rdi/rsi/rdx out first, which moves every
+        // register below; only the oracle match holds there.
+        if (!@import("build_options").abi_stress) {
+            // Each read's consumer of each base: the aload reads `data`, the
+            // guard_present before it `present`. Which loads the base itself
+            // (the range's `first`), and which reuse it.
+            for ([_]ngalloc.ArrayBaseField{ .data, .present }) |field| {
+                var sb: [3]?ngalloc.SharedBase = undefined;
+                var use: [3]u16 = undefined;
+                for (&sb, &use, reads) |*s, *u, r| {
+                    u.* = if (field == .data) r else r - 1;
+                    s.* = alloc.sharedBase(u.*, field);
+                }
+                switch (mode) {
+                    // Both bases: one range, opened by the first read.
+                    .shared => {
                         for (sb) |s| try testing.expect(s != null);
                         try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
                         try testing.expectEqual(@as(u32, use[2]), sb[0].?.last);
                         try testing.expectEqual(@as(u32, 3), sb[0].?.uses);
                         try testing.expectEqual(sb[0].?.first, sb[2].?.first);
                     },
-                    // Nine registers hold three homes, `container`'s
-                    // bases, the element, the extra value and both shared
-                    // bases. The container gives its register to the first
-                    // read's value, so the second read's takes a base:
-                    // `present`'s, whose next load is further off than
-                    // `data`'s, which that read itself consumes. The first
-                    // two reads share it.
-                    .present => {
+                    .tight => switch (field) {
+                        // One range, opened by the first read.
+                        .data => {
+                            for (sb) |s| try testing.expect(s != null);
+                            try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
+                            try testing.expectEqual(@as(u32, use[2]), sb[0].?.last);
+                            try testing.expectEqual(@as(u32, 3), sb[0].?.uses);
+                            try testing.expectEqual(sb[0].?.first, sb[2].?.first);
+                        },
+                        // Twelve registers hold three homes, `container`'s
+                        // bases, the element, the extra values and both shared
+                        // bases. The container gives its register to the first
+                        // read's value, so the second read's takes a base:
+                        // `present`'s, whose next load is further off than
+                        // `data`'s, which that read itself consumes. The first
+                        // two reads share it.
+                        .present => {
+                            for (sb[0..2]) |s| try testing.expect(s != null);
+                            try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
+                            try testing.expectEqual(@as(u32, use[1]), sb[1].?.last);
+                            try testing.expect(sb[2] == null);
+                        },
+                    },
+                    .callout => {
+                        // The callout clobbers the register: the first two reads
+                        // share one range, and the third, alone, loads its own.
                         for (sb[0..2]) |s| try testing.expect(s != null);
                         try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
                         try testing.expectEqual(@as(u32, use[1]), sb[1].?.last);
                         try testing.expect(sb[2] == null);
                     },
-                },
-                .callout => {
-                    // The callout clobbers the register: the first two reads
-                    // share one range, and the third, alone, loads its own.
-                    for (sb[0..2]) |s| try testing.expect(s != null);
-                    try testing.expectEqual(@as(u32, use[0]), sb[0].?.first);
-                    try testing.expectEqual(@as(u32, use[1]), sb[1].?.last);
-                    try testing.expect(sb[2] == null);
-                },
-                .pressure => for (sb) |s| try testing.expect(s == null),
+                    .pressure => for (sb) |s| try testing.expect(s == null),
+                }
             }
+            // Doc 63 register pressure, item 2: the body reads `container` only
+            // through its hoisted bases, so wherever registers ran out it gave up
+            // its own for a frame cell. The callout splits the ranges, so nothing
+            // there runs short and it keeps its register.
+            const cs = alloc.slots[@intCast(alloc.slot_id_of_ref[0])];
+            try testing.expect(cs.prologue_only);
+            try testing.expect(cs.data_home != null and cs.len_home != null);
+            try testing.expectEqual(mode != .callout, cs.home == .spill);
+            // Item 3: rdi/rsi/rdx go to values only once the pool and the
+            // prologue-only homes are used up, so not with three reads alone.
+            for (alloc.abi_cell) |c| try testing.expectEqual(mode == .tight or mode == .pressure, c != null);
         }
-        // Doc 63 register pressure, item 2: the body reads `container` only
-        // through its hoisted bases, so wherever registers ran out it gave up
-        // its own for a frame cell. The callout splits the ranges, so nothing
-        // there runs short and it keeps its register.
-        const cs = alloc.slots[@intCast(alloc.slot_id_of_ref[0])];
-        try testing.expect(cs.prologue_only);
-        try testing.expect(cs.data_home != null and cs.len_home != null);
-        try testing.expectEqual(mode != .callout, cs.home == .spill);
 
         // A full scan, one starting past the hole, one exiting at the hole,
         // and one running off the container.

@@ -31,12 +31,23 @@ pub fn build(b: *std.Build) void {
         "jit-debug",
         "Compile in live JIT debug logging (src/jitdbg.zig); enable at runtime with --jit-debug.",
     ) orelse false;
+    // `-Dabi-stress=true`: every `.loop` trace gives up rdi/rsi/rdx and hands
+    // them to body values first (doc 63, register pressure item 3), so the
+    // test suite and the hashgate exercise the exit reloads everywhere
+    // instead of only under register pressure. A testing build, never a
+    // shipped one: it costs every trace a store per entry and loads per exit.
+    const abi_stress = b.option(
+        bool,
+        "abi-stress",
+        "Make every loop trace give up its ABI registers (rdi/rsi/rdx) to body values first (testing).",
+    ) orelse false;
     // `mahina --version`: the version is build.zig.zon's; the commit is only
     // known when the builder says (tools/mahina-cli.sh passes LUNE_COMMIT), so
     // a plain build reads no git state and stays reproducible.
     const version_commit = b.option([]const u8, "version-commit", "The commit this is built from, for `mahina --version` (the release CLIs pass it)");
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "jit_debug", jit_debug);
+    build_opts.addOption(bool, "abi_stress", abi_stress);
     build_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
     build_opts.addOption(?[]const u8, "version_commit", version_commit);
     const build_opts_mod = build_opts.createModule();

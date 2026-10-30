@@ -284,6 +284,11 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     };
     var alloc = ngalloc.analyzeWith(gpa, t, kinds, slot_of, .{ .exit_side = exit_side }) orelse return null;
     defer alloc.deinit(gpa);
+    // What exit code sees (doc 63, register pressure item 3): the lowering's
+    // stubs, the exit location map and the page facts all read it.
+    var exit_view = alloc.exitView(gpa) catch return null;
+    defer if (exit_view) |v| gpa.free(v.loc);
+    const xalloc: *const Alloc = if (exit_view) |*v| v else &alloc;
 
     // Doc 22 §A.1b/§B.4: the page-owned seed plan. Needs the slot classes
     // (carried-heap discrimination), so it runs after `analyze`. `null` ⇒ more
@@ -449,7 +454,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, &asm_buf, shared_exit, slots, ret_cont_keys, link_hit_counters, slot_rowless_ok, metadata_cells, silent_emissions, exit_side_cells, seed_ctx, seed_plan, heap) catch |e| {
+    const entry_stubs = lower(gpa, t, trace_id, kinds, &alloc, xalloc, &asm_buf, shared_exit, slots, ret_cont_keys, link_hit_counters, slot_rowless_ok, metadata_cells, silent_emissions, exit_side_cells, seed_ctx, seed_plan, heap) catch |e| {
         if (comptime jitdbg.enabled) dbg_lower_error = e;
         if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
@@ -542,10 +547,10 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     // Doc 56 §4.2 (Phase 1): where each value an exit may need lives. Read
     // off the finished allocation, after emission, so it cannot influence
     // the code. Fail-soft: no map on OOM, like the exit snapshots.
-    const exit_locs = exitloc.build(gpa, t, kinds, &alloc) catch ExitLocMap{};
+    const exit_locs = exitloc.build(gpa, t, kinds, xalloc) catch ExitLocMap{};
     // Doc 67 §5.3: the slab fact tables, likewise read off the finished
     // allocation and fail-closed (null proves nothing).
-    const page_facts = factbuild.build(gpa, t, kinds, &alloc);
+    const page_facts = factbuild.build(gpa, t, kinds, xalloc);
     keep_exit_side_cells = true;
     keep_ret_cont_keys = true;
     keep_link_hit_counters = true;
@@ -600,6 +605,7 @@ const ngalloc = @import("nativegen_alloc.zig");
 pub const SlotClass = ngalloc.SlotClass;
 pub const Alloc = ngalloc.Alloc;
 pub const regBit = ngalloc.regBit;
+pub const AbiValue = ngalloc.AbiValue;
 pub const analyze = ngalloc.analyze;
 /// The erroring form, for the jitdbg "unsupported in analyze" probe: its
 /// error-return trace names the exact `error.Bail` site.
@@ -844,10 +850,12 @@ fn emitPreciseSnapshotFlush(a: *x64.Assembler, t: *const Trace, kinds: []const K
 
 /// Lower a proven trace to machine code (cut-2). ABI: rdi = tags base, rsi = payloads
 /// base (the SoA register file's two lanes), rdx = native result out-param, rbx =
-/// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
+/// committed counter, rax/rcx = scratch. A `.loop` trace may give rdi/rsi/rdx to body
+/// values (`ngalloc.AbiValue`); the exit stubs restore them, and the code after a stub
+/// head reads values through `xalloc` (`Alloc.exitView`, or `alloc` itself). Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, ret_cont_keys: []u32, link_hit_counters: []artifact.LinkHitCounter, slot_rowless_ok: []u8, metadata_cells: []usize, silent_emissions: []?SilentSiteEmission, exit_side_cells: []usize, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const Kind, alloc: *const Alloc, xalloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, ret_cont_keys: []u32, link_hit_counters: []artifact.LinkHitCounter, slot_rowless_ok: []u8, metadata_cells: []usize, silent_emissions: []?SilentSiteEmission, exit_side_cells: []usize, seed_ctx: ?*const NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -929,6 +937,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // whole body. Un-fused, rbx = 0, so this stores 0 and `local_completed ==
     // completed` (asserted in the wrapper).
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "entry_rbx"), .rbx);
+    // Doc 63 (register pressure, item 3): the ABI registers this trace gave
+    // to body values go to their cells; the prologue below still reads them
+    // in place (only transients take them, and it runs before any of those
+    // is defined).
+    try emit.emitAbiPark(a, alloc);
 
     const loop_top = try a.label();
     const deopt_exit = try a.label();
@@ -1686,10 +1699,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     std.debug.assert(ins.aux >= 0);
                     // Loop-invariant: load seeded cell pointer from slab.
                     const off: i32 = @as(i32, @intCast(ins.aux)) * 8;
+                    const payloads = try emit.abiBase(a, alloc, .payloads, .rax);
                     switch (placeOfRef(alloc, i)) {
-                        .reg => |r| try a.movRegMem(r, .rsi, off),
+                        .reg => |r| try a.movRegMem(r, payloads, off),
                         .mem => |d| {
-                            try a.movRegMem(.rax, .rsi, off);
+                            try a.movRegMem(.rax, payloads, off);
                             try a.movMemReg(.rsp, d, .rax);
                         },
                         .xmm, .imm => unreachable, // a cell pointer is an int kind, never an XMM home
@@ -1749,10 +1763,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // from `[rsi + aux*8]` into the token's home.
             .uref => {
                 const off: i32 = @as(i32, @intCast(ins.aux)) * 8;
+                const payloads = try emit.abiBase(a, alloc, .payloads, .rax);
                 switch (placeOfRef(alloc, i)) {
-                    .reg => |r| try a.movRegMem(r, .rsi, off),
+                    .reg => |r| try a.movRegMem(r, payloads, off),
                     .mem => |d| {
-                        try a.movRegMem(.rax, .rsi, off);
+                        try a.movRegMem(.rax, payloads, off);
                         try a.movMemReg(.rsp, d, .rax);
                     },
                     .xmm, .imm => unreachable, // a cell pointer is an int kind, never an XMM home
@@ -2770,6 +2785,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     for (exit_labels, 0..) |maybe_l, ei| {
         if (maybe_l) |l| {
             a.bind(l);
+            try emit.emitAbiRestore(a, xalloc);
             try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(ei));
             // Doc 45 D6: PRECISE exits never stage slot dispatch, never open
             // a patch window, never take the linked loop-done branch (codex
@@ -2901,7 +2917,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     try a.cmpRegImm32(.rax, @intCast(trace_exec.LEDGER_CAP - 2));
                     try a.jcc(.a, bridge_full);
 
-                    try emitCompositeBridgeSnapshot(a, t, kinds, alloc, ei);
+                    try emitCompositeBridgeSnapshot(a, t, kinds, xalloc, ei);
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                     try emitSilentSite(a, silent_emissions, metadata_cells, ei, .region_bridge);
                     try emitLedgerAppend(a, trace_id, .region_bridge);
@@ -2958,7 +2974,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     for (linked_loop_done_labels, 0..) |maybe_l, ei| {
         if (maybe_l) |l| {
             a.bind(l);
-            try emitLinkedLoopDoneSnapshot(a, t, kinds, alloc, ei);
+            try emitLinkedLoopDoneSnapshot(a, t, kinds, xalloc, ei);
             try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
             if (shared_exit != null) try emitSilentSite(a, silent_emissions, metadata_cells, ei, .loop_done_linked);
             // 2.3c-2a: record this loop-done transition (chain source I→C once 2.3c-2c
@@ -2987,7 +3003,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         for (0..t.snapshots.len) |si| {
             if (mat[si]) |ml| {
                 a.bind(ml);
-                flush_stores += try emitPreciseSnapshotFlush(a, t, kinds, alloc, @intCast(si + 1));
+                flush_stores += try emitPreciseSnapshotFlush(a, t, kinds, xalloc, @intCast(si + 1));
                 try a.cmpDwordMemImm(.rdx, @offsetOf(NativeResult, "runtime_error"), 0);
                 try a.jcc(.ne, precise_tail_err.?);
                 try a.jmp(precise_tail_resume.?);
@@ -3027,7 +3043,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         try a.jcc(.e, l);
         skip_flush = l;
     }
-    try emitCarriedHomesFlush(a, t, kinds, alloc);
+    try emitCarriedHomesFlush(a, t, kinds, xalloc);
     if (skip_flush) |l| a.bind(l);
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     // 2.3c-2a: record this ordinary / loop-done-ordinary transition. The mini-stub wrote
@@ -3196,7 +3212,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     try a.jcc(.e, l);
                     silent_skip = l;
                 }
-                try emitCarriedHomesFlush(a, t, kinds, alloc);
+                try emitCarriedHomesFlush(a, t, kinds, xalloc);
                 if (silent_skip) |l| a.bind(l);
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
             }

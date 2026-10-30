@@ -40,34 +40,15 @@ pub fn build(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc
     if (t.exit_snapshots.len == 0 or n == 0 or n >= ExitLoc.LIVE_WHOLE_BODY) return .{};
     std.debug.assert(kinds.len == n and alloc.loc.len == n and alloc.last_use.len == n);
 
-    var first_exit: ?usize = null;
-    for (0..n) |i| {
-        if (t.exitSnapIdx(i) != null) {
-            first_exit = i;
-            break;
-        }
-    }
-    const fe = first_exit orelse return .{};
+    const fe = ngalloc.firstExit(t) orelse return .{};
 
     const needed = try gpa.alloc(bool, n);
     defer gpa.free(needed);
     @memset(needed, false);
 
-    // (1) Snapshot refs. The store holds only snapshots some body exit
-    // uses (`tropt` zeroes the rest and finalize compacts them away).
-    for (t.exit_snapshot_slots) |ss| {
-        if (ss.ref < n) needed[ss.ref] = true;
-    }
-
-    // (2) What the sunk stores below the first exit read. `finalize`
-    // appends them after every guard, so any of them may belong to an
-    // earlier bytecode than some exit above it.
-    for (fe + 1..n) |i| {
-        const ins = t.instrs[i];
-        if (!isSunkStoreOp(ins.op)) continue;
-        markStoreRead(t, needed, ins.a, i);
-        markStoreRead(t, needed, ins.b, i);
-    }
+    // (1) Snapshot refs, and (2) what the sunk stores below the first exit
+    // read: the same set the allocator gives shadow cells (`AbiEvict`).
+    ngalloc.markExitReads(t, fe, needed);
 
     // (3) Carried homes: exactly the slots the ordinary deopt flush writes
     // back (`lower`'s `deopt_exit`).
@@ -105,33 +86,6 @@ fn frameWords(kinds: []const Kind, alloc: *const Alloc) u32 {
     var boxed: u32 = 0;
     for (kinds) |k| boxed += @intFromBool(k == .boxed);
     return alloc.spill_count + boxed;
-}
-
-/// The deferred store ops `finalize` sinks below every guard (the
-/// `loopDoneSnapshotSupported` inventory plus `sgm_setpos`).
-fn isSunkStoreOp(op: trace_ir.IrOp) bool {
-    return switch (op) {
-        .astore, .hstore, .ustore, .gstore, .sgm_setpos => true,
-        else => false,
-    };
-}
-
-/// Mark `ref`, read by instruction `reader`, and — when it is an address
-/// token — what the store reaches through it: an `aref`'s table and index,
-/// an `href`'s table root and key, a `gcell`'s row token and column, a
-/// `garow`'s table and row. Refs strictly decrease, so this terminates; the
-/// deepest real chain is `gstore → gcell → garow → table`.
-fn markStoreRead(t: *const Trace, needed: []bool, ref: usize, reader: usize) void {
-    if (ref >= reader) return;
-    needed[ref] = true;
-    const tok = t.instrs[ref];
-    switch (tok.op) {
-        .aref, .href, .garow, .gcell => {
-            markStoreRead(t, needed, tok.a, ref);
-            markStoreRead(t, needed, tok.b, ref);
-        },
-        else => {},
-    }
 }
 
 fn flushedCarried(s: SlotInfo, n: usize) bool {
@@ -209,7 +163,9 @@ fn row(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ref: usize) Ex
     if (!ngalloc.isTransient(ins.op)) return out;
     // Nor does a const-key aref: it is an immediate (`prove.arefConstIdx`).
     if (alloc.arefImm(ref) != null) return out;
-    setPlace(&out, alloc.loc[ref]);
+    // An adapter runs after the exit stub's head, which saved a given-up
+    // ABI register to its shadow (`Alloc.exitLoc`).
+    setPlace(&out, alloc.exitLoc(alloc.loc[ref]));
     var until: usize = alloc.last_use[ref];
     // At its last use the value's register may be handed straight to the
     // reading instruction's result (win-1 operand reuse). An exit taken by
@@ -228,6 +184,9 @@ fn row(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ref: usize) Ex
 fn setPlace(out: *ExitLoc, l: Loc) void {
     switch (l) {
         .reg => |r| {
+            // An exit reloads a given-up ABI register before anything
+            // reads a value, so `row` maps it to its shadow first.
+            std.debug.assert(ngalloc.regBit(r) & ngalloc.ABI_REG_MASK == 0);
             out.tag = .reg;
             out.payload = @intFromEnum(r);
         },

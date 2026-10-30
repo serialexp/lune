@@ -2193,7 +2193,7 @@ test "doc 25: malformed ty stamps fail closed — .boolean stamp, and .float on 
     }
 }
 
-test "doc 25: int divide + float-kernel callout + spill pressure — div_save owns a unique slot past the callout area" {
+test "doc 25: int divide + float-kernel callout + spill pressure — rdx's slot is unique and outside the callout area" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     // Slots: r0=i, r1..r12=int accs (carried), r13=a, r14=b (invariant int),
@@ -2260,8 +2260,11 @@ test "doc 25: int divide + float-kernel callout + spill pressure — div_save ow
     var es = [_]u16{};
     const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
-    // Structural proof: div_save exists, is a real spill slot, and sits
-    // wholly PAST the callout save region (never its padding slot).
+    // Structural proof: the slot rdx lives in across a division is a real
+    // spill slot outside the callout save region (never its padding slot).
+    // A dividing loop gives rdx to the body (doc 63 register pressure item
+    // 3), so that slot is its ABI cell, written once per entry, and there is
+    // no per-division park.
     {
         const kinds = try gpa.alloc(Kind, ins.items.len);
         defer gpa.free(kinds);
@@ -2270,10 +2273,11 @@ test "doc 25: int divide + float-kernel callout + spill pressure — div_save ow
         try testing.expect(proveKinds(gpa, &t, kinds, slot_of));
         var al = analyze(gpa, &t, kinds, slot_of) orelse return error.AnalyzeBailed;
         defer al.deinit(gpa);
-        const ds = al.div_save orelse return error.DivSaveMissing;
+        try testing.expect(al.div_save == null);
+        const cell = al.abi_cell[@intFromEnum(nativegen.AbiValue.result)] orelse return error.ResultCellMissing;
         try testing.expect(al.callout_save_count != 0); // the float mod IS a callout
-        try testing.expect(ds > al.callout_save_base + al.callout_save_count); // past area + padding
-        try testing.expect(ds < al.spill_count); // inside the frame
+        try testing.expect(cell < al.callout_save_base or cell > al.callout_save_base + al.callout_save_count); // outside area + padding
+        try testing.expect(cell < al.spill_count); // inside the frame
     }
 
     // Behavioural proof: full tier parity. a=17, b=5 → q=3, m=2 per iter.
@@ -2287,6 +2291,98 @@ test "doc 25: int divide + float-kernel callout + spill pressure — div_save ow
     try expectMatch(&t, &regs);
     // Negative operand pressure leg: floored adjusts live in the same body.
     regs[13] = Value.int(-17);
+    try expectMatch(&t, &regs);
+}
+
+test "doc 63 register pressure item 3: a value live across a callout or an int division stays out of the ABI registers it would lose" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Slots: r0=i, r1=limit, r2=acc (carried), r3=b (invariant int). Eight
+    // values `w` live across a float callout, which stages its argument in
+    // rdi/rsi/rdx; six more `u`, defined after it, live across an int `%`,
+    // whose `idiv` clobbers rdx; two `v` come after the `%`. All of them feed
+    // `acc` at the end, so they run the pool dry: `w` spills, `u` may take rdi
+    // and rsi, and a value defined after the `%` rdx.
+    const W = 8;
+    const U = 6;
+    const V = 2;
+    var ins: std.ArrayListUnmanaged(I) = .empty;
+    defer ins.deinit(gpa);
+    const at = struct {
+        fn f(list: *std.ArrayListUnmanaged(I), g: std.mem.Allocator, x: I) !u16 {
+            try list.append(g, x);
+            return @intCast(list.items.len - 1);
+        }
+    }.f;
+
+    const r_i = try at(&ins, gpa, .{ .op = .slot_load, .aux = 0 });
+    _ = try at(&ins, gpa, .{ .op = .guard_int, .a = r_i });
+    const r_lim = try at(&ins, gpa, .{ .op = .slot_load, .aux = 1 });
+    _ = try at(&ins, gpa, .{ .op = .guard_int, .a = r_lim });
+    const r_lt = try at(&ins, gpa, .{ .op = .lt, .a = r_i, .b = r_lim });
+    _ = try at(&ins, gpa, .{ .op = .guard_true, .a = r_lt });
+    var acc = try at(&ins, gpa, .{ .op = .slot_load, .aux = 2 });
+    _ = try at(&ins, gpa, .{ .op = .guard_int, .a = acc });
+    const r_b = try at(&ins, gpa, .{ .op = .slot_load, .aux = 3 });
+    _ = try at(&ins, gpa, .{ .op = .guard_int, .a = r_b });
+    const r_one = try at(&ins, gpa, .{ .op = .konst, .aux = 0 });
+
+    // Each value is the one before plus 1, so no two are alike.
+    var vals: [W + U + V]u16 = undefined;
+    var prev = r_i;
+    for (&vals, 0..) |*v, k| {
+        if (k == W) {
+            const f = try at(&ins, gpa, .{ .op = .konst, .aux = 1 });
+            _ = try at(&ins, gpa, .{ .op = .fsin, .a = f, .ty = .float });
+        }
+        if (k == W + U) {
+            const m = try at(&ins, gpa, .{ .op = .mod, .a = r_i, .b = r_b, .ty = .int });
+            acc = try at(&ins, gpa, .{ .op = .add, .a = acc, .b = m, .ty = .int });
+        }
+        v.* = try at(&ins, gpa, .{ .op = .add, .a = prev, .b = r_one, .ty = .int });
+        prev = v.*;
+    }
+    for (vals) |v| acc = try at(&ins, gpa, .{ .op = .add, .a = acc, .b = v, .ty = .int });
+    const r_inc = try at(&ins, gpa, .{ .op = .add, .a = r_i, .b = r_one, .ty = .int });
+    _ = try at(&ins, gpa, .{ .op = .phi, .b = acc, .aux = 2 });
+    _ = try at(&ins, gpa, .{ .op = .phi, .b = r_inc, .aux = 0 });
+    _ = try at(&ins, gpa, .{ .op = .loop });
+
+    var consts = [_]Value{ Value.int(1), Value.float(0.5) };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    {
+        const kinds = try gpa.alloc(Kind, ins.items.len);
+        defer gpa.free(kinds);
+        const slot_of = try gpa.alloc(i32, ins.items.len);
+        defer gpa.free(slot_of);
+        try testing.expect(proveKinds(gpa, &t, kinds, slot_of));
+        var al = analyze(gpa, &t, kinds, slot_of) orelse return error.AnalyzeBailed;
+        defer al.deinit(gpa);
+        const abi = regBit(.rdi) | regBit(.rsi) | regBit(.rdx);
+        for (vals, 0..) |v, k| {
+            const bit: u16 = switch (al.loc[v]) {
+                .reg => |r| regBit(r),
+                else => 0,
+            };
+            if (k < W) try testing.expect(bit & abi == 0);
+            if (k >= W and k < W + U) try testing.expect(bit & regBit(.rdx) == 0);
+        }
+        // All three went to values, and the division parks nothing.
+        var taken: u16 = 0;
+        for (al.loc) |l| switch (l) {
+            .reg => |r| taken |= regBit(r) & abi,
+            else => {},
+        };
+        try testing.expectEqual(abi, taken);
+        for (al.abi_cell) |c| try testing.expect(c != null);
+        try testing.expect(al.div_save == null);
+    }
+
+    var regs = [_]Value{ Value.int(0), Value.int(6), Value.int(0), Value.int(7) };
+    try expectMatch(&t, &regs);
+    regs[0] = Value.int(-9);
     try expectMatch(&t, &regs);
 }
 

@@ -27,6 +27,7 @@ const VALUE_LANE = layout.VALUE_LANE;
 const GRID_LANE = layout.GRID_LANE;
 const BOOL_LANE = layout.BOOL_LANE;
 const SPILL_MAX = mcode.SPILL_MAX;
+const abi_stress = @import("build_options").abi_stress;
 
 // ---------------------------------------------------------------------------
 // cut-2: register allocation + single-snapshot deopt — the analysis half
@@ -205,6 +206,18 @@ pub const Alloc = struct {
     // site's guard immediately follows its call. Null without host calls.
     host_epoch_save: ?u32 = null,
 
+    // --- given-up ABI registers (doc 63, register pressure item 3) ---
+    // The frame cell each `AbiValue` lives in once its register went to body
+    // values (`AbiEvict`), null while it stays in its register. `lower`
+    // stores the register there at `body_entry`, and every exit stub reloads
+    // it before anything else, so what runs after a stub sees the ABI as it
+    // always did. Indexed by `@intFromEnum(AbiValue)`.
+    abi_cell: [3]?u32 = .{ null, null, null },
+    // The cell an exit stub saves a given-up register to before reloading
+    // it, for a register a value some exit reads may be in. Exit code reads
+    // such a value there (`exitView`).
+    abi_shadow: [3]?u32 = .{ null, null, null },
+
     // --- const-key arefs (doc 63 §5.10.7 follow-up) ---
     // The trace this allocation describes, so `refBaseReg` can materialize a
     // const-key aref's index as an immediate (`prove.arefConstIdx`) — such an
@@ -229,6 +242,48 @@ pub const Alloc = struct {
     /// a lower-indexed guard may not have, so those paths keep the bit set.
     pub fn astorePresenceProven(self: *const Alloc, idx: usize) bool {
         return idx < self.presence_proven.bit_length and self.presence_proven.isSet(idx);
+    }
+
+    /// The frame displacement of `v`'s cell when the trace gave its
+    /// register up, null while `v` stays in its register.
+    pub fn abiDisp(self: *const Alloc, v: AbiValue) ?i32 {
+        const c = self.abi_cell[@intFromEnum(v)] orelse return null;
+        return @as(i32, @intCast(c)) * 8;
+    }
+
+    /// The frame displacement of the cell an exit stub saves `v`'s register
+    /// to, null when no value an exit reads is ever in it.
+    pub fn shadowDisp(self: *const Alloc, v: AbiValue) ?i32 {
+        const c = self.abi_shadow[@intFromEnum(v)] orelse return null;
+        return @as(i32, @intCast(c)) * 8;
+    }
+
+    /// Where code after an exit stub's head finds a value the body keeps at
+    /// `l`: a given-up ABI register with a shadow is its shadow cell.
+    pub fn exitLoc(self: *const Alloc, l: Loc) Loc {
+        switch (l) {
+            .reg => |r| if (AbiValue.ofReg(r)) |v| {
+                if (self.abi_shadow[@intFromEnum(v)]) |c| return .{ .spill = c };
+            },
+            else => {},
+        }
+        return l;
+    }
+
+    /// The allocation as code after an exit stub's head sees it: a value in
+    /// a given-up ABI register is in that register's shadow cell, as the
+    /// stub reloaded the register. Null when no register has a shadow (the
+    /// allocation itself is the view). Only `loc` is the view's own: free it
+    /// alone, never `deinit` the view.
+    pub fn exitView(self: *const Alloc, gpa: std.mem.Allocator) !?Alloc {
+        for (self.abi_shadow) |sh| {
+            if (sh != null) break;
+        } else return null;
+        const loc = try gpa.dupe(Loc, self.loc);
+        for (loc) |*l| l.* = self.exitLoc(l.*);
+        var view = self.*;
+        view.loc = loc;
+        return view;
     }
 
     /// The immediate index of `ref` when it is a const-key aref here.
@@ -343,6 +398,38 @@ pub fn regBit(r: Reg) u16 {
 /// (tags base), rsi (payloads base), and rdx (native result out-param).
 pub const ALLOC_ORDER = [_]Reg{ .r8, .r9, .r10, .r11, .rbp, .r12, .r13, .r14, .r15 };
 pub const CALLEE_SAVED_MASK: u16 = regBit(.rbp) | regBit(.r12) | regBit(.r13) | regBit(.r14) | regBit(.r15);
+
+/// The three values the native trace ABI keeps in registers (`lower`): the
+/// register file's tag lane and payload lane, and the `*NativeResult`
+/// out-param. A `.loop` trace can give their registers to body values
+/// (`AbiEvict`, doc 63 register pressure item 3).
+pub const AbiValue = enum(u2) {
+    tags,
+    payloads,
+    result,
+
+    pub fn reg(v: AbiValue) Reg {
+        return switch (v) {
+            .tags => .rdi,
+            .payloads => .rsi,
+            .result => .rdx,
+        };
+    }
+
+    pub fn ofReg(r: Reg) ?AbiValue {
+        return switch (r) {
+            .rdi => .tags,
+            .rsi => .payloads,
+            .rdx => .result,
+            else => null,
+        };
+    }
+};
+pub const ABI_REG_MASK: u16 = regBit(.rdi) | regBit(.rsi) | regBit(.rdx);
+/// The order `AbiEvict` gives the registers up in. Each costs the same (a
+/// store per entry, a load per exit taken); rdx first, as the one a dividing
+/// body gives up anyway.
+const ABI_ORDER = [_]AbiValue{ .result, .payloads, .tags };
 
 /// Preference order for Phase-2 invariant array-base homes: `ALLOC_ORDER` reversed,
 /// so base pointers claim the callee-saved tail (r15…r12, rbp) the body's linear
@@ -1503,6 +1590,10 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // load. Exit stubs and adapters, which run at other points, never share.
     var bases: std.ArrayList(SharedBase) = .empty;
     defer bases.deinit(gpa);
+    // The ABI registers the body may take, for shared bases and transients
+    // (doc 63, register pressure item 3).
+    var abi = try AbiEvict.init(gpa, t, kinds, slots.items, slot_id_of_ref, callouts.items, marker_idx, &spill_count);
+    defer abi.deinit(gpa);
     // A base the lowering loads itself: no hoisted home holds it.
     const unhomed = struct {
         fn f(sl: []const SlotInfo, sid_of: []const i32, root: usize, field: ArrayBaseField) bool {
@@ -1571,7 +1662,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // second, parallel active set tracks the XMM pool (float transients) — the two
     // register files expire independently into `free` / `free_xmm`.
     // `base` names the shared base an entry holds (NO_BASE for a transient).
-    var active: [ALLOC_ORDER.len]struct { reg: Reg, last: u32, base: u32 = NO_BASE } = undefined;
+    var active: [ALLOC_ORDER.len + ABI_ORDER.len]struct { reg: Reg, last: u32, base: u32 = NO_BASE } = undefined;
     var active_len: usize = 0;
     var active_xmm: [XMM_ALLOC_ORDER.len]struct { reg: Reg, last: u32 } = undefined;
     var active_xmm_len: usize = 0;
@@ -1591,14 +1682,18 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             var wb: usize = 0;
             for (active[0..active_len]) |e| {
                 if (e.last < i) {
-                    free |= regBit(e.reg);
+                    abi.release(&free, e.reg);
                 } else {
                     active[wb] = e;
                     wb += 1;
                 }
             }
             active_len = wb;
-            if (pickReg(&free) orelse evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r| {
+            if ((if (abi_stress) abi.take(b.first, b.last, &spill_count) else null) orelse
+                pickReg(&free) orelse
+                evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp) orelse
+                abi.take(b.first, b.last, &spill_count)) |r|
+            {
                 b.reg = r;
                 used_callee |= regBit(r) & CALLEE_SAVED_MASK;
                 active[active_len] = .{ .reg = r, .last = b.last, .base = @intCast(next_base) };
@@ -1623,7 +1718,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         var w: usize = 0;
         for (active[0..active_len]) |e| {
             if (e.last < i) {
-                free |= regBit(e.reg);
+                abi.release(&free, e.reg);
             } else {
                 active[w] = e;
                 w += 1;
@@ -1688,6 +1783,8 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             const r = loc[c.ref].reg;
             if (home_reg_mask & regBit(r) != 0) continue;
             if (last_use[c.ref] != i) continue;
+            // A given-up ABI register passes on only to a result it may hold.
+            if (regBit(r) & ABI_REG_MASK != 0 and abi.allowed(i, last_use[i]) & regBit(r) == 0) continue;
             // Repurpose the operand's active entry for the result's live range.
             for (active[0..active_len]) |*e| {
                 if (e.reg == r) {
@@ -1700,15 +1797,20 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         }
         if (coalesced) |r| {
             loc[i] = .{ .reg = r };
-        } else if (pickReg(&free) orelse evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r| {
+        } else if ((if (abi_stress) abi.take(i, last_use[i], &spill_count) else null) orelse
+            pickReg(&free) orelse
+            evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp) orelse
+            abi.take(i, last_use[i], &spill_count)) |r|
+        {
             // A prologue-only slot gives up its register before a shared
             // base does: it costs one store per entry, the base a load per
-            // consumer per iteration.
+            // consumer per iteration. An ABI register costs the same store,
+            // and a load per exit taken.
             loc[i] = .{ .reg = r };
             used_callee |= regBit(r) & CALLEE_SAVED_MASK;
             active[active_len] = .{ .reg = r, .last = last_use[i] };
             active_len += 1;
-        } else if (evictSharedBase(active[0..active_len], bases.items, i, if (i < base_of.len) base_of[i] else .{})) |e| {
+        } else if (evictSharedBase(active[0..active_len], bases.items, i, if (i < base_of.len) base_of[i] else .{}, abi.allowed(i, last_use[i]))) |e| {
             // A shared base is rematerializable (each consumer can reload it
             // from its table), so it gives up its register before any value
             // spills: its range now ends before `i`, and the consumers from
@@ -1719,7 +1821,9 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             loc[i] = .{ .spill = spill_count };
             spill_count += 1;
         }
+        if (loc[i] == .reg) abi.note(i, loc[i].reg);
     }
+    const abi_shadow = abi.shadows(&spill_count);
 
     // --- invariant assertions (compiled out in release; the structural guardrail) ---
     if (std.debug.runtime_safety) {
@@ -1855,15 +1959,17 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // --- rdx park slot for inline int mod/idiv (doc 25 D1) ---
     // Reserved AFTER the callout region so it can never alias it (codex
     // medium). One slot serves every int mod/idiv in the body — the park is
-    // strictly instruction-local, never live across two of them.
+    // strictly instruction-local, never live across two of them. A trace
+    // whose rdx went to the body (`AbiEvict`) parks nothing: no value in rdx
+    // spans a division, and the exit stubs reload `*NativeResult`.
     var div_save: ?u32 = null;
-    for (t.instrs) |ins| {
+    if (abi.cell[@intFromEnum(AbiValue.result)] == null) for (t.instrs) |ins| {
         if ((ins.op == .mod or ins.op == .idiv) and ins.ty == .int) {
             div_save = spill_count;
             spill_count += 1;
             break;
         }
-    }
+    };
 
     // --- tnew out-param word (doc 45 D6) ---
     // Same discipline as div_save: reserved after the callout region, one
@@ -1903,6 +2009,8 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         .div_save = div_save,
         .tnew_out = tnew_out,
         .host_epoch_save = host_epoch_save,
+        .abi_cell = abi.cell,
+        .abi_shadow = abi_shadow,
         .trace = t,
         .shared_bases = shared_bases,
         .base_of = base_of,
@@ -1911,14 +2019,18 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
 }
 
 /// The active shared base with the furthest last consumer, its range cut to
-/// end before `i` so `i` can take its register; null when none is active. A
+/// end before `i` so `i` can take its register; null when none is active
+/// (none whose register `i` may hold, for an ABI one). A
 /// base `i` itself reads (`now`) goes last: evicting it costs a load at `i`
 /// as well as later, where any other base's next load is still to come.
-fn evictSharedBase(active: anytype, bases: []SharedBase, i: usize, now: BaseOf) ?*std.meta.Elem(@TypeOf(active)) {
+fn evictSharedBase(active: anytype, bases: []SharedBase, i: usize, now: BaseOf, abi_ok: u16) ?*std.meta.Elem(@TypeOf(active)) {
     var pick: ?*std.meta.Elem(@TypeOf(active)) = null;
     var pick_now = false;
     for (active) |*e| {
         if (e.base == NO_BASE) continue;
+        // A base in a given-up ABI register passes it only to a value
+        // `AbiEvict.allowed` admits (`abi_ok`).
+        if (regBit(e.reg) & ABI_REG_MASK & ~abi_ok != 0) continue;
         const is_now = e.base == now.data or e.base == now.present;
         const better = if (pick == null)
             true
@@ -2114,6 +2226,227 @@ const HomeReads = struct {
         return !self.hot.isSet(lr) and !(self.has_append and self.len.isSet(lr));
     }
 };
+
+/// Doc 63 (register pressure, item 3): the ABI registers (`AbiValue`) a
+/// `.loop` trace gives to body values. A given-up value lives in a frame cell
+/// from `body_entry` on (one store per entry), and every exit stub reloads it
+/// first (one load per exit taken), so everything after the stubs (flushes,
+/// the ledger, adapters, linked handoffs, the trampoline) sees the ABI it
+/// always did. When a value an exit reads where the body left it (a snapshot
+/// ref or sunk-store operand, `markExitReads`, or a φ's back-edge value,
+/// which the loop-done and bridge snapshots write) may be in the register,
+/// the stub first saves the register to a shadow cell, and exit code reads
+/// the value there (`Alloc.exitView`): one more store per exit taken. Two
+/// things keep a value out of a given-up register:
+///   - a body callout in its range: argument staging writes rdi, rsi and
+///     rdx in a fixed order, which could overwrite a value before reading
+///     it as an argument;
+///   - for rdx, an int `mod`/`idiv` in its range: `idiv` clobbers it.
+/// A register goes on demand, like a prologue-only home: when a value would
+/// otherwise take a shared base's register or spill. rdx goes as soon as the
+/// body divides, as that drops the park around each division (two moves per
+/// iteration) for the same per-entry store and per-exit load. rdi/rsi stay
+/// when the back-edge flushes a write-only slot (it writes through both).
+/// rsi stays when a body `href`/`uref` loads a seeded cell from the slab: it
+/// could load rsi's cell first (`emit.abiBase`, which a run-once one does),
+/// but that is a load per iteration. Precise traces
+/// flush mid-iteration snapshots at their exits and keep all three. Empty
+/// (and every method a no-op) when nothing may go.
+const AbiEvict = struct {
+    /// The registers this trace may give up, as `regBit`s.
+    ok: u16 = 0,
+    /// Given up, and holding no body value now.
+    free: u16 = 0,
+    /// Given up, and held a value some exit reads.
+    shadow: u16 = 0,
+    cell: [3]?u32 = .{ null, null, null },
+    exit_read: []bool = &.{},
+    /// How many body callouts / int divisions have an index below `k`.
+    callouts_below: []u32 = &.{},
+    divs_below: []u32 = &.{},
+
+    fn init(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, slots: []const SlotInfo, slot_id_of_ref: []const i32, callouts: []const u32, marker_idx: ?usize, spill_count: *u32) !AbiEvict {
+        const n = t.instrs.len;
+        if (n == 0 or t.instrs[n - 1].op != .loop or t.deopt_mode == .precise) return .{};
+        var ok: u16 = ABI_REG_MASK;
+        for (slots) |s| {
+            if (s.class == .write_only) ok &= ~(regBit(.rdi) | regBit(.rsi));
+        }
+        const body_from = if (marker_idx) |m| m + 1 else 0;
+        var divides = false;
+        for (t.instrs[body_from..]) |ins| switch (ins.op) {
+            .href => if (!isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) {
+                ok &= ~regBit(.rsi);
+            },
+            .uref => ok &= ~regBit(.rsi),
+            .mod, .idiv => if (ins.ty == .int) {
+                divides = true;
+            },
+            else => {},
+        };
+        if (ok == 0) return .{};
+
+        var self: AbiEvict = .{ .ok = ok };
+        errdefer self.deinit(gpa);
+        self.exit_read = try gpa.alloc(bool, n);
+        @memset(self.exit_read, false);
+        if (firstExit(t)) |fe| markExitReads(t, fe, self.exit_read);
+        for (t.instrs) |ins| {
+            if (ins.op == .phi) self.exit_read[ins.b] = true;
+        }
+        self.callouts_below = try gpa.alloc(u32, n + 1);
+        self.divs_below = try gpa.alloc(u32, n + 1);
+        var nc: u32 = 0;
+        var nd: u32 = 0;
+        var next: usize = 0;
+        for (t.instrs, 0..) |ins, i| {
+            self.callouts_below[i] = nc;
+            self.divs_below[i] = nd;
+            if (next < callouts.len and callouts[next] == i) {
+                nc += 1;
+                next += 1;
+            }
+            if ((ins.op == .mod or ins.op == .idiv) and ins.ty == .int) nd += 1;
+        }
+        self.callouts_below[n] = nc;
+        self.divs_below[n] = nd;
+
+        if (divides and ok & regBit(.rdx) != 0) self.giveUp(.result, spill_count);
+        if (abi_stress) for (ABI_ORDER) |v| {
+            if (ok & regBit(v.reg()) != 0 and self.cell[@intFromEnum(v)] == null) self.giveUp(v, spill_count);
+        };
+        return self;
+    }
+
+    fn deinit(self: *AbiEvict, gpa: std.mem.Allocator) void {
+        gpa.free(self.exit_read);
+        gpa.free(self.callouts_below);
+        gpa.free(self.divs_below);
+    }
+
+    fn giveUp(self: *AbiEvict, v: AbiValue, spill_count: *u32) void {
+        self.cell[@intFromEnum(v)] = spill_count.*;
+        spill_count.* += 1;
+        self.free |= regBit(v.reg());
+    }
+
+    /// The registers a value live from instruction `def` through `last` may
+    /// take.
+    fn allowed(self: *const AbiEvict, def: usize, last: usize) u16 {
+        if (self.ok == 0) return 0;
+        const end = @max(def, last) + 1;
+        if (self.callouts_below[end] != self.callouts_below[def]) return 0;
+        var m = self.ok;
+        if (self.divs_below[end] != self.divs_below[def]) m &= ~regBit(.rdx);
+        return m;
+    }
+
+    /// A register for a value live from `def` through `last`: a given-up one
+    /// that is free, else the next one to give up. Null when none qualifies,
+    /// which is every trace with nothing to give up: the check is inline.
+    inline fn take(self: *AbiEvict, def: usize, last: usize, spill_count: *u32) ?Reg {
+        if (self.ok == 0) return null;
+        return self.takeFrom(self.allowed(def, last), spill_count);
+    }
+
+    /// Value `ref` is in register `r`: an exit reading it needs `r`'s shadow.
+    inline fn note(self: *AbiEvict, ref: usize, r: Reg) void {
+        if (regBit(r) & ABI_REG_MASK != 0 and self.exit_read[ref]) self.shadow |= regBit(r);
+    }
+
+    /// The shadow cells, once every value is placed.
+    fn shadows(self: *const AbiEvict, spill_count: *u32) [3]?u32 {
+        var out: [3]?u32 = .{ null, null, null };
+        for (ABI_ORDER) |v| {
+            if (self.shadow & regBit(v.reg()) == 0) continue;
+            out[@intFromEnum(v)] = spill_count.*;
+            spill_count.* += 1;
+        }
+        return out;
+    }
+
+    fn takeFrom(self: *AbiEvict, m: u16, spill_count: *u32) ?Reg {
+        for (ABI_ORDER) |v| {
+            const b = regBit(v.reg());
+            if (self.free & m & b != 0) {
+                self.free &= ~b;
+                return v.reg();
+            }
+        }
+        for (ABI_ORDER) |v| {
+            const b = regBit(v.reg());
+            if (m & b != 0 and self.cell[@intFromEnum(v)] == null) {
+                self.giveUp(v, spill_count);
+                self.free &= ~b;
+                return v.reg();
+            }
+        }
+        return null;
+    }
+
+    /// Return an expired value's register: an ABI one to `self.free`, any
+    /// other to the pool.
+    inline fn release(self: *AbiEvict, free: *u16, r: Reg) void {
+        if (regBit(r) & ABI_REG_MASK != 0) self.free |= regBit(r) else free.* |= regBit(r);
+    }
+};
+
+/// The first instruction that can exit through an exit snapshot, if any.
+pub fn firstExit(t: *const Trace) ?usize {
+    for (0..t.instrs.len) |i| {
+        if (t.exitSnapIdx(i) != null) return i;
+    }
+    return null;
+}
+
+/// The values an exit reads where the body left them (doc 56 §4.2): every
+/// ref an exit snapshot restores, and every value a sunk store below the
+/// first exit `fe` reads, through its address token down to the table,
+/// index and value. `finalize` appends the sunk stores after every guard, so
+/// any of them may belong to an earlier bytecode than some exit above it.
+/// The exit location map describes these (and the carried homes), and one in
+/// a given-up ABI register gets that register's shadow cell (`AbiEvict`).
+pub fn markExitReads(t: *const Trace, fe: usize, needed: []bool) void {
+    const n = t.instrs.len;
+    // The store holds only snapshots some body exit uses (`tropt` zeroes
+    // the rest and finalize compacts them away).
+    for (t.exit_snapshot_slots) |ss| {
+        if (ss.ref < n) needed[ss.ref] = true;
+    }
+    for (fe + 1..n) |i| {
+        const ins = t.instrs[i];
+        if (!isSunkStoreOp(ins.op)) continue;
+        markStoreRead(t, needed, ins.a, i);
+        markStoreRead(t, needed, ins.b, i);
+    }
+}
+
+/// The deferred store ops `finalize` sinks below every guard (the
+/// `loopDoneSnapshotSupported` inventory plus `sgm_setpos`).
+fn isSunkStoreOp(op: trace_ir.IrOp) bool {
+    return switch (op) {
+        .astore, .hstore, .ustore, .gstore, .sgm_setpos => true,
+        else => false,
+    };
+}
+
+/// Mark `ref`, read by instruction `reader`, and — when it is an address
+/// token — what the store reaches through it: an `aref`'s table and index,
+/// an `href`'s table root and key, a `gcell`'s row token and column, a
+/// `garow`'s table and row. Refs strictly decrease, so this terminates; the
+/// deepest real chain is `gstore → gcell → garow → table`.
+fn markStoreRead(t: *const Trace, needed: []bool, ref: usize, reader: usize) void {
+    if (ref >= reader) return;
+    needed[ref] = true;
+    const tok = t.instrs[ref];
+    switch (tok.op) {
+        .aref, .href, .garow, .gcell => {
+            markStoreRead(t, needed, tok.a, ref);
+            markStoreRead(t, needed, tok.b, ref);
+        },
+        else => {},
+    }
+}
 
 /// Doc 63 (register pressure, item 2): hand a value that would otherwise
 /// spill the register of a `prologue_only` slot (`file` picks GP or XMM). The

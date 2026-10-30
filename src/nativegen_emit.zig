@@ -603,6 +603,38 @@ pub fn emitFloatBinOp(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, 
     }
 }
 
+/// Doc 63 (register pressure, item 3): at `body_entry`, store each ABI
+/// register the trace gave to body values (`Alloc.abi_cell`) to its frame
+/// cell. Every entry passes here before any body value is written.
+pub fn emitAbiPark(a: *x64.Assembler, alloc: *const Alloc) !void {
+    for (std.enums.values(ngalloc.AbiValue)) |v| {
+        if (alloc.abiDisp(v)) |d| try a.movMemReg(.rsp, d, v.reg());
+    }
+}
+
+/// The head of every exit stub: save each given-up ABI register a value
+/// some exit reads may be in to its shadow cell, then reload every given-up
+/// one from its cell, so all code after it (the flushes, the ledger,
+/// adapters, a linked handoff, the trampoline) sees the ABI it always did,
+/// and reads those values in the shadows (`Alloc.exitView`).
+pub fn emitAbiRestore(a: *x64.Assembler, alloc: *const Alloc) !void {
+    for (std.enums.values(ngalloc.AbiValue)) |v| {
+        if (alloc.shadowDisp(v)) |d| try a.movMemReg(.rsp, d, v.reg());
+    }
+    for (std.enums.values(ngalloc.AbiValue)) |v| {
+        if (alloc.abiDisp(v)) |d| try a.movRegMem(v.reg(), .rsp, d);
+    }
+}
+
+/// A register holding ABI value `v` for a body read: its own while the trace
+/// keeps it, else `scratch`, loaded from its cell. Only a run-once reader
+/// meets a given-up one (`AbiEvict` keeps it when the loop reads it).
+pub fn abiBase(a: *x64.Assembler, alloc: *const Alloc, v: ngalloc.AbiValue, scratch: Reg) !Reg {
+    const d = alloc.abiDisp(v) orelse return v.reg();
+    try a.movRegMem(scratch, .rsp, d);
+    return scratch;
+}
+
 /// Flush one slot's `Value` into the SoA register file: the 1-byte tag into
 /// `tags[slot]` (rdi, scale-1) and the 8 payload bytes into `payloads[slot]` (rsi,
 /// scale-8). The tag is written with a single-byte store (NOT the old 4-byte
@@ -639,7 +671,12 @@ pub fn flushBoxedSlot(a: *x64.Assembler, dst_slot: i32, tag_spill: u32, payload:
     try a.movByteMemReg(.rdi, dst_slot, .rax);
     const poff: i32 = dst_slot * 8;
     switch (payload) {
-        .reg => |r| try a.movMemReg(.rsi, poff, r),
+        .reg => |r| {
+            // Never a base: a trace that flushes slots in its body keeps
+            // rdi/rsi, and exit code reads given-up ones in their shadows.
+            std.debug.assert(r != .rdi and r != .rsi);
+            try a.movMemReg(.rsi, poff, r);
+        },
         .mem => |d| {
             try a.movRegMem(.rax, .rsp, d);
             try a.movMemReg(.rsi, poff, .rax);
@@ -654,7 +691,12 @@ pub fn flushSlot(a: *x64.Assembler, slot: i32, kind: Kind, payload: Place) !void
     const poff: i32 = slot * 8;
     try a.movByteMemImm(.rdi, slot, tag);
     switch (payload) {
-        .reg => |r| try a.movMemReg(.rsi, poff, r),
+        .reg => |r| {
+            // Never a base: a trace that flushes slots in its body keeps
+            // rdi/rsi, and exit code reads given-up ones in their shadows.
+            std.debug.assert(r != .rdi and r != .rsi);
+            try a.movMemReg(.rsi, poff, r);
+        },
         .xmm => |x| try a.movsdMemReg(.rsi, poff, x),
         .mem => |d| {
             try a.movRegMem(.rax, .rsp, d);
@@ -1886,7 +1928,10 @@ pub fn emitFloorCeilCallout(
 /// so native must not either (codex blocker, doc 25). `idiv` clobbers
 /// rdx:rax, and rdx carries the live `*NativeResult`, so rdx is parked in
 /// the allocator-owned `div_save` frame slot for the duration; rax/rcx are
-/// body scratch. The result canonically ends in rax on every path.
+/// body scratch. A trace that gave rdx to the body (`ngalloc.AbiValue`)
+/// parks nothing: `*NativeResult` is in its cell, which the exit stubs
+/// reload, and no body value in rdx spans a division. The result
+/// canonically ends in rax on every path.
 pub fn emitIntDivMod(
     a: *x64.Assembler,
     alloc: *const Alloc,
@@ -1894,10 +1939,11 @@ pub fn emitIntDivMod(
     i: usize,
     exit_labels: []?x64.Label,
 ) !void {
-    const save_disp: i32 = @as(i32, @intCast(alloc.div_save.?)) * 8;
+    const park: ?i32 = if (alloc.div_save) |s| @as(i32, @intCast(s)) * 8 else null;
+    std.debug.assert((park == null) == (alloc.abiDisp(.result) != null));
     // Park rdx. The mov leaves rdx itself intact, so the zero-divisor exit
     // below still runs with a valid *NativeResult in rdx.
-    try a.movMemReg(.rsp, save_disp, .rdx);
+    if (park) |d| try a.movMemReg(.rsp, d, .rdx);
     try placeToReg(a, .rax, placeOfRef(alloc, ins.a)); // dividend
     try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // divisor
     try a.cmpRegImm32(.rcx, 0);
@@ -1941,7 +1987,7 @@ pub fn emitIntDivMod(
     }
     a.bind(done);
     try regToPlace(a, placeOfRef(alloc, i), .rax); // home is never rax/rcx/rdx
-    try a.movRegMem(.rdx, .rsp, save_disp); // unpark
+    if (park) |d| try a.movRegMem(.rdx, .rsp, d); // unpark
 }
 
 /// Emit the mid-body callout for an allocating interned-string producer

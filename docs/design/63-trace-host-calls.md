@@ -10,7 +10,7 @@ arrays included. Phase 4 not started. Revision 6, approved by Codex and
 Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
 Owner: Bart
-Last updated: 2026-10-30
+Last updated: 2026-10-31
 
 ## Implementation status
 
@@ -1930,6 +1930,50 @@ allocatable GPRs and each body konst took the ninth for a `movabs`.
    chained entry re-runs the prologue, and the cell store is one more
    instruction per hop. Compile cost is about +27k instructions on nbody.
    The probe went 87 → 71 instructions per iteration.
+3. *The pinned GPRs* (`AbiEvict`, `Alloc.abi_cell`/`abi_shadow`/
+   `exitView` in `nativegen_alloc.zig`, `emitAbiPark`/`emitAbiRestore`/
+   `abiBase` in `nativegen_emit.zig`). The native ABI pins rdi (tags),
+   rsi (payloads), rdx (`*NativeResult`) and rbx (the completed
+   counter). Bart scoped this to the first three, on demand. A `.loop`,
+   non-precise trace may give them to body transients. A given-up value
+   is stored to a frame cell at `body_entry` (one store per entry, after
+   the prologue has read it), and every exit stub's head reloads it (one
+   load per exit taken). Everything after the head (the flushes, the
+   ledger, the doc 56 adapters, linked handoffs, the trampoline) sees the
+   ABI it always did. Those adapters read exit-snapshot values where the
+   body left them, so excluding exit-read values from the three registers
+   left the probe's `p[2]`/`p[3]` spilling. Instead, a value an exit reads
+   (`markExitReads`, or a φ's back-edge value) may take one: the head
+   first saves the register to a shadow cell, and exit code reads it there
+   through `Alloc.exitView`. The location map and page facts read that
+   view too. A register goes when a transient or shared base would
+   otherwise spill or evict a shared base, after the prologue-only homes.
+   rdx goes up front when the body has an int `%` or `//`: the per-
+   division park (two moves per iteration) becomes one store per entry.
+   Two rules keep a value out of a register it would lose:
+   - a body callout in its range, since argument staging writes all
+     three registers;
+   - for rdx, an int division in its range, since `idiv` clobbers it.
+   rdi and rsi stay pinned when the back-edge flushes a write-only slot.
+   rsi also stays when a body `href` or `uref` loads a seeded cell from
+   the slab. A run-once one loads the cell (`abiBase`); a body one could
+   too, so this rule is about cost, not correctness. Precise traces flush
+   mid-iteration snapshots at their exits and keep all three.
+   `-Dabi-stress=true` gives every eligible trace all three up front and
+   hands them out first; the suite and the hashgate pass that way.
+   Mutations caught: no shadow store, no reload, no callout rule (the new
+   lowering test and the stress suite), no division rule, and no
+   write-only rule. Dropping the `href`/`uref` rule keeps the suite
+   green, as it should. On `bench/` (instructions, JIT on, against item
+   2): grid_matmul −19.1%, grid_matmul_f64 −13.6%, array3d −12.1%,
+   nsieve-bit −9.0%, scalar −2.3%, repack −1.6%, spectral-norm −1.6%,
+   binary-trees −1.4%, nbody −1.3%. Every regression above noise (the
+   scimark runs +1.2%, co_churn, io_lines, pairs_hash) shows the same
+   delta in tier-0, from the `proc` module landing in between, not from
+   this item. Compile cost is about +140k instructions per nbody trace,
+   mostly the bigger exit-stub heads (`AbiEvict.init` about 21k). The
+   probe went 71 → 65 instructions per iteration, with no body spills and
+   no division park.
 
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace
