@@ -15,8 +15,17 @@ pub const ClientGeneral = struct {
     positionEncodings: ?[]const []const u8 = null,
 };
 
+pub const DynamicRegistration = struct {
+    dynamicRegistration: ?bool = null,
+};
+
+pub const ClientWorkspace = struct {
+    didChangeWatchedFiles: ?DynamicRegistration = null,
+};
+
 pub const ClientCapabilities = struct {
     general: ?ClientGeneral = null,
+    workspace: ?ClientWorkspace = null,
 };
 
 pub const WorkspaceFolder = struct {
@@ -51,6 +60,39 @@ pub const RuntimeOptions = struct {
 
 pub const DiagnosticsOptions = struct {
     suppress: ?[]const []const u8 = null,
+};
+
+pub const FileSystemWatcher = struct {
+    globPattern: []const u8,
+};
+
+pub const DidChangeWatchedFilesRegistrationOptions = struct {
+    watchers: []const FileSystemWatcher,
+};
+
+pub const Registration = struct {
+    id: []const u8,
+    method: []const u8,
+    registerOptions: DidChangeWatchedFilesRegistrationOptions,
+};
+
+pub const RegistrationParams = struct {
+    registrations: []const Registration,
+};
+
+pub const FileChangeType = struct {
+    pub const created: u8 = 1;
+    pub const changed: u8 = 2;
+    pub const deleted: u8 = 3;
+};
+
+pub const FileEvent = struct {
+    uri: []const u8,
+    type: u8,
+};
+
+pub const DidChangeWatchedFilesParams = struct {
+    changes: []const FileEvent = &.{},
 };
 
 pub const WorkspaceFoldersChangeEvent = struct {

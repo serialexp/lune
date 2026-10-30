@@ -264,10 +264,14 @@ land; move whole phases to Done once everything inside them is checked.
       key or a wrong type is a warning (`window/showMessage`) naming it, and
       the options are ignored as a whole. The Zed extension passes
       `lsp.mahina.initialization_options`.
-    - [ ] `workspace/didChangeWatchedFiles` (client registration): reload a
-      changed `mahina.toml` (today a config edit needs the folder re-added or
-      a restart). The P6d cache needs no invalidation: it checks the text on
-      each lookup.
+    - [x] `workspace/didChangeWatchedFiles`: after `initialized`, a client
+      that offers dynamic registration is asked (`client/registerCapability`)
+      to watch `**/mahina.toml`; a change, creation or deletion of a folder's
+      file reads that folder's config again, republishes or clears its error,
+      and analyses every open document again. A client that cannot watch is
+      told once (`window/logMessage`) that a config edit then needs the
+      folder re-added or a restart. A refused registration is logged. The
+      P6d cache needs no invalidation: it checks the text on each lookup.
     - [ ] workspace symbols.
 - [ ] **P7 — JIT lenses** (§7.6): extend the `--emit-coverage` artifact
   with source spans and structured abort records; in Zed, a code action

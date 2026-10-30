@@ -182,6 +182,8 @@ pub const Incoming = struct {
     /// Present for requests and notifications; null for a response.
     method: ?[]const u8 = null,
     params: ?json.Value = null,
+    /// A response's error message, when the client refused a request of ours.
+    failure: ?[]const u8 = null,
 
     pub fn isRequest(self: Incoming) bool {
         return self.method != null and self.id != null;
@@ -228,6 +230,9 @@ pub fn parse(arena: std.mem.Allocator, body: []const u8, id_out: *?Id) ParseErro
         return error.InvalidRequest;
     }
     msg.params = obj.get("params");
+    if (msg.method == null) if (member(obj.get("error"), "message")) |m| {
+        msg.failure = if (m == .string) m.string else "(no message)";
+    };
     return msg;
 }
 
@@ -421,6 +426,27 @@ fn putNotification(jw: *json.Stringify, method: []const u8, params: anytype) jso
     try jw.beginObject();
     try jw.objectField("jsonrpc");
     try jw.write("2.0");
+    try jw.objectField("method");
+    try jw.write(method);
+    try jw.objectField("params");
+    try jw.write(params);
+    try jw.endObject();
+}
+
+/// A request of the server's own (`client/registerCapability`).
+pub fn encodeRequest(a: std.mem.Allocator, id: Id, method: []const u8, params: anytype) error{OutOfMemory}![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    var jw: json.Stringify = .{ .writer = &aw.writer, .options = .{ .emit_null_optional_fields = false } };
+    putRequest(&jw, id, method, params) catch return error.OutOfMemory;
+    return aw.toOwnedSlice();
+}
+
+fn putRequest(jw: *json.Stringify, id: Id, method: []const u8, params: anytype) json.Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("jsonrpc");
+    try jw.write("2.0");
+    try jw.objectField("id");
+    try jw.write(id);
     try jw.objectField("method");
     try jw.write(method);
     try jw.objectField("params");
@@ -647,4 +673,15 @@ test "decodeStrict: a misspelt or ill-typed member is refused by its path" {
     try testing.expectEqualStrings("inner.list must be an array of strings", (try decodeStrict(S, a, wrong)).bad);
     const not_obj = try json.parseFromSliceLeaky(json.Value, a, "[1]", .{});
     try testing.expectEqualStrings("the value must be an object", (try decodeStrict(S, a, not_obj)).bad);
+}
+test "encodeRequest, and a refused response's message" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = try encodeRequest(a, .{ .string = "r1" }, "client/registerCapability", .{ .x = 1 });
+    try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"client/registerCapability\",\"params\":{\"x\":1}}", body);
+    var id: ?Id = null;
+    const refused = try parse(a, "{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"error\":{\"code\":-32601,\"message\":\"no\"}}", &id);
+    try testing.expectEqualStrings("no", refused.failure.?);
+    try testing.expect((try parse(a, "{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"result\":null}", &id)).failure == null);
 }
