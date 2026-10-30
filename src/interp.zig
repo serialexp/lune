@@ -3014,8 +3014,8 @@ pub const Vm = struct {
     /// What a system group installs, by name: its natives (from
     /// `base_natives`) and the values that are not natives. `module` is null
     /// for a global.
-    const SystemMember = struct { module: ?[]const u8, name: []const u8, groups: system.Groups };
-    const system_members = blk: {
+    pub const SystemMember = struct { module: ?[]const u8, name: []const u8, groups: system.Groups };
+    pub const system_members = blk: {
         var n: usize = 0;
         for (base_natives) |bn| n += @intFromBool(bn.groups != system.Groups.none);
         const values = [_]SystemMember{
@@ -7129,8 +7129,8 @@ pub const Vm = struct {
             // untouched since the last φ flush). The ordinary ENTRY contract
             // applies, minus everything D6 suppresses for precise pages — no
             // side-trace wants (`noteTakenExit` below is skipped), no
-            // continuation arms, no prime sides, no chains, no
-            // widen-eviction probe. Productive → receipt + tier-0 at the
+            // continuation arms, no prime sides, no chains. (It does take
+            // the widen-eviction probe, below.) Productive → receipt + tier-0 at the
             // anchor (`pc` is unadvanced here); zero → penalty receipt +
             // next candidate (regs entry-coherent, so the sibling trial walk
             // stays sound). One-shot precise prologue exits took the head
@@ -7152,6 +7152,14 @@ pub const Vm = struct {
                 }
                 self.trace.dbg("precise prologue-exit: trace={d} exit={d} completed={d}", .{ ct.id, result.exit_instr, local_done });
                 self.trace.onSideExitReceipt(ct, local_done, result.exit_instr, local_done, .deferred, .entered);
+                // Widen-eviction, as for an ordinary zero exit below: a
+                // precise trace has no side traces to grow past a lane its
+                // array widened beyond, so without it the trace fails its
+                // entry check until the anchor gates, and never re-records.
+                // Zero iterations only: the regs are then entry-coherent.
+                if (local_done == 0 and !wctx.dead.full() and !wctx.dead.has(ct) and self.trace.laneWidenedPast(ct, regs)) {
+                    wctx.dead.add(ct);
+                }
                 wctx.dead.retire(&self.trace);
                 if (local_done > 0) {
                     if (mode == .full and self.runFastPath()) {

@@ -155,13 +155,62 @@ fn unquote(comptime raw: []const u8) []const u8 {
     return &out;
 }
 
-/// The system group of the native named `name`, from `interp.base_natives`.
+/// The system group of the native named `name`, from `interp.base_natives`,
+/// or of the value (`io.stdin`) the VM installs with a group.
 fn groupsOf(comptime name: []const u8) system.Groups {
     for (interp.base_natives) |bn| {
         if (bn.manual) continue;
         if (std.mem.eql(u8, qualifiedName(bn), name)) return bn.groups;
     }
+    for (interp.Vm.system_members) |sm| {
+        const m = sm.module orelse continue;
+        if (name.len == m.len + 1 + sm.name.len and std.mem.startsWith(u8, name, m) and
+            name[m.len] == '.' and std.mem.endsWith(u8, name, sm.name)) return sm.groups;
+    }
     return .none;
+}
+
+/// A global whose every native is in a system group, and the groups that
+/// install it (`aio`).
+const GatedGlobal = struct { name: []const u8, groups: system.Groups };
+
+const gated_globals: []const GatedGlobal = blk: {
+    @setEvalBranchQuota(100_000);
+    var out: []const GatedGlobal = &.{};
+    var seen: []const []const u8 = &.{};
+    for (interp.base_natives) |bn| {
+        if (bn.manual) continue;
+        const top = bn.module orelse bn.name;
+        if (top[0] == '@') continue;
+        const dup = for (seen) |s| {
+            if (std.mem.eql(u8, s, top)) break true;
+        } else false;
+        if (dup) continue;
+        seen = seen ++ .{top};
+        var groups: system.Groups = .none;
+        const free = for (interp.base_natives) |other| {
+            if (other.manual or !std.mem.eql(u8, other.module orelse other.name, top)) continue;
+            if (other.groups == system.Groups.none) break true;
+            groups = groups.unite(other.groups);
+        } else false;
+        if (!free) out = out ++ .{GatedGlobal{ .name = top, .groups = groups }};
+    }
+    break :blk out;
+};
+
+/// Whether the global `name` exists with `enabled` groups: it does unless every
+/// native installing it is in a group none of which is enabled. A name the
+/// stdlib does not install (a host's own) is not this table's to judge.
+pub fn globalAvailable(name: []const u8, enabled: system.Groups) bool {
+    for (gated_globals) |g| {
+        if (std.mem.eql(u8, g.name, name)) return g.groups.overlaps(enabled);
+    }
+    return true;
+}
+
+/// Whether `e` is installed with `enabled` groups.
+pub fn available(e: *const Entry, enabled: system.Groups) bool {
+    return e.groups == system.Groups.none or e.groups.overlaps(enabled);
 }
 
 /// A native's inventory name (`inventoryName`, at compile time).
@@ -209,6 +258,19 @@ test "a doubled quote in a description is one quote" {
     const e = lookup("aio.read").?;
     try testing.expect(std.mem.indexOf(u8, e.description, "\"b\"") != null);
     try testing.expect(std.mem.indexOf(u8, e.description, "\"\"b\"\"") == null);
+}
+
+test "availability: a global or a member in a system group needs that group" {
+    try testing.expect(globalAvailable("print", .none));
+    try testing.expect(globalAvailable("io", .none));
+    try testing.expect(!globalAvailable("aio", .none));
+    try testing.expect(globalAvailable("aio", .{ .clock = true }));
+    try testing.expect(globalAvailable("spawn", .none));
+    try testing.expect(!available(lookup("io.open").?, .{ .stdio = true }));
+    try testing.expect(available(lookup("io.open").?, .{ .files = true }));
+    try testing.expect(available(lookup("io.write").?, .none));
+    // A value installed with a group.
+    try testing.expect(!available(lookup("io.stdin").?, .none));
 }
 
 test "a native's system group comes from its registration" {

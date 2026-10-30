@@ -457,7 +457,7 @@ pub const Server = struct {
         const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
         const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
         if (try self.moduleAccess(a, c)) |m| return memberCompletion(id, m, out);
-        const items = try completion.complete(a, c.an, c.settings.known_globals, c.offset);
+        const items = try completion.complete(a, c.an, c.settings.known_globals, c.settings.system, c.offset);
         const oa = out.arena.allocator();
         const list = try oa.alloc(protocol.CompletionItem, items.len);
         for (items, list) |it, *slot| {
@@ -502,7 +502,7 @@ pub const Server = struct {
         const named = (try library.hoverAt(a, c.an, c.offset)) orelse return out.result(id, @as(?u8, null));
         const oa = out.arena.allocator();
         try out.result(id, protocol.Hover{
-            .contents = .{ .kind = protocol.MarkupKind.markdown, .value = try library.markdown(oa, named.entry) },
+            .contents = .{ .kind = protocol.MarkupKind.markdown, .value = try library.markdown(oa, named.entry, c.settings.system) },
             .range = c.index.toRange(c.an.source, named.span.start, named.span.end, self.encoding),
         });
     }
@@ -1961,4 +1961,26 @@ test "module exports: members after a module local's dot or colon, and definitio
     try testing.expect(itemNamed(open, "sub") != null);
     try testing.expect(itemNamed(open, "add") == null);
     try testing.expectEqual(@as(u64, 2), h.server.module_cache.builds);
+}
+test "system groups: a folder's mahina.toml decides which members exist, and hover says what is missing" {
+    var mem: MemoryFiles = .{ .entries = &.{
+        .{ "/w/mahina.toml", "version = 1\n[runtime]\nsystem = [\"stdio\"]\n" },
+    } };
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.files = mem.files();
+    h.server.known_globals = &.{ "print", "io" };
+    _ = try initWith(&h,
+        \\"workspaceFolders":[{"uri":"file:///w","name":"w"}]
+    );
+    _ = try openDoc(&h, 0, "file:///w/m.mah", "local f = io.open(\"x\")\nlocal l = io.read()\nx = io.\n");
+    const members = try requestAt(&h, 1, "file:///w/m.mah", "textDocument/completion", 2, 7);
+    try testing.expect(itemNamed(members, "open") == null);
+    try testing.expect(itemNamed(members, "read") != null);
+    const open = try requestAt(&h, 2, "file:///w/m.mah", "textDocument/hover", 0, 14);
+    const text = open.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, text, "files system group, which this project does not enable") != null);
+    const read = try requestAt(&h, 3, "file:///w/m.mah", "textDocument/hover", 1, 14);
+    const read_text = read.object.get("result").?.object.get("contents").?.object.get("value").?.string;
+    try testing.expect(std.mem.indexOf(u8, read_text, "does not enable") == null);
 }

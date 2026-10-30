@@ -132,9 +132,9 @@ pub fn hoverAt(a: std.mem.Allocator, an: *const Analysis, offset: u32) std.mem.A
 }
 
 /// The members of the library the cursor follows (`string.fo|`) that a program
-/// may use today. Empty after `:`, after a local's `.`, and for a name that is
-/// no library.
-pub fn members(a: std.mem.Allocator, an: *const Analysis, offset: u32) std.mem.Allocator.Error![]const Member {
+/// may use today, given the `enabled` system groups. Empty after `:`, after a
+/// local's `.`, and for a name that is no library.
+pub fn members(a: std.mem.Allocator, an: *const Analysis, offset: u32, enabled: system.Groups) std.mem.Allocator.Error![]const Member {
     const src = an.source;
     var p: usize = @min(offset, src.len);
     while (p > 0 and isIdentByte(src[p - 1])) p -= 1;
@@ -143,7 +143,7 @@ pub fn members(a: std.mem.Allocator, an: *const Analysis, offset: u32) std.mem.A
     if (isLocal(an, lib, head.start)) return &.{};
     var out: std.ArrayList(Member) = .empty;
     for (stdlib_db.entries) |*e| {
-        if (!offered(e)) continue;
+        if (!offered(e) or !stdlib_db.available(e, enabled)) continue;
         if (e.name.len <= lib.len + 1) continue;
         if (!std.mem.eql(u8, e.name[0..lib.len], lib) or e.name[lib.len] != '.') continue;
         const label = e.name[lib.len + 1 ..];
@@ -241,8 +241,9 @@ pub fn paramSpans(a: std.mem.Allocator, signature: []const u8) std.mem.Allocator
 }
 
 /// The hover text for `entry`: its signature, its description, what its status
-/// means for a program written today, and the system groups it needs.
-pub fn markdown(a: std.mem.Allocator, entry: *const stdlib_db.Entry) std.mem.Allocator.Error![]const u8 {
+/// means for a program written today, and the system groups it needs, saying
+/// so when none of them is `enabled`.
+pub fn markdown(a: std.mem.Allocator, entry: *const stdlib_db.Entry, enabled: system.Groups) std.mem.Allocator.Error![]const u8 {
     const shown = if (entry.signature.len > 0) entry.signature else entry.name;
     const status: []const u8 = if (std.mem.eql(u8, entry.status, "partial"))
         "\n\n*Partly implemented.*"
@@ -261,8 +262,10 @@ pub fn markdown(a: std.mem.Allocator, entry: *const stdlib_db.Entry) std.mem.All
     }
     const needs: []const u8 = if (groups.items.len == 0)
         ""
+    else if (stdlib_db.available(entry, enabled))
+        try std.fmt.allocPrint(a, "\n\n*Needs the {s} system group.*", .{groups.items})
     else
-        try std.fmt.allocPrint(a, "\n\n*Needs the {s} system group.*", .{groups.items});
+        try std.fmt.allocPrint(a, "\n\n*Needs the {s} system group, which this project does not enable (`system` in mahina.toml).*", .{groups.items});
     return std.fmt.allocPrint(a, "```mahina\n{s}\n```\n\n{s}{s}{s}", .{ shown, entry.description, status, needs });
 }
 
@@ -319,7 +322,7 @@ test "members: the library's functions a program may use, after its dot" {
     var an: Analysis = undefined;
     defer an.deinit();
     const off = try analyseAt(&an, a, "x = string.|");
-    const ms = try members(a, &an, off);
+    const ms = try members(a, &an, off, .all);
     var has_format = false;
     for (ms) |m| {
         try testing.expect(std.mem.indexOfScalar(u8, m.label, '.') == null);
@@ -338,15 +341,15 @@ test "members: nothing for a local's dot, after a colon, or for a name that is n
     var an: Analysis = undefined;
     defer an.deinit();
     const local = try analyseAt(&an, a, "local string = {}\nstring.|");
-    try testing.expectEqual(@as(usize, 0), (try members(a, &an, local)).len);
+    try testing.expectEqual(@as(usize, 0), (try members(a, &an, local, .all)).len);
     var an2: Analysis = undefined;
     defer an2.deinit();
     const colon = try analyseAt(&an2, a, "string:|");
-    try testing.expectEqual(@as(usize, 0), (try members(a, &an2, colon)).len);
+    try testing.expectEqual(@as(usize, 0), (try members(a, &an2, colon, .all)).len);
     var an3: Analysis = undefined;
     defer an3.deinit();
     const unknown = try analyseAt(&an3, a, "zebra.|");
-    try testing.expectEqual(@as(usize, 0), (try members(a, &an3, unknown)).len);
+    try testing.expectEqual(@as(usize, 0), (try members(a, &an3, unknown, .all)).len);
 }
 
 test "signature help: the call the cursor is in, and its argument" {

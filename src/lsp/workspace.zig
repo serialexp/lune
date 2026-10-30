@@ -9,8 +9,10 @@
 //! open documents resolve there.
 
 const std = @import("std");
+const system = @import("../system.zig");
 const config = @import("config.zig");
 const modules = @import("modules.zig");
+const stdlib_db = @import("stdlib_db.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -57,6 +59,8 @@ pub const Settings = struct {
     package_path: []const []const u8,
     known_globals: []const []const u8,
     suppress: []const []const u8,
+    /// The system groups the host enables.
+    system: system.Groups,
 };
 
 pub const Workspace = struct {
@@ -119,12 +123,7 @@ pub const Workspace = struct {
             }
         }
         f.runtime_cwd = try std.fs.path.resolveAllocPosix(a, &.{ dir, f.config.cwd });
-        if (f.config.globals.len > 0) {
-            const all = try a.alloc([]const u8, host_globals.len + f.config.globals.len);
-            @memcpy(all[0..host_globals.len], host_globals);
-            for (f.config.globals, all[host_globals.len..]) |g, *slot| slot.* = g.name;
-            f.known_globals = all;
-        }
+        f.known_globals = try knownGlobals(a, host_globals, f.config);
 
         if (self.indexOf(dir)) |i| {
             self.destroy(self.folders.items[i]);
@@ -174,21 +173,36 @@ pub const Workspace = struct {
             .package_path = &config.default_package_path,
             .known_globals = host_globals,
             .suppress = &.{},
+            .system = .all,
         };
         if (self.folderOf(p)) |f| return .{
             .cwd = f.runtime_cwd,
             .package_path = f.config.package_path,
             .known_globals = f.known_globals,
             .suppress = f.config.suppress,
+            .system = f.config.system,
         };
         return .{
             .cwd = try std.fs.path.resolveAllocPosix(a, &.{ p, ".." }),
             .package_path = &config.default_package_path,
             .known_globals = host_globals,
             .suppress = &.{},
+            .system = .all,
         };
     }
 };
+
+/// The host's globals that the config's system groups install, then the
+/// config's `[globals]`. Allocated in `a` unless it is `host` unchanged.
+fn knownGlobals(a: Allocator, host: []const []const u8, cfg: config.Config) Allocator.Error![]const []const u8 {
+    if (cfg.globals.len == 0 and cfg.system == system.Groups.all) return host;
+    var out: std.ArrayList([]const u8) = try .initCapacity(a, host.len + cfg.globals.len);
+    for (host) |g| {
+        if (stdlib_db.globalAvailable(g, cfg.system)) out.appendAssumeCapacity(g);
+    }
+    for (cfg.globals) |g| out.appendAssumeCapacity(g.name);
+    return out.items;
+}
 
 /// Whether `path` is `dir` or lies under it.
 fn contains(dir: []const u8, path: []const u8) bool {
@@ -284,6 +298,28 @@ test "workspace: each folder reads its own config, and nested folders take the i
     const outside = try ws.settingsFor(a, "/w/ab/m.mah", &host);
     try testing.expectEqualStrings("/w/ab", outside.cwd.?);
     try testing.expect((try ws.settingsFor(a, null, &host)).cwd == null);
+}
+
+test "workspace: the system groups decide which of the host's globals exist" {
+    var mem: MemoryFiles = .{ .entries = &.{
+        .{ "/none/mahina.toml", "version = 1\n[runtime]\nsystem = []\n" },
+        .{ "/clock/mahina.toml", "version = 1\n[runtime]\nsystem = [\"clock\"]\n" },
+    } };
+    var ws = Workspace.init(testing.allocator);
+    defer ws.deinit();
+    const host = [_][]const u8{ "print", "aio" };
+    _ = try ws.add("file:///none", "/none", mem.files(), &host);
+    _ = try ws.add("file:///clock", "/clock", mem.files(), &host);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const none = try ws.settingsFor(a, "/none/m.mah", &host);
+    try testing.expectEqual(system.Groups.none, none.system);
+    try testing.expectEqual(@as(usize, 1), none.known_globals.len);
+    try testing.expectEqualStrings("print", none.known_globals[0]);
+    try testing.expectEqual(@as(usize, 2), (try ws.settingsFor(a, "/clock/m.mah", &host)).known_globals.len);
+    // Outside any folder, every group, as the CLI gives.
+    try testing.expectEqual(system.Groups.all, (try ws.settingsFor(a, "/elsewhere/m.mah", &host)).system);
 }
 
 test "workspace: a rejected config keeps the defaults and says why; re-adding and removing" {

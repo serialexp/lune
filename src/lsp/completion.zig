@@ -9,6 +9,7 @@
 const std = @import("std");
 const lexer = @import("../lexer.zig");
 const resolve = @import("../resolve.zig");
+const system = @import("../system.zig");
 const token = @import("../token.zig");
 const analysis_mod = @import("analysis.zig");
 const navigation = @import("navigation.zig");
@@ -55,13 +56,16 @@ pub fn complete(
     a: std.mem.Allocator,
     an: *const Analysis,
     known_globals: []const []const u8,
+    /// The system groups the host enables: a library member outside them is
+    /// not offered.
+    enabled: system.Groups,
     offset: u32,
 ) std.mem.Allocator.Error![]const Item {
     switch (try lexer.contextAt(a, an.source, offset)) {
         .code => {},
         .string, .comment => return &.{},
     }
-    if (afterMemberAccess(an.source, offset)) return memberItems(a, an, offset);
+    if (afterMemberAccess(an.source, offset)) return memberItems(a, an, offset, enabled);
     const under = an.res.occurrenceCovering(offset);
     if (under) |o| if (o.access == .declare) return &.{}; // naming something new
 
@@ -116,8 +120,8 @@ pub fn complete(
 
 /// After `lib.`: the library's members. A function has its signature as detail;
 /// a constant (`math.pi`) is a variable.
-fn memberItems(a: std.mem.Allocator, an: *const Analysis, offset: u32) std.mem.Allocator.Error![]const Item {
-    const ms = try library.members(a, an, offset);
+fn memberItems(a: std.mem.Allocator, an: *const Analysis, offset: u32, enabled: system.Groups) std.mem.Allocator.Error![]const Item {
+    const ms = try library.members(a, an, offset, enabled);
     const items = try a.alloc(Item, ms.len);
     for (ms, items) |m, *slot| {
         const callable = m.entry.signature.len > 0;
@@ -151,7 +155,7 @@ fn completeAt(arena: std.mem.Allocator, marked: []const u8) ![]const Item {
     const src = try std.mem.concat(arena, u8, &.{ marked[0..bar], marked[bar + 1 ..] });
     var an = try analysis_mod.analyse(testing.allocator, src, &known, .{});
     defer an.deinit();
-    const items = try complete(arena, &an, &known, @intCast(bar));
+    const items = try complete(arena, &an, &known, .all, @intCast(bar));
     // `an` owns the label text of locals; copy it out before it goes.
     const out = try arena.alloc(Item, items.len);
     for (items, out) |it, *slot| {
@@ -229,6 +233,19 @@ test "completion: a library's members after its dot, and nothing else there" {
     // Keywords and locals are not members.
     try testing.expect(find(items, "while") == null);
     try testing.expect(find(items, "x") == null);
+}
+
+test "completion: a member in a system group the host does not enable is not offered" {
+    var an = try analysis_mod.analyse(testing.allocator, "x = io.", &known, .{});
+    defer an.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const stdio_only = try complete(a, &an, &known, .{ .stdio = true }, 7);
+    try testing.expect(find(stdio_only, "open") == null);
+    try testing.expect(find(stdio_only, "read") != null);
+    try testing.expect(find(stdio_only, "write") != null);
+    try testing.expect(find(try complete(a, &an, &known, .all, 7), "open") != null);
 }
 
 test "completion: a global that is only read, or is being typed, is not offered" {

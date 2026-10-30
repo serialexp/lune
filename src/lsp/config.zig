@@ -11,7 +11,9 @@
 //!     [runtime]
 //!     cwd = "."                      # the directory `require` searches from
 //!     package_path = ["./?.mah", "./?/init.mah"]
-//!     system = ["files", "stdio"]    # system groups the program is given
+//!     system = ["files", "stdio"]    # system groups the program is given;
+//!                                    # all of them when absent, as the CLI
+//!                                    # gives, none for `[]`
 //!
 //!     [globals]                      # host globals, with a description each
 //!     spawn = "starts a host process"
@@ -36,7 +38,9 @@ pub const Global = struct {
 pub const Config = struct {
     cwd: []const u8 = ".",
     package_path: []const []const u8 = &default_package_path,
-    system: []const []const u8 = &.{},
+    /// The system groups the host enables (doc 65 §5.2): every one unless the
+    /// config says, as `mahina run` gives every one unless `--system` says.
+    system: system.Groups = .all,
     globals: []const Global = &.{},
     suppress: []const []const u8 = &.{},
 };
@@ -219,12 +223,16 @@ const Value = union(enum) {
     integer: i64,
 };
 
-/// The system group names `system = [...]` may list.
-fn isGroupName(name: []const u8) bool {
-    inline for (@typeInfo(system.Group).@"enum".field_names) |g| {
-        if (std.mem.eql(u8, g, name)) return true;
+/// The groups `names` lists, or the first name that is no group.
+pub fn groupsOf(names: []const []const u8) union(enum) { ok: system.Groups, unknown: []const u8 } {
+    var out: system.Groups = .none;
+    for (names) |n| {
+        const group = std.meta.stringToEnum(system.Group, n) orelse return .{ .unknown = n };
+        switch (group) {
+            inline else => |t| @field(out, @tagName(t)) = true,
+        }
     }
-    return false;
+    return .{ .ok = out };
 }
 
 /// Parse `source`. The result's strings live in `a`, which the caller keeps
@@ -282,14 +290,13 @@ fn parseInto(p: *Parser) Error!Parsed {
                         } else if (std.mem.eql(u8, key, "package_path")) {
                             cfg.package_path = try p.stringArray();
                         } else if (std.mem.eql(u8, key, "system")) {
-                            const names = try p.stringArray();
-                            for (names) |n| {
-                                if (!isGroupName(n)) {
+                            switch (groupsOf(try p.stringArray())) {
+                                .ok => |g| cfg.system = g,
+                                .unknown => |n| {
                                     p.failure = .{ .line = p.line, .column = key_at, .message = try std.fmt.allocPrint(p.a, "unknown system group '{s}'", .{n}) };
                                     return error.Malformed;
-                                }
+                                },
                             }
-                            cfg.system = names;
                         } else return unknownKey(p, key_at, key, "[runtime]");
                     },
                     .globals => {
@@ -362,7 +369,7 @@ test "config: a full file reads every table" {
     try testing.expectEqualStrings("src", c.cwd);
     try testing.expectEqual(@as(usize, 2), c.package_path.len);
     try testing.expectEqualStrings("./?/init.mah", c.package_path[1]);
-    try testing.expectEqualStrings("stdio", c.system[1]);
+    try testing.expectEqual(system.Groups{ .files = true, .stdio = true }, c.system);
     try testing.expectEqualStrings("spawn", c.globals[0].name);
     try testing.expectEqualStrings("starts a host process", c.globals[0].description);
     try testing.expectEqualStrings("unused-local", c.suppress[0]);

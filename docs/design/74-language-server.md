@@ -219,11 +219,8 @@ land; move whole phases to Done once everything inside them is checked.
   that scan if it ever matters. Calls are resolved by name only: `f:read(` on a
   value (a local `file`) answers nothing, and so does a callee with a space in
   it (`string . sub(`). Overloads are not split (one signature per name). Values
-  (`math.pi`, `io.stdin`) have no signature; `io.stdin`'s system group is not
-  shown, since it is installed through a value list in `interp.zig` that the
-  table does not read. The group note says what the host needs but does not
-  check that it has it. The inventory's descriptions are implementation notes,
-  shown verbatim in hover.
+  (`math.pi`, `io.stdin`) have no signature. The inventory's descriptions are
+  implementation notes, shown verbatim in hover.
 - [ ] **P6 — cross-file** (§7.4): `require` resolution mirroring
   `package.searchpath`, `mahina.toml` (with a TOML-subset reader in
   `src/lsp/config.zig`), open-document overlays,
@@ -254,12 +251,19 @@ land; move whole phases to Done once everything inside them is checked.
     `require("x").f` without a local; a typed local
     (`local m: T = require("x")`); a module that is itself a required
     value (`return require("y")`).
-  - [ ] P6e `workspace/didChangeWatchedFiles` (client registration): reload a
-    changed `mahina.toml` (today a config edit needs the folder re-added or a
-    restart); workspace symbols (the P6d cache needs no invalidation: it
-    checks the text on each lookup);
-    `initializationOptions` overriding `mahina.toml`; `system` groups
-    filtering the host globals (parsed, not applied yet).
+  - [ ] P6e, in four parts:
+    - [x] `system` groups applied: `system = [...]` sets the groups (every
+      one when absent, as the CLI gives; none for `[]`). A host global whose
+      every native is in a group none of which is on (`aio`) is not known,
+      `lib.` completion leaves out the members of groups that are off, and
+      hover on one says the project does not enable its group. `io.stdin`'s
+      group is now read from the VM's own list (`Vm.system_members`).
+    - [ ] `initializationOptions` overriding `mahina.toml`.
+    - [ ] `workspace/didChangeWatchedFiles` (client registration): reload a
+      changed `mahina.toml` (today a config edit needs the folder re-added or
+      a restart). The P6d cache needs no invalidation: it checks the text on
+      each lookup.
+    - [ ] workspace symbols.
 - [ ] **P7 — JIT lenses** (§7.6): extend the `--emit-coverage` artifact
   with source spans and structured abort records; in Zed, a code action
   running the file and inlay hints from the result. The viz already shades
