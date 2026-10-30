@@ -1,8 +1,9 @@
 //! The workspace symbol index (doc 74 §7.4, P6e): every function and method
 //! of every source file in the workspace folders, at any depth, and each
 //! file's top-level names, for `workspace/symbol`; and the globals each file
-//! uses, for finding the files a rename or references must read
-//! (`filesUsing`).
+//! uses, with where it uses them, so references and rename of a global
+//! answer for the other files without reading them (`filesUsing`,
+//! `currentUsers`).
 //!
 //! Built in the background. When a folder appears, the index saved for it
 //! last session (the host's `Store`) is loaded and the folder walked, a
@@ -37,7 +38,7 @@ pub const max_files = 200_000;
 
 /// Bump when what an entry holds changes (`syntax.symbols`, `useKey`, the
 /// layout below): an index saved by another version is not loaded.
-pub const format_version: u32 = 3;
+pub const format_version: u32 = 4;
 
 /// What one `work` slice may spend: a stat or a directory listing costs one,
 /// a parse one more per 128 bytes of the file. About 5 ms.
@@ -90,6 +91,37 @@ pub const Symbol = struct {
     owner: u32,
 };
 
+/// Where a file uses a global: the line and the first character of the
+/// name, in the index's encoding.
+pub const Spot = struct {
+    line: u32,
+    character: u32,
+};
+
+/// A global a file uses.
+pub const Use = struct {
+    /// The name, in the entry's strings.
+    name: u32,
+    name_len: u16,
+    /// Its spots in `Entry.spots`, in source order.
+    first: u32,
+    count: u32,
+    /// Which of its spots declares it, its first write (as
+    /// `navigation.definition` has it); `no_decl` when nothing writes it.
+    decl: u32,
+
+    pub const no_decl = std.math.maxInt(u32);
+
+    /// The name at `s`: an identifier, as long in every encoding as in
+    /// bytes, so its end follows from its start.
+    pub fn range(u: *const Use, s: Spot) position.Range {
+        return .{
+            .start = .{ .line = s.line, .character = s.character },
+            .end = .{ .line = s.line, .character = s.character + u.name_len },
+        };
+    }
+};
+
 /// The owner of a removed entry's symbols, until `compactIfWasteful`.
 const dead = std.math.maxInt(u32);
 
@@ -114,10 +146,16 @@ pub const Entry = struct {
     len: u32,
     pool_first: u32,
     pool_len: u32,
-    /// The `useKey` of each global the file reads or writes, owned. A file
-    /// held by a lookup is read: two names sharing a key cost a read, not a
-    /// wrong answer.
-    uses: []u64,
+    /// Owned: the `useKey` of each global the file reads or writes (one per
+    /// `uses`, in order), then that of each other name it declares (a local,
+    /// a parameter, a loop variable), which is all a rename needs to know of
+    /// which files could capture its new name.
+    keys: []u64,
+    /// The globals, and where each is used. Owned.
+    uses: []Use,
+    spots: []Spot,
+    /// The parser dropped some of its text, whose names are unknown here.
+    damaged: bool,
     /// Its slot in `Index.slots`.
     id: u32,
     /// When polling, a file's: when it is next stamped, and the wait after
@@ -141,6 +179,30 @@ pub const Entry = struct {
 
     pub fn uri(e: *const Entry) []const u8 {
         return e.strings[e.key_len..][0..e.uri_len];
+    }
+
+    /// The global `name`, if the file uses it.
+    pub fn use(e: *const Entry, name: []const u8) ?*const Use {
+        const want = useKey(name);
+        for (e.keys[0..e.uses.len], e.uses) |k, *u| {
+            if (k == want and std.mem.eql(u8, e.useName(u), name)) return u;
+        }
+        return null;
+    }
+
+    pub fn useName(e: *const Entry, u: *const Use) []const u8 {
+        return e.strings[u.name..][0..u.name_len];
+    }
+
+    pub fn spotsOf(e: *const Entry, u: *const Use) []const Spot {
+        return e.spots[u.first..][0..u.count];
+    }
+
+    /// Whether the file declares a name spelled `name`, other than a global.
+    /// Now and then yes for a name only sharing its `useKey`, which costs
+    /// the caller a read, not a wrong answer.
+    pub fn declares(e: *const Entry, name: []const u8) bool {
+        return std.mem.indexOfScalar(u64, e.keys[e.uses.len..], useKey(name)) != null;
     }
 };
 
@@ -315,7 +377,9 @@ pub const Index = struct {
     }
 
     fn free(self: *Index, e: *Entry) void {
+        self.gpa.free(e.keys);
         self.gpa.free(e.uses);
+        self.gpa.free(e.spots);
         self.gpa.free(e.strings);
         self.gpa.destroy(e);
     }
@@ -959,20 +1023,36 @@ pub const Index = struct {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const parsed = try self.parseText(scratch.allocator(), text);
-        try self.insertFound(key, uri, stamp, parsed.found, parsed.uses, self.pass, document, file);
+        try self.insertFound(key, uri, stamp, parsed, self.pass, document, file);
         try self.schedule(self.entries.get(key).?, if (had) .changed else .found);
     }
 
-    /// Add an entry under `key` (none there yet) holding `found` and `uses`.
-    fn insertFound(self: *Index, key: []const u8, uri: []const u8, stamp: workspace.Files.Stamp, found: []const Found, uses: []const u64, seen: u32, document: bool, file: bool) Allocator.Error!void {
+    /// Add an entry under `key` (none there yet) holding what `p` found.
+    fn insertFound(self: *Index, key: []const u8, uri: []const u8, stamp: workspace.Files.Stamp, p: Parsed, seen: u32, document: bool, file: bool) Allocator.Error!void {
+        const found = p.found;
         const e = try self.gpa.create(Entry);
         errdefer self.gpa.destroy(e);
-        e.strings = try self.gpa.alloc(u8, key.len + uri.len);
+        var names: usize = 0;
+        for (p.uses) |u| names += u.name.len;
+        e.strings = try self.gpa.alloc(u8, key.len + uri.len + names);
         errdefer self.gpa.free(e.strings);
-        e.uses = try self.gpa.dupe(u64, uses);
+        e.keys = try self.gpa.alloc(u64, p.uses.len + p.declared.len);
+        errdefer self.gpa.free(e.keys);
+        e.uses = try self.gpa.alloc(Use, p.uses.len);
         errdefer self.gpa.free(e.uses);
+        e.spots = try self.gpa.dupe(Spot, p.spots);
+        errdefer self.gpa.free(e.spots);
         @memcpy(e.strings[0..key.len], key);
-        @memcpy(e.strings[key.len..], uri);
+        @memcpy(e.strings[key.len..][0..uri.len], uri);
+        var at = key.len + uri.len;
+        for (p.uses, e.uses, e.keys[0..p.uses.len]) |u, *slot, *k| {
+            @memcpy(e.strings[at..][0..u.name.len], u.name);
+            slot.* = .{ .name = @intCast(at), .name_len = @intCast(u.name.len), .first = u.first, .count = u.count, .decl = u.decl };
+            k.* = useKey(u.name);
+            at += u.name.len;
+        }
+        @memcpy(e.keys[p.uses.len..], p.declared);
+        e.damaged = p.damaged;
         e.key_len = @intCast(key.len);
         e.uri_len = @intCast(uri.len);
         e.stamp = stamp;
@@ -1039,13 +1119,26 @@ pub const Index = struct {
         return f.name.len > 0 and f.name.len <= limit and (f.container == null or f.container.?.len <= limit);
     }
 
-    const Parsed = struct {
-        found: []const Found = &.{},
-        uses: []const u64 = &.{},
+    /// A global as parsed (or read back from a save): its spots are
+    /// `Parsed.spots[first..][0..count]`.
+    const FoundUse = struct {
+        name: []const u8,
+        first: u32,
+        count: u32,
+        decl: u32,
     };
 
-    /// The symbols of `text`, and the globals it uses, allocated in `a`
-    /// (scratch).
+    const Parsed = struct {
+        found: []const Found = &.{},
+        uses: []const FoundUse = &.{},
+        spots: []const Spot = &.{},
+        /// The `useKey` of each other name declared, once each.
+        declared: []const u64 = &.{},
+        damaged: bool = false,
+    };
+
+    /// The symbols of `text`, and the globals it uses and where, allocated
+    /// in `a` (scratch).
     fn parseText(self: *Index, a: Allocator, text: []const u8) Allocator.Error!Parsed {
         self.builds += 1;
         const source = try a.dupeSentinel(u8, text, 0);
@@ -1065,31 +1158,77 @@ pub const Index = struct {
         var out: std.ArrayList(Found) = .empty;
         try flatten(a, &out, outline, null, &index, text, self.encoding);
 
-        // The resolver makes one binding per global name.
         var res = try resolve.resolve(self.gpa, tree.root, @intCast(source.len));
         defer res.deinit();
-        var uses: std.ArrayList(u64) = .empty;
-        for (res.bindings.items) |b| {
-            if (b.kind == .global) try uses.append(a, useKey(b.name));
-        }
+        var parsed = try collectUses(a, &res, &index, text, self.encoding);
+        parsed.found = out.items;
+        return parsed;
+    }
 
-        return .{ .found = out.items, .uses = uses.items };
+    /// The globals `res` resolved (one binding per name), each with its
+    /// spots in `enc`, and the keys of the other names it declares.
+    fn collectUses(a: Allocator, res: *const resolve.Resolution, index: *const position.LineIndex, text: []const u8, enc: position.Encoding) Allocator.Error!Parsed {
+        const none = std.math.maxInt(u32);
+        const bindings = res.bindings.items;
+        // Each binding's place in `uses`, if it is a global's.
+        const place = try a.alloc(u32, bindings.len);
+        var uses: std.ArrayList(FoundUse) = .empty;
+        var declared: std.ArrayList(u64) = .empty;
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (bindings, place) |b, *at| {
+            at.* = none;
+            if (b.kind != .global) {
+                const k = useKey(b.name);
+                if (!(try seen.getOrPut(a, k)).found_existing) try declared.append(a, k);
+            } else if (b.name.len <= std.math.maxInt(u16)) {
+                at.* = @intCast(uses.items.len);
+                try uses.append(a, .{ .name = b.name, .first = 0, .count = 0, .decl = Use.no_decl });
+            }
+        }
+        const occs = res.occurrences.items;
+        for (occs) |o| {
+            const at = place[o.binding];
+            if (at != none) uses.items[at].count += 1;
+        }
+        var total: u32 = 0;
+        for (uses.items) |*u| {
+            u.first = total;
+            total += u.count;
+            u.count = 0;
+        }
+        // The occurrences are in source order, so the cursor only moves on.
+        const spots = try a.alloc(Spot, total);
+        var cur = position.Cursor.init(index, text, enc);
+        for (occs) |o| {
+            const at = place[o.binding];
+            if (at == none) continue;
+            const u = &uses.items[at];
+            const writes = o.access == .write or o.access == .read_write;
+            if (writes and o.span.start == bindings[o.binding].decl_span.start) u.decl = u.count;
+            const pos = cur.positionOf(o.span.start);
+            spots[u.first + u.count] = .{ .line = pos.line, .character = pos.character };
+            u.count += 1;
+        }
+        return .{ .uses = uses.items, .spots = spots, .declared = declared.items, .damaged = res.damaged.items.len > 0 };
     }
 
     // ---- the saved index ------------------------------------------------
     //
     // One file per root, named by a hash of its path: "MHSI", the format
     // version, a Wyhash of the rest, then the encoding, the root's path and
-    // extensions, and each file's entry: lengths, stamp, its strings (key,
-    // uri, names), its symbols, their name offsets into those strings, and
-    // its uses.
+    // extensions, and each file's entry: lengths, stamp, whether it is
+    // damaged, its strings (key, uri, global names, symbol names), its
+    // symbols with their name offsets into those strings, its globals (name
+    // offset, spots), the keys of its other names, and its spots.
     // Little-endian. Anything that does not check out is ignored whole: the
     // walk rebuilds.
 
     const magic = "MHSI";
     const header_bytes = magic.len + 4 + 8;
-    const entry_bytes = 4 + 4 + 4 + 8 + 16 + 4 + 4;
+    const entry_bytes = 4 + 4 + 4 + 8 + 16 + 4 + 4 + 4 + 4 + 1;
     const symbol_bytes = 16 + 4 + 4 + 2 + 2 + 1;
+    const use_bytes = 4 + 2 + 4 + 4 + 4;
+    const spot_bytes = 4 + 4;
 
     fn storeName(buf: *[32]u8, root: []const u8) []const u8 {
         return std.fmt.bufPrint(buf, "{x:0>16}.idx", .{std.hash.Wyhash.hash(0, root)}) catch unreachable;
@@ -1110,7 +1249,8 @@ pub const Index = struct {
         var it = self.entries.valueIterator();
         while (it.next()) |ep| {
             const e = ep.*;
-            if (self.savedWith(e, root.path)) size += entry_bytes + e.strings.len + e.pool_len + @as(usize, e.len) * symbol_bytes + 8 * e.uses.len;
+            if (self.savedWith(e, root.path)) size += entry_bytes + e.strings.len + e.pool_len + @as(usize, e.len) * symbol_bytes +
+                use_bytes * e.uses.len + 8 * (e.keys.len - e.uses.len) + spot_bytes * e.spots.len;
         }
         var out: std.ArrayList(u8) = try .initCapacity(scratch, size);
         out.appendSliceAssumeCapacity(magic);
@@ -1130,7 +1270,7 @@ pub const Index = struct {
         while (it.next()) |ep| {
             const e = ep.*;
             if (!self.savedWith(e, root.path)) continue;
-            const base = e.key_len + e.uri_len;
+            const base: u32 = @intCast(e.strings.len);
             putInt(&out, u32, base + e.pool_len);
             putInt(&out, u32, e.key_len);
             putInt(&out, u32, e.uri_len);
@@ -1138,6 +1278,9 @@ pub const Index = struct {
             putInt(&out, i128, e.stamp.mtime_ns);
             putInt(&out, u32, e.len);
             putInt(&out, u32, @intCast(e.uses.len));
+            putInt(&out, u32, @intCast(e.keys.len - e.uses.len));
+            putInt(&out, u32, @intCast(e.spots.len));
+            putInt(&out, u8, @intFromBool(e.damaged));
             out.appendSliceAssumeCapacity(e.strings);
             out.appendSliceAssumeCapacity(self.pool.items[e.pool_first..][0..e.pool_len]);
             for (e.first..e.first + e.len) |k| {
@@ -1152,7 +1295,18 @@ pub const Index = struct {
                 putInt(&out, u16, sym.container_len);
                 putInt(&out, u8, @intFromEnum(sym.kind));
             }
-            for (e.uses) |u| putInt(&out, u64, u);
+            for (e.uses) |u| {
+                putInt(&out, u32, u.name);
+                putInt(&out, u16, u.name_len);
+                putInt(&out, u32, u.first);
+                putInt(&out, u32, u.count);
+                putInt(&out, u32, u.decl);
+            }
+            for (e.keys[e.uses.len..]) |k| putInt(&out, u64, k);
+            for (e.spots) |s| {
+                putInt(&out, u32, s.line);
+                putInt(&out, u32, s.character);
+            }
             n += 1;
         }
         std.debug.assert(out.items.len == size);
@@ -1198,8 +1352,12 @@ pub const Index = struct {
         }
         var found: std.ArrayList(Found) = .empty;
         defer found.deinit(self.gpa);
-        var uses: std.ArrayList(u64) = .empty;
+        var uses: std.ArrayList(FoundUse) = .empty;
         defer uses.deinit(self.gpa);
+        var declared: std.ArrayList(u64) = .empty;
+        defer declared.deinit(self.gpa);
+        var spots: std.ArrayList(Spot) = .empty;
+        defer spots.deinit(self.gpa);
         const n = try r.int(u32);
         for (0..n) |_| {
             const strings_len = try r.int(u32);
@@ -1209,6 +1367,13 @@ pub const Index = struct {
             const mtime = try r.int(i128);
             const symbol_count = try r.int(u32);
             const use_count = try r.int(u32);
+            const declared_count = try r.int(u32);
+            const spot_count = try r.int(u32);
+            const damaged = switch (try r.int(u8)) {
+                0 => false,
+                1 => true,
+                else => return error.Corrupt,
+            };
             if (@as(u64, key_len) + uri_len > strings_len or key_len == 0) return error.Corrupt;
             if (mtime < std.math.minInt(i96) or mtime > std.math.maxInt(i96)) return error.Corrupt;
             const strings = try r.take(strings_len);
@@ -1233,17 +1398,41 @@ pub const Index = struct {
                     .range = range,
                 });
             }
-            if (@as(u64, use_count) * 8 > r.bytes.len - r.at) return error.Corrupt;
+            if (@as(u64, use_count) * use_bytes > r.bytes.len - r.at) return error.Corrupt;
             uses.clearRetainingCapacity();
             try uses.ensureTotalCapacity(self.gpa, use_count);
-            for (0..use_count) |_| uses.appendAssumeCapacity(try r.int(u64));
+            for (0..use_count) |_| {
+                const name_at = try r.int(u32);
+                const name_len = try r.int(u16);
+                const first = try r.int(u32);
+                const spot_n = try r.int(u32);
+                const decl = try r.int(u32);
+                if (name_len == 0 or @as(u64, name_at) + name_len > strings_len) return error.Corrupt;
+                if (@as(u64, first) + spot_n > spot_count or spot_n == 0) return error.Corrupt;
+                if (decl != Use.no_decl and decl >= spot_n) return error.Corrupt;
+                uses.appendAssumeCapacity(.{ .name = strings[name_at..][0..name_len], .first = first, .count = spot_n, .decl = decl });
+            }
+            if (@as(u64, declared_count) * 8 > r.bytes.len - r.at) return error.Corrupt;
+            declared.clearRetainingCapacity();
+            try declared.ensureTotalCapacity(self.gpa, declared_count);
+            for (0..declared_count) |_| declared.appendAssumeCapacity(try r.int(u64));
+            if (@as(u64, spot_count) * spot_bytes > r.bytes.len - r.at) return error.Corrupt;
+            spots.clearRetainingCapacity();
+            try spots.ensureTotalCapacity(self.gpa, spot_count);
+            for (0..spot_count) |_| spots.appendAssumeCapacity(.{ .line = try r.int(u32), .character = try r.int(u32) });
             const key = strings[0..key_len];
             const owner = innermost(self.roots.items, key);
             const ours = owner != null and std.mem.eql(u8, owner.?.path, root.path);
             if (!ours or self.entries.contains(key)) continue;
             const stamp: workspace.Files.Stamp = .{ .size = size, .mtime_ns = @intCast(mtime) };
             try added.ensureUnusedCapacity(scratch, 1);
-            try self.insertFound(key, strings[key_len..][0..uri_len], stamp, found.items, uses.items, 0, false, true);
+            try self.insertFound(key, strings[key_len..][0..uri_len], stamp, .{
+                .found = found.items,
+                .uses = uses.items,
+                .spots = spots.items,
+                .declared = declared.items,
+                .damaged = damaged,
+            }, 0, false, true);
             const e = self.entries.get(key).?;
             added.appendAssumeCapacity(e.key());
             try self.schedule(e, .found);
@@ -1253,18 +1442,58 @@ pub const Index = struct {
 
     // ---- searching ------------------------------------------------------
 
-    /// The entries of the files and documents that may use the global
-    /// `name`: every one that does, as indexed, and now and then one that
-    /// only shares its `useKey`. Allocated in `a`, valid until the index
-    /// changes. One pass over every entry's keys: a few ms at 100k files.
+    /// The entries of the files and documents that use the global `name`,
+    /// as indexed. Allocated in `a`, valid until the index changes. One pass
+    /// over every entry's keys (a name is compared only on a key's match): a
+    /// few ms at 100k files.
     pub fn filesUsing(self: *const Index, a: Allocator, name: []const u8) Allocator.Error![]const *const Entry {
         const want = useKey(name);
         var out: std.ArrayList(*const Entry) = .empty;
         for (self.slots.items) |slot| {
             const e = slot orelse continue;
-            if (std.mem.indexOfScalar(u64, e.uses, want) != null) try out.append(a, e);
+            if (std.mem.indexOfScalar(u64, e.keys[0..e.uses.len], want) == null) continue;
+            if (e.use(name) != null) try out.append(a, e);
         }
         return out.items;
+    }
+
+    pub const Users = struct {
+        entries: []const *const Entry,
+        /// A file among them changed and could not be read again: it is
+        /// left out.
+        unreadable: bool,
+    };
+
+    /// `filesUsing`, with every file among them made current first, so
+    /// their spots can be trusted: each is stamped, and one whose stamp
+    /// moved (or that a coarse clock may hide a rewrite of, `Entry.again`)
+    /// is parsed again, or dropped if it is gone. A stat per file, and a
+    /// parse per changed one. Open documents are current already.
+    pub fn currentUsers(self: *Index, scratch: Allocator, fs: workspace.Files, name: []const u8) Allocator.Error!Users {
+        const Stale = struct { path: []const u8, stamp: ?workspace.Files.Stamp };
+        var stale: std.ArrayList(Stale) = .empty;
+        for (try self.filesUsing(scratch, name)) |e| {
+            if (e.document or !e.file) continue;
+            self.stamps += 1;
+            const stamp = fs.stamp.?(fs.ctx, e.key());
+            const moved = stamp == null or !std.meta.eql(stamp.?, e.stamp);
+            if (moved or (self.polling and e.again)) try stale.append(scratch, .{ .path = try scratch.dupe(u8, e.key()), .stamp = stamp });
+        }
+        var unreadable = false;
+        for (stale.items) |s| {
+            const stamp = s.stamp orelse {
+                self.remove(s.path);
+                continue;
+            };
+            _ = try self.indexFile(scratch, fs, s.path, stamp, .always);
+            const e = self.entries.get(s.path) orelse continue;
+            if (!std.meta.eql(e.stamp, stamp)) {
+                // Not read: what it holds is from before the change.
+                unreadable = true;
+                self.remove(s.path);
+            }
+        }
+        return .{ .entries = try self.filesUsing(scratch, name), .unreadable = unreadable };
     }
 
     /// The symbols matching `query` (see `score`), the closest first, at most
@@ -1339,8 +1568,9 @@ pub const Hit = struct {
     }
 };
 
-/// What an entry keeps of a global it uses: a hash of the name. Saved, so
-/// changing it means a new `format_version`.
+/// The key an entry keeps of a name, to rule most entries out without
+/// comparing names: a hash of it. Saved, so changing it means a new
+/// `format_version`.
 pub fn useKey(name: []const u8) u64 {
     return std.hash.Wyhash.hash(0, name);
 }
@@ -1747,6 +1977,18 @@ fn usersOf(f: *Fixture, name: []const u8) ![]const u8 {
     return out.items;
 }
 
+/// Where the entry at `key` uses the global `name`: `line:character` for
+/// each spot, a `*` after the one declaring it.
+fn spotsOf(f: *Fixture, key: []const u8, name: []const u8) ![]const u8 {
+    const e = f.idx.entries.get(key).?;
+    const u = e.use(name) orelse return "";
+    var out: std.ArrayList(u8) = .empty;
+    for (e.spotsOf(u), 0..) |s, i| {
+        try out.print(f.a(), "{d}:{d}{s} ", .{ s.line, s.character, if (i == u.decl) "*" else "" });
+    }
+    return out.items;
+}
+
 test "symbol index: the files using a global, as walked, edited, opened and saved" {
     var entries = [_][2][]const u8{
         .{ "/w/a.mah", "counter = 0\nfunction bump() counter = counter + 1 end\n" },
@@ -1769,6 +2011,14 @@ test "symbol index: the files using a global, as walked, edited, opened and save
         try testing.expectEqualStrings("/w/a.mah /w/b.mah ", try usersOf(&f, "bump"));
         try testing.expectEqualStrings("/w/b.mah /w/c.mah ", try usersOf(&f, "print"));
         try testing.expectEqualStrings("", try usersOf(&f, "t"));
+        // Where: the first write declares it; through `_G` too.
+        try testing.expectEqualStrings("0:0* 1:16 1:26 ", try spotsOf(&f, "/w/a.mah", "counter"));
+        try testing.expectEqualStrings("2:9 ", try spotsOf(&f, "/w/c.mah", "counter"));
+        try testing.expectEqualStrings("0:3* ", try spotsOf(&f, "/w/d.mah", "counter"));
+        // The other names each declares.
+        try testing.expect(f.idx.entries.get("/w/b.mah").?.declares("counter"));
+        try testing.expect(f.idx.entries.get("/w/c.mah").?.declares("t"));
+        try testing.expect(!f.idx.entries.get("/w/a.mah").?.declares("counter"));
 
         // An open document is read as edited.
         const opened = [_]Open{.{ .uri = "file:///w/b.mah", .path = "/w/b.mah", .text = "counter = 2\n" }};
@@ -1787,6 +2037,38 @@ test "symbol index: the files using a global, as walked, edited, opened and save
     try testing.expectEqual(@as(u64, 0), f.idx.builds);
     try testing.expectEqualStrings("/w/a.mah /w/c.mah /w/d.mah ", try usersOf(&f, "counter"));
     try testing.expectEqualStrings("/w/a.mah /w/b.mah ", try usersOf(&f, "bump"));
+    try testing.expectEqualStrings("0:0* 1:16 1:26 ", try spotsOf(&f, "/w/a.mah", "counter"));
+    try testing.expectEqualStrings("0:3* ", try spotsOf(&f, "/w/d.mah", "counter"));
+    try testing.expect(f.idx.entries.get("/w/b.mah").?.declares("counter"));
+
+    // Made current before its spots are trusted: a file changed on disk is
+    // parsed again (the one only), one gone is dropped.
+    entries[0][1] = "\n\ncounter = 1\n";
+    entries[3][0] = "/w/gone.lua";
+    const users = try f.idx.currentUsers(f.a(), mem.files(), "counter");
+    try testing.expectEqual(@as(usize, 2), users.entries.len);
+    try testing.expect(!users.unreadable);
+    try testing.expectEqual(@as(u64, 1), f.idx.builds);
+    try testing.expectEqualStrings("2:0* ", try spotsOf(&f, "/w/a.mah", "counter"));
+    try testing.expectEqualStrings("/w/a.mah /w/c.mah ", try usersOf(&f, "counter"));
+}
+
+test "symbol index: spots are in the client's encoding, and damage is kept" {
+    // `é` is two bytes, one UTF-16 unit; `😀` four bytes, two units.
+    var entries = [_][2][]const u8{
+        .{ "/w/a.mah", "local s = \"é😀\" .. shared\nlocal = shared\n" },
+    };
+    var mem: workspace.MemoryFiles = .{ .entries = &entries };
+    const roots = [_]Root{.{ .path = "/w", .extensions = &.{".mah"} }};
+    var f = Fixture.init();
+    defer f.deinit();
+    try f.idx.setRoots(f.a(), &roots, null);
+    try f.settle(&mem, null);
+    try testing.expectEqualStrings("0:19 ", try spotsOf(&f, "/w/a.mah", "shared"));
+    try testing.expect(f.idx.entries.get("/w/a.mah").?.damaged);
+    try f.idx.setEncoding(.utf8);
+    try f.settle(&mem, null);
+    try testing.expectEqualStrings("0:22 ", try spotsOf(&f, "/w/a.mah", "shared"));
 }
 
 test "symbol index: slices of work, and the best matches kept" {

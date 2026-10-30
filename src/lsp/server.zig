@@ -393,15 +393,18 @@ pub const Server = struct {
         const oa = out.arena.allocator();
         var list: std.ArrayList(protocol.Location) = .empty;
         try self.appendLocations(oa, &list, c.doc.uri, c.index, c.an.source, try navigation.references(a, c.an, occ.binding, include));
-        // A global's uses in every other file that has one.
+        // A global's uses in every other file that has one, as the index
+        // holds them.
         const b = c.an.res.binding(occ.binding);
         if (b.kind == .global) {
             try self.refreshSymbols(a);
-            for (try self.otherUsers(a, c, b.name)) |e| {
-                var other = (try self.readElsewhere(e)) orelse continue;
-                defer other.deinit(self.gpa);
-                const g = navigation.globalNamed(&other.an, b.name) orelse continue;
-                try self.appendLocations(oa, &list, other.uri, &other.index, other.an.source, try navigation.references(a, &other.an, g, include));
+            for ((try self.otherUsers(a, c, b.name)).entries) |e| {
+                const u = e.use(b.name).?;
+                try list.ensureUnusedCapacity(oa, u.count);
+                for (e.spotsOf(u), 0..) |s, i| {
+                    if (!include and i == u.decl) continue;
+                    list.appendAssumeCapacity(.{ .uri = e.uri(), .range = u.range(s) });
+                }
             }
         }
         try out.result(id, list.items);
@@ -424,18 +427,24 @@ pub const Server = struct {
         }
     }
 
-    /// The entries the symbol index says may use the global `name`, but for
-    /// `c`'s document. Allocated in `a`; valid until the index changes.
-    fn otherUsers(self: *Server, a: std.mem.Allocator, c: Cursor, name: []const u8) Error![]const *const symbol_index.Entry {
+    /// The entries of the files using the global `name`, made current
+    /// with the disk first (`currentUsers`), but for `c`'s document, which
+    /// its own analysis answers for. Allocated in `a`; valid until the index
+    /// changes.
+    fn otherUsers(self: *Server, a: std.mem.Allocator, c: Cursor, name: []const u8) Error!symbol_index.Index.Users {
+        const all: symbol_index.Index.Users = if (self.symbolDisk()) |fs|
+            try self.symbols.currentUsers(a, fs, name)
+        else
+            .{ .entries = try self.symbols.filesUsing(a, name), .unreadable = false };
         var out: std.ArrayList(*const symbol_index.Entry) = .empty;
-        for (try self.symbols.filesUsing(a, name)) |e| {
+        for (all.entries) |e| {
             if (!std.mem.eql(u8, e.uri(), c.doc.uri)) try out.append(a, e);
         }
-        return out.items;
+        return .{ .entries = out.items, .unreadable = all.unreadable };
     }
 
-    /// A file other than the cursor's that a global reaches: its names
-    /// (`analysis.analyseNames`) and lines.
+    /// A file other than the cursor's that a rename must check in full: its
+    /// names (`analysis.analyseNames`) and lines.
     const Elsewhere = struct {
         /// The index entry's.
         uri: []const u8,
@@ -530,40 +539,54 @@ pub const Server = struct {
 
         // A global: every file that uses it is renamed too, each checked as
         // this one was, and none may use the new name as a global already.
+        // The index holds where each file uses it; only a file that declares
+        // a name spelled like the new one can capture it, so only that one
+        // is read and checked in full.
         try self.refreshSymbols(a);
         if (self.symbols.busy()) {
             return out.fail(id, .request_failed, "the workspace is still being indexed: try the rename again in a moment");
         }
-        var left_alone = c.an.res.damaged.items.len > 0;
-        var checked: std.StringHashMapUnmanaged(void) = .empty;
-        for (try self.otherUsers(a, c, b.name)) |e| {
-            var other = (try self.readElsewhere(e)) orelse {
-                left_alone = true;
-                continue;
-            };
-            defer other.deinit(self.gpa);
-            try checked.put(a, other.uri, {});
-            const g = navigation.globalNamed(&other.an, b.name) orelse continue;
-            const found = try navigation.references(a, &other.an, g, true);
-            const settings = try self.settingsOf(a, other.uri);
-            switch (navigation.checkRename(&other.an, settings.known_globals, g, found, p.newName)) {
-                .ok => {},
-                .refused => |r| return out.fail(id, .request_failed, try refusalMessage(a, &other.index, other.uri, r.reason, r.at, b.name, p.newName)),
-            }
-            if (other.an.res.damaged.items.len > 0) left_alone = true;
-            try files.append(oa, .{ .uri = other.uri, .edits = try self.editsFor(oa, &other.index, other.an.source, found, p.newName) });
-        }
-        for (try self.otherUsers(a, c, p.newName)) |e| {
-            if (checked.contains(e.uri())) continue;
-            var other = (try self.readElsewhere(e)) orelse continue;
-            defer other.deinit(self.gpa);
-            const g = navigation.globalNamed(&other.an, p.newName) orelse continue;
-            const line = other.index.lineOf(other.an.res.binding(g).decl_span.start) + 1;
+        // First, as making its users current may parse files again, which
+        // the entries below must outlive.
+        const taken = try self.otherUsers(a, c, p.newName);
+        if (taken.entries.len > 0) {
+            const e = taken.entries[0];
+            const u = e.use(p.newName).?;
+            const at = e.spotsOf(u)[if (u.decl != symbol_index.Use.no_decl) u.decl else 0];
             return out.fail(id, .request_failed, try std.fmt.allocPrint(
                 a,
                 "'{s}' is a global already, used at line {d} of {s}: renaming '{s}' to it would make the two one",
-                .{ p.newName, line, other.uri, b.name },
+                .{ p.newName, at.line + 1, e.uri(), b.name },
             ));
+        }
+        const users = try self.otherUsers(a, c, b.name);
+        var left_alone = c.an.res.damaged.items.len > 0 or users.unreadable;
+        for (users.entries) |e| {
+            const settings = try self.settingsOf(a, e.uri());
+            for (settings.known_globals) |k| {
+                if (std.mem.eql(u8, k, b.name)) return out.fail(id, .request_failed, try refusalMessage(a, c.index, e.uri(), .builtin, null, b.name, p.newName));
+            }
+            if (e.declares(p.newName)) {
+                var other = (try self.readElsewhere(e)) orelse {
+                    left_alone = true;
+                    continue;
+                };
+                defer other.deinit(self.gpa);
+                const g = navigation.globalNamed(&other.an, b.name) orelse continue;
+                const found = try navigation.references(a, &other.an, g, true);
+                switch (navigation.checkRename(&other.an, settings.known_globals, g, found, p.newName)) {
+                    .ok => {},
+                    .refused => |r| return out.fail(id, .request_failed, try refusalMessage(a, &other.index, other.uri, r.reason, r.at, b.name, p.newName)),
+                }
+                if (other.an.res.damaged.items.len > 0) left_alone = true;
+                try files.append(oa, .{ .uri = other.uri, .edits = try self.editsFor(oa, &other.index, other.an.source, found, p.newName) });
+                continue;
+            }
+            if (e.damaged) left_alone = true;
+            const u = e.use(b.name).?;
+            const edits = try oa.alloc(protocol.TextEdit, u.count);
+            for (edits, e.spotsOf(u)) |*slot, s| slot.* = .{ .range = u.range(s), .newText = p.newName };
+            try files.append(oa, .{ .uri = e.uri(), .edits = edits });
         }
         const message = if (self.symbolDisk() == null)
             try std.fmt.allocPrint(oa, "{s} is a global: only the open documents were renamed; files that are not open are unchanged.", .{b.name})
@@ -2610,6 +2633,67 @@ test "rename and references: a global reaches every file that uses it" {
     try testing.expectEqual(@as(i64, -32803), errorCode(capture));
     const capture_message = capture.object.get("error").?.object.get("message").?.string;
     try testing.expect(std.mem.indexOf(u8, capture_message, "line 3 of file:///w/b.mah") != null);
+}
+
+test "rename and references: other files answer from the index, read only where a name could be captured" {
+    var entries = [_][2][]const u8{
+        .{ "/w/a.mah", "counter = 0\n" },
+        .{ "/w/b.mah", "print(counter)\n" },
+        .{ "/w/c.mah", "local function f(tally)\n  return counter + tally\nend\n" },
+    };
+    var mem: MemoryFiles = .{ .entries = &entries };
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.files = mem.files();
+    h.server.known_globals = &.{"print"};
+    _ = try initWith(&h,
+        \\"rootUri":"file:///w"
+    );
+    while (h.server.symbols.busy()) _ = try h.tick(0);
+    _ = try openDoc(&h, 0, "file:///w/a.mah", entries[0][1]);
+    const reads = mem.reads;
+
+    // References: b's and c's from the index, with nothing read. (The open
+    // document is what the request indexes.)
+    const refs = try askIn(&h, "file:///w/a.mah", "textDocument/references", 0, 0,
+        \\,"context":{"includeDeclaration":false}
+    );
+    try testing.expectEqual(@as(usize, 2), refs.object.get("result").?.array.items.len);
+    try testing.expectEqual(reads, mem.reads);
+    const builds = h.server.symbols.builds;
+
+    // A rename to a name no other file declares reads none of them.
+    const ok = try askIn(&h, "file:///w/a.mah", "textDocument/rename", 0, 0,
+        \\,"newName":"total"
+    );
+    try testing.expectEqual(@as(?usize, 1), editsIn(ok, "file:///w/b.mah"));
+    try testing.expectEqual(@as(?usize, 1), editsIn(ok, "file:///w/c.mah"));
+    try testing.expectEqual(reads, mem.reads);
+    try testing.expectEqual(builds, h.server.symbols.builds);
+
+    // To a name c declares: c alone is read and checked in full.
+    const capture = try askIn(&h, "file:///w/a.mah", "textDocument/rename", 0, 0,
+        \\,"newName":"tally"
+    );
+    try testing.expectEqual(@as(i64, -32803), errorCode(capture));
+    const message = capture.object.get("error").?.object.get("message").?.string;
+    try testing.expect(std.mem.indexOf(u8, message, "line 2 of file:///w/c.mah") != null);
+    try testing.expectEqual(reads + 1, mem.reads);
+
+    // A file changed on disk since it was indexed is parsed again first.
+    entries[1][1] = "\nprint(counter, counter)\n";
+    const moved = try askIn(&h, "file:///w/a.mah", "textDocument/references", 0, 0,
+        \\,"context":{"includeDeclaration":false}
+    );
+    const locs = moved.object.get("result").?.array.items;
+    try testing.expectEqual(@as(usize, 3), locs.len);
+    try testing.expectEqual(builds + 1, h.server.symbols.builds);
+    var b_on_line_1: usize = 0;
+    for (locs) |l| {
+        if (!std.mem.eql(u8, l.object.get("uri").?.string, "file:///w/b.mah")) continue;
+        if (l.object.get("range").?.object.get("start").?.object.get("line").?.integer == 1) b_on_line_1 += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), b_on_line_1);
 }
 
 test "workspace symbols: every folder's functions, an open document's as edited, the closest first" {

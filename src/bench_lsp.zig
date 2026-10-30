@@ -377,6 +377,7 @@ const WorkspaceSymbols = struct {
     refs_some: u64,
     rename_some: u64,
     refs_all: u64,
+    rename_all: u64,
     symbols: usize,
     live: usize,
     peak: usize,
@@ -432,6 +433,7 @@ fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, files: usize, reps: usiz
         .refs_some = std.math.maxInt(u64),
         .rename_some = std.math.maxInt(u64),
         .refs_all = std.math.maxInt(u64),
+        .rename_all = std.math.maxInt(u64),
         .symbols = 0,
         .live = 0,
         .peak = 0,
@@ -557,6 +559,10 @@ fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, files: usize, reps: usiz
         const refs_all = try std.fmt.bufPrint(&abuf, at, .{ "references", 0, all });
         r.refs_all = @min(r.refs_all, try timedRequest(io, &core, &out, refs_all));
         if (std.mem.count(u8, out.messages()[0], "\"uri\"") != users) return error.ReferencesMissed;
+        var nbuf: [512]u8 = undefined;
+        const rename_all = try std.fmt.bufPrint(&nbuf, at, .{ "rename", 0, ",\"newName\":\"shared_trace\"" });
+        r.rename_all = @min(r.rename_all, try timedRequest(io, &core, &out, rename_all));
+        if (std.mem.count(u8, out.messages()[0], "\"newText\"") != users) return error.RenameMissed;
 
 
     }
@@ -790,11 +796,11 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
         \\  1 change: one file rewritten, reported, and the narrow query
         \\  polling: for a client that cannot watch, the narrow query; idle/s and stamps/s: an idle second's polling, averaged over 5 minutes
         \\  refs 1% / rename 1%: from an open file, references to and a rename of a global one file in 100 writes
-        \\  refs all: references to a global every file calls
+        \\  refs all / rename all: references to and a rename of a global every file calls
         \\
-        \\{s: <12} {s: >8} {s: >10} {s: >9} {s: >9} {s: >8} {s: >8} {s: >9} {s: >8} {s: >8} {s: >9} {s: >8} {s: >10} {s: >9} {s: >10} {s: >9} {s: >10}
+        \\{s: <12} {s: >8} {s: >10} {s: >9} {s: >9} {s: >8} {s: >8} {s: >9} {s: >8} {s: >8} {s: >9} {s: >8} {s: >10} {s: >9} {s: >10} {s: >10} {s: >9} {s: >10}
         \\
-    , .{ "folder", "files", "symbols", "cold", "restart", "narrow", "broad", "1 change", "polling", "idle/s", "stamps/s", "refs 1%", "rename 1%", "refs all", "index MiB", "peak MiB", "saved MiB" });
+    , .{ "folder", "files", "symbols", "cold", "restart", "narrow", "broad", "1 change", "polling", "idle/s", "stamps/s", "refs 1%", "rename 1%", "refs all", "rename all", "index MiB", "peak MiB", "saved MiB" });
     defer std.Io.Dir.cwd().deleteTree(io, symbols_dir) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, symbols_cache) catch {};
     const folders = [_]struct { name: []const u8, files: usize, reps: usize }{
@@ -806,7 +812,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
     for (folders) |f| {
         try writeWorkspace(gpa, io, f.files);
         const got = try workspaceSymbols(gpa, io, f.files, f.reps);
-        mahina.io.print("{s: <12} {d: >8} {d: >10} {d: >9.1} {d: >9.1} {d: >8.2} {d: >8.2} {d: >9.2} {d: >8.2} {d: >8.2} {d: >9} {d: >8.1} {d: >10.1} {d: >9.1} {d: >10.1} {d: >9.1} {d: >10.1}\n", .{
+        mahina.io.print("{s: <12} {d: >8} {d: >10} {d: >9.1} {d: >9.1} {d: >8.2} {d: >8.2} {d: >9.2} {d: >8.2} {d: >8.2} {d: >9} {d: >8.1} {d: >10.1} {d: >9.1} {d: >10.1} {d: >10.1} {d: >9.1} {d: >10.1}\n", .{
             f.name,
             f.files,
             got.symbols,
@@ -821,6 +827,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
             ms(got.refs_some),
             ms(got.rename_some),
             ms(got.refs_all),
+            ms(got.rename_all),
             @as(f64, @floatFromInt(got.live)) / mib,
             @as(f64, @floatFromInt(got.peak)) / mib,
             @as(f64, @floatFromInt(got.saved_bytes)) / mib,

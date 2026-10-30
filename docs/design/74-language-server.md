@@ -793,15 +793,26 @@ place both showed.
 **Globals across files (2026-10-30).** Rename and references of a global
 reach every file that uses it; definition still looks in the cursor's file
 only. The symbol index also runs the resolver on each file it parses and
-keeps a 64-bit hash (`useKey`) of each global the file reads or writes
-(`Entry.uses`, saved with the entry, format 3); `filesUsing` scans them, a
-shared hash costing only a needless read. Each file it gives, but the
-cursor's, is read (its open document ahead of the disk) and parsed and
-resolved, not compiled (`analysis.analyseNames`). A rename checks every such
-file with its own folder's settings as the cursor's file is checked
-(capture either way, a host global), and is refused when another file
-already uses the new name as a global, which would merge the two; a file
-that cannot be read or parsed is left alone, with a warning. With walks still under way
+keeps, per global the file reads or writes, its name, a 64-bit hash of it
+(`useKey`) to rule other files out fast, and every use's line and first
+character in the client's encoding (`Entry.uses`, `Entry.spots`; the end
+follows, a global's name being an identifier), with which use declares it;
+plus the hash of every other name the file declares (`Entry.declares`) and
+whether the parser dropped text (`Entry.damaged`). All saved with the entry
+(format 4). `filesUsing` scans the hashes and compares names on a match.
+Before the spots are trusted, `currentUsers` stamps each file among them
+and parses again one whose stamp moved (or whose rewrite a coarse clock may
+hide, `Entry.again`), dropping one that is gone; open documents are indexed
+as edited already. References then answer for every other file from the
+index alone. A rename checks every such file with its own folder's
+settings as the cursor's file is checked: a host global by name, and
+capture only where it can happen, in a file that declares a name spelled
+like the new one, which alone is read and resolved in full
+(`analysis.analyseNames`, its open document ahead of the disk); the rest
+are renamed from their spots. It is refused when another file already
+uses the new name as a global, which would merge the two; a damaged file
+or one that changed and cannot be read is left alone, with a warning.
+With walks still under way
 the index is incomplete, so a rename is refused until it is idle;
 references answer from what is indexed. The browser has no disk: only the
 open documents are renamed, and a warning says so. Bart was away when the
@@ -822,17 +833,22 @@ is refused). A key is a name only when its text is: an escaped
 (`_G["\120"]`) or long-bracket key, a keyword, `local g = _G`, `rawset`
 and computed keys stay invisible, as they are to any static tool. Bart's
 direction for declaring a global on purpose is a `global x` statement,
-with `_G.x` kept for Lua code (TODO.md).
+with `_G.x` kept for Lua code, following Lua 5.5's global declarations
+(TODO.md).
 
-Measured (`bench-lsp`, load average ~2; every file calls the global
-`shared_log`, one in 100 writes `shared_total`), at 1k / 10k / 100k files:
-references to and a rename of `shared_total` 0.2 / 3.1 / 34 ms (10 / 100 /
-1,000 files read); a lookup that finds no other file, about 1 ms at 100k;
-the resolver adds about 15% to a cold walk (28 / 298 / 3080 ms without it,
-33 / 341 / 3583 ms with). References to `shared_log`, in every file, read
-and parse them all: 31 / 313 / 3307 ms, a cold walk's cost. That is the
-open limit: answering without the reads means keeping every global
-occurrence's position in the index, many times its size.
+Measured (`bench-lsp`; every file calls the global `shared_log`, one in
+100 writes `shared_total`), at 1k / 10k / 100k files. When the index held
+only the hashes, each user was read and parsed: references to
+`shared_total` took 0.2 / 3.1 / 34 ms, and to `shared_log`, in every file,
+31 / 313 / 3307 ms, a cold walk's cost; the resolver added about 15% to a
+cold walk. With the spots (2026-10-30, Bart: memory is cheap next to
+rust-analyzer's gigabytes; load average 20–45, so the best of the runs):
+references and rename of `shared_total` 0.0 / 0.1 / 7 and 0.0 / 0.2 / 10
+ms; of `shared_log` 1.0 / 12.7 / 185 and 1.1 / 12.1 / 226 ms, a stat per
+file at 100k. The index grows from 65 to 83 MiB at 100k files (peak 130 to
+170 MiB) and its save from 43 to 58 MiB. The walk's own work grows 3.4%
+(user instructions, cold walk and restart of 20k files: 8.74 G to 9.04 G);
+its wall time could not be told apart under that load.
 
 **Cost, measured** (`zig build bench-lsp`, cross-file table: a literal
 `require` per 14 lines, half resolving nowhere, real disk): 0.08 ms added

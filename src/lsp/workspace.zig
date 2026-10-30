@@ -287,6 +287,8 @@ const testing = std.testing;
 /// Files held in memory, by path.
 pub const MemoryFiles = struct {
     entries: []const [2][]const u8,
+    /// Files read so far.
+    reads: usize = 0,
 
     pub fn files(self: *MemoryFiles) Files {
         return .{ .ctx = self, .read = read, .exists = exists, .list = list, .stamp = stamp, .dir_stamp = dirStamp };
@@ -359,6 +361,7 @@ pub const MemoryFiles = struct {
     fn read(ctx: ?*anyopaque, a: Allocator, path: []const u8) ?[]u8 {
         const self: *MemoryFiles = @ptrCast(@alignCast(ctx.?));
         const bytes = self.find(path) orelse return null;
+        self.reads += 1;
         return a.dupe(u8, bytes) catch null;
     }
 
