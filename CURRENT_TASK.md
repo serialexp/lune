@@ -17,7 +17,7 @@ DOC 44 STITCHING: numeric-for roots DONE (2026-10-28, coral-marten), committed, 
 - Known noise: euler14-bit +0.8% instructions with identical traces (interp.zig layout).
 - Next: doc 63 Phase 2b/2c (direct host calls; stitching is its fallback).
 
-DOC 74 LANGUAGE SERVER: P0–P5 DONE, P6a–d DONE (2026-10-27 to 2026-10-29, coral-raven). P6e in progress (2026-10-30): system groups DONE; next initializationOptions, watched files (mahina.toml reload), workspace symbols.
+DOC 74 LANGUAGE SERVER: P0–P5 DONE, P6a–d DONE (2026-10-27 to 2026-10-29, coral-raven). P6e in progress (2026-10-30): system groups DONE, initializationOptions DONE; next watched files (mahina.toml reload), workspace symbols.
 - P6d (2026-10-29): module exports (exports.zig: `return M` / `return {..}`
   shapes; the consumer's `local m = require("x")`), module_cache.zig (per
   path, checked against the module's text by hash each time, 64 entries,

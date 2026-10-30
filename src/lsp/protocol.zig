@@ -4,6 +4,7 @@
 //! Optional fields default to null and are omitted from output when null.
 
 const position = @import("position.zig");
+const jsonrpc = @import("jsonrpc.zig");
 
 pub const Position = position.Position;
 pub const Range = position.Range;
@@ -30,6 +31,26 @@ pub const InitializeParams = struct {
     rootUri: ?[]const u8 = null,
     /// Every folder of the workspace; takes precedence over `rootUri`.
     workspaceFolders: ?[]const WorkspaceFolder = null,
+};
+
+/// `initializationOptions` (doc 74 §7.4): the tables of `mahina.toml`, as
+/// JSON, overriding it in every folder. Decoded strictly
+/// (`jsonrpc.decodeStrict`), so a misspelt key is reported.
+pub const InitializationOptions = struct {
+    runtime: ?RuntimeOptions = null,
+    /// Host globals, each with a description: `{"spawn": "starts a process"}`.
+    globals: ?[]const jsonrpc.NameValue = null,
+    diagnostics: ?DiagnosticsOptions = null,
+};
+
+pub const RuntimeOptions = struct {
+    cwd: ?[]const u8 = null,
+    package_path: ?[]const []const u8 = null,
+    system: ?[]const []const u8 = null,
+};
+
+pub const DiagnosticsOptions = struct {
+    suppress: ?[]const []const u8 = null,
 };
 
 pub const WorkspaceFoldersChangeEvent = struct {

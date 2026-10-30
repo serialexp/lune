@@ -266,6 +266,95 @@ pub fn decodeParams(comptime T: type, arena: std.mem.Allocator, params: ?Value) 
     return decode(T, arena, v);
 }
 
+/// The member `name` of an object, or null (also when `v` is no object).
+pub fn member(v: ?Value, name: []const u8) ?Value {
+    const obj = v orelse return null;
+    if (obj != .object) return null;
+    return obj.object.get(name);
+}
+
+/// One `"name": "value"` member of a JSON object of strings.
+pub const NameValue = struct { name: []const u8, value: []const u8 };
+
+/// What `decodeStrict` gives: the value, or why it was refused.
+pub fn Strict(comptime T: type) type {
+    return union(enum) { ok: T, bad: []const u8 };
+}
+
+/// Decode `value` as `T`, refusing what `T` does not name, unlike `decode`:
+/// for settings a person writes, where a misspelt key must be reported, not
+/// dropped. The refusal names the member as a dotted path (`runtime.cwd`).
+/// `T` is built from structs whose fields all have defaults, optionals,
+/// strings, string slices, and `[]const NameValue` (a JSON object of
+/// strings). Strings are copied into `a`.
+pub fn decodeStrict(comptime T: type, a: std.mem.Allocator, value: Value) error{OutOfMemory}!Strict(T) {
+    var out: T = undefined;
+    if (try strictInto(T, a, value, "", &out)) |why| return .{ .bad = why };
+    return .{ .ok = out };
+}
+
+fn strictInto(comptime T: type, a: std.mem.Allocator, value: Value, path: []const u8, out: *T) error{OutOfMemory}!?[]const u8 {
+    const shown = if (path.len == 0) "the value" else path;
+    switch (@typeInfo(T)) {
+        .optional => |o| {
+            if (value == .null) {
+                out.* = null;
+                return null;
+            }
+            var inner: o.child = undefined;
+            if (try strictInto(o.child, a, value, path, &inner)) |why| return why;
+            out.* = inner;
+            return null;
+        },
+        .@"struct" => |s| {
+            if (value != .object) return try std.fmt.allocPrint(a, "{s} must be an object", .{shown});
+            out.* = .{};
+            var it = value.object.iterator();
+            next: while (it.next()) |kv| {
+                const key = kv.key_ptr.*;
+                const sub = if (path.len == 0) key else try std.fmt.allocPrint(a, "{s}.{s}", .{ path, key });
+                inline for (s.field_names, s.field_types) |name, F| {
+                    if (std.mem.eql(u8, name, key)) {
+                        if (try strictInto(F, a, kv.value_ptr.*, sub, &@field(out.*, name))) |why| return why;
+                        continue :next;
+                    }
+                }
+                return try std.fmt.allocPrint(a, "unknown member '{s}'", .{sub});
+            }
+            return null;
+        },
+        else => {},
+    }
+    if (T == []const u8) {
+        if (value != .string) return try std.fmt.allocPrint(a, "{s} must be a string", .{shown});
+        out.* = try a.dupe(u8, value.string);
+        return null;
+    }
+    if (T == []const []const u8) {
+        if (value != .array) return try std.fmt.allocPrint(a, "{s} must be an array of strings", .{shown});
+        const list = try a.alloc([]const u8, value.array.items.len);
+        for (value.array.items, list) |item, *slot| {
+            if (item != .string) return try std.fmt.allocPrint(a, "{s} must be an array of strings", .{shown});
+            slot.* = try a.dupe(u8, item.string);
+        }
+        out.* = list;
+        return null;
+    }
+    if (T == []const NameValue) {
+        if (value != .object) return try std.fmt.allocPrint(a, "{s} must be an object of strings", .{shown});
+        const list = try a.alloc(NameValue, value.object.count());
+        var it = value.object.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| : (i += 1) {
+            if (kv.value_ptr.* != .string) return try std.fmt.allocPrint(a, "{s} must be an object of strings", .{shown});
+            list[i] = .{ .name = try a.dupe(u8, kv.key_ptr.*), .value = try a.dupe(u8, kv.value_ptr.string) };
+        }
+        out.* = list;
+        return null;
+    }
+    @compileError("decodeStrict: unsupported type " ++ @typeName(T));
+}
+
 /// A JSON value rendered back to text — for tests and for the places a
 /// handler passes an opaque `params` through.
 pub fn valueToString(arena: std.mem.Allocator, value: json.Value) error{OutOfMemory}![]u8 {
@@ -537,4 +626,25 @@ test "cancelTarget: integer and string ids; anything else is not a cancel" {
     try testing.expect(cancelTarget(other) == null);
     const bad = try parse(a, "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancelRequest\",\"params\":{\"id\":true}}", &id);
     try testing.expect(cancelTarget(bad) == null);
+}
+
+test "decodeStrict: a misspelt or ill-typed member is refused by its path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Inner = struct { cwd: ?[]const u8 = null, list: ?[]const []const u8 = null };
+    const S = struct { inner: ?Inner = null, names: ?[]const NameValue = null };
+    const ok = try json.parseFromSliceLeaky(json.Value, a, "{\"inner\":{\"cwd\":\"src\",\"list\":[\"a\",\"b\"]},\"names\":{\"x\":\"one\"}}", .{});
+    const got = (try decodeStrict(S, a, ok)).ok;
+    try testing.expectEqualStrings("src", got.inner.?.cwd.?);
+    try testing.expectEqualStrings("b", got.inner.?.list.?[1]);
+    try testing.expectEqualStrings("one", got.names.?[0].value);
+    try testing.expect((try decodeStrict(S, a, try json.parseFromSliceLeaky(json.Value, a, "{}", .{}))).ok.inner == null);
+
+    const typo = try json.parseFromSliceLeaky(json.Value, a, "{\"inner\":{\"cwdd\":\"src\"}}", .{});
+    try testing.expectEqualStrings("unknown member 'inner.cwdd'", (try decodeStrict(S, a, typo)).bad);
+    const wrong = try json.parseFromSliceLeaky(json.Value, a, "{\"inner\":{\"list\":[1]}}", .{});
+    try testing.expectEqualStrings("inner.list must be an array of strings", (try decodeStrict(S, a, wrong)).bad);
+    const not_obj = try json.parseFromSliceLeaky(json.Value, a, "[1]", .{});
+    try testing.expectEqualStrings("the value must be an object", (try decodeStrict(S, a, not_obj)).bad);
 }

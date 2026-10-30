@@ -17,6 +17,24 @@ To point at another binary:
 { "lsp": { "mahina": { "binary": { "path": "/path/to/mahina" } } } }
 ```
 
+Settings over every project's `mahina.toml` go in `initialization_options`,
+with the file's tables as JSON (doc 74 §7.4). `cwd`, `package_path` and
+`system` replace the file's; `globals` and `suppress` add to it:
+
+```json
+{
+  "lsp": {
+    "mahina": {
+      "initialization_options": {
+        "runtime": { "system": ["stdio", "clock"] },
+        "globals": { "spawn": "starts a host process" },
+        "diagnostics": { "suppress": ["unresolved-require"] }
+      }
+    }
+  }
+}
+```
+
 ## The grammar pin
 
 `extension.toml` names the Tree-sitter grammar by repository, commit and

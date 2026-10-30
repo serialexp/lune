@@ -45,6 +45,30 @@ pub const Config = struct {
     suppress: []const []const u8 = &.{},
 };
 
+/// What the editor's `initializationOptions` set over every folder's
+/// `mahina.toml` (doc 74 §7.4). A setting with one value (`cwd`,
+/// `package_path`, `system`) replaces the file's; a list of names
+/// (`globals`, `suppress`) is added to the file's, so an editor-wide
+/// suppression does not undo a project's own.
+pub const Overrides = struct {
+    cwd: ?[]const u8 = null,
+    package_path: ?[]const []const u8 = null,
+    system: ?system.Groups = null,
+    globals: []const Global = &.{},
+    suppress: []const []const u8 = &.{},
+
+    /// `base` with these applied; new lists are allocated in `a`.
+    pub fn apply(self: Overrides, a: std.mem.Allocator, base: Config) std.mem.Allocator.Error!Config {
+        var out = base;
+        if (self.cwd) |c| out.cwd = c;
+        if (self.package_path) |pp| out.package_path = pp;
+        if (self.system) |s| out.system = s;
+        if (self.globals.len > 0) out.globals = try std.mem.concat(a, Global, &.{ base.globals, self.globals });
+        if (self.suppress.len > 0) out.suppress = try std.mem.concat(a, []const u8, &.{ base.suppress, self.suppress });
+        return out;
+    }
+};
+
 /// Where a config is wrong: 1-based line and column, and what is wrong.
 pub const Failure = struct {
     line: u32,
@@ -345,6 +369,28 @@ fn parseFailure(arena: std.mem.Allocator, source: []const u8) !Failure {
         .ok => error.UnexpectedSuccess,
         .failed => |f| f,
     };
+}
+
+test "config: overrides replace single settings and add to lists" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = try parseOk(a, "version = 1\n[runtime]\ncwd = \"src\"\n[globals]\nspawn = \"x\"\n[diagnostics]\nsuppress = [\"W0001\"]\n");
+    const o: Overrides = .{
+        .package_path = &.{"./lib/?.mah"},
+        .system = .none,
+        .globals = &.{.{ .name = "emit", .description = "y" }},
+        .suppress = &.{"unresolved-require"},
+    };
+    const c = try o.apply(a, base);
+    try testing.expectEqualStrings("src", c.cwd);
+    try testing.expectEqualStrings("./lib/?.mah", c.package_path[0]);
+    try testing.expectEqual(system.Groups.none, c.system);
+    try testing.expectEqual(@as(usize, 2), c.globals.len);
+    try testing.expectEqualStrings("emit", c.globals[1].name);
+    try testing.expectEqual(@as(usize, 2), c.suppress.len);
+    // Nothing set: the file as it is.
+    try testing.expectEqualStrings("W0001", (try (Overrides{}).apply(a, base)).suppress[0]);
 }
 
 test "config: a full file reads every table" {

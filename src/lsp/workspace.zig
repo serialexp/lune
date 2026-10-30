@@ -66,14 +66,33 @@ pub const Settings = struct {
 pub const Workspace = struct {
     gpa: Allocator,
     folders: std.ArrayList(*Folder) = .empty,
+    /// Owns `overrides` and `loose`: decode the editor's options into it,
+    /// then `setOverrides`.
+    options_arena: std.heap.ArenaAllocator,
+    /// The editor's `initializationOptions`, over every folder's config.
+    overrides: config.Overrides = .{},
+    /// What governs a file in no folder: the defaults with the overrides
+    /// applied, and the host globals that leaves known (null: the host's own).
+    loose: config.Config = .{},
+    loose_known: ?[]const []const u8 = null,
 
     pub fn init(gpa: Allocator) Workspace {
-        return .{ .gpa = gpa };
+        return .{ .gpa = gpa, .options_arena = std.heap.ArenaAllocator.init(gpa) };
     }
 
     pub fn deinit(self: *Workspace) void {
         for (self.folders.items) |f| self.destroy(f);
         self.folders.deinit(self.gpa);
+        self.options_arena.deinit();
+    }
+
+    /// Set the editor's overrides (allocated in `options_arena`). Folders added
+    /// from here on apply them; call it before adding any.
+    pub fn setOverrides(self: *Workspace, o: config.Overrides, host_globals: []const []const u8) Allocator.Error!void {
+        const a = self.options_arena.allocator();
+        self.overrides = o;
+        self.loose = try o.apply(a, .{});
+        self.loose_known = try knownGlobals(a, host_globals, self.loose);
     }
 
     fn destroy(self: *Workspace, f: *Folder) void {
@@ -122,6 +141,7 @@ pub const Workspace = struct {
                 }
             }
         }
+        f.config = try self.overrides.apply(a, f.config);
         f.runtime_cwd = try std.fs.path.resolveAllocPosix(a, &.{ dir, f.config.cwd });
         f.known_globals = try knownGlobals(a, host_globals, f.config);
 
@@ -168,12 +188,13 @@ pub const Workspace = struct {
         doc_path: ?[]const u8,
         host_globals: []const []const u8,
     ) Allocator.Error!Settings {
+        const known = self.loose_known orelse host_globals;
         const p = doc_path orelse return .{
             .cwd = null,
-            .package_path = &config.default_package_path,
-            .known_globals = host_globals,
-            .suppress = &.{},
-            .system = .all,
+            .package_path = self.loose.package_path,
+            .known_globals = known,
+            .suppress = self.loose.suppress,
+            .system = self.loose.system,
         };
         if (self.folderOf(p)) |f| return .{
             .cwd = f.runtime_cwd,
@@ -183,11 +204,11 @@ pub const Workspace = struct {
             .system = f.config.system,
         };
         return .{
-            .cwd = try std.fs.path.resolveAllocPosix(a, &.{ p, ".." }),
-            .package_path = &config.default_package_path,
-            .known_globals = host_globals,
-            .suppress = &.{},
-            .system = .all,
+            .cwd = try std.fs.path.resolveAllocPosix(a, &.{ p, "..", self.loose.cwd }),
+            .package_path = self.loose.package_path,
+            .known_globals = known,
+            .suppress = self.loose.suppress,
+            .system = self.loose.system,
         };
     }
 };
@@ -320,6 +341,39 @@ test "workspace: the system groups decide which of the host's globals exist" {
     try testing.expectEqual(@as(usize, 2), (try ws.settingsFor(a, "/clock/m.mah", &host)).known_globals.len);
     // Outside any folder, every group, as the CLI gives.
     try testing.expectEqual(system.Groups.all, (try ws.settingsFor(a, "/elsewhere/m.mah", &host)).system);
+}
+
+test "workspace: the editor's overrides apply over every folder's config and to loose files" {
+    var mem: MemoryFiles = .{ .entries = &.{
+        .{ "/w/mahina.toml", "version = 1\n[runtime]\ncwd = \"src\"\nsystem = [\"files\"]\n[diagnostics]\nsuppress = [\"W0001\"]\n" },
+    } };
+    var ws = Workspace.init(testing.allocator);
+    defer ws.deinit();
+    const host = [_][]const u8{ "print", "aio" };
+    try ws.setOverrides(.{
+        .system = .none,
+        .package_path = &.{"./lib/?.mah"},
+        .suppress = &.{"unresolved-require"},
+        .globals = &.{.{ .name = "emit", .description = "" }},
+    }, &host);
+    _ = try ws.add("file:///w", "/w", mem.files(), &host);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const in_w = try ws.settingsFor(a, "/w/m.mah", &host);
+    try testing.expectEqualStrings("/w/src", in_w.cwd.?);
+    try testing.expectEqual(system.Groups.none, in_w.system);
+    try testing.expectEqualStrings("./lib/?.mah", in_w.package_path[0]);
+    try testing.expectEqual(@as(usize, 2), in_w.suppress.len);
+    // `aio` needs a group the override turned off; `emit` is the editor's.
+    try testing.expectEqual(@as(usize, 2), in_w.known_globals.len);
+    try testing.expectEqualStrings("emit", in_w.known_globals[1]);
+
+    const loose = try ws.settingsFor(a, "/elsewhere/m.mah", &host);
+    try testing.expectEqualStrings("/elsewhere", loose.cwd.?);
+    try testing.expectEqual(system.Groups.none, loose.system);
+    try testing.expectEqualStrings("unresolved-require", loose.suppress[0]);
+    try testing.expectEqualStrings("emit", (try ws.settingsFor(a, null, &host)).known_globals[1]);
 }
 
 test "workspace: a rejected config keeps the defaults and says why; re-adding and removing" {

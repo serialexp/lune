@@ -258,7 +258,12 @@ land; move whole phases to Done once everything inside them is checked.
       `lib.` completion leaves out the members of groups that are off, and
       hover on one says the project does not enable its group. `io.stdin`'s
       group is now read from the VM's own list (`Vm.system_members`).
-    - [ ] `initializationOptions` overriding `mahina.toml`.
+    - [x] `initializationOptions` overriding `mahina.toml`: the file's
+      tables as JSON (`runtime`, `globals` as an object of descriptions,
+      `diagnostics`), decoded strictly (`jsonrpc.decodeStrict`): a misspelt
+      key or a wrong type is a warning (`window/showMessage`) naming it, and
+      the options are ignored as a whole. The Zed extension passes
+      `lsp.mahina.initialization_options`.
     - [ ] `workspace/didChangeWatchedFiles` (client registration): reload a
       changed `mahina.toml` (today a config edit needs the folder re-added or
       a restart). The P6d cache needs no invalidation: it checks the text on
@@ -627,7 +632,12 @@ parses the subset the config needs (tables, strings, integers, booleans,
 string arrays) and rejects anything else with a located error, published
 as a diagnostic on `mahina.toml` itself. Versioned (`version = 1`), never executed,
 with LSP `initializationOptions` overriding it, documented precedence and
-per-root behaviour in multi-root workspaces. Content: runtime cwd,
+per-root behaviour in multi-root workspaces. *As built (P6e):* the options
+apply over every folder's file and to files in no folder. A setting with one
+value (`cwd`, `package_path`, `system`) replaces the file's; a list of names
+(`globals`, `suppress`) is added to the file's, so an editor-wide
+suppression does not undo a project's own. An option's `cwd` is relative to
+each folder (to the file's own directory outside every folder). Content: runtime cwd,
 `package.path`, enabled system groups, extra host globals with optional
 member descriptions (for embedding hosts), and diagnostic code
 suppressions.

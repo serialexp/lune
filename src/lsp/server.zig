@@ -28,6 +28,7 @@ const exports = @import("exports.zig");
 const module_cache = @import("module_cache.zig");
 const uri_mod = @import("uri.zig");
 const workspace = @import("workspace.zig");
+const config = @import("config.zig");
 
 /// Analysis runs this long after the last change...
 pub const debounce_ms: u64 = 50;
@@ -787,7 +788,9 @@ pub const Server = struct {
             .serverInfo = .{ .name = server_name },
         });
         // After the response: a folder's config may publish diagnostics, and
-        // nothing may precede the answer to `initialize`.
+        // nothing may precede the answer to `initialize`. The editor's options
+        // come first, since every folder applies them.
+        try self.applyOptions(a, jsonrpc.member(params, "initializationOptions"), out);
         if (p.workspaceFolders) |folders| {
             for (folders) |f| try self.addFolder(a, f.uri, out);
         } else if (p.rootUri) |root| {
@@ -796,6 +799,43 @@ pub const Server = struct {
     }
 
     // ---- workspace folders and their config (doc 74 §7.4) ------------------
+
+    /// Take the editor's `initializationOptions` over every folder's
+    /// `mahina.toml`. Options that are refused are reported and ignored as a
+    /// whole, since half of a setting applied is harder to see than none.
+    fn applyOptions(self: *Server, a: std.mem.Allocator, raw: ?jsonrpc.Value, out: *Outbox) Error!void {
+        const value = raw orelse return;
+        const oa = self.ws.options_arena.allocator();
+        const opts = switch (try jsonrpc.decodeStrict(?protocol.InitializationOptions, oa, value)) {
+            .ok => |o| o orelse return,
+            .bad => |why| return refuseOptions(a, why, out),
+        };
+        var o: config.Overrides = .{};
+        if (opts.runtime) |r| {
+            o.cwd = r.cwd;
+            o.package_path = r.package_path;
+            if (r.system) |names| switch (config.groupsOf(names)) {
+                .ok => |g| o.system = g,
+                .unknown => |n| return refuseOptions(a, try std.fmt.allocPrint(a, "unknown system group '{s}' in runtime.system", .{n}), out),
+            };
+        }
+        if (opts.globals) |gs| {
+            const list = try oa.alloc(config.Global, gs.len);
+            for (gs, list) |g, *slot| slot.* = .{ .name = g.name, .description = g.value };
+            o.globals = list;
+        }
+        if (opts.diagnostics) |d| if (d.suppress) |s| {
+            o.suppress = s;
+        };
+        try self.ws.setOverrides(o, self.known_globals);
+    }
+
+    fn refuseOptions(a: std.mem.Allocator, why: []const u8, out: *Outbox) Error!void {
+        try out.notify("window/showMessage", protocol.LogMessageParams{
+            .type = protocol.MessageType.warning,
+            .message = try std.fmt.allocPrint(a, "mahina: initializationOptions ignored: {s}", .{why}),
+        });
+    }
 
     /// Add a workspace folder, read its `mahina.toml`, and publish what is
     /// wrong with it (or clear what was).
@@ -1983,4 +2023,35 @@ test "system groups: a folder's mahina.toml decides which members exist, and hov
     const read = try requestAt(&h, 3, "file:///w/m.mah", "textDocument/hover", 1, 14);
     const read_text = read.object.get("result").?.object.get("contents").?.object.get("value").?.string;
     try testing.expect(std.mem.indexOf(u8, read_text, "does not enable") == null);
+}
+test "initializationOptions: override every folder's mahina.toml; a misspelt key is reported and nothing applies" {
+    var mem: MemoryFiles = .{ .entries = &.{
+        .{ "/w/mahina.toml", "version = 1\n[diagnostics]\nsuppress = [\"W0001\"]\n" },
+    } };
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.files = mem.files();
+    h.server.known_globals = &.{ "print", "require" };
+    _ = try initWith(&h,
+        \\"workspaceFolders":[{"uri":"file:///w","name":"w"}],"initializationOptions":{"globals":{"spawn":"starts a process"},"diagnostics":{"suppress":["unresolved-require"]}}
+    );
+    // `spawn` is known, `undefined_name` is suppressed by the file, the missing
+    // module by the editor.
+    _ = try openDoc(&h, 0, "file:///w/m.mah", "spawn(undefined_name, require(\"gone\"))\n");
+    const t = try h.tick(50);
+    try testing.expectEqual(@as(usize, 0), diagnosticsFor(t, "file:///w/m.mah").?.len);
+
+    var bad = Harness.init(.{});
+    defer bad.deinit();
+    bad.server.known_globals = &.{"print"};
+    const r = try initWith(&bad,
+        \\"rootUri":"file:///w","initializationOptions":{"runtime":{"systm":["files"]}}
+    );
+    var said: ?[]const u8 = null;
+    for (r) |m| {
+        const method = m.object.get("method") orelse continue;
+        if (std.mem.eql(u8, method.string, "window/showMessage")) said = m.object.get("params").?.object.get("message").?.string;
+    }
+    try testing.expectEqualStrings("mahina: initializationOptions ignored: unknown member 'runtime.systm'", said.?);
+    try testing.expect(bad.server.ws.loose.system == @import("../system.zig").Groups.all);
 }

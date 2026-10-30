@@ -39,6 +39,18 @@ impl zed::Extension for MahinaExtension {
             env: worktree.shell_env(),
         })
     }
+
+    /// `lsp.mahina.initialization_options` in Zed's settings: the tables of
+    /// `mahina.toml` as JSON, overriding it in every folder (doc 74 §7.4).
+    fn language_server_initialization_options(
+        &mut self,
+        language_server_id: &LanguageServerId,
+        worktree: &zed::Worktree,
+    ) -> Result<Option<zed::serde_json::Value>> {
+        Ok(LspSettings::for_worktree(language_server_id.as_ref(), worktree)
+            .ok()
+            .and_then(|s| s.initialization_options))
+    }
 }
 
 zed::register_extension!(MahinaExtension);
