@@ -344,25 +344,34 @@ fn writeWorkspace(gpa: std.mem.Allocator, io: std.Io, files: usize) !void {
     }
 }
 
-/// `workspace/symbol` over `symbols_dir`: cold (every file read and parsed),
-/// warm (the walk finds every stamp unchanged), best of `reps`; the server's
-/// memory once the index is built, and its peak while building it.
-fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !struct { cold: u64, warm: u64, symbols: usize, live: usize, peak: usize } {
+const WorkspaceSymbols = struct { cold: u64, warm: u64, changed: u64, unwatched: u64, symbols: usize, live: usize, peak: usize };
+
+/// `workspace/symbol` over `symbols_dir`, best of `reps`: cold (every file
+/// read and parsed); warm, for a client that watches files (nothing
+/// reported, so only the search); after one file is rewritten and reported;
+/// and warm for a client that cannot watch (a walk finding every stamp
+/// unchanged). Also the server's memory once the index is built, and its
+/// peak while building it.
+fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !WorkspaceSymbols {
     var tracker = mahina.mem.TrackingAllocator.init(gpa);
     const ta = tracker.allocator();
     var cold: u64 = std.math.maxInt(u64);
     var warm: u64 = std.math.maxInt(u64);
+    var changed: u64 = std.math.maxInt(u64);
+    var unwatched: u64 = std.math.maxInt(u64);
     var symbols: usize = 0;
     var live: usize = 0;
-    for (0..reps) |_| {
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace/symbol\",\"params\":{\"query\":\"wrk_12\"}}";
+    const edited = symbols_dir ++ "/d_0/f_0.mah";
+    const report = "{\"jsonrpc\":\"2.0\",\"method\":\"workspace/didChangeWatchedFiles\",\"params\":{\"changes\":[{\"uri\":\"file://" ++ edited ++ "\",\"type\":2}]}}";
+    for (0..reps) |rep| {
         var core = server.Server.init(ta, .{});
         defer core.deinit();
         core.files = lsp.host_stdio.disk;
         var out = server.Outbox.init(ta);
         defer out.deinit();
-        try core.handle(0, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{},\"rootUri\":\"file://" ++ symbols_dir ++ "\"}}", &out);
+        try core.handle(0, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{\"workspace\":{\"didChangeWatchedFiles\":{\"dynamicRegistration\":true}}},\"rootUri\":\"file://" ++ symbols_dir ++ "\"}}", &out);
         try core.handle(0, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}", &out);
-        const body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"workspace/symbol\",\"params\":{\"query\":\"wrk_12\"}}";
         for ([_]*u64{ &cold, &warm }) |slot| {
             out.reset();
             const t0 = now(io);
@@ -372,13 +381,32 @@ fn workspaceSymbols(gpa: std.mem.Allocator, io: std.Io, reps: usize) !struct { c
             slot.* = @min(slot.*, @as(u64, @intCast(t1 - t0)));
         }
         if (core.symbols.truncated) return error.Truncated;
+
+        var buf: [64]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "function edited_{d}() end\n", .{rep});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = edited, .data = text });
+        const builds = core.symbols.builds;
+        out.reset();
+        const t0 = now(io);
+        try core.handle(20, report, &out);
+        try core.handle(20, body, &out);
+        const t1 = now(io);
+        if (core.symbols.builds != builds + 1) return error.ChangeMissed;
+        changed = @min(changed, @as(u64, @intCast(t1 - t0)));
+
+        core.watches_files = false;
+        out.reset();
+        const t2 = now(io);
+        try core.handle(30, body, &out);
+        const t3 = now(io);
+        unwatched = @min(unwatched, @as(u64, @intCast(t3 - t2)));
         out.reset();
         live = tracker.stats.live_bytes;
         symbols = 0;
         var it = core.symbols.entries.valueIterator();
         while (it.next()) |e| symbols += e.*.symbols.len;
     }
-    return .{ .cold = cold, .warm = warm, .symbols = symbols, .live = live, .peak = tracker.stats.peak_bytes };
+    return .{ .cold = cold, .warm = warm, .changed = changed, .unwatched = unwatched, .symbols = symbols, .live = live, .peak = tracker.stats.peak_bytes };
 }
 
 fn open(gpa: std.mem.Allocator, core: *server.Server, out: *server.Outbox, text: []const u8) !void {
@@ -596,24 +624,28 @@ fn run(gpa: std.mem.Allocator, io: std.Io) !void {
     mahina.io.print(
         \\
         \\workspace symbols: `workspace/symbol` over a folder on disk, files of 100 lines (doc 74 §7.4; best of N, ms)
+        \\  warm: a watching client, nothing changed; 1 change: one file rewritten and reported; unwatched: a client that cannot watch
         \\
-        \\{s: <30} {s: >9} {s: >9} {s: >10} {s: >10} {s: >10} {s: >10}
+        \\{s: <30} {s: >9} {s: >9} {s: >10} {s: >10} {s: >10} {s: >10} {s: >10} {s: >10}
         \\
-    , .{ "folder", "files", "symbols", "cold", "warm", "index MiB", "peak MiB" });
+    , .{ "folder", "files", "symbols", "cold", "warm", "1 change", "unwatched", "index MiB", "peak MiB" });
     defer std.Io.Dir.cwd().deleteTree(io, symbols_dir) catch {};
     const folders = [_]struct { name: []const u8, files: usize, reps: usize }{
         .{ .name = "1k files", .files = 1_000, .reps = 5 },
         .{ .name = "10k files", .files = 10_000, .reps = 3 },
+        .{ .name = "20k files (the cap)", .files = lsp.symbol_index.max_files, .reps = 3 },
     };
     for (folders) |f| {
         try writeWorkspace(gpa, io, f.files);
         const got = try workspaceSymbols(gpa, io, f.reps);
-        mahina.io.print("{s: <30} {d: >9} {d: >9} {d: >10.2} {d: >10.2} {d: >10.1} {d: >10.1}\n", .{
+        mahina.io.print("{s: <30} {d: >9} {d: >9} {d: >10.2} {d: >10.2} {d: >10.2} {d: >10.2} {d: >10.1} {d: >10.1}\n", .{
             f.name,
             f.files,
             got.symbols,
             ms(got.cold),
             ms(got.warm),
+            ms(got.changed),
+            ms(got.unwatched),
             @as(f64, @floatFromInt(got.live)) / (1024.0 * 1024.0),
             @as(f64, @floatFromInt(got.peak)) / (1024.0 * 1024.0),
         });

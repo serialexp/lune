@@ -189,6 +189,10 @@ pub const Server = struct {
         const method = msg.method orelse {
             if (msg.failure) |why| {
                 try out.log(protocol.MessageType.warning, try std.fmt.allocPrint(a, "the client refused a request: {s}", .{why}));
+                // No watcher: workspace symbols have no change log to go by.
+                if (msg.id) |id| if (id == .string and std.mem.eql(u8, id.string, watch_registration)) {
+                    self.watches_files = false;
+                };
             }
             return;
         };
@@ -610,8 +614,10 @@ pub const Server = struct {
     }
 
     /// Bring the symbol index up to date with the open documents and every
-    /// folder's files.
+    /// folder's files: from the change log the client's watcher feeds, or,
+    /// without one, by walking every folder.
     pub fn refreshSymbols(self: *Server, a: std.mem.Allocator) Error!void {
+        if (!self.watches_files) self.symbols.stale = true;
         const roots = try a.alloc(symbol_index.Root, self.ws.folders.items.len);
         for (self.ws.folders.items, roots) |f, *r| r.* = .{
             .path = f.path,
@@ -792,10 +798,11 @@ pub const Server = struct {
             var it = self.docs.map.valueIterator();
             while (it.next()) |d| markDirty(d.*, now_ms);
         } else if (std.mem.eql(u8, method, "initialized")) {
-            try self.watchConfigs(out);
+            try self.watchFiles(out);
         } else if (std.mem.eql(u8, method, "workspace/didChangeWatchedFiles")) {
             const p = jsonrpc.decodeParams(protocol.DidChangeWatchedFilesParams, a, params) catch |e|
                 return self.badNotification(a, method, e, out);
+            try self.noteChanges(a, p.changes);
             if (try self.reloadConfigs(a, p.changes, out)) {
                 var it = self.docs.map.valueIterator();
                 while (it.next()) |d| markDirty(d.*, now_ms);
@@ -904,24 +911,42 @@ pub const Server = struct {
     }
 
     /// The id of the server's one `client/registerCapability` request.
-    pub const watch_registration = "mahina/watch-config";
+    pub const watch_registration = "mahina/watch-files";
 
-    /// Ask the client to report changes to any `mahina.toml`, when it can
-    /// (dynamic registration is the only way LSP offers). A client that
-    /// cannot is told, once, what a config edit then needs, if there is a
-    /// folder on a disk to have one.
-    fn watchConfigs(self: *Server, out: *Outbox) Error!void {
+    /// Ask the client to report changes to files, when it can (dynamic
+    /// registration is the only way LSP offers): any `mahina.toml`, and
+    /// every file and directory, the change log of the workspace symbol
+    /// index (`symbol_index.Index.note` drops what cannot matter to it). A
+    /// client that cannot is told, once, what that costs, if there is a
+    /// folder on a disk.
+    fn watchFiles(self: *Server, out: *Outbox) Error!void {
         if (!self.watches_files) {
             if (self.files == null or self.ws.folders.items.len == 0) return;
-            return out.log(protocol.MessageType.info, "the client cannot watch files: an edit to mahina.toml takes effect when its folder is re-added or the server restarts");
+            return out.log(protocol.MessageType.info, "the client cannot watch files: an edit to mahina.toml takes effect when its folder is re-added or the server restarts, and workspace symbols look at every file on each request");
         }
-        const watchers = [_]protocol.FileSystemWatcher{.{ .globPattern = "**/" ++ workspace.config_name }};
+        const watchers = [_]protocol.FileSystemWatcher{
+            .{ .globPattern = "**/" ++ workspace.config_name },
+            .{ .globPattern = "**/*" },
+        };
         const registrations = [_]protocol.Registration{.{
             .id = watch_registration,
             .method = "workspace/didChangeWatchedFiles",
             .registerOptions = .{ .watchers = &watchers },
         }};
         try out.request(.{ .string = watch_registration }, "client/registerCapability", protocol.RegistrationParams{ .registrations = &registrations });
+    }
+
+    /// Log the reported changes for the workspace symbol index.
+    fn noteChanges(self: *Server, a: std.mem.Allocator, changes: []const protocol.FileEvent) Error!void {
+        for (changes) |c| {
+            const path = (try uri_mod.toPath(a, c.uri)) orelse continue;
+            const change: symbol_index.Index.Change = switch (c.type) {
+                protocol.FileChangeType.created => .created,
+                protocol.FileChangeType.deleted => .deleted,
+                else => .changed,
+            };
+            try self.symbols.note(try std.fs.path.resolveAllocPosix(a, &.{path}), change);
+        }
     }
 
     /// Read again the config of every folder whose `mahina.toml` changed,
@@ -2187,10 +2212,10 @@ test "watched files: the server asks to watch mahina.toml, and an edit to one is
     try testing.expectEqualStrings("**/mahina.toml", reg.get("registerOptions").?.object.get("watchers").?.array.items[0].object.get("globPattern").?.string);
     // The client's answer needs no reply; a refusal is logged.
     try testing.expectEqual(@as(usize, 0), (try h.send(1,
-        \\{"jsonrpc":"2.0","id":"mahina/watch-config","result":null}
+        \\{"jsonrpc":"2.0","id":"mahina/watch-files","result":null}
     )).len);
     const refused = try h.send(1,
-        \\{"jsonrpc":"2.0","id":"mahina/watch-config","error":{"code":-32601,"message":"unsupported"}}
+        \\{"jsonrpc":"2.0","id":"mahina/watch-files","error":{"code":-32601,"message":"unsupported"}}
     );
     try testing.expectEqualStrings("window/logMessage", refused[0].object.get("method").?.string);
 
@@ -2278,4 +2303,53 @@ test "workspace symbols: every folder's functions, an open document's as edited,
         try names.append(testing.allocator, ' ');
     }
     try testing.expectEqualStrings("scratch subtract M:size ", names.items);
+}
+
+test "workspace symbols: a watching client's changes are the only paths looked at again; a refusal walks every time" {
+    var entries = [_][2][]const u8{
+        .{ "/w/a.mah", "function alpha() end\n" },
+        .{ "/w/b.mah", "function beta() end\n" },
+    };
+    var mem: MemoryFiles = .{ .entries = &entries };
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.files = mem.files();
+    _ = try h.send(0,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"workspace":{"didChangeWatchedFiles":{"dynamicRegistration":true}}},"workspaceFolders":[{"uri":"file:///w","name":"w"}]}}
+    );
+    const ready = try h.send(0,
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+    );
+    const watchers = ready[0].object.get("params").?.object.get("registrations").?.array.items[0].object.get("registerOptions").?.object.get("watchers").?.array.items;
+    try testing.expectEqualStrings("**/*", watchers[1].object.get("globPattern").?.string);
+
+    const query =
+        \\{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"a"}}
+    ;
+    const first = try h.send(1, query);
+    try testing.expectEqual(@as(usize, 2), first[first.len - 1].object.get("result").?.array.items.len);
+    const stamped = h.server.symbols.stamps;
+
+    // Unreported, a change is not looked for; reported, only its path is.
+    entries[1][1] = "function gamma() end\n";
+    _ = try h.send(2, query);
+    try testing.expectEqual(stamped, h.server.symbols.stamps);
+    _ = try h.send(3,
+        \\{"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":"file:///w/b.mah","type":2},{"uri":"file:///w/.zig-cache/x","type":1}]}}
+    );
+    const after = try h.send(4,
+        \\{"jsonrpc":"2.0","id":3,"method":"workspace/symbol","params":{"query":"gamma"}}
+    );
+    try testing.expectEqual(@as(usize, 1), after[after.len - 1].object.get("result").?.array.items.len);
+    try testing.expectEqual(stamped + 1, h.server.symbols.stamps);
+
+    // The client refuses to watch: each request walks every folder.
+    _ = try h.send(5,
+        \\{"jsonrpc":"2.0","id":"mahina/watch-files","error":{"code":-32601,"message":"unsupported"}}
+    );
+    entries[0][1] = "function delta() end\n";
+    const walked = try h.send(6,
+        \\{"jsonrpc":"2.0","id":4,"method":"workspace/symbol","params":{"query":"delta"}}
+    );
+    try testing.expectEqual(@as(usize, 1), walked[walked.len - 1].object.get("result").?.array.items.len);
 }

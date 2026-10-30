@@ -279,10 +279,18 @@ land; move whole phases to Done once everything inside them is checked.
       `package_path` template names (`.mah`, `.lua`); hidden directories,
       `node_modules`, `zig-out` and `target` are not entered, symbolic links
       are not followed, and at most 20,000 files are indexed. The index is
-      kept per file and brought up to date on each request: the folders are
-      walked and each file's size and modification time
-      (`workspace.Files.stamp`) compared with those it was indexed at, so
-      only a changed file is read and parsed again; open documents are
+      kept per file. A folder is walked once, when it appears (again when
+      its extensions change, or when a nested folder inside it goes); after
+      that a request looks only at the paths the client's watcher reported
+      since the last one (`**/*` is registered with `**/mahina.toml`; the
+      index drops a change to a non-source file, a path in no folder or in
+      a directory not walked). A reported directory stands for everything
+      under it: deleted, its files go; created, it is walked. A looked-at
+      file is parsed again only when its size or modification time
+      (`workspace.Files.stamp`) differs. A client that cannot watch, or
+      refuses the registration, has no change log, so every request walks
+      every folder, the stamps still sparing the parsing. A change log
+      longer than 20,000 paths is dropped for a walk. Open documents are
       indexed from their text, keyed by its hash, and a document with no
       file is searched too. Matching ignores case and ranks the whole name,
       then a prefix, then a substring, then a subsequence; at most 500
@@ -697,16 +705,19 @@ module exporting one function per 13 lines, load average ~16): completion
 after `m.` costs 0.31 / 4.0 / 64 ms cold and 0.02 / 0.12 / 1.5 ms warm at
 1k / 10k / 100k lines of module. The host reads files up to 16 MiB.
 
-**Workspace symbols, as built in P6e (2026-10-30).** The index is checked
-against the disk on every request (a walk and one stat per file) instead of
-being invalidated by file events: it never relies on a client's watcher
-reporting a deleted directory, and it needs no watcher at all. Each file's
-entry is two allocations sized exactly. Measured (`bench-lsp`, "workspace
-symbols", files of 100 lines with 8 functions each, load average ~2.5):
-28 / 296 ms cold and 0.6 / 11.6 ms warm at 1k / 10k files; the index holds
-0.7 / 7.1 MiB, and building it peaks at 1.1 / 9.1 MiB (each file's text is
-freed once it is indexed). The warm cost at 10k files is the stats; a
-watcher on source files could skip the walk while nothing changes.
+**Workspace symbols, as built in P6e (2026-10-30).** The first cut walked
+every folder and stamped every file on each request (11.6 ms at 10k files,
+growing with the workspace); Bart chose the client's file watcher as the
+index's change log instead, with the walk kept only for a client that
+cannot watch. Each file's entry is two allocations sized exactly. Measured
+(`bench-lsp`, "workspace symbols", files of 100 lines with 8 functions
+each, load average ~2): at 1k / 10k / 20k files, 28 / 296 / 599 ms cold;
+warm for a watching client 0.11 / 1.5 / 4.8 ms, and 0.12 / 1.3 / 3.9 ms
+with one file rewritten and reported; warm for a client that cannot watch
+0.6 / 10.9 / 25 ms. The index holds 0.7 / 7.1 / 14.3 MiB, and building it
+peaks at 1.2 / 9.1 / 18.3 MiB (each file's text is freed once it is
+indexed). A watching client's warm cost is now the search, a scan of every
+symbol: linear in the workspace, the next lever if the cap rises.
 
 **Cost, measured** (`zig build bench-lsp`, cross-file table: a literal
 `require` per 14 lines, half resolving nowhere, real disk): 0.08 ms added
