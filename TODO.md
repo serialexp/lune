@@ -15,13 +15,17 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       raise a runtime error when the global is already non-nil; `<const>`
       applies to globals, `<close>` to locals only. Open before the design
       doc: whether attributes (`<const>`, `<close>`, which mahina has none
-      of yet, locals included) come in the same change. **Divergence from
-      Lua (Bart):** in Lua `local t <const> = {}` still allows `t.x = 1`
-      (only the variable is fixed); in mahina a const value cannot be
-      written into either. Open: shallow (t's own fields) or deep, and how
-      a write through an alias (`local u = t; u.x = 1`) is caught: the
-      compiler cannot see aliases, so it needs a frozen mark on the
-      table at run time (with its cost on every table store). In mahina the
+      of yet, locals included) come in the same change. **Const and
+      frozen are two things (Bart, 2026-10-31, as JS and Luau have them):**
+      `<const>` only forbids assigning the variable again, as in Lua 5.5
+      and JS `const`; `t.x = 1` through it is allowed. Freezing is a
+      separate run-time call, `table.freeze(t)` (with `table.isfrozen`),
+      as Luau's and JS `Object.freeze`: shallow, permanent, for every
+      holder of `t`, and a write to a frozen table is an error (as in
+      Luau). A deep freeze is the program calling it recursively. Costs a
+      frozen bit per table, tested on every table store (the JIT can hoist
+      it). `table.freeze`/`isfrozen` are Luau's, not Lua 5.4's: they get
+      rows in the stdlib inventory when they land (Rule Z-5). In mahina the
       resolver would own the declarations as scoped bindings (doc 74 §6.3),
       and the undefined-global warning stays for code outside any
       declaration. The resolver already treats `_G.x` as the global `x`
