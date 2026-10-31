@@ -897,12 +897,15 @@ test "nativegen(doc63 cleanups): an element table's array bases load once per ra
             }
             // Doc 63 register pressure, item 2: the body reads `container` only
             // through its hoisted bases, so wherever registers ran out it gave up
-            // its own for a frame cell. The callout splits the ranges, so nothing
-            // there runs short and it keeps its register.
+            // its own. The callout splits the ranges, so nothing there runs
+            // short and it keeps its register. The home is then the slot's own
+            // payload cell, also where the trace gave rsi to body values
+            // (`.tight` and `.pressure`): only the prologue and exit code read
+            // it, and both see rsi as the slab.
             const cs = alloc.slots[@intCast(alloc.slot_id_of_ref[0])];
             try testing.expect(cs.prologue_only);
             try testing.expect(cs.data_home != null and cs.len_home != null);
-            try testing.expectEqual(mode != .callout, cs.home == .spill);
+            try testing.expectEqual(mode != .callout, cs.home == .slab);
             // Item 3: rdi/rsi/rdx go to values only once the pool and the
             // prologue-only homes are used up, so not with three reads alone.
             for (alloc.abi_cell) |c| try testing.expectEqual(mode == .tight or mode == .pressure, c != null);

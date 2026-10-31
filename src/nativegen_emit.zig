@@ -78,7 +78,7 @@ const SilentExitMetadata = artifact.SilentExitMetadata;
 pub fn placeToReg(a: *x64.Assembler, dst: Reg, src: Place) !void {
     switch (src) {
         .reg => |r| if (r != dst) try a.movRegReg(dst, r),
-        .mem => |d| try a.movRegMem(dst, .rsp, d),
+        .mem => |m| try a.movRegMem(dst, m.base, m.disp),
         .imm => |v| try a.movRegImm32Sx(dst, v),
         .xmm => unreachable, // a GP destination never receives a float source
     }
@@ -87,7 +87,7 @@ pub fn placeToReg(a: *x64.Assembler, dst: Reg, src: Place) !void {
 pub fn regToPlace(a: *x64.Assembler, dst: Place, src: Reg) !void {
     switch (dst) {
         .reg => |r| if (r != src) try a.movRegReg(r, src),
-        .mem => |d| try a.movMemReg(.rsp, d, src),
+        .mem => |m| try a.movMemReg(.rsp, m.frameDisp(), src),
         .xmm => unreachable, // a GP source never targets a float home
         .imm => unreachable, // an immediate is never written
     }
@@ -105,8 +105,8 @@ pub fn refBaseReg(a: *x64.Assembler, alloc: *const Alloc, ref: usize, scratch: R
     }
     switch (placeOfRef(alloc, ref)) {
         .reg => |r| return r,
-        .mem => |d| {
-            try a.movRegMem(scratch, .rsp, d);
+        .mem => |m| {
+            try a.movRegMem(scratch, m.base, m.disp);
             return scratch;
         },
         .imm => |v| {
@@ -179,8 +179,8 @@ pub fn arrayFieldReg(a: *x64.Assembler, alloc: *const Alloc, aref_a: usize, fiel
 pub fn refHomeBaseReg(a: *x64.Assembler, s: SlotInfo, scratch: Reg) !Reg {
     switch (slotHomePlace(s)) {
         .reg => |r| return r,
-        .mem => |d| {
-            try a.movRegMem(scratch, .rsp, d);
+        .mem => |m| {
+            try a.movRegMem(scratch, m.base, m.disp);
             return scratch;
         },
         .xmm => unreachable, // only `.ptr`/`.func`/`.native` heap-pointer slots reach here, never float
@@ -202,13 +202,13 @@ pub fn emitAluRegPlace(a: *x64.Assembler, op: trace.IrOp, dst: Reg, src: Place) 
             .bxor => try a.xorRegReg(dst, r),
             else => unreachable,
         },
-        .mem => |d| switch (op) {
-            .add => try a.addRegMem(dst, .rsp, d),
-            .sub => try a.subRegMem(dst, .rsp, d),
-            .mul => try a.imulRegMem(dst, .rsp, d),
-            .band => try a.andRegMem(dst, .rsp, d),
-            .bor => try a.orRegMem(dst, .rsp, d),
-            .bxor => try a.xorRegMem(dst, .rsp, d),
+        .mem => |m| switch (op) {
+            .add => try a.addRegMem(dst, m.base, m.disp),
+            .sub => try a.subRegMem(dst, m.base, m.disp),
+            .mul => try a.imulRegMem(dst, m.base, m.disp),
+            .band => try a.andRegMem(dst, m.base, m.disp),
+            .bor => try a.orRegMem(dst, m.base, m.disp),
+            .bxor => try a.xorRegMem(dst, m.base, m.disp),
             else => unreachable,
         },
         .imm => |v| switch (op) {
@@ -250,14 +250,15 @@ pub fn emitBinAlu(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: 
                 try emitAluRegPlace(a, op, R, pb);
             }
         },
-        .mem => |D| {
+        .mem => |dm| {
+            const D = dm.frameDisp();
             if (Place.eql(pa, dst)) {
                 // In-place spilled home (win 2): `op [dst], b`. Load b to rcx if spilled.
                 std.debug.assert(op != .mul); // no imul store form
                 const src_reg: Reg = switch (pb) {
                     .reg => |r| r,
-                    .mem => |bd| blk: {
-                        try a.movRegMem(.rcx, .rsp, bd);
+                    .mem => |bm| blk: {
+                        try a.movRegMem(.rcx, bm.base, bm.disp);
                         break :blk .rcx;
                     },
                     .imm => |v| blk: {
@@ -310,7 +311,7 @@ pub fn emitShift(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: P
     if (pb == .imm) {
         if (!(pa == .reg and pa.reg == W)) try placeToReg(a, W, pa);
         try emitShiftImm(a, op, W, pb.imm);
-        if (dst == .mem) try a.movMemReg(.rsp, dst.mem, W);
+        if (dst == .mem) try a.movMemReg(.rsp, dst.mem.frameDisp(), W);
         return;
     }
     // Load the count into rcx FIRST: pb's home may coincide with the dst register (the
@@ -366,7 +367,7 @@ pub fn emitShift(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: P
 
     a.bind(done_lbl);
     // Spilled dst: write the computed value back to its stack home.
-    if (dst == .mem) try a.movMemReg(.rsp, dst.mem, W);
+    if (dst == .mem) try a.movMemReg(.rsp, dst.mem.frameDisp(), W);
 }
 
 /// `emitShift`'s legs for a count known at compile time, applied to `W`.
@@ -441,8 +442,8 @@ pub fn emitCompareFlags(a: *x64.Assembler, op: trace.IrOp, kind: Kind, pa: Place
 fn intCompareFlags(a: *x64.Assembler, pa: Place, pb: Place) !void {
     const lhs: Reg = switch (pa) {
         .reg => |r| r,
-        .mem => |d| blk: {
-            try a.movRegMem(.rax, .rsp, d);
+        .mem => |m| blk: {
+            try a.movRegMem(.rax, m.base, m.disp);
             break :blk .rax;
         },
         .imm => |v| blk: {
@@ -453,7 +454,7 @@ fn intCompareFlags(a: *x64.Assembler, pa: Place, pb: Place) !void {
     };
     switch (pb) {
         .reg => |r| try a.cmpRegReg(lhs, r),
-        .mem => |d| try a.cmpRegMem(lhs, .rsp, d),
+        .mem => |m| try a.cmpRegMem(lhs, m.base, m.disp),
         .imm => |v| try a.cmpRegImm32(lhs, v),
         .xmm => unreachable, // F1 admits only int compare operands (float compare is F2)
     }
@@ -466,10 +467,10 @@ fn condToPlace(a: *x64.Assembler, cc: x64.Cond, dst: Place) !void {
             try a.setcc(cc, R);
             try a.movzxRegReg8(R, R); // zero-extend the 0/1 byte to the full register
         },
-        .mem => |D| {
+        .mem => |m| {
             try a.setcc(cc, .rax);
             try a.movzxRegReg8(.rax, .rax);
-            try a.movMemReg(.rsp, D, .rax);
+            try a.movMemReg(.rsp, m.frameDisp(), .rax);
         },
         .xmm => unreachable, // a comparison result is a bool, never homed in an XMM
         .imm => unreachable, // only a konst is an immediate
@@ -563,13 +564,13 @@ pub fn floatOperandToXmm(a: *x64.Assembler, dst_xmm: Reg, place: Place, kind: Ki
     switch (kind) {
         .float => switch (place) {
             .xmm => |x| try a.movsdRegReg(dst_xmm, x),
-            .mem => |d| try a.movsdRegMem(dst_xmm, .rsp, d),
+            .mem => |m| try a.movsdRegMem(dst_xmm, m.base, m.disp),
             .reg => unreachable, // a float never lives in a GP register
             .imm => unreachable, // a float konst keeps its home (`konstImm`)
         },
         .int => switch (place) {
             .reg => |r| try a.cvtsi2sdRegReg(dst_xmm, r),
-            .mem => |d| try a.cvtsi2sdRegMem(dst_xmm, .rsp, d),
+            .mem => |m| try a.cvtsi2sdRegMem(dst_xmm, m.base, m.disp),
             .xmm => unreachable, // an int never lives in an XMM register
             .imm => |v| {
                 try a.movRegImm32Sx(.rax, v);
@@ -598,7 +599,7 @@ pub fn emitFloatBinOp(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, 
     }
     switch (dst) {
         .xmm => |x| if (x != XMM_SCRATCH0) try a.movsdRegReg(x, XMM_SCRATCH0),
-        .mem => |d| try a.movsdMemReg(.rsp, d, XMM_SCRATCH0),
+        .mem => |m| try a.movsdMemReg(.rsp, m.frameDisp(), XMM_SCRATCH0),
         .reg, .imm => unreachable, // a float result never homes in a GP register
     }
 }
@@ -677,8 +678,8 @@ pub fn flushBoxedSlot(a: *x64.Assembler, dst_slot: i32, tag_spill: u32, payload:
             std.debug.assert(r != .rdi and r != .rsi);
             try a.movMemReg(.rsi, poff, r);
         },
-        .mem => |d| {
-            try a.movRegMem(.rax, .rsp, d);
+        .mem => |m| {
+            try a.movRegMem(.rax, m.base, m.disp);
             try a.movMemReg(.rsi, poff, .rax);
         },
         .imm => |v| try a.movMemImm32(.rsi, poff, v),
@@ -698,8 +699,8 @@ pub fn flushSlot(a: *x64.Assembler, slot: i32, kind: Kind, payload: Place) !void
             try a.movMemReg(.rsi, poff, r);
         },
         .xmm => |x| try a.movsdMemReg(.rsi, poff, x),
-        .mem => |d| {
-            try a.movRegMem(.rax, .rsp, d);
+        .mem => |m| {
+            try a.movRegMem(.rax, m.base, m.disp);
             try a.movMemReg(.rsi, poff, .rax);
         },
         .imm => |v| try a.movMemImm32(.rsi, poff, v),
@@ -716,18 +717,18 @@ pub fn movePlace(a: *x64.Assembler, dst: Place, src: Place) !void {
         .reg => |r| try placeToReg(a, r, src),
         .xmm => |dx| switch (src) {
             .xmm => |sx| try a.movsdRegReg(dx, sx),
-            .mem => |sd| try a.movsdRegMem(dx, .rsp, sd),
+            .mem => |sm| try a.movsdRegMem(dx, sm.base, sm.disp),
             .reg => unreachable, // a float src never lives in a GP register
             .imm => unreachable, // a float konst keeps its home (`konstImm`)
         },
-        .mem => |d| switch (src) {
-            .reg => |sr| try a.movMemReg(.rsp, d, sr),
-            .xmm => |sx| try a.movsdMemReg(.rsp, d, sx),
-            .mem => |sd| {
-                try a.movRegMem(.rax, .rsp, sd);
-                try a.movMemReg(.rsp, d, .rax);
+        .mem => |dm| switch (src) {
+            .reg => |sr| try a.movMemReg(.rsp, dm.frameDisp(), sr),
+            .xmm => |sx| try a.movsdMemReg(.rsp, dm.frameDisp(), sx),
+            .mem => |sm| {
+                try a.movRegMem(.rax, sm.base, sm.disp);
+                try a.movMemReg(.rsp, dm.frameDisp(), .rax);
             },
-            .imm => |v| try a.movMemImm32(.rsp, d, v),
+            .imm => |v| try a.movMemImm32(.rsp, dm.frameDisp(), v),
         },
         .imm => unreachable, // an immediate is never written
     }
@@ -776,7 +777,7 @@ pub fn emitParallelMove(a: *x64.Assembler, moves: []Move, done: []bool) !void {
         if (fcycle) {
             switch (moves[start].dst) {
                 .xmm => |x| try a.movsdRegReg(XMM_SCRATCH1, x),
-                .mem => |d| try a.movsdRegMem(XMM_SCRATCH1, .rsp, d),
+                .mem => |dm| try a.movsdRegMem(XMM_SCRATCH1, dm.base, dm.disp),
                 .reg, .imm => unreachable,
             }
         } else {
@@ -803,7 +804,7 @@ pub fn emitParallelMove(a: *x64.Assembler, moves: []Move, done: []bool) !void {
                 if (fcycle) {
                     switch (m.dst) {
                         .xmm => |x| try a.movsdRegReg(x, XMM_SCRATCH1),
-                        .mem => |d| try a.movsdMemReg(.rsp, d, XMM_SCRATCH1),
+                        .mem => |dm| try a.movsdMemReg(.rsp, dm.frameDisp(), XMM_SCRATCH1),
                         .reg, .imm => unreachable,
                     }
                 } else {
@@ -1868,7 +1869,7 @@ pub fn emitFloatCallout(
     try emitCalloutRestore(a, alloc);
     switch (placeOfRef(alloc, i)) {
         .xmm => |x| if (x != XMM_SCRATCH0) try a.movsdRegReg(x, XMM_SCRATCH0),
-        .mem => |d| try a.movsdMemReg(.rsp, d, XMM_SCRATCH0),
+        .mem => |m| try a.movsdMemReg(.rsp, m.frameDisp(), XMM_SCRATCH0),
         .reg, .imm => unreachable, // a float result never homes in a GP register
     }
 }
@@ -2336,7 +2337,7 @@ pub fn emitStr2NumCallout(
         try regToPlace(a, placeOfRef(alloc, i), .rax);
     } else switch (placeOfRef(alloc, i)) {
         .xmm => |x| try a.movqXmmReg(x, .rax),
-        .mem => |d| try a.movMemReg(.rsp, d, .rax),
+        .mem => |m| try a.movMemReg(.rsp, m.frameDisp(), .rax),
         .reg, .imm => unreachable,
     }
 }

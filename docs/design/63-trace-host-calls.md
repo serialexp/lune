@@ -1975,6 +1975,35 @@ allocatable GPRs and each body konst took the ninth for a `movabs`.
    probe went 71 → 65 instructions per iteration, with no body spills and
    no division park.
 
+*Item 2's homes move to the slab* (`Loc.slab`, `Place.Mem` in
+`nativegen_alloc.zig`). A memory place used to be a frame displacement.
+It is now a base register and a displacement, and code that writes one
+takes `Mem.frameDisp`, which asserts the base is rsp. An evicted
+prologue-only slot no longer takes a frame cell: its home is its own
+payload cell, `[rsi + slot*8]`. Nothing in the trace writes an invariant
+slot, and the prologue's home load is a raw payload load for every kind,
+so the cell holds the home's value for the whole run. The prologue skips
+the cell store it made per entry, which was item 2's nsieve-bit-fp cost.
+Exits record the place as `ExitPlaceTag.slab`, and the doc 56 adapters
+read it from the slab, which they run with. Only the prologue and exit
+code read such a home: by definition no body or run-once instruction
+does. Both see rsi as the slab, also in a trace that gave rsi to body
+values (item 3): the prologue runs before `body_entry` parks it, and
+every exit stub's head reloads it first. A frame-cell fallback for those
+traces was built, then dropped: without it the suite, the abi-stress
+suite and the oracle comparison in the item 2 test (whose `.tight` and
+`.pressure` modes give rsi up) all pass. Mutations caught: a slab place
+one cell off (the suite, broadly), and no prologue skip for a slab home
+(the `frameDisp` assertion). The bigger `locToPlace`/`placeOfRef` stopped
+being inlined, costing about +64k instructions per nbody compile, so both
+are `inline`; the remaining compile cost is about +7k (callgrind,
+nbody 1000). On `bench/` (instructions, JIT on, against item 3):
+nsieve-bit-fp −0.15%, nsieve-bit −0.08%, spectral-norm −0.04%, str_gmatch
+−0.02%, array3d −0.01%. The worst regression is nbody at +0.008%
+(compile cost). The tiny scimark runs and while_shortcircuit_probe move by
+a few hundred to a thousand instructions. The probe is unchanged: it
+evicts no prologue-only slot.
+
 **Precise traces take the widen-eviction probe.** `wide` stores into an
 array whose lane widens after the trace is recorded. An ordinary trace
 whose prologue fails for that reason is evicted and re-recorded (the

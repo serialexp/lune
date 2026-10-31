@@ -380,6 +380,7 @@ fn placeOf(r: ExitLoc) ?Loc {
         .reg => .{ .reg = @enumFromInt(r.payload) },
         .xmm => .{ .xmm = @enumFromInt(r.payload) },
         .spill => .{ .spill = r.payload / 8 },
+        .slab => .{ .slab = @intCast(r.payload) },
         .konst, .none => null,
     };
 }

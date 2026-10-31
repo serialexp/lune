@@ -198,6 +198,10 @@ fn setPlace(out: *ExitLoc, l: Loc) void {
             out.tag = .spill;
             out.payload = idx * 8;
         },
+        .slab => |slot| {
+            out.tag = .slab;
+            out.payload = slot;
+        },
         // No snapshot names a flags compare (`isFlagsCompare`), and a
         // konst's row is `.konst` before it gets here.
         .flags, .imm => unreachable,

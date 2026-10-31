@@ -432,7 +432,7 @@ pub const SeedPlan = struct {
 /// `TraceCode.consts` (rebuilt from the constant, never read from the
 /// body), and `none` means the body keeps no copy at all (a `.none`-kind
 /// value, e.g. a dead window load).
-pub const ExitPlaceTag = enum(u8) { reg, xmm, spill, konst, none };
+pub const ExitPlaceTag = enum(u8) { reg, xmm, spill, slab, konst, none };
 
 /// Doc 56 §4.2 (Phase 1): one row of the exit location map — where the
 /// value of IR ref `ref` lives in the compiled body.
@@ -458,7 +458,8 @@ pub const ExitLoc = struct {
     /// it, so the slab is already current). `NO_SLOT` otherwise.
     invariant_slot: u16 = NO_SLOT,
     /// `reg`/`xmm`: the register's enum value; `spill`: byte displacement;
-    /// `konst`: constant index; `none`: 0.
+    /// `slab`: the slot whose payload cell holds it; `konst`: constant
+    /// index; `none`: 0.
     payload: u32 = 0,
     /// Doc 56 Phase 4: the proved kind of the IR value itself. `kind` is
     /// what a slot flush boxes with (the SLOT's kind for a `slot_load`);

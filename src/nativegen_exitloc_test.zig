@@ -43,6 +43,10 @@ fn expectPlace(row: nativegen.ExitLoc, alloc: *const ngalloc.Alloc, loc: ngalloc
             try testing.expectEqual(nativegen.ExitLoc.Tag.spill, row.tag);
             try testing.expectEqual(idx * 8, row.payload);
         },
+        .slab => |slot| {
+            try testing.expectEqual(nativegen.ExitLoc.Tag.slab, row.tag);
+            try testing.expectEqual(@as(u32, slot), row.payload);
+        },
         // No exit materializes a flags compare (`isFlagsCompare`).
         .flags => return error.FlagsCompareAtExit,
         // A konst's row is `.konst`, never a place.

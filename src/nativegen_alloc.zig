@@ -53,6 +53,17 @@ pub const Loc = union(enum) {
     /// immediate operand, or materializes it where it needs a register
     /// (LuaJIT's `asm_isk32` and `ra_rematk`). The konst itself emits nothing.
     imm: i32,
+    /// The slot's own payload cell in the register file, `[rsi + slot*8]`:
+    /// the home of a prologue-only invariant slot that gave up its register
+    /// (doc 63 register pressure, item 2). Nothing in the trace writes an
+    /// invariant slot, so the cell holds the value the prologue checked for
+    /// the whole run, and the slot needs no frame cell or store of its own.
+    /// Only the prologue and the exit code read such a home: a prologue-only
+    /// slot has no reader in the body or the run-once region (`HomeReads`).
+    /// Both see rsi as the slab, even in a trace that gives rsi to body
+    /// values (`AbiEvict`): the prologue runs before `body_entry` parks it,
+    /// and every exit stub reloads it first (`emitAbiRestore`).
+    slab: u16,
 };
 
 /// How a slot participates in the loop, deciding its prologue/back-edge/EXIT handling.
@@ -121,8 +132,9 @@ pub const SlotInfo = struct {
     /// through its hoisted bases (`HomeReads`; a table is marked only once
     /// Phase 2 has seated them all). It takes a register while one is free, and is the
     /// first to give it up when anything else would spill
-    /// (`evictPrologueOnly`): its home then moves to a frame cell, which only
-    /// the prologue reads.
+    /// (`evictPrologueOnly`): its home then moves to its own payload cell
+    /// (`Loc.slab`), or a frame cell the prologue fills when the trace gives
+    /// rsi to body values.
     prologue_only: bool = false,
     /// win 2: the store_ref transient was allocated *into* home, so the op updates the
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
@@ -1268,25 +1280,29 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         if (s.kind == .float) {
             // Float home: draw from the XMM pool, else a shared 8-byte spill cell.
             if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER) orelse
-                if (s.prologue_only) null else evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_xmm_mask, .xmm)) |r|
+                if (s.prologue_only) null else evictPrologueOnly(&evictable, slots.items, loc, &home_xmm_mask, .xmm)) |r|
             {
                 s.home = .{ .xmm = r };
                 home_xmm_mask |= regBit(r);
+            } else if (s.prologue_only) {
+                s.home = .{ .slab = s.slot };
             } else {
                 s.home = .{ .spill = spill_count };
                 spill_count += 1;
             }
         } else if (pickReg(&free) orelse
-            if (s.prologue_only) null else evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+            if (s.prologue_only) null else evictPrologueOnly(&evictable, slots.items, loc, &home_reg_mask, .gp)) |r|
         {
             s.home = .{ .reg = r };
             home_reg_mask |= regBit(r);
             used_callee |= regBit(r) & CALLEE_SAVED_MASK;
+        } else if (s.prologue_only) {
+            s.home = .{ .slab = s.slot };
         } else {
             s.home = .{ .spill = spill_count };
             spill_count += 1;
         }
-        if (s.prologue_only and s.home != .spill) try evictable.append(gpa, @intCast(sid));
+        if (s.prologue_only and (s.home == .reg or s.home == .xmm)) try evictable.append(gpa, @intCast(sid));
     }
     // Resolve slot_load refs to their slot home. A `.none` (snapshot-only)
     // slot has no home — its loc stays the value-less placeholder, and every
@@ -1351,7 +1367,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             switch (kinds[i]) {
                 .float => {
                     if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER) orelse
-                        evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_xmm_mask, .xmm)) |r|
+                        evictPrologueOnly(&evictable, slots.items, loc, &home_xmm_mask, .xmm)) |r|
                     {
                         loc[i] = .{ .xmm = r };
                         home_xmm_mask |= regBit(r);
@@ -1362,7 +1378,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 },
                 .int, .bool => {
                     if (pickReg(&free) orelse
-                        evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+                        evictPrologueOnly(&evictable, slots.items, loc, &home_reg_mask, .gp)) |r|
                     {
                         loc[i] = .{ .reg = r };
                         home_reg_mask |= regBit(r);
@@ -1464,7 +1480,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             if (s.class == .write_only or s.kind != .ptr) continue;
             if (need_data[sid]) {
                 if (pickRegFrom(&free, &BASE_HOME_ORDER) orelse
-                    evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+                    evictPrologueOnly(&evictable, slots.items, loc, &home_reg_mask, .gp)) |r|
                 {
                     s.data_home = r;
                     home_reg_mask |= regBit(r);
@@ -1473,7 +1489,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             }
             if (need_present[sid]) {
                 if (pickRegFrom(&free, &BASE_HOME_ORDER) orelse
-                    evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+                    evictPrologueOnly(&evictable, slots.items, loc, &home_reg_mask, .gp)) |r|
                 {
                     s.present_home = r;
                     home_reg_mask |= regBit(r);
@@ -1482,7 +1498,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             }
             if (need_len[sid] and !has_append) {
                 if (pickRegFrom(&free, &BASE_HOME_ORDER) orelse
-                    evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp)) |r|
+                    evictPrologueOnly(&evictable, slots.items, loc, &home_reg_mask, .gp)) |r|
                 {
                     s.len_home = r;
                     home_reg_mask |= regBit(r);
@@ -1691,7 +1707,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             active_len = wb;
             if ((if (abi_stress) abi.take(b.first, b.last, &spill_count) else null) orelse
                 pickReg(&free) orelse
-                evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp) orelse
+                evictPrologueOnly(&evictable, slots.items, loc, &home_reg_mask, .gp) orelse
                 abi.take(b.first, b.last, &spill_count)) |r|
             {
                 b.reg = r;
@@ -1752,7 +1768,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // first — see the win-2 skip above), so allocate a fresh XMM or a spill cell.
         if (kinds[i] == .float) {
             if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER) orelse
-                evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_xmm_mask, .xmm)) |r|
+                evictPrologueOnly(&evictable, slots.items, loc, &home_xmm_mask, .xmm)) |r|
             {
                 loc[i] = .{ .xmm = r };
                 active_xmm[active_xmm_len] = .{ .reg = r, .last = last_use[i] };
@@ -1799,7 +1815,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             loc[i] = .{ .reg = r };
         } else if ((if (abi_stress) abi.take(i, last_use[i], &spill_count) else null) orelse
             pickReg(&free) orelse
-            evictPrologueOnly(&evictable, slots.items, loc, &spill_count, &home_reg_mask, .gp) orelse
+            evictPrologueOnly(&evictable, slots.items, loc, &home_reg_mask, .gp) orelse
             abi.take(i, last_use[i], &spill_count)) |r|
         {
             // A prologue-only slot gives up its register before a shared
@@ -1846,7 +1862,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     std.debug.assert(seen_xmm & b == 0);
                     seen_xmm |= b;
                 },
-                .spill => {},
+                .spill, .slab => {},
                 .flags, .imm => unreachable, // a slot home is a register or a cell
             }
         }
@@ -1866,7 +1882,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     seen_xmm |= b;
                 },
                 .spill => {},
-                .flags, .imm => unreachable, // a computed home is a register or a cell
+                .flags, .imm, .slab => unreachable, // a computed home is a register or a frame cell
             }
         }
         // [Phase 2] Invariant array-base homes are register-disjoint from slot homes,
@@ -1891,6 +1907,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 .reg => |r| std.debug.assert(home_reg_mask & regBit(r) == 0),
                 .xmm => |r| std.debug.assert(home_xmm_mask & regBit(r) == 0),
                 .spill, .flags, .imm => {},
+                .slab => unreachable, // only a slot home is a slab cell
             }
         }
         // every slot-bound φ's back-edge update ref has a concrete location (always does)
@@ -1930,7 +1947,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                     switch (l) {
                         .reg => |r| gp.* |= regBit(r),
                         .xmm => |r| xmm.* |= regBit(r),
-                        .spill, .flags, .imm => {},
+                        .spill, .flags, .imm, .slab => {},
                     }
                 }
             }.f;
@@ -2078,8 +2095,31 @@ pub const Place = union(enum) {
     reg: Reg, // a general-purpose register
     xmm: Reg, // an XMM register (float). Distinct tag → a GP reg and the XMM of the
     // same 0..15 index never compare equal (they are physically distinct registers).
-    mem: i32, // rsp-relative byte displacement (kind-agnostic 8-B cell)
+    mem: Mem, // an 8-byte cell (kind-agnostic)
     imm: i32, // a constant operand, sign-extended to 64 bits (`Loc.imm`)
+
+    /// A cell at `[base + disp]`: a frame cell off rsp (`Loc.spill`), or a
+    /// slot's payload cell off rsi (`Loc.slab`), which only reads take.
+    pub const Mem = struct {
+        base: Reg,
+        disp: i32,
+
+        /// The frame cell at byte displacement `disp`.
+        pub fn frame(disp: i32) Mem {
+            return .{ .base = .rsp, .disp = disp };
+        }
+
+        pub fn eql(x: Mem, y: Mem) bool {
+            return x.base == y.base and x.disp == y.disp;
+        }
+
+        /// The displacement of a cell code writes: always a frame cell, as
+        /// no instruction writes an invariant slot.
+        pub fn frameDisp(m: Mem) i32 {
+            std.debug.assert(m.base == .rsp);
+            return m.disp;
+        }
+    };
 
     // pub for nativegen.zig's emitters (file-split pass).
     pub fn eql(x: Place, y: Place) bool {
@@ -2087,19 +2127,20 @@ pub const Place = union(enum) {
         return switch (x) {
             .reg => x.reg == y.reg,
             .xmm => x.xmm == y.xmm,
-            .mem => x.mem == y.mem,
+            .mem => x.mem.eql(y.mem),
             .imm => x.imm == y.imm,
         };
     }
 };
 
 /// Map an allocation `Loc` to a `Place`: a register stays a register; a spill slot
-/// becomes a frame displacement `[rsp + idx*8]`.
-pub fn locToPlace(l: Loc) Place {
+/// becomes a frame cell `[rsp + idx*8]`, a slab home the slot's cell `[rsi + slot*8]`.
+pub inline fn locToPlace(l: Loc) Place {
     return switch (l) {
         .reg => |r| .{ .reg = r },
         .xmm => |r| .{ .xmm = r },
-        .spill => |idx| .{ .mem = @as(i32, @intCast(idx)) * 8 },
+        .spill => |idx| .{ .mem = .frame(@as(i32, @intCast(idx)) * 8) },
+        .slab => |slot| .{ .mem = .{ .base = .rsi, .disp = @as(i32, slot) * 8 } },
         // Only its guard reads a flags compare, and that guard branches on
         // the flags without asking for a place.
         .flags => unreachable,
@@ -2450,20 +2491,22 @@ fn markStoreRead(t: *const Trace, needed: []bool, ref: usize, reader: usize) voi
 
 /// Doc 63 (register pressure, item 2): hand a value that would otherwise
 /// spill the register of a `prologue_only` slot (`file` picks GP or XMM). The
-/// slot's home moves to a fresh frame cell for the whole trace — the body
-/// never reads it, so the only cost is the prologue's store to the cell — and
-/// leaves `home_mask`, which the caller sets again if the taker is a home.
+/// slot's home moves to its own payload cell (`Loc.slab`) for the whole
+/// trace — the body never reads it, and nothing writes it, so it costs
+/// nothing — and leaves `home_mask`, which the caller sets again if the
+/// taker is a home. A trace that gives rsi to the body moves such homes to
+/// frame cells once allocation is done (`analyzeInner`).
 /// `loc` of the slot's load follows the home. `evictable` lists the
 /// candidates (an evicted one leaves it). null when there is none to take,
 /// which is most traces: the check is inline at every failed register pick.
-inline fn evictPrologueOnly(evictable: *std.ArrayList(u16), slots: []SlotInfo, loc: []Loc, spill_count: *u32, home_mask: *u16, file: RegFile) ?Reg {
+inline fn evictPrologueOnly(evictable: *std.ArrayList(u16), slots: []SlotInfo, loc: []Loc, home_mask: *u16, file: RegFile) ?Reg {
     if (evictable.items.len == 0) return null;
-    return evictFrom(evictable, slots, loc, spill_count, home_mask, file);
+    return evictFrom(evictable, slots, loc, home_mask, file);
 }
 
 const RegFile = enum { gp, xmm };
 
-fn evictFrom(evictable: *std.ArrayList(u16), slots: []SlotInfo, loc: []Loc, spill_count: *u32, home_mask: *u16, file: RegFile) ?Reg {
+fn evictFrom(evictable: *std.ArrayList(u16), slots: []SlotInfo, loc: []Loc, home_mask: *u16, file: RegFile) ?Reg {
     for (evictable.items, 0..) |sid, k| {
         const s = &slots[sid];
         const r = switch (s.home) {
@@ -2471,8 +2514,7 @@ fn evictFrom(evictable: *std.ArrayList(u16), slots: []SlotInfo, loc: []Loc, spil
             .xmm => |r| if (file == .xmm) r else continue,
             else => continue,
         };
-        s.home = .{ .spill = spill_count.* };
-        spill_count.* += 1;
+        s.home = .{ .slab = s.slot };
         loc[@intCast(s.load_ref)] = s.home;
         home_mask.* &= ~regBit(r);
         _ = evictable.swapRemove(k);
@@ -2506,7 +2548,7 @@ pub fn slotHomePlace(s: SlotInfo) Place {
 
 /// Where ref `r`'s value lives — its linear-scan-assigned register or frame slot.
 /// A `slot_load` ref resolves to its slot home (its `loc` was set to that home).
-pub fn placeOfRef(alloc: *const Alloc, r: usize) Place {
+pub inline fn placeOfRef(alloc: *const Alloc, r: usize) Place {
     // A const-key aref has no loc; its readers go through `refBaseReg`.
     std.debug.assert(alloc.arefImm(r) == null);
     return locToPlace(alloc.loc[r]);
