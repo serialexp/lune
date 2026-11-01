@@ -1,7 +1,7 @@
 DOC 76 GLOBAL DECLARATIONS / ATTRIBUTES / FROZEN TABLES (2026-11-01, coral-raven). Doc 76 checklist.
-- Done: phases 0-3 (d4df993), phase 4 table.freeze/isfrozen/clone (638fc90), D8 constant <const> folding (ddbee74), one guard_table per table in tropt (6b64d10).
+- Done: phases 0-3 (d4df993), phase 4 table.freeze/isfrozen/clone (638fc90), D8 constant <const> folding (ddbee74), one guard_table per table in tropt (6b64d10), phase 5 language server (8fb6392).
 - Phase 6: local store microbenchmarks in doc 76 §5.4 (tier-0 +1..+4 instr/store; native ≈0 except per-iteration tables +1.6% and set_global +2.6%). Still open: `just bench` on the pinned pool (needs a push), and Bart's pick between the two tier-0 options in §5.4.
-- Also open: Phase 3b (a __close value recorded as a call, not an abort), the 5.4 <close> gaps (TODO.md), Phase 5 (LSP).
+- Also open: Phase 3b (a __close value recorded as a call, not an abort), the 5.4 <close> gaps (TODO.md).
 
 DOC 63 TYPED CARRIED LOADS DONE (2026-10-30, coral-marten). Doc 63 §5.10.7.
 - The recorder type-guards a loop-carried number copy (LuaJIT SLOAD typecheck): w4/w8/w16 392/420/501, wide 476 (tier-0 607/791/1159/1096). Pure-guest 8-local rotation 450 -> 23 instr/iter. bench/ neutral.
