@@ -165,6 +165,14 @@ pub fn flushStdout(vm: *Vm) void {
     if (vm.out) |w| w.flush() catch {} else mio.flush();
 }
 
+/// Flush stderr, and stdout with it: before a child writes to the same
+/// terminal directly (`proc` with inherited streams), what the program printed
+/// first must be out first.
+pub fn flushStandardStreams(vm: *Vm) void {
+    flushStdout(vm);
+    if (vm.err) |w| w.flush() catch {} else mio.stderrWriter().flush() catch {};
+}
+
 // ---------------------------------------------------------------------------
 // Opening
 // ---------------------------------------------------------------------------

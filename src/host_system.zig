@@ -889,3 +889,17 @@ test "proc pipeline: a stage that cannot start ends the ones before it, and a ti
     });
     try testing.expect(t.done.timed_out);
 }
+
+test "proc forwards Ctrl-C to the children's group and goes on waiting" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    // The child signals its parent once the wait is certainly under way, as a
+    // terminal's Ctrl-C would: only the parent receives it.
+    const r = RealSystem.procRun(&sys, .{
+        .stages = &.{&.{ "/bin/sh", "-c", "sleep 0.3; kill -INT $PPID; sleep 30" }},
+        .max_bytes = 16,
+    });
+    try testing.expectEqualStrings("SIGINT", r.done.stages[0].status.signaled);
+    try testing.expect(!r.done.timed_out);
+}

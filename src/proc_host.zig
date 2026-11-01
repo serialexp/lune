@@ -250,6 +250,115 @@ const Deadline = struct {
     }
 };
 
+/// Ctrl-C while a call waits (doc 75 §6, Q12): the terminal delivers SIGINT
+/// to mahina, the foreground group, not to the children in their own group.
+/// While any call is waiting, a handler records it and the wait forwards it
+/// to the children's group, then goes on waiting: the child may handle it, and
+/// the call ends however the child does. The disposition is process-wide, so
+/// it is installed by the first waiting call and restored by the last.
+const Interrupt = struct {
+    var flag: std.atomic.Value(bool) = .init(false);
+    var users: std.atomic.Value(u32) = .init(0);
+    var old: posix.Sigaction = undefined;
+
+    /// How long a wait sleeps between looks at the flag: a signal does not cut
+    /// short the `poll` below it (std retries it).
+    const check_ms: i32 = 50;
+
+    fn handler(_: posix.SIG) callconv(.c) void {
+        flag.store(true, .release);
+    }
+
+    fn acquire() void {
+        if (users.fetchAdd(1, .acq_rel) != 0) return;
+        const act: posix.Sigaction = .{ .handler = .{ .handler = handler }, .mask = posix.sigemptyset(), .flags = 0 };
+        posix.sigaction(.INT, &act, &old);
+    }
+
+    fn release() void {
+        if (users.fetchSub(1, .acq_rel) == 1) posix.sigaction(.INT, &old, null);
+    }
+
+    /// Whether Ctrl-C arrived since the last look; forwards it to `pgid`.
+    fn forward(pgid: posix.pid_t) void {
+        if (flag.swap(false, .acq_rel)) _ = posix.system.kill(-pgid, .INT);
+    }
+};
+
+/// This process's group.
+fn ownPgrp() posix.pid_t {
+    if (builtin.link_libc) {
+        const C = struct {
+            extern "c" fn getpgid(pid: posix.pid_t) posix.pid_t;
+        };
+        return C.getpgid(0);
+    }
+    return @intCast(posix.system.getpgid(0));
+}
+
+/// The terminal's foreground group (`tcgetpgrp`), or null when stdin is not a
+/// terminal. libc builds call libc's, which std's wrapper does not reach.
+fn ttyForeground() ?posix.pid_t {
+    if (builtin.link_libc) {
+        const C = struct {
+            extern "c" fn tcgetpgrp(fd: c_int) posix.pid_t;
+        };
+        const g = C.tcgetpgrp(0);
+        return if (g < 0) null else g;
+    }
+    return posix.tcgetpgrp(0) catch null;
+}
+
+fn ttySetForeground(pgrp: posix.pid_t) !void {
+    if (builtin.link_libc) {
+        const C = struct {
+            extern "c" fn tcsetpgrp(fd: c_int, pgrp: posix.pid_t) c_int;
+        };
+        if (C.tcsetpgrp(0, pgrp) != 0) return error.NotATerminal;
+        return;
+    }
+    try posix.tcsetpgrp(0, pgrp);
+}
+
+/// The terminal handed to a child that reads it (doc 75 §6): a child that
+/// inherits stdin from a terminal we are the foreground group of becomes the
+/// terminal's foreground group for its lifetime, or it would be stopped the
+/// first time it read (`SIGTTIN`). The terminal then delivers Ctrl-C to it
+/// directly. Handed back by `release`.
+const Foreground = struct {
+    saved: ?posix.pid_t = null,
+
+    fn take(wanted: bool, pgid: posix.pid_t) Foreground {
+        if (!wanted) return .{};
+        const mine = ownPgrp();
+        const fg = ttyForeground() orelse return .{};
+        if (fg != mine) return .{};
+        setForeground(pgid) catch return .{};
+        // A child that read before it got the terminal is stopped: go on.
+        _ = posix.system.kill(-pgid, .CONT);
+        return .{ .saved = mine };
+    }
+
+    fn release(self: *Foreground) void {
+        if (self.saved) |mine| setForeground(mine) catch {};
+        self.saved = null;
+    }
+
+    /// `tcsetpgrp` from a background group raises SIGTTOU, so it is ignored
+    /// around the call.
+    fn setForeground(pgrp: posix.pid_t) !void {
+        const ign: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
+        var old: posix.Sigaction = undefined;
+        posix.sigaction(.TTOU, &ign, &old);
+        defer posix.sigaction(.TTOU, &old, null);
+        try ttySetForeground(pgrp);
+    }
+
+    fn owns(self: *const Foreground) bool {
+        return self.saved != null;
+    }
+};
+
 const Pipes = struct {
     stdin: ?posix.fd_t = null,
     out: ?posix.fd_t = null,
@@ -273,106 +382,271 @@ const Pipes = struct {
     }
 };
 
-/// Service the pipes until they have all closed (or the deadline gave up on
-/// them): feed `input`, drain the last stage's stdout and every stage's
-/// stderr into the tails.
-fn pump(gpa: Allocator, pipes: *Pipes, input: []const u8, cap: *Capture, pgid: posix.pid_t, dl: *Deadline) !void {
-    var fed: usize = 0;
-    if (pipes.stdin) |fd| {
-        if (input.len == 0) {
-            closeFd(fd);
-            pipes.stdin = null;
-        } else setNonblocking(fd);
+/// One launched call: its children, the pipes to them and what they have
+/// written so far. `run` makes one on the stack and waits for it at once; a
+/// spawned background job (doc 75 Phase 3) is one on the heap that `advance`
+/// moves along whenever the program looks at it.
+pub const Job = struct {
+    gpa: Allocator,
+    n: usize = 0,
+    pids: [max_stages]posix.pid_t = undefined,
+    /// How each child ended, once it has been reaped.
+    ended: [max_stages]?Reaped = @splat(null),
+    pgid: posix.pid_t = 0,
+    pipes: Pipes = .{},
+    /// What the first stage's stdin is fed from, and how much has gone.
+    input: []const u8 = "",
+    input_owned: bool = false,
+    fed: usize = 0,
+    stdout_captured: bool = false,
+    stderr_captured: bool = false,
+    /// Where the captured streams collect; the result points into it.
+    cap: *Capture,
+    dl: Deadline,
+    /// Every child is reaped and the pipes are closed.
+    finished: bool = false,
+    /// The pump hit an error that left the stream state unknown.
+    failed: bool = false,
+
+    pub fn init(gpa: Allocator, cap: *Capture) Job {
+        return .{ .gpa = gpa, .cap = cap, .dl = .{ .at = null } };
     }
-    var scratch: [64 * 1024]u8 = undefined;
-    // Which descriptor each poll entry is: 0 stdin, 1 stdout, 2 + i the
-    // stderr of stage i.
-    var fds: [max_stages + 2]posix.pollfd = undefined;
-    var which: [max_stages + 2]u8 = undefined;
-    while (pipes.open()) {
-        const now = nowNs();
-        dl.step(pgid, now);
-        if (dl.give_up) return;
-        var n: usize = 0;
-        if (pipes.stdin) |fd| {
-            fds[n] = .{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 };
-            which[n] = 0;
-            n += 1;
+
+    /// Release the descriptors and the owned input. A job still running is
+    /// `terminate`d first by whoever owns it.
+    pub fn deinit(self: *Job) void {
+        self.pipes.closeAll();
+        if (self.input_owned) self.gpa.free(@constCast(self.input));
+        self.input = "";
+    }
+
+    pub fn pid(self: *const Job) posix.pid_t {
+        return self.pgid;
+    }
+
+    /// Whether the job still has to be waited on.
+    pub fn running(self: *const Job) bool {
+        return !self.finished;
+    }
+
+    /// Signal the whole group, unless every child has already been reaped:
+    /// a reaped pid may be recycled, so a finished job is never signalled.
+    pub fn signal(self: *Job, sig: posix.SIG) bool {
+        if (self.finished) return false;
+        _ = posix.system.kill(-self.pgid, sig);
+        return true;
+    }
+
+    /// End the job now: SIGTERM, a moment to leave, then SIGKILL, and reap
+    /// everything. For a VM that is closing with children still running.
+    pub fn terminate(self: *Job) void {
+        if (self.finished) return;
+        _ = posix.system.kill(-self.pgid, .TERM);
+        const give_up = nowNs() + term_grace_ns;
+        var all = false;
+        while (!all and nowNs() < give_up) {
+            all = true;
+            for (0..self.n) |i| {
+                if (self.ended[i] == null) self.ended[i] = tryReap(self.pids[i]);
+                if (self.ended[i] == null) all = false;
+            }
+            if (!all) _ = posix.poll(&.{}, 5) catch {};
         }
-        if (pipes.out) |fd| {
-            fds[n] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
-            which[n] = 1;
-            n += 1;
+        if (!all) _ = posix.system.kill(-self.pgid, .KILL);
+        var dl: Deadline = .{ .at = null };
+        for (0..self.n) |i| {
+            if (self.ended[i] == null) self.ended[i] = reap(self.pids[i], self.pgid, &dl, false);
         }
-        for (pipes.errs, 0..) |p, i| {
-            const fd = p orelse continue;
-            fds[n] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
-            which[n] = @intCast(2 + i);
-            n += 1;
+        self.pipes.closeAll();
+        self.finished = true;
+    }
+
+    /// Move the job along. Blocking: until every pipe has closed and every
+    /// child is reaped. Not blocking: one look at the pipes and the children.
+    /// True once the job is finished.
+    pub fn advance(self: *Job, block: bool, watch_stop: bool) bool {
+        if (self.finished) return true;
+        self.pump(block) catch {
+            // Out of memory or a poll fault: end the children rather than leak them.
+            _ = posix.system.kill(-self.pgid, .KILL);
+            self.pipes.closeAll();
+            self.failed = true;
+        };
+        if (self.pipes.open() and !self.dl.give_up and !self.failed) return false;
+        // The pipes are done with (closed, or given up on).
+        self.pipes.closeAll();
+        for (0..self.n) |i| {
+            if (self.ended[i] != null) continue;
+            if (block) {
+                self.ended[i] = reap(self.pids[i], self.pgid, &self.dl, watch_stop);
+            } else {
+                self.dl.step(self.pgid, nowNs());
+                self.ended[i] = tryReap(self.pids[i]);
+                if (self.ended[i] == null) return false;
+            }
         }
-        _ = try posix.poll(fds[0..n], dl.pollTimeout(now));
-        for (fds[0..n], which[0..n]) |pf, w| {
-            if (pf.revents == 0) continue;
-            if (w == 0) {
-                const fd = pipes.stdin.?;
-                if (pf.revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) {
-                    // The child closed its stdin early: not an error.
-                    closeFd(fd);
-                    pipes.stdin = null;
-                    continue;
-                }
-                const rc = posix.system.write(fd, input[fed..].ptr, input.len - fed);
-                switch (posix.errno(rc)) {
-                    .SUCCESS => {
-                        fed += @intCast(rc);
-                        if (fed == input.len) {
+        self.finished = true;
+        return true;
+    }
+
+    /// Service the pipes until they have all closed (or the deadline gave up
+    /// on them), or for one pass when not `block`ing: feed the input, drain
+    /// the last stage's stdout and every stage's stderr into the tails.
+    fn pump(self: *Job, block: bool) !void {
+        const pipes = &self.pipes;
+        const cap = self.cap;
+        var scratch: [64 * 1024]u8 = undefined;
+        // Which descriptor each poll entry is: 0 stdin, 1 stdout, 2 + i the
+        // stderr of stage i.
+        var fds: [max_stages + 2]posix.pollfd = undefined;
+        var which: [max_stages + 2]u8 = undefined;
+        while (pipes.open()) {
+            const now = nowNs();
+            self.dl.step(self.pgid, now);
+            Interrupt.forward(self.pgid);
+            if (self.dl.give_up) return;
+            var n: usize = 0;
+            if (pipes.stdin) |fd| {
+                fds[n] = .{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 };
+                which[n] = 0;
+                n += 1;
+            }
+            if (pipes.out) |fd| {
+                fds[n] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
+                which[n] = 1;
+                n += 1;
+            }
+            for (pipes.errs, 0..) |p, i| {
+                const fd = p orelse continue;
+                fds[n] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
+                which[n] = @intCast(2 + i);
+                n += 1;
+            }
+            const wait_ms = self.dl.pollTimeout(now);
+            const sleep_ms: i32 = if (!block) 0 else if (wait_ms < 0 or wait_ms > Interrupt.check_ms) Interrupt.check_ms else wait_ms;
+            _ = try posix.poll(fds[0..n], sleep_ms);
+            for (fds[0..n], which[0..n]) |pf, w| {
+                if (pf.revents == 0) continue;
+                if (w == 0) {
+                    const fd = pipes.stdin.?;
+                    if (pf.revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) {
+                        // The child closed its stdin early: not an error.
+                        closeFd(fd);
+                        pipes.stdin = null;
+                        continue;
+                    }
+                    const rc = posix.system.write(fd, self.input[self.fed..].ptr, self.input.len - self.fed);
+                    switch (posix.errno(rc)) {
+                        .SUCCESS => {
+                            self.fed += @intCast(rc);
+                            if (self.fed == self.input.len) {
+                                closeFd(fd);
+                                pipes.stdin = null;
+                            }
+                        },
+                        .AGAIN, .INTR => {},
+                        else => {
                             closeFd(fd);
                             pipes.stdin = null;
-                        }
+                        },
+                    }
+                    continue;
+                }
+                const slot = if (w == 1) &pipes.out else &pipes.errs[w - 2];
+                const tail = if (w == 1) &cap.out else &cap.errs.items[w - 2];
+                const fd = slot.*.?;
+                const rc = posix.system.read(fd, &scratch, scratch.len);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => {
+                        const got: usize = @intCast(rc);
+                        if (got == 0) {
+                            closeFd(fd);
+                            slot.* = null;
+                        } else try tail.push(self.gpa, scratch[0..got]);
                     },
                     .AGAIN, .INTR => {},
                     else => {
                         closeFd(fd);
-                        pipes.stdin = null;
+                        slot.* = null;
                     },
                 }
-                continue;
             }
-            const slot = if (w == 1) &pipes.out else &pipes.errs[w - 2];
-            const tail = if (w == 1) &cap.out else &cap.errs.items[w - 2];
-            const fd = slot.*.?;
-            const rc = posix.system.read(fd, &scratch, scratch.len);
-            switch (posix.errno(rc)) {
-                .SUCCESS => {
-                    const got: usize = @intCast(rc);
-                    if (got == 0) {
-                        closeFd(fd);
-                        slot.* = null;
-                    } else try tail.push(gpa, scratch[0..got]);
+            if (!block) return;
+        }
+    }
+
+    /// What the finished job did. Slices point into `cap`.
+    pub fn result(self: *Job) seam.ProcResult {
+        if (self.failed) return .{ .fail = .{ .class = .other } };
+        var truncated = self.stdout_captured and self.cap.out.dropped;
+        for (0..self.n) |i| {
+            const stderr_bytes: []const u8 = if (self.stderr_captured) blk: {
+                if (self.cap.errs.items[i].dropped) truncated = true;
+                break :blk self.cap.errs.items[i].finish();
+            } else "";
+            self.cap.stages.items[i] = .{
+                .status = switch (self.ended[i].?) {
+                    .exited => |c| .{ .exited = c },
+                    .signaled => |sig| .{ .signaled = signalName(sig, &self.cap.sigs.items[i]) },
                 },
-                .AGAIN, .INTR => {},
-                else => {
-                    closeFd(fd);
-                    slot.* = null;
-                },
-            }
+                .stderr = stderr_bytes,
+            };
+        }
+        return .{ .done = .{
+            .stages = self.cap.stages.items,
+            .stdout = if (self.stdout_captured) self.cap.out.finish() else "",
+            .timed_out = self.dl.timed_out,
+            .truncated = truncated,
+        } };
+    }
+};
+
+const Reaped = union(enum) { exited: u32, signaled: u32 };
+
+/// One non-blocking look at whether `pid` has ended.
+fn tryReap(pid: posix.pid_t) ?Reaped {
+    while (true) {
+        var status: if (builtin.link_libc) c_int else i32 = undefined;
+        const rc = posix.system.wait4(pid, &status, @intCast(posix.W.NOHANG), null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return null;
+                const s: u32 = @bitCast(@as(i32, status));
+                if (posix.W.IFSIGNALED(s)) return .{ .signaled = @intFromEnum(posix.W.TERMSIG(s)) };
+                return .{ .exited = posix.W.EXITSTATUS(s) };
+            },
+            .INTR => continue,
+            // Already reaped: nothing more to learn.
+            else => return .{ .exited = 0 },
         }
     }
 }
 
-const Reaped = union(enum) { exited: u32, signaled: u32 };
-
 /// Wait for the child to end. With no deadline pending this blocks; with one
 /// it polls, escalating when the deadline passes. `pgid` is the group the
-/// deadline signals.
-fn reap(pid: posix.pid_t, pgid: posix.pid_t, dl: *Deadline) Reaped {
+/// deadline and Ctrl-C signal. With `watch_stop` (the child owns the
+/// terminal) a child that stops (Ctrl-Z) cannot be waited on for ever: until
+/// there is job control (doc 75 Phase 5) it is killed and reported as ended by
+/// the stopping signal.
+fn reap(pid: posix.pid_t, pgid: posix.pid_t, dl: *Deadline, watch_stop: bool) Reaped {
+    var stopped_by: ?u32 = null;
     while (true) {
+        Interrupt.forward(pgid);
         const blocking = dl.at == null and !dl.timed_out;
         var status: if (builtin.link_libc) c_int else i32 = undefined;
-        const rc = posix.system.wait4(pid, &status, if (blocking) 0 else posix.W.NOHANG, null);
+        var options: u32 = if (blocking) 0 else posix.W.NOHANG;
+        if (watch_stop) options |= posix.W.UNTRACED;
+        const rc = posix.system.wait4(pid, &status, @intCast(options), null);
         switch (posix.errno(rc)) {
             .SUCCESS => if (rc != 0) {
                 const s: u32 = @bitCast(@as(i32, status));
+                // (std's `IFSTOPPED` takes a core-dumped SIGSEGV for a stop.)
+                if (s & 0xff == 0x7f) {
+                    stopped_by = (s >> 8) & 0xff;
+                    _ = posix.system.kill(-pgid, .KILL);
+                    continue;
+                }
+                if (stopped_by) |sig| return .{ .signaled = sig };
                 if (posix.W.IFSIGNALED(s)) return .{ .signaled = @intFromEnum(posix.W.TERMSIG(s)) };
                 return .{ .exited = posix.W.EXITSTATUS(s) };
             },
@@ -386,16 +660,20 @@ fn reap(pid: posix.pid_t, pgid: posix.pid_t, dl: *Deadline) Reaped {
     }
 }
 
-/// Run `req` to completion: every stage is started before any is waited on,
-/// all in one process group. `host_env` is the environment an omitted
-/// `req.env` means; null: the process environment. A stage that cannot be
-/// started ends the ones before it and fails the call.
-pub fn run(gpa: Allocator, io: Io, host_env: ?*const std.process.Environ.Map, req: seam.ProcRequest, cap: *Capture) seam.ProcResult {
-    if (comptime !supported) return .{ .fail = .{ .class = .other } };
+/// Start `req` on `job`: every stage is launched before any is waited on, all
+/// in one process group. `host_env` is the environment an omitted `req.env`
+/// means; null: the process environment. A stage that cannot be started ends
+/// the ones before it and fails the call, leaving `job` with nothing to wait
+/// on. `own_input` copies stdin bytes into the job, for a job that outlives
+/// the request.
+pub fn start(job: *Job, io: Io, host_env: ?*const std.process.Environ.Map, req: seam.ProcRequest, own_input: bool) ?seam.ProcFail {
+    if (comptime !supported) return .{ .class = .other };
+    const gpa = job.gpa;
+    const cap = job.cap;
     const n = req.stages.len;
-    if (n == 0 or n > max_stages) return .{ .fail = .{ .class = .other } };
+    if (n == 0 or n > max_stages) return .{ .class = .other };
     for (req.stages, 0..) |argv, i| {
-        if (argv.len == 0) return .{ .fail = .{ .stage = @intCast(i), .class = .not_found } };
+        if (argv.len == 0) return .{ .stage = @intCast(i), .class = .not_found };
     }
 
     // The children's whole environment.
@@ -404,11 +682,11 @@ pub fn run(gpa: Allocator, io: Io, host_env: ?*const std.process.Environ.Map, re
     const env: *const std.process.Environ.Map = blk: {
         if (req.env) |pairs| {
             own_env = std.process.Environ.Map.init(gpa);
-            for (pairs) |kv| own_env.?.put(kv.name, kv.value) catch return .{ .fail = .{ .class = .other } };
+            for (pairs) |kv| own_env.?.put(kv.name, kv.value) catch return .{ .class = .other };
             break :blk &own_env.?;
         }
         if (host_env) |m| break :blk m;
-        own_env = processEnviron(gpa) catch return .{ .fail = .{ .class = .other } };
+        own_env = processEnviron(gpa) catch return .{ .class = .other };
         break :blk &own_env.?;
     };
 
@@ -428,8 +706,8 @@ pub fn run(gpa: Allocator, io: Io, host_env: ?*const std.process.Environ.Map, re
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         var denied = false;
         const found = searchPath(io, env.get("PATH") orelse "", prog, req.cwd, &path_buf, &denied) orelse
-            return .{ .fail = .{ .stage = @intCast(i), .class = if (denied) .permission_denied else .not_found } };
-        exes[i] = arena.dupe(u8, found) catch return .{ .fail = .{ .class = .other } };
+            return .{ .stage = @intCast(i), .class = if (denied) .permission_denied else .not_found };
+        exes[i] = arena.dupe(u8, found) catch return .{ .class = .other };
     }
 
     // The first stage's stdin.
@@ -444,12 +722,12 @@ pub fn run(gpa: Allocator, io: Io, host_env: ?*const std.process.Environ.Map, re
         .bytes => .pipe,
         .inherit => .inherit,
         .file => |path| blk: {
-            stdin_file = Io.Dir.cwd().openFile(io, path, .{}) catch |e| return .{ .fail = .{ .class = startClass(e) } };
+            stdin_file = Io.Dir.cwd().openFile(io, path, .{}) catch |e| return .{ .class = startClass(e) };
             break :blk .{ .file = stdin_file.? };
         },
     };
 
-    cap.prepare(gpa, n, req.max_bytes) catch return .{ .fail = .{ .class = .other } };
+    cap.prepare(gpa, n, req.max_bytes) catch return .{ .class = .other };
 
     var pipes: Pipes = .{};
     var pids: [max_stages]posix.pid_t = undefined;
@@ -553,46 +831,54 @@ pub fn run(gpa: Allocator, io: Io, host_env: ?*const std.process.Environ.Map, re
         started += 1;
     }
 
-    // The children are ours to reap by hand; the pipes are ours to close.
-    var dl: Deadline = .{ .at = if (req.timeout_ns) |t| nowNs() +| t else null };
-
     if (failure) |f| {
         if (prev_r) |fd| closeFd(fd);
         pipes.closeAll();
         if (started > 0) _ = posix.system.kill(-pgid, .KILL);
-        for (pids[0..started]) |pid| _ = reap(pid, pgid, &dl);
-        return .{ .fail = f };
+        var dl: Deadline = .{ .at = null };
+        for (pids[0..started]) |pid| _ = reap(pid, pgid, &dl, false);
+        return f;
     }
 
-    pump(gpa, &pipes, input, cap, pgid, &dl) catch {
-        // Out of memory or a poll fault: end the children rather than leak them.
-        _ = posix.system.kill(-pgid, .KILL);
-        pipes.closeAll();
-        for (pids[0..n]) |pid| _ = reap(pid, pgid, &dl);
-        return .{ .fail = .{ .class = .other } };
-    };
-    pipes.closeAll();
-
-    var truncated = req.stdout == .capture and cap.out.dropped;
-    for (0..n) |i| {
-        const stderr_bytes: []const u8 = if (req.stderr == .capture) blk: {
-            if (cap.errs.items[i].dropped) truncated = true;
-            break :blk cap.errs.items[i].finish();
-        } else "";
-        cap.stages.items[i] = .{
-            .status = switch (reap(pids[i], pgid, &dl)) {
-                .exited => |c| .{ .exited = c },
-                .signaled => |sig| .{ .signaled = signalName(sig, &cap.sigs.items[i]) },
-            },
-            .stderr = stderr_bytes,
-        };
+    job.n = n;
+    job.pids = pids;
+    job.pgid = pgid;
+    job.pipes = pipes;
+    job.stdout_captured = req.stdout == .capture;
+    job.stderr_captured = req.stderr == .capture;
+    job.dl = .{ .at = if (req.timeout_ns) |t| nowNs() +| t else null };
+    job.fed = 0;
+    if (job.pipes.stdin) |fd| {
+        if (input.len == 0) {
+            closeFd(fd);
+            job.pipes.stdin = null;
+        } else {
+            setNonblocking(fd);
+            if (own_input) {
+                job.input = gpa.dupe(u8, input) catch {
+                    job.terminate();
+                    return .{ .class = .other };
+                };
+                job.input_owned = true;
+            } else job.input = input;
+        }
     }
-    return .{ .done = .{
-        .stages = cap.stages.items,
-        .stdout = if (req.stdout == .capture) cap.out.finish() else "",
-        .timed_out = dl.timed_out,
-        .truncated = truncated,
-    } };
+    return null;
+}
+
+/// Run `req` to completion. See `start`. The result points into `cap`.
+pub fn run(gpa: Allocator, io: Io, host_env: ?*const std.process.Environ.Map, req: seam.ProcRequest, cap: *Capture) seam.ProcResult {
+    var job = Job.init(gpa, cap);
+    defer job.deinit();
+    if (start(&job, io, host_env, req, false)) |fail| return .{ .fail = fail };
+    // Waiting from here on: Ctrl-C is the children's, and a child that reads
+    // the terminal is its foreground group.
+    Interrupt.acquire();
+    defer Interrupt.release();
+    var fg = Foreground.take(req.stdin == .inherit, job.pgid);
+    defer fg.release();
+    _ = job.advance(true, fg.owns());
+    return job.result();
 }
 
 const testing = std.testing;

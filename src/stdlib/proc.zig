@@ -524,6 +524,7 @@ fn execute(vm: *Vm, o: *const Options, pipeline: bool, out: []Value) anyerror!us
     // A recording is a promise to replay: refuse a call it could not.
     if (vm.effect_mode != .off and !o.recordable()) return error.ProcNotRecordable;
     if (vm.effect_mode == .record) try reserveLog(vm, o);
+    if (o.stdout == .inherit or o.stderr == .inherit) io.flushStandardStreams(vm);
 
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(vm.gpa);
