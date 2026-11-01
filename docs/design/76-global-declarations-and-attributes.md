@@ -65,7 +65,8 @@ land; move whole phases to Done once everything inside them is checked.
   - [x] `tbc`, `tfor_prep`, `close` and `ret_close` recorded while the
     values are nil or false, so loops with a generic `for` inside stay
     native
-  - [ ] a value with a `__close` recorded as the call, not an abort
+  - [ ] a value with a `__close` recorded as the call, not an abort:
+    general metamethod recording, doc 77 (its Phase 5)
 - [ ] **`<close>` gaps against 5.4** (§6.2, TODO.md).
   - [x] pending closes run on an uncaught top-level error
   - [ ] a `__close` that yields

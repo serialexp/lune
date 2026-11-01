@@ -13,6 +13,10 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       `synthErrorValue` builds the caught value from `describeFault`'s
       message, which leaves `faultVarInfo`'s suffix to the reporter, so
       `pcall`, a `__close`'s error argument and the top-level report all lack it.
+- [ ] **`__len` gets one argument** (seen 2026-11-01, doc 77 review).
+      `Vm.lenValue` calls `handler(t)`; 5.4's `luaV_objlen` calls
+      `handler(t, t)`, as the unary arithmetic metamethods already do here
+      (`unMeta`). Visible to a handler that reads its second parameter.
 - [ ] **A `__close` cannot yield** (doc 76 §6.2). 5.4 suspends a coroutine
       mid-close; mahina raises "attempt to yield across a C-call boundary",
       because `Vm.callClose` runs the close as a nested call. Needs the close
