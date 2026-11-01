@@ -56,10 +56,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v9 (doc 75 §4): `environ` (19), the environment as one byte record.
 /// v10 (doc 75 §4): `proc_run` (20), a finished program as one byte record,
 /// or a start failure.
+/// v12 (doc 75 §6): `getcwd` (21), the working directory.
 /// v11 (doc 75 §3.6): the `proc_run` record covers a pipeline: a tag, the
 /// stage count and each stage's status and stderr; a start failure names its
 /// stage.
-pub const effect_format_version: u32 = 11;
+pub const effect_format_version: u32 = 12;
 
 /// The encoded size of an `EffectFile` with no entries: the `version` word and
 /// the entry count.
@@ -128,7 +129,7 @@ fn resultShapeOf(kind: EffectKind) Shape {
         .getenv, .file_read => .string_or_nil,
         .file_open, .file_seek => .int_or_fail,
         .file_write, .file_control, .fs_mutate => .ok_or_fail,
-        .fs_tmpname => .string_or_fail,
+        .fs_tmpname, .getcwd => .string_or_fail,
         .file_read_op => .read_value,
         .aio_result => .nil_bytes_or_fail,
         .environ => .environ,
@@ -541,7 +542,7 @@ test "an unknown effect kind is rejected" {
     var heap = gc.Heap.init(gpa);
     defer heap.deinit();
     // 3 and 4 are the retired argc/argv.
-    for ([_]u8{ 3, 4, 21, 250 }) |kind| {
+    for ([_]u8{ 3, 4, 22, 250 }) |kind| {
         const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{
             .{ .kind = kind, .result = .{ .tag = 2, .body = .{ .ConstInt = .{ .v = 1 } } } },
         } };

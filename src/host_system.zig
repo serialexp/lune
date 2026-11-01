@@ -29,6 +29,10 @@ pub const RealSystem = struct {
     /// The process environment (the CLI's `Init.environ_map`). Null in
     /// libmahina, which reads the host process's through libc.
     env_map: ?*std.process.Environ.Map = null,
+    /// The environment once the program has changed it (`setenv`): a copy of
+    /// the above (or of libc's `environ`), from then on the only one read, by
+    /// `getenv`, `environ` and the children (doc 75 §6).
+    owned_env: ?std.process.Environ.Map = null,
     /// The bytes behind the last borrowed result (`readFile`), freed on the
     /// next call that borrows and at `deinit`.
     last: ?[]u8 = null,
@@ -51,6 +55,7 @@ pub const RealSystem = struct {
 
     pub fn deinit(self: *RealSystem) void {
         self.dropLast();
+        if (self.owned_env) |*m| m.deinit();
         self.proc_capture.deinit(self.gpa);
         // Programs still running when the VM closes do not outlive it.
         var job_it = self.jobs.valueIterator();
@@ -78,6 +83,9 @@ pub const RealSystem = struct {
         .readFile = &readFile,
         .getenv = &getenv,
         .environ = &environ,
+        .setenv = &setenv,
+        .chdir = &chdir,
+        .getcwd = &getcwd,
         .proc = if (proc_host.supported) &procRun else null,
         .proc_spawn = if (proc_host.supported) &procSpawn else null,
         .proc_job = if (proc_host.supported) &procJob else null,
@@ -102,6 +110,46 @@ pub const RealSystem = struct {
 
     fn of(ctx: *anyopaque) *RealSystem {
         return @ptrCast(@alignCast(ctx));
+    }
+
+    /// The environment programs and `getenv` see: the program's own copy once
+    /// it changed one, else the CLI's map; null reads the process's.
+    fn activeEnv(self: *RealSystem) ?*std.process.Environ.Map {
+        if (self.owned_env) |*m| return m;
+        return self.env_map;
+    }
+
+    fn setenv(ctx: *anyopaque, name: []const u8, value: ?[]const u8) ?seam.ErrorClass {
+        const self = of(ctx);
+        if (self.owned_env == null) {
+            self.owned_env = if (self.env_map) |m|
+                m.clone(self.gpa) catch return .other
+            else
+                proc_host.processEnviron(self.gpa) catch return .other;
+        }
+        const m = &self.owned_env.?;
+        if (value) |v| {
+            m.put(name, v) catch return .other;
+        } else {
+            _ = m.swapRemove(name);
+        }
+        return null;
+    }
+
+    fn chdir(ctx: *anyopaque, path: []const u8) ?seam.ErrorClass {
+        const self = of(ctx);
+        std.process.setCurrentPath(self.io, path) catch |e| return classOf(e);
+        return null;
+    }
+
+    fn getcwd(ctx: *anyopaque) seam.Result([]const u8) {
+        const self = of(ctx);
+        self.dropLast();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = std.process.currentPath(self.io, &buf) catch |e| return .{ .fail = classOf(e) };
+        const dir = self.gpa.dupe(u8, buf[0..n]) catch return .{ .fail = .other };
+        self.last = dir;
+        return .{ .ok = dir };
     }
 
     fn dropLast(self: *RealSystem) void {
@@ -596,7 +644,7 @@ pub const RealSystem = struct {
     /// has none yet (Phase 6).
     fn environ(ctx: *anyopaque, visit: seam.EnvVisitFn, visit_ctx: *anyopaque) void {
         const self = of(ctx);
-        if (self.env_map) |m| {
+        if (self.activeEnv()) |m| {
             var it = m.iterator();
             while (it.next()) |e| visit(visit_ctx, e.key_ptr.*, e.value_ptr.*);
             return;
@@ -621,7 +669,7 @@ pub const RealSystem = struct {
         // so the call runs on a private, threadless Io over this host's gpa.
         var threaded: std.Io.Threaded = .init(self.gpa, .{ .async_limit = .nothing });
         defer threaded.deinit();
-        return proc_host.run(self.gpa, threaded.io(), self.env_map, req, &self.proc_capture);
+        return proc_host.run(self.gpa, threaded.io(), self.activeEnv(), req, &self.proc_capture);
     }
 
     /// `proc.spawn` (doc 75 Phase 3): start the programs and keep the job.
@@ -632,7 +680,7 @@ pub const RealSystem = struct {
         const box = self.gpa.create(JobBox) catch return .{ .fail = .{ .class = .other } };
         box.cap = .{};
         box.job = proc_host.Job.init(self.gpa, &box.cap);
-        if (proc_host.start(&box.job, threaded.io(), self.env_map, req, true)) |fail| {
+        if (proc_host.start(&box.job, threaded.io(), self.activeEnv(), req, true)) |fail| {
             box.job.deinit();
             box.cap.deinit(self.gpa);
             self.gpa.destroy(box);
@@ -673,7 +721,7 @@ pub const RealSystem = struct {
 
     fn getenv(ctx: *anyopaque, name: []const u8) ?[]const u8 {
         const self = of(ctx);
-        if (self.env_map) |m| return m.get(name);
+        if (self.activeEnv()) |m| return m.get(name);
         if (builtin.os.tag == .windows) {
             // libmahina on Windows: the process environment block, which has
             // no libc `getenv` behind it.
@@ -1023,4 +1071,65 @@ test "proc jobs still running when the host closes are ended, and a job's timeou
     }
     // The host's deinit reaped it: there is no such child to signal any more.
     try testing.expect(std.posix.system.kill(pid, @enumFromInt(0)) != 0);
+}
+
+test "setenv gives the program its own environment: getenv, environ and the children read it" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var map = std.process.Environ.Map.init(testing.allocator);
+    defer map.deinit();
+    try map.put("KEPT", "from-the-cli");
+    try map.put("PATH", "/usr/bin:/bin");
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), &map);
+    defer sys.deinit();
+
+    try testing.expect(RealSystem.setenv(&sys, "MAHINA_T", "one") == null);
+    try testing.expectEqualStrings("one", RealSystem.getenv(&sys, "MAHINA_T").?);
+    try testing.expectEqualStrings("from-the-cli", RealSystem.getenv(&sys, "KEPT").?);
+    // The CLI's own map is not touched; the program holds a copy.
+    try testing.expect(map.get("MAHINA_T") == null);
+
+    const r = RealSystem.procRun(&sys, .{
+        .stages = &.{&.{ "/bin/sh", "-c", "printf '%s/%s' \"$MAHINA_T\" \"$KEPT\"" }},
+        .max_bytes = 64,
+    });
+    try testing.expectEqualStrings("one/from-the-cli", r.done.stdout);
+
+    // Overwriting and removing, and a removed variable is gone for children too.
+    try testing.expect(RealSystem.setenv(&sys, "MAHINA_T", "two") == null);
+    try testing.expectEqualStrings("two", RealSystem.getenv(&sys, "MAHINA_T").?);
+    try testing.expect(RealSystem.setenv(&sys, "KEPT", null) == null);
+    try testing.expect(RealSystem.getenv(&sys, "KEPT") == null);
+    const g = RealSystem.procRun(&sys, .{
+        .stages = &.{&.{ "/bin/sh", "-c", "printf '%s/%s' \"$MAHINA_T\" \"${KEPT-unset}\"" }},
+        .max_bytes = 64,
+    });
+    try testing.expectEqualStrings("two/unset", g.done.stdout);
+
+    const Seen = struct {
+        var t: ?[]const u8 = null;
+        fn visit(_: *anyopaque, name: []const u8, value: []const u8) void {
+            if (std.mem.eql(u8, name, "MAHINA_T")) t = value;
+        }
+    };
+    var dummy: u8 = 0;
+    RealSystem.environ(&sys, &Seen.visit, &dummy);
+    try testing.expectEqualStrings("two", Seen.t.?);
+}
+
+test "getcwd names an absolute directory, and chdir to it succeeds while a missing one fails" {
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    const here = switch (RealSystem.getcwd(&sys)) {
+        .ok => |d| try testing.allocator.dupe(u8, d),
+        .fail => return error.SkipZigTest,
+    };
+    defer testing.allocator.free(here);
+    try testing.expect(std.fs.path.isAbsolute(here));
+    // Not a real move: the cwd is the process's, shared with every other test.
+    try testing.expect(RealSystem.chdir(&sys, here) == null);
+    try testing.expectEqual(seam.ErrorClass.not_found, RealSystem.chdir(&sys, "/no/such/directory").?);
+    switch (RealSystem.getcwd(&sys)) {
+        .ok => |d| try testing.expectEqualStrings(here, d),
+        .fail => return error.TestUnexpectedResult,
+    }
 }

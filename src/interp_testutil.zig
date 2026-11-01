@@ -343,6 +343,19 @@ pub const FakeHost = struct {
     kill_signal: [16]u8 = undefined,
     kill_signal_len: usize = 0,
     kill_calls: usize = 0,
+    /// The working directory and environment mutations (doc 75 §6): what
+    /// `getcwd` answers, what `chdir` and `setenv` answer, and the last
+    /// request each saw.
+    cwd: seam.Result([]const u8) = .{ .ok = "/work" },
+    chdir_result: ?seam.ErrorClass = null,
+    setenv_result: ?seam.ErrorClass = null,
+    mutate_calls: usize = 0,
+    set_name: [32]u8 = undefined,
+    set_name_len: usize = 0,
+    set_value: [32]u8 = undefined,
+    set_value_len: ?usize = null,
+    chdir_path: [64]u8 = undefined,
+    chdir_path_len: usize = 0,
     proc_max_bytes: usize = 0,
     proc_timeout_ns: ?u64 = null,
 
@@ -595,6 +608,32 @@ pub const FakeHost = struct {
         for (self.vars) |kv| visit(visit_ctx, kv[0], kv[1]);
     }
 
+    fn setenvFn(ctx: *anyopaque, name: []const u8, val: ?[]const u8) ?seam.ErrorClass {
+        const self = of(ctx);
+        self.calls += 1;
+        self.mutate_calls += 1;
+        self.set_name_len = @min(name.len, self.set_name.len);
+        @memcpy(self.set_name[0..self.set_name_len], name[0..self.set_name_len]);
+        self.set_value_len = if (val) |v| @min(v.len, self.set_value.len) else null;
+        if (val) |v| @memcpy(self.set_value[0..self.set_value_len.?], v[0..self.set_value_len.?]);
+        return self.setenv_result;
+    }
+
+    fn chdirFn(ctx: *anyopaque, path: []const u8) ?seam.ErrorClass {
+        const self = of(ctx);
+        self.calls += 1;
+        self.mutate_calls += 1;
+        self.chdir_path_len = @min(path.len, self.chdir_path.len);
+        @memcpy(self.chdir_path[0..self.chdir_path_len], path[0..self.chdir_path_len]);
+        return self.chdir_result;
+    }
+
+    fn getcwdFn(ctx: *anyopaque) seam.Result([]const u8) {
+        const self = of(ctx);
+        self.calls += 1;
+        return self.cwd;
+    }
+
     fn localZoneFn(ctx: *anyopaque, utc: i64) seam.LocalZone {
         const self = of(ctx);
         return if (self.tz) |tz| tz.lookup(utc) else seam.LocalZone.utc;
@@ -633,6 +672,9 @@ pub const FakeHost = struct {
         .wallSeconds = &wallSecondsFn,
         .localZone = &localZoneFn,
         .environ = &environFn,
+        .setenv = &setenvFn,
+        .chdir = &chdirFn,
+        .getcwd = &getcwdFn,
         .proc = &procFn,
         .proc_spawn = &procSpawnFn,
         .proc_job = &procJobFn,

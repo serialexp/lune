@@ -115,14 +115,21 @@ land; move whole phases to Done once everything inside them is checked.
   Phase 4.
 - [ ] **Phase 6 — macOS and Windows spawn backends** (§7). After the REPL
   (Q10), earlier if a platform is easy. Q14 is decided (macOS 10.15); Q14b is open.
-- [ ] **Phase 4a — `os.setenv`, `os.chdir`, `os.getcwd` and the owned
-  host environment** (§6). One authoritative environment map and working
-  directory in the CLI host; inventory rows (added, `not-started`); the effect
-  kinds for the two mutations are decided with the implementation (replay
-  skips the mutation and feeds back its logged result, as `fs_mutate` does).
-  Also the REPL shortcuts for the two (§6). `os.getcwd` was added so the prompt
-  can read the directory (accepted 2026-10-30); further small host functions
-  the REPL turns out to need may be added the same way.
+- [x] **Phase 4a — `os.setenv`, `os.chdir`, `os.getcwd` and the owned
+  host environment** (§6). Done: `RealSystem` keeps one environment map
+  (`owned_env`, copied from the CLI's map or libc `environ` on the first
+  `setenv`; `activeEnv()` is what `getenv`, `environ`, `proc.run` and
+  `proc.spawn` then read) and `chdir` is a real process chdir, so relative
+  file paths and the children's inherited cwd agree. Effects: `setenv` and
+  `chdir` reuse `fs_mutate` (an `?ErrorClass` outcome; replay skips the
+  mutation and feeds back the logged result), `getcwd` is the new kind 21
+  (`string_or_fail`, effect format v12). All three are in the `env` group.
+  `setenv` refuses an empty name, `=` or NUL in a name, and NUL in a value,
+  before the host is asked; `nil` removes. `getcwd` raises when the host cannot
+  say or the directory is not UTF-8. The REPL shortcuts (`cd`, `export`) are
+  Phase 4, not here. `os.getcwd` was added so the prompt can read the
+  directory (accepted 2026-10-30); further small host functions the REPL turns
+  out to need may be added the same way.
 - [ ] **Phase 6a — raise the macOS release floor to 10.15** in
   `tools/mahina-cli.sh` (currently 10.12 x86-64), with the Darwin backend.
 - [ ] **Q14b — Windows `.bat`/`.cmd`.** Rejected with an error, or explicitly

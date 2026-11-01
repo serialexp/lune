@@ -469,6 +469,8 @@ pub const EffectKind = enum(u8) {
     /// Doc 75 §4: `proc.run`. One byte record (how it ended, whether bytes
     /// were dropped, the captured stdout and stderr), or a start failure.
     proc_run = 20,
+    /// Doc 75 §6: `os.getcwd()`. The working directory, or a failure.
+    getcwd = 21,
 };
 
 /// Doc 63 §5.9 (Q4): the disturb count at which a native stops being traced.

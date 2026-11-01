@@ -386,3 +386,85 @@ test "os: a replayed environ record that is malformed refuses the replay" {
     defer testing.allocator.free(bad);
     try testing.expectError(error.EffectKindMismatch, run(testing.allocator, .{ .mode = .replay, .log = bad }, "os.environ()"));
 }
+
+test "os: setenv and chdir hand the host the change, and a replay makes no host call" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    const r = try recordReplay(testing.allocator, &host, .{},
+        \\print(os.setenv("GREETING", "hi"), os.chdir("/tmp/x"), os.getcwd())
+        \\print(os.setenv("GREETING", nil))
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("true\ttrue\t/work\ntrue\n", r.out);
+    try testing.expectEqual(@as(usize, 3), host.mutate_calls);
+    try testing.expectEqualStrings("GREETING", host.set_name[0..host.set_name_len]);
+    try testing.expectEqual(@as(?usize, null), host.set_value_len);
+    try testing.expectEqualStrings("/tmp/x", host.chdir_path[0..host.chdir_path_len]);
+    var mutations: usize = 0;
+    var cwds: usize = 0;
+    for (r.kinds) |k| {
+        if (k == .fs_mutate) mutations += 1;
+        if (k == .getcwd) cwds += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), mutations);
+    try testing.expectEqual(@as(usize, 1), cwds);
+}
+
+test "os: setenv refuses a name or value the environment cannot hold, before the host is asked" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    const r = try run(testing.allocator, .{ .host = &host },
+        \\print(pcall(os.setenv, "", "x"))
+        \\print(pcall(os.setenv, "A=B", "x"))
+        \\print(pcall(os.setenv, "A\0B", "x"))
+        \\print(pcall(os.setenv, "A", "x\0y"))
+        \\print(pcall(os.setenv, "A", 5))
+        \\print(pcall(os.setenv))
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), host.mutate_calls);
+    var lines = std.mem.splitScalar(u8, r.out, '\n');
+    var n: usize = 0;
+    while (lines.next()) |l| {
+        if (l.len == 0) continue;
+        n += 1;
+        try testing.expect(std.mem.startsWith(u8, l, "false\t"));
+    }
+    try testing.expectEqual(@as(usize, 6), n);
+}
+
+test "os: a failed chdir or setenv is a failure value, and a replay returns it" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.chdir_result = .not_found;
+    host.setenv_result = .other;
+    const r = try recordReplay(testing.allocator, &host, .{ .io_errors = .lua },
+        \\local ok, msg, class = os.chdir("/nope")
+        \\print(ok, type(msg), class)
+        \\print((os.setenv("A", "b")))
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, r.out, "nil\tstring\t"));
+    try testing.expect(std.mem.endsWith(u8, r.out, "\nnil\n"));
+}
+
+test "os: getcwd raises when the host cannot say, and the replay raises the same" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.cwd = .{ .fail = .not_found };
+    const source = "print(pcall(os.getcwd))";
+    const rec = try run(testing.allocator, .{ .host = &host, .mode = .record }, source);
+    defer rec.deinit(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, rec.out, "false\t"));
+    const calls = host.calls;
+    const rep = try run(testing.allocator, .{ .mode = .replay, .log = rec.log }, source);
+    defer rep.deinit(testing.allocator);
+    try testing.expectEqualStrings(rec.out, rep.out);
+    try testing.expectEqual(calls, host.calls);
+}
+
+test "os: setenv, chdir and getcwd are absent without the env group" {
+    const r = try run(testing.allocator, .{ .groups = .{} }, "print(os.setenv, os.chdir, os.getcwd)");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("nil\tnil\tnil\n", r.out);
+}

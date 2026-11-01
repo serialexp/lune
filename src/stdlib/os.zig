@@ -335,6 +335,89 @@ fn osTmpnameN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize
 }
 
 // ---------------------------------------------------------------------------
+// os.setenv, os.chdir, os.getcwd (doc 75 §6)
+// ---------------------------------------------------------------------------
+
+/// `os.setenv(name, value)`: set a variable of the environment that
+/// `os.getenv`, `os.environ()` and a spawned program's omitted `env` read;
+/// `nil` removes it. Not in Lua. A host mutation, logged as its outcome like
+/// `os.remove`: a replay skips the change and feeds back the result.
+fn osSetenvN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    const name = try strArg(vm, args, 0);
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '=') != null or std.mem.indexOfScalar(u8, name, 0) != null)
+        return vm.badArgReason(1, "invalid variable name");
+    const val: ?[]const u8 = if (args.len >= 2 and !args[1].isNil())
+        interp.strBytes(args[1]) orelse return vm.badArg(2, "string", args[1])
+    else
+        null;
+    if (val) |v| if (std.mem.indexOfScalar(u8, v, 0) != null) return vm.badArgReason(2, "value contains a NUL byte");
+    try interp.noteIoErrorMode(vm);
+    const err = try io.control(vm, .fs_mutate, struct {
+        name: []const u8,
+        val: ?[]const u8,
+        pub fn run(self: @This(), v: *Vm) anyerror!?ErrorClass {
+            const sys = v.system orelse return .other;
+            const set = sys.vtable.setenv orelse return .other;
+            return set(sys.ctx, self.name, self.val);
+        }
+    }{ .name = name, .val = val });
+    if (err) |c| return io.failWith(vm, out, "set", .{ .path = name }, c, false);
+    return io.putResults(out, &.{Value.boolean(true)});
+}
+
+/// `os.chdir(path)`: change the working directory, for relative paths and
+/// for programs spawned afterwards. Not in Lua. Logged like `os.remove`.
+fn osChdirN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    const path = try strArg(vm, args, 0);
+    try interp.noteIoErrorMode(vm);
+    const err = try io.control(vm, .fs_mutate, struct {
+        path: []const u8,
+        pub fn run(self: @This(), v: *Vm) anyerror!?ErrorClass {
+            const sys = v.system orelse return .other;
+            const chdir = sys.vtable.chdir orelse return .other;
+            return chdir(sys.ctx, self.path);
+        }
+    }{ .path = path });
+    if (err) |c| return io.failWith(vm, out, "change directory to", .{ .path = path }, c, false);
+    return io.putResults(out, &.{Value.boolean(true)});
+}
+
+/// `os.getcwd()`: the working directory, absolute. Not in Lua. An input like
+/// `os.getenv`: logged in `record`, taken from the log in `replay`. Raises
+/// when the host cannot say.
+fn osGetcwdN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    _ = args;
+    const vm = vmOf(ctx);
+    const dir: Value = switch (vm.effect_mode) {
+        .replay => switch (try interp.replayHost(vm, .getcwd)) {
+            .value => |v| if (interp.strBytes(v) != null) v else return error.EffectKindMismatch,
+            .fail => return vm.raiseLocatedError("cannot get the working directory", 1),
+            .bytes => return error.EffectKindMismatch,
+        },
+        .off, .record => blk: {
+            const r: system.Result([]const u8) = if (vm.system) |sys|
+                if (sys.vtable.getcwd) |get| get(sys.ctx) else .{ .fail = .other }
+            else
+                .{ .fail = .other };
+            // A directory that is not UTF-8 cannot become a string (S-B).
+            const ok: ?[]const u8 = switch (r) {
+                .ok => |s| if (std.unicode.utf8ValidateSlice(s)) s else null,
+                .fail => null,
+            };
+            const v: ?Value = if (ok) |s| try vm.heap.internValue(s) else null;
+            try interp.recordHost(vm, .getcwd, if (v) |vv| .{ .value = vv } else .{ .fail = switch (r) {
+                .fail => |c| c,
+                .ok => .not_utf8,
+            } });
+            break :blk v orelse return vm.raiseLocatedError("cannot get the working directory", 1);
+        },
+    };
+    return io.putResults(out, &.{dir});
+}
+
+// ---------------------------------------------------------------------------
 // os.environ
 // ---------------------------------------------------------------------------
 
@@ -504,4 +587,7 @@ pub const natives = [_]function.BaseNative{
     entry("os.tmpname", &osTmpnameN, "tmpname", .{ .files = true }),
     entry("os.exit", &osExitN, "exit", .{ .env = true }),
     entry("os.environ", &osEnvironN, "environ", .{ .env = true }),
+    entry("os.setenv", &osSetenvN, "setenv", .{ .env = true }),
+    entry("os.chdir", &osChdirN, "chdir", .{ .env = true }),
+    entry("os.getcwd", &osGetcwdN, "getcwd", .{ .env = true }),
 };

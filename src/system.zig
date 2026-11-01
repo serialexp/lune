@@ -257,6 +257,16 @@ pub const HostSystem = struct {
         /// this function has an empty environment as far as `os.environ` goes.
         environ: ?*const fn (ctx: *anyopaque, visit: EnvVisitFn, visit_ctx: *anyopaque) void = null,
 
+        // ---- the working directory and the environment (doc 75 §6) ----
+        /// Set a variable of the environment `getenv`, `environ` and an
+        /// omitted `env` read (`null`: remove it). Null on success.
+        setenv: ?*const fn (ctx: *anyopaque, name: []const u8, value: ?[]const u8) ?ErrorClass = null,
+        /// Change the working directory every relative path resolves against,
+        /// the children's included. Null on success.
+        chdir: ?*const fn (ctx: *anyopaque, path: []const u8) ?ErrorClass = null,
+        /// The working directory, absolute; valid until the next host call.
+        getcwd: ?*const fn (ctx: *anyopaque) Result([]const u8) = null,
+
         // ---- processes ----
         /// Run a program to completion (doc 75). Blocks. The result's slices
         /// are valid until the next host call.
