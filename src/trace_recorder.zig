@@ -42,6 +42,7 @@ const MAX_INLINE_DEPTH = @import("trace_types.zig").MAX_INLINE_DEPTH;
 const CallEdge = @import("trace_types.zig").CallEdge;
 const SlotStore = @import("trace_ir.zig").SlotStore;
 const trace_snapshot = @import("trace_snapshot.zig");
+const bc_liveness = @import("bc_liveness.zig");
 pub const AbortReason = enum {
     /// An opcode the recorder does not yet model (tables, globals, concat, …).
     nyi_opcode,
@@ -585,6 +586,16 @@ pub inline fn isOneShotKind(kind: TraceKind) bool {
     return kind == .head or kind == .cont;
 }
 
+/// `RecordingSession.entry_state`.
+pub const EntryState = enum(u8) {
+    /// `bindEntry` has not run yet.
+    unbound,
+    /// It ran, binding nothing `TraceCode.for_alias` names.
+    bound,
+    /// It bound the anchor `for`'s visible variable to its index.
+    for_alias,
+};
+
 pub const RecordingSession = struct {
     /// Doc 63 §5.3: see `pending_host`.
     pub const PendingHost = struct {
@@ -1043,10 +1054,12 @@ pub const RecordingSession = struct {
     /// eager guard_gc) has been emitted yet this recording. Deferred to the
     /// first body `recordInstr`; cleared in `reset`.
     precise_prologue_done: bool = false,
-    /// Whether the entry bindings (`bindEntry`) have been made this recording.
-    /// Deferred to the first body `recordInstr` like the precise prologue, so
-    /// an armed recording stays empty until it records; cleared in `reset`.
-    entry_bound: bool = false,
+    /// Whether the entry bindings (`bindEntry`) have been made this recording,
+    /// and whether they bound a `for`'s visible variable to its index (for
+    /// `TraceCode.for_alias`). Deferred to the first body `recordInstr` like
+    /// the precise prologue, so an armed recording stays empty until it
+    /// records; cleared in `reset`.
+    entry_state: EntryState = .unbound,
     /// Doc 56 §4.2 (ORDINARY recordings): the current guest bytecode's
     /// boundary ordinal — one-based, bumped once per `recordInstr`; 0 before
     /// the first body bytecode (arm-time ops). `emit` stamps it on every op
@@ -1398,8 +1411,8 @@ pub const RecordingSession = struct {
         // the last COMPLETED instruction, so a failing body op resumes at this
         // pc with those values. Budget overflow is deterministic admission
         // refusal (`.snapshot_limit`), never a partial candidate.
-        if (!self.entry_bound) {
-            self.entry_bound = true;
+        if (self.entry_state == .unbound) {
+            self.entry_state = .bound;
             self.bindEntry() catch return self.abort(.alloc);
         }
         if (self.precise) {
@@ -1609,31 +1622,49 @@ pub const RecordingSession = struct {
     /// failures, not mid-body deopts.
     /// LuaJIT's `rec_for_loop` entry binding: a root anchored at a numeric
     /// `for` body starts with the visible variable `R[a+3]` equal to the index
-    /// `R[a]`, because both of tier-0's arrivals at the body start copy one
-    /// into the other (`for_prep`, and `for_loop`'s taken back-edge). So the
-    /// visible variable's entry value is the index's ref, carrying the type
-    /// proof the index gets, instead of a slot_load of its own that a body
-    /// using `i` only as a copy (a host-call argument, a move into a φ'd
-    /// slot) would leave untyped. `.input`, not `.def`: the binding is not a
-    /// write, so it adds no φ and no back-edge store.
-    ///
-    /// Precise recordings only. There a full-window snapshot names the
-    /// visible variable at every exit, so an untyped load of it is
-    /// unflushable and refuses native. An ordinary recording only reads it
-    /// where the body does, and binding it there moved bench/ both ways
-    /// (nsieve-bit −4.6%, nsieve and sieve_int +3.1%, grid_matmul +1.3%,
-    /// JIT on; TODO.md).
+    /// `R[a]` when tier-0 can arrive there only through `for_prep` and the
+    /// loop's own `for_loop`, as both copy one into the other
+    /// (`forBodyEntryExclusive`). So the visible variable's entry value is
+    /// the index's ref, carrying the type proof the index gets, instead of a
+    /// slot_load of its own. `.input`, not `.def`: the binding is not a
+    /// write, so it adds no φ and no back-edge store. The trace records the
+    /// pair (`TraceCode.for_alias`, from `entry_state`), so native code can
+    /// keep the two in one home.
     fn bindEntry(self: *RecordingSession) !void {
-        if (!self.precise or self.kind != .root or self.inline_depth != 0) return;
+        if (self.kind != .root or self.inline_depth != 0) return;
         const pc = self.anchor.pc;
-        if (pc == 0 or pc > self.anchor.proto.code.len) return;
-        const prep = self.anchor.proto.code[pc - 1];
+        const code = self.anchor.proto.code;
+        if (pc == 0 or pc > code.len) return;
+        const prep = code[pc - 1];
         if (prep.op != .for_prep) return;
         const vis: usize = @as(usize, prep.a) + 3;
         if (vis >= self.anchor_num_registers) return;
+        if (!forBodyEntryExclusive(code, pc - 1)) return;
         std.debug.assert(self.reg_map[vis].state == .undef);
         const idx = try self.refOf(prep.a);
         self.reg_map[vis] = .{ .ref = idx, .state = .input };
+        self.entry_state = .for_alias;
+    }
+
+    /// Whether tier-0 reaches the body of the numeric `for` whose `for_prep`
+    /// is at `prep_pc` only from that `for_prep` and the loop's `for_loop`.
+    /// A loop whose header is the body's first instruction (`for ... do
+    /// while c do ... end ... end`) jumps there too, with the visible
+    /// variable possibly reassigned. Only the body itself can: without
+    /// `goto`, nothing outside a loop jumps into it, so the scan covers the
+    /// body, O(body) as recording one iteration of it is. Adding `goto` must
+    /// widen it to the whole proto.
+    pub fn forBodyEntryExclusive(code: []const bytecode.Instr, prep_pc: u32) bool {
+        const body: u32 = prep_pc + 1;
+        const loop_pc: i64 = @as(i64, body) + code[prep_pc].aux;
+        if (loop_pc < body or loop_pc >= code.len or code[@intCast(loop_pc)].op != .for_loop) return false;
+        var p: u32 = body;
+        while (p < loop_pc) : (p += 1) {
+            for (bc_liveness.successors(code[p], p, code.len)) |s| {
+                if (s == body) return false;
+            }
+        }
+        return true;
     }
 
     fn beginPreciseInner(self: *RecordingSession) !void {
@@ -6704,7 +6735,7 @@ pub const RecordingSession = struct {
         self.host_sites.clearRetainingCapacity(); // doc 63 §5.1
         self.pending_host = null;
         self.precise_prologue_done = false; // doc 45 D2: prologue emitted at first body instr
-        self.entry_bound = false;
+        self.entry_state = .unbound;
         self.cur_ord = 0; // doc 56 §4.2: first body bytecode opens ordinal 1
         self.exit_ord_overflow = false;
         self.exit_snap_exhausted = false;

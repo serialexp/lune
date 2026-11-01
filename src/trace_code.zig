@@ -445,6 +445,21 @@ pub const ExitFacts = packed struct(u64) {
     resume_pc: u32 = 0,
 };
 
+/// `TraceCode.for_alias`: the tier-0 slots of a numeric `for`'s index and
+/// its visible variable.
+pub const ForAlias = struct {
+    index: u16,
+    visible: u16,
+
+    /// The pair of the `for` whose body `anchor` starts (its `for_prep` is
+    /// the instruction before).
+    pub fn ofAnchor(anchor: AnchorKey) ForAlias {
+        const prep = anchor.proto.code[anchor.pc - 1];
+        std.debug.assert(prep.op == .for_prep);
+        return .{ .index = prep.a, .visible = prep.a + 3 };
+    }
+};
+
 pub const TraceCode = struct {
     /// Borrowed proto identity; its program image must outlive this artifact.
     anchor: AnchorKey,
@@ -459,6 +474,11 @@ pub const TraceCode = struct {
     /// test left mid-trip carries `GuardRole.loop_test_copy`
     /// (`isLoopTestCopy`).
     instunrolled: u8 = 0,
+    /// A numeric `for` root's visible variable entered bound to its index
+    /// (`RecordingSession.bindEntry`): at every entry the two slots hold the
+    /// same value. Native code keeps them in one home when the body also
+    /// writes them the same value (`SlotClass.alias`). Null otherwise.
+    for_alias: ?ForAlias = null,
     /// Owned SSA instruction array. Frozen after publication.
     instrs: []IrInstr,
     /// Owned constants. Heap values here are NOT rooted (doc 61 §7.1): a

@@ -14,6 +14,7 @@ const arr = @import("array.zig");
 const Value = value.Value;
 const RegWindow = @import("regwindow.zig").RegWindow;
 const Trace = @import("trace_code.zig").TraceCode;
+const ForAlias = @import("trace_code.zig").ForAlias;
 const Reg = x64.Reg;
 const object = @import("object.zig");
 const function = @import("function.zig");
@@ -1204,6 +1205,56 @@ test "nativegen: analyze classifies slots and pins disjoint homes" {
     // Each exit_store's producer is live through to the loop marker (the back-edge).
     try testing.expectEqual(@as(u32, instrs.len - 1), al.last_use[8]); // acc+i
     try testing.expectEqual(@as(u32, instrs.len - 1), al.last_use[10]); // i+1
+}
+
+/// A counting `for` (index slot 0, limit 1, visible 3, acc 5) whose visible
+/// variable's φ is fed `vis_b`.
+fn forAliasInstrs(vis_b: u16) [15]I {
+    return .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .slot_load, .aux = 5 }, // 4: acc
+        .{ .op = .guard_int, .a = 4 }, // 5
+        .{ .op = .add, .a = 4, .b = 0 }, // 6: acc + i (the visible i is the index)
+        .{ .op = .konst, .aux = 0 }, // 7: 1
+        .{ .op = .add, .a = 0, .b = 7 }, // 8: i + 1
+        .{ .op = .le, .a = 8, .b = 1 }, // 9
+        .{ .op = .guard_true, .a = 9 }, // 10
+        .{ .op = .phi, .b = 6, .aux = 5 }, // 11
+        .{ .op = .phi, .b = 8, .aux = 0 }, // 12
+        .{ .op = .phi, .b = vis_b, .aux = 3 }, // 13: visible <- vis_b
+        .{ .op = .loop }, // 14
+    };
+}
+
+fn forAliasSlot(alias: ?ForAlias, vis_b: u16) !nativegen.SlotInfo {
+    var instrs = forAliasInstrs(vis_b);
+    var consts = [_]Value{Value.int(1)};
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .for_alias = alias };
+    var kinds: [instrs.len]Kind = undefined;
+    var slot_of: [instrs.len]i32 = undefined;
+    try testing.expect(proveKinds(testing.allocator, &t, &kinds, &slot_of));
+    var al = analyze(testing.allocator, &t, &kinds, &slot_of) orelse return error.AnalyzeBailed;
+    defer al.deinit(testing.allocator);
+    for (al.slots) |s| {
+        if (s.slot != 3) continue;
+        if (s.class == .alias) try testing.expectEqual(@as(u16, 0), al.slots[@intCast(s.alias_of)].slot);
+        return s;
+    }
+    return error.VisibleSlotMissing;
+}
+
+test "nativegen: a for's visible variable written its index's update is an alias" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const fa: ForAlias = .{ .index = 0, .visible = 3 };
+    try testing.expectEqual(SlotClass.alias, (try forAliasSlot(fa, 8)).class);
+    // Written something else (`i = acc` in the body): two values, write-only.
+    try testing.expectEqual(SlotClass.write_only, (try forAliasSlot(fa, 6)).class);
+    // A trace whose recorder bound nothing (`for_alias` null): write-only.
+    try testing.expectEqual(SlotClass.write_only, (try forAliasSlot(null, 8)).class);
 }
 
 test "nativegen: analyze rejects a type-unstable carried slot" {

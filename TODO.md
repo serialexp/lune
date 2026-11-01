@@ -5,9 +5,29 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 ## Language: declaring a global (noted 2026-10-30)
 
 - [ ] **Lua 5.5 global declarations, attributes and frozen tables.**
-      Designed in doc 76 (decisions D1–D4 there: follow 5.5 as written,
-      `global` reserved, `<const>` is not a freeze, `table.freeze` as
-      Luau's, attributes in the same change). Open questions Q1–Q4 there.
+      Designed in doc 76 (decisions D1–D8 there); its status list tracks
+      the phases.
+- [ ] **An uncaught error skips pending `__close`s** (doc 76 §6.2). An
+      error that reaches the top of the main chunk ends the program without
+      closing its to-be-closed variables; lua.c closes them, because it runs
+      the chunk under `pcall`. Run the top-level unwind's closes too.
+- [ ] **A `__close` cannot yield** (doc 76 §6.2). 5.4 suspends a coroutine
+      mid-close; mahina raises "attempt to yield across a C-call boundary",
+      because `Vm.callClose` runs the close as a nested call. Needs the close
+      to be a resumable frame (doc 68's continuation kinds).
+- [ ] **Generic `for` over a native iterator never traces** (seen
+      2026-11-01, measuring doc 76). `for _, v in ipairs(t)`,
+      `for k, v in pairs(t)` and `for k, v in next, t` all abort recording
+      (`host_barrier` at the `ipairs`/`pairs` call or at `itern` with
+      `inext`, `itern_next` for `next`), in an outer loop too, so the whole
+      nest runs on tier 0. Only closure iterators trace. Before doc 76 as
+      after it.
+- [ ] **`pairs`/`ipairs` look their iterator up by name per call**
+      (`stdlib/base.zig` `globalNative`): an intern lookup plus a globals
+      read on every call, and the result is whatever the global `next` is
+      now, so `next = nil; pairs(t)` breaks `pairs`, which Lua's doesn't.
+      Same in `string.gmatch`/`utf8.codes` (`stdlib/string.zig`). Resolve
+      each once, at install and keyframe restore.
 
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
@@ -21,12 +41,16 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       250** (doc 63 §5.10.6). Shim 196, `cHostCall` 71, the host 12, the
       native body ~90. Doc 63 §5.10.6 lists the options. Parked by Bart
       (2026-10-30).
-- [ ] **The entry alias moves ordinary traces both ways.** Binding the
+- [x] **The entry alias moves ordinary traces both ways.** Binding the
       numeric-for visible variable to the index's ref at a root's entry
       (`bindEntry`) is limited to precise recordings: on all roots it gave
       nsieve-bit −4.6% but nsieve +3.1%, sieve_int +3.2%, grid_matmul
       +1.3% (JIT on). Find what the alias changes in nsieve's trace before
-      widening it.
+      widening it. **Done (2026-11-01, doc 63 §5.10.6 "The entry alias,
+      on every root"):** the binding made the visible variable write-only,
+      stored to the slab every iteration; it is now `SlotClass.alias`, no
+      home and no back-edge store. Every root binds when the CFG allows it,
+      which also fixed a hang the precise-only binding had.
 - [x] **`two` costs 9 more instructions a call with the flag on** (1235
       against 1226, §8.1 probe). The design says the disturbing shapes stay
       at today's numbers; find where the 9 go. **Explained (2026-11-01):** a

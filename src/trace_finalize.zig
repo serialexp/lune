@@ -454,6 +454,7 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .unrolled_while = rec.unrolled_while,
         .peeled = rec.peel != null,
         .instunrolled = rec.unroll_used,
+        .for_alias = if (rec.entry_state == .for_alias) code_mod.ForAlias.ofAnchor(rec.anchor) else null,
         // Doc 45 D2: snapshot ownership moves to the code (freed by its
         // deinit, which every candidate error path funnels through). No error
         // return exists past this literal, so the errdefer above cannot

@@ -77,6 +77,16 @@ pub const SlotClass = enum {
     /// in exit_stores, NOT slot_loaded (e.g. `flag = i<limit`). No home; committed to
     /// regs[] at the back-edge (cut-1 style); never touched at EXIT.
     write_only,
+    /// A numeric `for`'s visible variable kept equal to its index
+    /// (`TraceCode.for_alias`): it enters holding the index's value and the
+    /// body writes it the index's update. No home and no back-edge commit;
+    /// every exit writes it what it writes the index (`alias_of`).
+    alias,
+
+    /// A write-only or alias slot has no home and no entry load.
+    pub fn homeless(c: SlotClass) bool {
+        return c == .write_only or c == .alias;
+    }
 };
 
 /// Compile-time facts about one tier-0 slot.
@@ -140,6 +150,8 @@ pub const SlotInfo = struct {
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
     coalesced: bool,
+    /// `.alias`: the slot id of the carried index whose writes it shares.
+    alias_of: i32 = -1,
     /// Doc 39 (peeled trace): the ref of this slot's INTERNAL (steady-state) φ —
     /// the slot-bound φ's `a` association stamped by the recorder — or -1. When
     /// >= 0 the slot's post-run-once value lives in that φ's computed home, not in
@@ -913,6 +925,27 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             }
         }
     }
+    // A numeric `for`'s visible variable entered bound to the index
+    // (`for_alias`). When the body also writes it the index's update, the
+    // two hold one value at every exit, so the visible slot needs neither a
+    // home nor the write-only commit each back-edge: exits write it from the
+    // index. Anything else (a body that reassigns `i`, a one-shot close)
+    // leaves it write-only.
+    if (t.for_alias) |fa| alias: {
+        var vid: ?usize = null;
+        var xid: ?usize = null;
+        for (slots.items, 0..) |s, id| {
+            if (s.slot == fa.visible) vid = id;
+            if (s.slot == fa.index) xid = id;
+        }
+        const v = &slots.items[vid orelse break :alias];
+        const x = slots.items[xid orelse break :alias];
+        if (v.class != .write_only or x.class != .carried) break :alias;
+        if (x.kind != .int and x.kind != .float) break :alias;
+        if (v.store_ref != x.store_ref) break :alias;
+        v.class = .alias;
+        v.alias_of = @intCast(xid.?);
+    }
 
     // [doc 22 §A.1, fail closed] Structural bails for carried-heap slots. The
     // `.ptr`-keyed lane/grid analyses below skip a carried-heap slot by kind
@@ -990,7 +1023,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // path's validity regardless of lane.
     for (slots.items) |*s| {
         if (s.kind != .ptr) continue;
-        if (s.class == .write_only) continue;
+        if (s.class.homeless()) continue;
         const lr: u16 = @intCast(s.load_ref);
         // An aref on this slot REQUIRES a guard_lane (the recorder always emits both);
         // a malformed trace with array access but no lane would miscompile, so track it.
@@ -1009,7 +1042,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // lane (set above) here is malformed; bail rather than miscompile.
     for (slots.items) |*s| {
         if (s.kind != .ptr) continue;
-        if (s.class == .write_only) continue;
+        if (s.class.homeless()) continue;
         const lr: u16 = @intCast(s.load_ref);
         var has_garow = false;
         var ge: i32 = -1;
@@ -1269,7 +1302,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     var home_xmm_mask: u16 = 0;
 
     for (slots.items, 0..) |*s, sid| {
-        if (s.class == .write_only) continue;
+        if (s.class.homeless()) continue;
         // Doc 45 D6: a snapshot-only load (kind `.none` — a dead anchor-window
         // slot the precise recorder force-loaded so full-window snapshots have
         // a ref) gets NO home: the body never reads it, the exit materializers
@@ -1477,7 +1510,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // iteration 1's table only (and the prologue never fills it); leaving
         // its homes null keeps every consumer on the per-iteration load.
         for (slots.items, 0..) |*s, sid| {
-            if (s.class == .write_only or s.kind != .ptr) continue;
+            if (s.class.homeless() or s.kind != .ptr) continue;
             if (need_data[sid]) {
                 if (pickRegFrom(&free, &BASE_HOME_ORDER) orelse
                     evictPrologueOnly(&evictable, slots.items, loc, &home_reg_mask, .gp)) |r|
@@ -1850,7 +1883,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         for (slots.items) |s| {
             // A `.none` (snapshot-only) slot has no home: its `home` is
             // undefined, exactly as the allocation loop above leaves it.
-            if (s.class == .write_only or s.pin_only or s.kind == .none) continue;
+            if (s.class.homeless() or s.pin_only or s.kind == .none) continue;
             switch (s.home) {
                 .reg => |r| {
                     const b = regBit(r);
@@ -1953,7 +1986,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             }.f;
             for (loc) |l| noteLoc(l, &gp_used, &xmm_used);
             for (slots.items) |s| {
-                if (s.class != .write_only) noteLoc(s.home, &gp_used, &xmm_used);
+                if (!s.class.homeless()) noteLoc(s.home, &gp_used, &xmm_used);
                 for ([_]?Reg{ s.data_home, s.present_home, s.len_home }) |maybe| {
                     if (maybe) |r| gp_used |= regBit(r);
                 }

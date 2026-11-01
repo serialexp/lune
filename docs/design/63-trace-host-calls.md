@@ -10,7 +10,7 @@ arrays included. Phase 4 not started. Revision 6, approved by Codex and
 Antigravity (confirmation round 6, receipts `docs/reviews/doc63/*-rev6.md`).
 Q1–Q5 decided by Bart (2026-10-10; §9). Review history in §11–§15.
 Owner: Bart
-Last updated: 2026-10-31
+Last updated: 2026-11-01
 
 ## Implementation status
 
@@ -21,6 +21,12 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
 
 ### Done
 
+- [x] **The entry alias on every root, one home for a `for`'s index and
+  its visible variable** (2026-11-01, §5.10.6 after "The entry alias").
+  Ordinary roots bind too, and native code gives the visible variable no
+  home and no back-edge store (`SlotClass.alias`). JIT on: sieve_int
+  −4.1%, nsieve −3.9%, grid_matmul −3.4%, nsieve-bit −2.6%. Also fixes a
+  hang the precise-only binding had on a body that starts with a loop.
 - [x] **`two`'s 9 instructions a call, explained** (2026-11-01, §5.10.6
   after the table). Not a per-call cost: the steady-state slopes match to
   the hundredth with the flag on and off. The flag-on run carries a fixed
@@ -1702,6 +1708,37 @@ root's entry (`rec_for_loop`), and so does the recorder now. Tier-0 makes
 the two equal at both arrivals (`for_prep` and `for_loop`'s back-edge). It
 is limited to precise recordings: on every root it moved `bench/` both ways
 (TODO.md).
+
+*The entry alias, on every root (2026-11-01).* What moved `bench/` both
+ways was native code, not the binding. A bound visible variable has a
+store and no load, so the allocator classed it write-only. A write-only
+slot is stored to the slab, tag and payload, at every back-edge, and
+keeps `rdi`/`rsi` pinned for that store: nsieve's inner loops paid both
+for a variable they never read. The recorder now hands the pair to native
+code (`TraceCode.for_alias`). When the body writes the visible variable
+the index's own update, the allocator classes it `SlotClass.alias`: no
+home, no prologue load, no back-edge store, and every exit writes it
+exactly what it writes the index (`boundary.carriedWrites`, the exit
+map's carried rows). Any other write keeps it write-only. A body that
+reassigns `i` would probably be sound as an alias too (the snapshot
+covers exits after the write, and the next iteration does not read it),
+but that is not needed yet.
+
+The binding also had a soundness gap, precise recordings included. A
+trace anchors at (proto, pc), and a `while` that starts the `for` body
+has its header at the same pc. Its back-edge arrives there with the
+visible variable reassigned (`for i = 1, n do while i % 7 ~= 0 do i = i +
+1 end ... end`), so binding it to the index there ran the loop forever.
+`forBodyEntryExclusive` scans the body for a jump to its first
+instruction and binds only when there is none. Without `goto` nothing
+outside a loop's body jumps into it, so the body is enough; adding
+`goto` must widen the scan to the proto.
+
+`bench/` instruction counts against HEAD, JIT on: sieve_int −4.1%,
+nsieve −3.9%, grid_matmul −3.4%, grid_matmul_f64 −3.2%, nsieve-bit
+−2.6%, array3d −1.1%, nothing worse than +0.06% except proc_capture
++0.19% (process spawning). Tier-1a (`--trace`): repack −5.7%, nsieve
+−5.4%, sieve_int −4.8%, worst nsieve-bit-fp +0.11%.
 
 **Measured** (§8.1 probe, instructions per iteration, ReleaseFast, flag on
 in a shadow build; the flag-off JIT column is today's):

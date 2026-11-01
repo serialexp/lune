@@ -2435,3 +2435,111 @@ test "doc 51 F1: variable-trip numeric nest with cross-iteration table aliasing 
         \\print(string.format("%0.9f", s))
     );
 }
+
+/// The root trace anchored at the one numeric `for` in `tr`'s program, and
+/// whether native analysis gives its visible variable `SlotClass.alias`.
+fn forAliasClass(gpa: std.mem.Allocator, tr: *const trace.Trace) !?nativegen.SlotClass {
+    const fa = tr.code.for_alias orelse return null;
+    const n = tr.code.instrs.len;
+    const kinds = try gpa.alloc(nativegen.Kind, n);
+    defer gpa.free(kinds);
+    const slot_of = try gpa.alloc(i32, n);
+    defer gpa.free(slot_of);
+    if (!nativegen.proveKinds(gpa, &tr.code, kinds, slot_of)) return error.ProveFailed;
+    var al = nativegen.analyze(gpa, &tr.code, kinds, slot_of) orelse return error.AnalyzeBailed;
+    defer al.deinit(gpa);
+    for (al.slots) |s| {
+        if (s.slot == fa.visible) return s.class;
+    }
+    return error.VisibleSlotMissing;
+}
+const nativegen = @import("nativegen.zig");
+
+/// `forBodyEntryExclusive` for the one numeric `for` in `source`'s main chunk.
+fn forBodyExclusive(gpa: std.mem.Allocator, source: [:0]const u8) !bool {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    var chunk = try compiler.compile(gpa, &heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    const code = chunk.proto.code;
+    for (code, 0..) |ins, pc| {
+        if (ins.op == .for_prep) return @import("trace_recorder.zig").RecordingSession.forBodyEntryExclusive(code, @intCast(pc));
+    }
+    return error.NoNumericFor;
+}
+
+test "for alias: the visible variable shares the index's home and every exit writes it the index" {
+    // `i` is read only after a side exit (`hit + i` runs on tier-0 once the
+    // branch guard fails), so a stale visible slot shows up in `hit`.
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const sources = [_][:0]const u8{
+        \\local acc, hit = 0, 0
+        \\for i = 1, 3000 do
+        \\  if i % 1000 == 0 then hit = hit + i end
+        \\  acc = acc + i
+        \\end
+        \\print(acc, hit)
+        ,
+        \\local acc, hit = 0, 0
+        \\for x = 0.5, 300.5 do
+        \\  if x == 150.5 then hit = hit + x end
+        \\  acc = acc + x
+        \\end
+        \\print(acc, hit)
+    };
+    const expected = [_][]const u8{ "4501500\t6000\n", "45300.5\t150.5\n" };
+    for (sources, expected) |src, want| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        var chunk = try runNativeForTrace(&vm, gpa, src, &sink);
+        defer chunk.deinit();
+        try testing.expectEqualStrings(want, sink.buffered());
+        var aliased = false;
+        for (vm.trace.registry.cache.items) |tr| {
+            const class = try forAliasClass(gpa, tr) orelse continue;
+            try testing.expectEqual(nativegen.SlotClass.alias, class);
+            try testing.expect(tr.native == .compiled);
+            aliased = true;
+        }
+        try testing.expect(aliased);
+        try expectProgram(src, want);
+    }
+}
+
+test "for alias: a body that starts with a loop jumping back to it binds nothing" {
+    // The `while` header is the `for` body's first instruction, so its
+    // back-edge arrives at the `for` anchor with `i` reassigned: the visible
+    // variable is not the index there.
+    const src =
+        \\local s = 0
+        \\for i = 1, 20000 do
+        \\  while i % 7 ~= 0 do i = i + 1 end
+        \\  s = s + i
+        \\end
+        \\print(s)
+    ;
+    const gpa = testing.allocator;
+    // Checked on the bytecode first: binding there runs the loop forever.
+    try testing.expect(!try forBodyExclusive(gpa, src));
+    try testing.expect(try forBodyExclusive(gpa, "local s = 0 for i = 1, 9 do s = s + i end"));
+    try expectProgram(src, "200070003\n");
+    if (comptime !nativegen.is_x64_linux) return;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa, src, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("200070003\n", sink.buffered());
+    try testing.expect(vm.trace.registry.cache.items.len != 0);
+    for (vm.trace.registry.cache.items) |tr| try testing.expect(tr.code.for_alias == null);
+}

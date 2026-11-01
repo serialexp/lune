@@ -52,17 +52,19 @@ pub fn build(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc
 
     // (3) Carried homes: exactly the slots the ordinary deopt flush writes
     // back (`lower`'s `deopt_exit`).
+    // A `for` alias is flushed from its index's home.
     var n_carried: usize = 0;
     for (alloc.slots) |s| {
-        if (flushedCarried(s, n)) n_carried += 1;
+        if (flushedCarried(flushSource(alloc, s), n)) n_carried += 1;
     }
     const carried: []CarriedHome = if (n_carried == 0) &.{} else try gpa.alloc(CarriedHome, n_carried);
     errdefer if (carried.len != 0) gpa.free(carried);
     var ci: usize = 0;
     for (alloc.slots) |s| {
-        if (!flushedCarried(s, n)) continue;
-        const lr: usize = @intCast(s.load_ref);
-        carried[ci] = .{ .slot = s.slot, .ref = @intCast(lr), .kind = s.kind };
+        const src = flushSource(alloc, s);
+        if (!flushedCarried(src, n)) continue;
+        const lr: usize = @intCast(src.load_ref);
+        carried[ci] = .{ .slot = s.slot, .ref = @intCast(lr), .kind = src.kind };
         needed[lr] = true;
         ci += 1;
     }
@@ -86,6 +88,12 @@ fn frameWords(kinds: []const Kind, alloc: *const Alloc) u32 {
     var boxed: u32 = 0;
     for (kinds) |k| boxed += @intFromBool(k == .boxed);
     return alloc.spill_count + boxed;
+}
+
+/// The slot whose home an exit flushes into `s`: its `for` index for an
+/// alias (`SlotClass.alias`), else itself.
+fn flushSource(alloc: *const Alloc, s: SlotInfo) SlotInfo {
+    return if (s.class == .alias) alloc.slots[@intCast(s.alias_of)] else s;
 }
 
 fn flushedCarried(s: SlotInfo, n: usize) bool {
@@ -134,7 +142,7 @@ fn row(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ref: usize) Ex
         const sid = alloc.slot_id_of_ref[ref];
         if (sid < 0) return out;
         const s = alloc.slots[@intCast(sid)];
-        if (s.class == .write_only or s.kind == .none) return out;
+        if (s.class.homeless() or s.kind == .none) return out;
         // Doc 57: a home-less pinned slot has no place. Its slab is current
         // (invariant), so an adapter restoring its OWN slot may skip it; any
         // other consumer finds no place and fails closed.

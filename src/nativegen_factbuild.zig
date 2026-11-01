@@ -217,10 +217,10 @@ fn entryFacts(t: *const Trace, kinds: []const Kind, alloc: *const Alloc, out: []
         };
         n += 1;
     }
-    // §5.1: the `.loop` back-edge writes the `write_only` slots, so no entry
-    // fact may be about one.
+    // §5.1: the `.loop` back-edge writes the `write_only` slots, and a `for`
+    // alias is never read, so no entry fact may be about either.
     if (std.debug.runtime_safety) for (alloc.slots) |s| {
-        if (s.class != .write_only) continue;
+        if (!s.class.homeless()) continue;
         for (out[0..n]) |f| std.debug.assert(!f.mentions(s.slot));
     };
     return facts.canonicalize(out[0..n]).len;

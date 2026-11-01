@@ -47,7 +47,7 @@ pub fn flushTag(kind: Kind) u8 {
 /// prologue check — the body never reads it and the exit materializers skip
 /// it (its slab slot stays current).
 pub fn entryTag(s: SlotInfo) ?u8 {
-    if (s.class == .write_only) return null;
+    if (s.class.homeless()) return null;
     if (s.kind == .boxed or s.kind == .none) return null;
     return switch (s.kind) {
         .ptr, .func, .native => layout.TAG_HEAP, // all invariant heap pointers
@@ -194,9 +194,15 @@ fn phiWrite(kinds: []const Kind, alloc: *const Alloc, p: trace_ir.IrInstr) Write
 /// keeps each carried slot in its home across local iterations, so until an
 /// exit re-boxes it the slab still holds the trace-entry value. `bridge_exit`
 /// names an armed composite bridge's guard: the slots its set E commits are
-/// skipped, since E overwrites them anyway.
+/// skipped, since E overwrites them anyway. A `for` alias
+/// (`SlotClass.alias`) is written exactly what its index is.
 fn carriedWrites(t: *const Trace, alloc: *const Alloc, bridge_exit: ?usize, sink: anytype) !void {
-    for (alloc.slots) |s| {
+    for (alloc.slots) |slot| {
+        const s = if (slot.class == .alias) alias: {
+            var x = alloc.slots[@intCast(slot.alias_of)];
+            x.slot = slot.slot;
+            break :alias x;
+        } else slot;
         if (s.class != .carried) continue;
         // Boxed pass-through traces are one-shot. Before their terminal commit the
         // VM slot is still the entry Value byte-for-byte, so a guard exit must not

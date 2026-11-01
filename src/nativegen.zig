@@ -617,7 +617,7 @@ const jitdbg = @import("jitdbg.zig");
 /// `nativegen_prove.dbg_last_idx`.
 pub threadlocal var dbg_lower_error: if (jitdbg.enabled) ?anyerror else void = if (jitdbg.enabled) null else {};
 const Loc = ngalloc.Loc;
-const SlotInfo = ngalloc.SlotInfo;
+pub const SlotInfo = ngalloc.SlotInfo;
 const CALLEE_SAVED_MASK = ngalloc.CALLEE_SAVED_MASK;
 const XMM_SCRATCH0 = ngalloc.XMM_SCRATCH0;
 const XMM_SCRATCH1 = ngalloc.XMM_SCRATCH1;
@@ -1022,7 +1022,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // prologue-failure contract: failed entry leaves regs[] byte-identical.
     try snapshotBoxedTags(a, t, kinds, alloc);
     for (alloc.slots) |s| {
-        if (s.class == .write_only) continue;
+        if (s.class.homeless()) continue;
         if (s.kind == .none) continue; // doc 45 D6: no home to load into
         if (s.pin_only) continue; // doc 57: checked in memory above, no home
         // payload lane: `payloads[slot]` at rsi+slot*8 (scale-8, free).
@@ -1048,7 +1048,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // since neither changes within a native run (the read path never widens). A miss
     // returns 0 (regs[] untouched). The bool-lane is the only lane proveKinds admits.
     for (alloc.slots) |s| {
-        if (s.class == .write_only or s.kind != .ptr) continue;
+        if (s.class.homeless() or s.kind != .ptr) continue;
         const preg: Reg = switch (slotHomePlace(s)) {
             .reg => |r| r,
             .mem => |m| blk: {
@@ -1119,7 +1119,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // and re-runs the iteration. Byte-identical to irinterp's `guard_func` arm: heap
     // + type==function + `closure.proto.id == aux`.
     for (alloc.slots) |s| {
-        if (s.class == .write_only or s.kind != .func) continue;
+        if (s.class.homeless() or s.kind != .func) continue;
         const preg = try refHomeBaseReg(a, s, .rax);
         // header.type == function (the payload is a TAG_HEAP `*GcHeader`).
         try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, FUNCTION_TYPE);
@@ -1144,7 +1144,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // `?RecordedBuiltin` laid out `[payload, has_value]`, so the non-null check is the flag
     // byte == 1 and the identity check is the payload byte == tag.
     for (alloc.slots) |s| {
-        if (s.class == .write_only or s.kind != .native) continue;
+        if (s.class.homeless() or s.kind != .native) continue;
         const preg = try refHomeBaseReg(a, s, .rax);
         // header.type == native (the payload is a TAG_HEAP `*GcHeader`).
         try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, NATIVE_TYPE);
@@ -1168,7 +1168,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // (regs[] untouched), side-exiting to tier-0 which re-observes and aborts
     // or re-guards.
     for (alloc.slots) |s| {
-        if (s.class == .write_only or !s.is_string) continue;
+        if (s.class.homeless() or !s.is_string) continue;
         const preg = try refHomeBaseReg(a, s, .rax);
         try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, STRING_TYPE);
         try a.jcc(.ne, prologue_fail);

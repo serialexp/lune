@@ -31,6 +31,7 @@ const Scratch = struct {
     anchor: types.AnchorKey = .{ .proto = &scratch_proto, .pc = 0, .proto_id = scratch_proto.id },
     unrolled_while: bool = false,
     unroll_used: u8 = 0,
+    entry_state: @import("trace_recorder.zig").EntryState = .unbound,
     side_src: ?types.ExitKey = .{ .trace_id = 12, .exit_instr = 2 },
     // Doc 45 D2: finalize reads the precise flag and, when set, hands the
     // builder's snapshot arrays to the code. The fixture stays entry-replay.
