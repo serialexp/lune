@@ -2,7 +2,8 @@ DOC 76 GLOBAL DECLARATIONS / ATTRIBUTES / FROZEN TABLES (2026-11-01, coral-raven
 - Done: phases 0-3 (d4df993), phase 4 table.freeze/isfrozen/clone (638fc90), D8 constant <const> folding (ddbee74), one guard_table per table in tropt (6b64d10), phase 5 language server (8fb6392).
 - Phase 6: local store microbenchmarks in doc 76 §5.4 (tier-0 +1..+4 instr/store; native ≈0 except per-iteration tables +1.6% and set_global +2.6%). Still open: `just bench` on the pinned pool (needs a push), and Bart's pick between the two tier-0 options in §5.4.
 - An uncaught error runs the pending closes (98ff883, in Vm.exec).
-- Also open, each needing Bart: Phase 3b (a __close value recorded as a call, not an abort). It would be the first metamethod call a trace makes; docs 61/63 assume traces make none, and every metatable aborts recording today, so it wants a design (general metamethod-call recording, LuaJIT lj_record_mm_call style) first. A __close that yields (TODO.md) needs a resumable close frame (doc 68 continuation kinds), also design first.
+- Phase 3b moved into doc 77 (recording metamethods; reviewed by Codex + Antigravity, Q1-Q5 decided 2026-11-02, nothing implemented). Its Phase 4 (function metamethods) waits on doc 68 P2; Phases 0-3 do not. Allocating handlers went to doc 78 (allocation in inlined calls), written and parked, not reviewed.
+- Still open: a __close that yields (TODO.md; doc 68 continuation kinds), Phase 6's `just bench` on the pinned pool (needs a push), Bart's pick between the §5.4 tier-0 options.
 
 DOC 63 TYPED CARRIED LOADS DONE (2026-10-30, coral-marten). Doc 63 §5.10.7.
 - The recorder type-guards a loop-carried number copy (LuaJIT SLOAD typecheck): w4/w8/w16 392/420/501, wide 476 (tier-0 607/791/1159/1096). Pure-guest 8-local rotation 450 -> 23 instr/iter. bench/ neutral.
