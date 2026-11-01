@@ -70,6 +70,10 @@ land; move whole phases to Done once everything inside them is checked.
   the strict-scope errors as diagnostics (§7).
 - [ ] **Phase 6 — measured.** A table-store benchmark before and after the
   `readonly` check, and the suite (`just bench`) (§5.4).
+  - [x] store microbenchmarks, user instructions, local (§5.4)
+  - [ ] `just bench` on the pinned profile pool
+  - [ ] a decision on the tier-0 residue (§5.4: header byte order, the
+    `set_global` check)
 
 ## 1. Why this exists
 
@@ -299,6 +303,33 @@ The check is one byte test on a cache line every store already touches. The
 budget: no table-store microbenchmark slower by more than noise in user
 instructions, and `just bench` flat. Measured in Phase 6, on the pinned
 profile pool.
+
+Measured 2026-11-01 (ReleaseFast, `perf stat -e instructions:u`, bc80f7c
+against 6b64d10), extra instructions per store:
+
+| store | tier 0 | native |
+|---|---|---|
+| `t[i] = v`, in bounds | +1 (+0.7%) | ≈0 (+0.1%): hoisted to the prologue |
+| `h.k = v`, `set_field` | +2 (+2.4%) | ≈0 |
+| `h[k] = v`, string key | +1 (+0.4%) | +1 (+0.3%) |
+| `g = v`, `set_global` | +4 (+2.9%) | +4 (+2.6%) |
+| `row[j] = v`, a table per iteration | +1 (+0.7%) | +1.3 (+1.6%): one `bt` per row of 3, plus tier 0's share |
+| append into a fresh table | +0.6% | +0.2% |
+
+The native column started worse for per-iteration tables (+3.3%): a read's
+plain `guard_table` and the store's writable one both survived. `tropt` now
+keeps one guard per table and moves the bit up to it.
+
+What is left is tier 0's. `isWritableTable()` adds an `and` to the type
+test (the color byte sits between type and flags). Two ways to make it
+free, both open:
+
+- Swap `color` and `flags` in `GcHeader`, so one 16-bit compare tests
+  "a table with no flag set". A pinned table would then take the slow
+  lane, and a generational `remembered` bit would too, once it exists.
+- `set_global`/`def_global` load the globals table to test it. Freezing
+  `_G` could instead switch those two opcodes to checking handlers, so the
+  common path pays nothing.
 
 ### 5.5 `table.clone` (D7)
 
