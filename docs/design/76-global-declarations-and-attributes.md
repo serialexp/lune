@@ -2,7 +2,7 @@
 
 Status: draft, not yet implemented
 Owner: Bart
-Last updated: 2026-10-31
+Last updated: 2026-11-01
 
 ## Implementation status
 
@@ -24,6 +24,16 @@ land; move whole phases to Done once everything inside them is checked.
   the program calling it recursively.
 - [x] **D4 — one change** (§Phasing): decided 2026-10-31 — attributes
   (`<const>`, `<close>`) land with `global`, not separately.
+- [x] **D5 — the generic `for` takes a closing value** (§6.3): decided
+  2026-11-01 — four values, as 5.4 and 5.5; the fourth is closed like a
+  `<close>` variable when the loop ends, by any route.
+- [x] **D6 — `for` control variables are read-only** (§3.4): decided
+  2026-11-01 — as 5.5: the numeric `for`'s variable and the generic `for`'s
+  first variable are `<const>` inside the loop body.
+- [x] **D7 — `table.clone`** (§5.5): decided 2026-11-01 — added with
+  `table.freeze`, as Luau's.
+- [x] **D8 — `<const>` locals with a constant value are folded** (§4.2):
+  decided 2026-11-01 — as 5.4: no register, the constant in every use.
 
 ### Outstanding
 
@@ -31,34 +41,25 @@ land; move whole phases to Done once everything inside them is checked.
   `global` names (prefix and postfix); `global *`, `global <attrib> *`,
   `global function`; the AST to carry them (§3).
 - [ ] **Phase 1 — the resolver owns the declarations.** Global declarations
-  as scoped bindings; the strict scope; `<const>` checks; undeclared names
-  and assignments to a const as compile errors; the compiler reads it all
-  from the resolver (§3.2, §4).
+  as scoped bindings; the strict scope; `<const>` checks, `for` control
+  variables included; undeclared names and assignments to a const as
+  compile errors; constant `<const>` locals folded; the compiler reads it
+  all from the resolver (§3.2, §3.4, §4).
 - [ ] **Phase 2 — `global x = v` and `global function f`** raise a run-time
   error when the global is already non-nil (§3.3).
 - [ ] **Phase 3 — `<close>`.** Scope exit, `break`, `return`, error unwind
-  through `pcall`, `coroutine.close` (§6). The recorder aborts at a
-  to-be-closed variable at first.
+  through `pcall`, `coroutine.close`; the generic `for`'s closing value
+  (§6). The recorder aborts at a to-be-closed variable at first.
 - [ ] **Phase 3b — `<close>` in traces.** Record the close as a call, so a
   hot loop with a to-be-closed variable inside stays native (§6.4).
-- [ ] **Phase 4 — `table.freeze` / `table.isfrozen`.** The table's
-  `readonly` bit; every store path checks it, the JIT's included; keyframes
-  carry it; inventory rows (§5).
+- [ ] **Phase 4 — `table.freeze` / `table.isfrozen` / `table.clone`.**
+  The table's `readonly` bit; every store path checks it, the JIT's
+  included; keyframes carry it; inventory rows (§5).
 - [ ] **Phase 5 — language server.** The keyword, attributes and
   declarations in completion, semantic tokens, hover, definition and rename;
   the strict-scope errors as diagnostics (§7).
 - [ ] **Phase 6 — measured.** A table-store benchmark before and after the
   `readonly` check, and the suite (`just bench`) (§5.4).
-- [ ] **Q1 — the generic `for`'s closing value** (§6.3): Lua 5.4 and 5.5
-  take a fourth value from a generic `for`'s explist and close it when the
-  loop ends; mahina takes three. Follow?
-- [ ] **Q2 — read-only `for` variables** (§8): Lua 5.5 also makes loop
-  variables read-only. Not part of D1's section; follow?
-- [ ] **Q3 — `table.clone`** (§5.3): Luau pairs `table.freeze` with
-  `table.clone` (shallow, never frozen). Add it here, later, or not at all?
-- [ ] **Q4 — compile-time constants** (§4.2): Lua 5.4 folds a `<const>`
-  local with a constant initializer into its uses and gives it no register.
-  Do the same?
 
 ## 1. Why this exists
 
@@ -96,8 +97,8 @@ run-time behaviour of `<close>` and frozen tables, and their cost.
   text explains globals through `_ENV`, and nothing here depends on it.
 - Deep freezing, or freezing anything but tables (D3).
 - A const that freezes (D3). `local t <const> = {}; t.x = 1` is allowed.
-- The rest of 5.5 (named vararg tables, `table.create`, …), except where a
-  question below asks.
+- The rest of 5.5 (named vararg tables, `table.create`, …), except the
+  `for` changes (D5, D6).
 
 ## 3. Global declarations
 
@@ -158,6 +159,15 @@ Bytecode: a `def_global` that loads the slot (the doc 62 slot hint applies),
 raises `global 'x' already defined` when non-nil, and stores. The recorder
 treats it as `get_global`, a guard that the value is nil, and `set_global`.
 
+### 3.4 Read-only `for` variables (D6)
+
+As 5.5 §3.3.5: the numeric `for`'s variable is a read-only (`const`) local of
+the loop body, and so is the generic `for`'s first variable, the control
+variable. The generic `for`'s other variables stay ordinary locals. An
+assignment to a read-only one is the same compile error as for any
+`<const>` (§4.1). A body that wants to change the value copies it into a
+local first.
+
 ## 4. `<const>`
 
 ### 4.1 Meaning
@@ -169,12 +179,15 @@ untouched (D3). A `<const>` local needs an initializer; a `<const>` global
 without one declares a read-only global name. For a global, only this chunk's
 syntax is bound; `_G.x = 1` and other chunks may still write it.
 
-### 4.2 Constants (Q4)
+### 4.2 Constants (D8)
 
-5.4 compiles a `<const>` local whose initializer is a constant expression
-(nil, a boolean, a number, a string) as that constant: no register, folded
-into every use. It changes nothing a program can see and saves a register and
-a move. Proposed as part of Phase 1, pending Q4.
+As 5.4: a `<const>` local whose initializer is a constant expression (nil, a
+boolean, a number, a string) compiles as that constant, with no register,
+folded into every use. It changes nothing a program can see and saves a
+register and a move. The resolver marks the binding; the compiler emits the
+constant where it would read the register. A closure capturing it gets the
+constant too, not an upvalue. A `<const>` global is never folded: another
+chunk may write it (§4.1).
 
 ## 5. Frozen tables
 
@@ -225,7 +238,7 @@ Fresh tables (constructors, `set_list`, `table.pack`, `table.create`) cannot
 be frozen yet and need no check. Grid inflation and deflation (doc 14)
 change a table's representation, not its contents, and stay allowed.
 
-`table.clone` (Q3) is not part of this unless decided.
+`table.clone` (§5.5) builds a fresh table and needs no check on its result.
 
 ### 5.4 Cost
 
@@ -233,6 +246,15 @@ The check is one byte test on a cache line every store already touches. The
 budget: no table-store microbenchmark slower by more than noise in user
 instructions, and `just bench` flat. Measured in Phase 6, on the pinned
 profile pool.
+
+### 5.5 `table.clone` (D7)
+
+Luau's: `table.clone(t)` returns a new table with the same keys, values and
+metatable, never frozen, even if `t` was. Shallow. It errors if `t`'s
+metatable is protected (has `__metatable`), as Luau's does
+(`ltablib.cpp` `tclone`). It copies the representation as it stands (array
+part, hash part, grid), so the copy costs one allocation per part and no
+rehash. A `table` library function, deterministic; an inventory row.
 
 ## 6. `<close>`
 
@@ -263,13 +285,17 @@ the other pending closes still run.
 - Determinism: closes run in a fixed order at fixed points; nothing new for
   replay.
 
-### 6.3 The generic `for` (Q1)
+### 6.3 The generic `for` (D5)
 
-5.4 and 5.5 take four values from a generic `for`'s explist; the fourth is
-closed when the loop ends, by any route. mahina takes three
-(`compiler.zig` `compileGenericFor`). Following would make `for l in
-io.lines(f)`-style iterators able to close their file; it costs a fourth
-reserved slot per loop.
+As 5.4 and 5.5: the explist is adjusted to four values; the fourth, the
+closing value, behaves like a `<close>` variable of the loop and is closed
+when the loop ends, by any route (normal end, `break`, `return`, error).
+`nil` or `false` means nothing to close. mahina takes three today
+(`compiler.zig` `compileGenericFor`); the fourth costs one more reserved slot
+per loop and a `tbc` only when the value is not nil (checked at run time, so
+a loop without one pays a nil test once per loop, not per iteration). It
+lets `for l in io.lines(f)`-style iterators close their file. The recorder's
+treatment is §6.4's.
 
 ### 6.4 In traces
 
@@ -291,20 +317,19 @@ call), at the scope exit it happens at.
 
 ## 8. Open questions for review
 
-- **Q1** — the generic `for`'s closing value (§6.3).
-- **Q2** — read-only `for` variables: 5.5 makes a loop's control variables
-  read-only (an assignment to one is a compile error). It is a separate item
-  of 5.5's change list, not part of §3.3.7, so D1 does not settle it.
-- **Q3** — `table.clone` (§5.3).
-- **Q4** — compile-time constants for `<const>` locals (§4.2).
+None; Q1–Q4 became D5–D8 (2026-11-01). Two details to confirm against the
+reference sources while implementing: whether 5.5 checks every name of
+`global a, b = …` before assigning any (§3.3), and whether Luau refuses a
+store into a frozen table before `__newindex` dispatch (§5.1).
 
 ## References
 
-- Lua 5.5 reference manual §3.3.7 (global declarations), §3.3.8 (to-be-closed
+- Lua 5.5 reference manual §3.3.5 (`for`: read-only control variables, the
+  closing value), §3.3.7 (global declarations), §3.3.8 (to-be-closed
   variables), §8.1 (`global` reserved, `LUA_COMPAT_GLOBAL`):
   https://www.lua.org/manual/5.5/manual.html
 - Luau library, `table.freeze` / `table.isfrozen` / `table.clone`:
-  https://luau.org/library
+  https://luau.org/library; source `VM/src/ltablib.cpp` (`tfreeze`, `tclone`).
 - Doc 74 §6.3 (the resolver owns scoping), "Globals across files".
 - Doc 62 (global slot hints), doc 68 (`pcall` frames), doc 73 (coroutines),
   doc 14 (grids), doc 47 (`ArrayPart.frozen`), doc 04 (snapshot schema).
