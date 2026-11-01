@@ -27,8 +27,8 @@ _(nothing yet)_
     metamethod's nested `callValue` runs, at the right inline depth, and
     that the host epoch it bumps disturbs nothing in the recording (§6.1)
 - [ ] **Phase 1 — tables that carry a metatable, on their raw paths** (§4, §5).
-  - [ ] `guard_table`'s metatable-allowed form (encoding: Q4), in tier-1a,
-    native and tropt
+  - [ ] `guard_table` aux bit `GUARD_TABLE_ANY_META` (Q4: merged with AND,
+    the writable bit with OR), in tier-1a, native and tropt
   - [ ] every other metatable refusal migrated (§4.1's list): `guard_absent`
     (tier-1a and the native int-key path), tier-1a `guard_hash`, native
     hash-cell entry seeding
@@ -79,7 +79,9 @@ _(nothing yet)_
 - [x] **Q2 decided** (Bart, 2026-11-02): `MAX_INDEX_CHAIN = 100`, as LuaJIT.
 - [x] **Q3 decided** (Bart, 2026-11-02): the computed-callee route by
   access path.
-- [ ] **Open questions** (§11): Q4–Q5 decided.
+- [x] **Q4 decided** (Bart, 2026-11-02): a "metatable allowed" bit, merged
+  with AND.
+- [ ] **Open questions** (§11): Q5 decided.
 
 ## 1. Why this exists
 
@@ -212,7 +214,8 @@ about it (§5.3); every other path keeps the metatable-free guard, so a loop
 that never sees a metatable compiles exactly as today. tropt's per-table
 merge (one `guard_table` per table, doc 76 6b64d10) must keep the stricter
 requirement: the merged guard allows a metatable only if every guard on that
-table did. How the bit is encoded, and so how the merge combines it, is Q4.
+table did. The bit means "metatable allowed" and merges with AND (Q4, decided), so an
+aux-0 guard keeps meaning "no metatable".
 
 The metatable refusals outside `guard_table` move to it, so that each guard
 proves one thing:
@@ -541,6 +544,12 @@ callouts per iteration for an invariant receiver.
   byte-identical. (b) Antigravity: a bit meaning "no metatable", so the
   existing OR merge needs no change; every existing metatable-free guard
   then carries the new bit.
+  **Decided (Bart, 2026-11-02): (a).** The default must fail safe: a guard
+  that omits the bit stays strict, so the worst case is an extra exit, where
+  under (b) an omitted bit would let a metatable through and a raw read skip
+  its `__index`. It also keeps metatable-free IR byte-identical, so §10's
+  unchanged-IR check stays a gate. The cost is a per-bit merge rule in
+  tropt (AND for ANY_META, OR for writable), tested in both merge orders.
 - **Q5 — allocating handlers in this doc?** (§2.1) (a) v1 as written,
   allocation-free handlers only, precise inlining a later doc; (b) bring
   inlining into precise recordings and a recorded `setmetatable` into this
