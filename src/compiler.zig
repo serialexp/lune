@@ -638,10 +638,42 @@ const Compiler = struct {
 
     /// The constant key of `t[e]` when `e` is a literal string, else null.
     fn literalKey(self: *Compiler, e: *const ast.Expr) Error!?IndexKey {
-        return switch (e.data) {
-            .string_raw => |raw| .{ .konst = try self.stringConstant(try self.decodeString(raw, e.span)) },
+        const lit = self.literalOf(e);
+        return switch (lit.data) {
+            .string_raw => |raw| .{ .konst = try self.stringConstant(try self.decodeString(raw, lit.span)) },
             else => null,
         };
+    }
+
+    /// Doc 76 D8: the literal `e` stands for when it names, through
+    /// parentheses, a `<const>` local the resolver folded; else `e`.
+    fn literalOf(self: *const Compiler, e: *const ast.Expr) *const ast.Expr {
+        var cur = e;
+        while (cur.data == .paren) cur = cur.data.paren;
+        if (cur.data != .name) return e;
+        const b = self.res.bindingAt(cur.span.start) orelse return e;
+        return self.res.binding(b).value orelse e;
+    }
+
+    /// Load the literal `lit` a folded `<const>` local stands for (doc 76
+    /// D8), stamped with the use's span, not the declaration's.
+    fn loadLiteral(self: *Compiler, lit: *const ast.Expr, dest: u16) Error!void {
+        if (self.numberLiteral(lit)) |v| return self.loadNumber(v, dest);
+        _ = try self.emit(switch (lit.data) {
+            .nil => Instr.opA(.load_nil, dest),
+            .bool => |b| Instr.opAB(.load_bool, dest, @intFromBool(b)),
+            .string_raw => |raw| Instr.opAB(.load_const, dest, try self.stringConstant(try self.decodeString(raw, lit.span))),
+            else => unreachable, // the resolver folds nothing else
+        });
+    }
+
+    /// `R[dest] = v`, a number: an int that fits rides in the instruction.
+    fn loadNumber(self: *Compiler, v: Value, dest: u16) Error!void {
+        if (v.isInt() and v.asInt() >= std.math.minInt(i32) and v.asInt() <= std.math.maxInt(i32)) {
+            _ = try self.emit(Instr.opAx(.load_int, dest, @intCast(v.asInt())));
+        } else {
+            _ = try self.emit(Instr.opAB(.load_const, dest, try self.addConstant(v)));
+        }
     }
 
     /// The key of `t[e]` for a single access: its constant when `e` is a
@@ -675,13 +707,15 @@ const Compiler = struct {
     /// Doc 66 P3: the value of a number literal, through parentheses and a
     /// unary minus, or null for any other expression. The minus folds exactly
     /// as `neg` would compute it at run time (an int wraps, a float flips its
-    /// sign), so `x * -1` carries `-1`.
-    fn numberLiteral(e: *const ast.Expr) ?Value {
+    /// sign), so `x * -1` carries `-1`. A folded `<const>` local's name is
+    /// its literal (doc 76 D8).
+    fn numberLiteral(self: *const Compiler, e: *const ast.Expr) ?Value {
         return switch (e.data) {
             .int => |i| Value.int(i),
             .float => |f| Value.float(f),
-            .paren => |inner| numberLiteral(inner),
-            .unary => |u| if (u.op != .neg) null else if (numberLiteral(u.operand)) |v|
+            .paren => |inner| self.numberLiteral(inner),
+            .name => if (self.literalOf(e) != e) self.numberLiteral(self.literalOf(e)) else null,
+            .unary => |u| if (u.op != .neg) null else if (self.numberLiteral(u.operand)) |v|
                 (if (v.isInt()) Value.int(0 -% v.asInt()) else Value.float(-v.asFloat()))
             else
                 null,
@@ -701,7 +735,7 @@ const Compiler = struct {
     /// reads no state, so taking it out of the evaluation order is exact.
     fn constantOperand(self: *Compiler, base: OpCode, comptime shape: bytecode.ArithShape, e: *const ast.Expr) Error!?ConstantOperand {
         const op = bytecode.constantFormOf(base, shape) orelse return null;
-        const v = numberLiteral(e) orelse return null;
+        const v = self.numberLiteral(e) orelse return null;
         return .{ .op = op, .k = try self.addConstant(v) };
     }
 
@@ -712,13 +746,13 @@ const Compiler = struct {
     /// constant on either side takes the same form.
     fn eqConstantOperand(self: *Compiler, base: OpCode, e: *const ast.Expr) Error!?ConstantOperand {
         const negate = base == .ne;
-        var cur = e;
+        var cur = self.literalOf(e);
         while (cur.data == .paren) cur = cur.data.paren;
         return switch (cur.data) {
             .nil => .{ .op = bytecode.eqOpOf(negate, .prim), .k = @intFromEnum(bytecode.Prim.nil) },
             .bool => |b| .{ .op = bytecode.eqOpOf(negate, .prim), .k = @intFromEnum(bytecode.Prim.of(Value.boolean(b)).?) },
             .string_raw => |raw| .{ .op = bytecode.eqOpOf(negate, .str), .k = try self.stringConstant(try self.decodeString(raw, cur.span)) },
-            else => if (numberLiteral(cur)) |v| .{ .op = bytecode.eqOpOf(negate, .num), .k = try self.addConstant(v) } else null,
+            else => if (self.numberLiteral(cur)) |v| .{ .op = bytecode.eqOpOf(negate, .num), .k = try self.addConstant(v) } else null,
         };
     }
 
@@ -909,6 +943,8 @@ const Compiler = struct {
     /// Load the value of `name` into `dest`: a local move, an upvalue read, or a
     /// global read (resolution order is local → upvalue → global).
     fn loadName(self: *Compiler, b: resolve.BindingId, dest: u16, span: ast.Span) Error!void {
+        // Doc 76 D8: a folded `<const>` local has no register or upvalue.
+        if (self.res.binding(b).value) |lit| return self.loadLiteral(lit, dest);
         if (self.resolveLocal(b)) |r| {
             if (r != dest) _ = try self.emit(Instr.opAB(.move, dest, r));
         } else if (try self.resolveUpvalue(b)) |up| {
@@ -1158,15 +1194,21 @@ const Compiler = struct {
     fn compileLocal(self: *Compiler, l: anytype) Error!void {
         const start = self.next_reg;
         const n_names: u16 = @intCast(l.names.len);
-        try self.compileValuesInto(l.values, start, n_names);
         // A REPL line's top-level locals outlive it: each goes to a fresh root
-        // upvalue (the session carries the cell to the next line).
+        // upvalue (the session carries the cell to the next line). A folded
+        // `<const>` one too: the line's own uses fold, a later line's read
+        // the cell (doc 76 D8).
         var attribs: [256]ast.Attrib = undefined;
         const few = l.names.len <= attribs.len;
         if (few) for (l.names, 0..) |nm, j| {
             attribs[j] = nm.attrib;
         };
-        if (few and self.replTopLevel(attribs[0..l.names.len])) {
+        const repl_cells = few and self.replTopLevel(attribs[0..l.names.len]);
+        if (!repl_cells) for (l.names) |nm| {
+            if (self.res.binding(self.bindingAt(nm.name_span)).value != null) return self.compileLocalFolded(l);
+        };
+        try self.compileValuesInto(l.values, start, n_names);
+        if (repl_cells) {
             for (l.names, 0..) |nm, j| {
                 const idx = try self.declareReplCell(nm.name_span, nm.name, nm.attrib);
                 _ = try self.emit(Instr.opAB(.set_upval, @intCast(start + j), idx));
@@ -1182,6 +1224,35 @@ const Compiler = struct {
         // Doc 76 §6: the parser allows one `<close>` per list.
         for (l.names, 0..) |nm, j| {
             if (nm.attrib == .close) try self.declareTbc(@intCast(start + j), nm.name);
+        }
+    }
+
+    /// Doc 76 D8: a `local` statement with names the resolver folded, which
+    /// it does only with one value per name. A folded name takes no register
+    /// and its literal no code: every use loads the literal (`loadName`).
+    /// The other names take consecutive registers, as usual. A literal reads
+    /// no state, so dropping it from the evaluation order is exact.
+    fn compileLocalFolded(self: *Compiler, l: anytype) Error!void {
+        const kept = try self.scratch.alloc(*ast.Expr, l.values.len);
+        defer self.scratch.free(kept);
+        var n: u16 = 0;
+        for (l.names, l.values) |nm, v| {
+            if (self.res.binding(self.bindingAt(nm.name_span)).value) |lit| {
+                // A string's escapes are checked here, whether it is used or not.
+                if (lit.data == .string_raw) _ = try self.decodeString(lit.data.string_raw, lit.span);
+            } else {
+                kept[n] = v;
+                n += 1;
+            }
+        }
+        const start = self.next_reg;
+        try self.compileValuesInto(kept[0..n], start, n);
+        var reg = start;
+        for (l.names) |nm| {
+            if (self.res.binding(self.bindingAt(nm.name_span)).value != null) continue;
+            try self.declareLocal(nm.name_span, reg);
+            if (nm.attrib == .close) try self.declareTbc(reg, nm.name);
+            reg += 1;
         }
     }
 
@@ -1683,12 +1754,14 @@ const Compiler = struct {
 
     /// Whether `e`'s value is true whatever runs: a literal other than
     /// `nil` and `false`, a table constructor or a function. (Every number
-    /// and string is true in Lua.)
-    fn isAlwaysTrue(e: *const ast.Expr) bool {
+    /// and string is true in Lua.) A folded `<const>` local's name is its
+    /// literal (doc 76 D8).
+    fn isAlwaysTrue(self: *const Compiler, e: *const ast.Expr) bool {
         return switch (e.data) {
             .bool => |b| b,
             .int, .float, .string_raw, .table, .function => true,
-            .paren => |inner| isAlwaysTrue(inner),
+            .paren => |inner| self.isAlwaysTrue(inner),
+            .name => self.literalOf(e) != e and self.isAlwaysTrue(self.literalOf(e)),
             else => false,
         };
     }
@@ -1772,13 +1845,13 @@ const Compiler = struct {
             else => unreachable,
         };
         const on: u16 = if (holds) bytecode.cmp_on_true else 0;
-        if (numberLiteral(cmp.rhs)) |v| {
+        if (self.numberLiteral(cmp.rhs)) |v| {
             const k = try self.addConstant(v);
             const t = try self.operandReg(cmp.lhs);
             self.cur_span = op_span;
             return Instr{ .op = bytecode.cmpBranchOp(rel, .num).?, .a = on, .b = t, .c = k };
         }
-        if (numberLiteral(cmp.lhs)) |v| {
+        if (self.numberLiteral(cmp.lhs)) |v| {
             // `K < x` is `x > K`: the same comparison of the same operands
             // (`>` is `<` swapped), so only the fault text needs the order.
             const mirrored: bytecode.CmpRel = switch (rel) {
@@ -2045,18 +2118,8 @@ const Compiler = struct {
             // stream well-formed for the checks that compile a damaged tree.
             .nil, .err => _ = try self.emit(Instr.opA(.load_nil, dest)),
             .bool => |b| _ = try self.emit(Instr.opAB(.load_bool, dest, @intFromBool(b))),
-            .int => |i| {
-                if (i >= std.math.minInt(i32) and i <= std.math.maxInt(i32)) {
-                    _ = try self.emit(Instr.opAx(.load_int, dest, @intCast(i)));
-                } else {
-                    const k = try self.addConstant(Value.int(i));
-                    _ = try self.emit(Instr.opAB(.load_const, dest, k));
-                }
-            },
-            .float => |f| {
-                const k = try self.addConstant(Value.float(f));
-                _ = try self.emit(Instr.opAB(.load_const, dest, k));
-            },
+            .int => |i| try self.loadNumber(Value.int(i), dest),
+            .float => |f| try self.loadNumber(Value.float(f), dest),
             .string_raw => |raw| {
                 const bytes = try self.decodeString(raw, e.span);
                 const k = try self.stringConstant(bytes);
@@ -2152,7 +2215,7 @@ const Compiler = struct {
                     defer to_c.deinit(self.scratch);
                     try self.condJumps(ab.lhs, false, &to_c);
                     try self.compileExprTo(ab.rhs, dest);
-                    const done = if (isAlwaysTrue(ab.rhs))
+                    const done = if (self.isAlwaysTrue(ab.rhs))
                         try self.emitJump(.jmp, 0)
                     else
                         try self.emitJump(.jmp_if_true, dest);
@@ -2230,7 +2293,7 @@ const Compiler = struct {
             .positional => {},
             .named => nhash += 1,
             // A number key is most likely the array part's.
-            .keyed => |kv| nhash += @intFromBool(numberLiteral(kv.key) == null),
+            .keyed => |kv| nhash += @intFromBool(self.numberLiteral(kv.key) == null),
         };
         if (nhash <= HashPart.first_alloc_keys) nhash = 0;
         _ = try self.emit(Instr.opABC(.new_table, dest, 0, @intCast(@min(nhash, std.math.maxInt(u16)))));

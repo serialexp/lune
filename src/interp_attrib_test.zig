@@ -182,6 +182,76 @@ test "doc 76: a <const> variable cannot be assigned, its value can" {
     try expectCompiles("local x <const> = 1\ndo local x = 2; x = 3 end");
 }
 
+test "doc 76: a <const> local with a constant value is that constant wherever it is used" {
+    try expectProgram(
+        \\local N <const> = 10
+        \\local NEG <const> = -3
+        \\local S <const> = "key"
+        \\local M <const> = (N)
+        \\local Z <const> = nil
+        \\local F <const> = 2.0
+        \\local B <const> = 9007199254740993
+        \\local x, Y <const> = 5, 2.5
+        \\local t = {}
+        \\t[S] = N * 2
+        \\print(t.key, t[S], N + NEG, M, Z, F, B, x, Y)
+        \\local function f() return N, S, M, -N, NEG < 0 end
+        \\print(f())
+        \\if N == 10 and S ~= "x" then print("eq") end
+        \\for i = 1, N do x = x + Y end
+        \\print(x, N > 5 and "big" or "small")
+        \\do local N = 2; print(N) end
+        \\do local N <const> = N + 1; print(N) end
+        \\local a <const>, b = 1
+        \\local c <const>, d <const> = 1, tostring(4)
+        \\print(a, b, c, d, math.type(F))
+        \\
+    , "20\t20\t7\t10\tnil\t2\t9007199254740993\t5\t2.5\n" ++
+        "10\tkey\t10\t-10\ttrue\neq\n30\tbig\n2\n11\n1\tnil\t1\t4\tfloat\n");
+}
+
+/// The root function of `source`, compiled, for a look at its shape.
+fn rootProto(source: [:0]const u8, f: *const fn (*const @import("bytecode.zig").Proto) anyerror!void) !void {
+    const gpa = testing.allocator;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try interp.Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try f(chunk.proto);
+}
+
+test "doc 76: a folded <const> local takes no register, and a closure gets no upvalue for it" {
+    try rootProto(
+        \\local A <const> = 1
+        \\local S <const> = "s"
+        \\local function g() return A, S end
+        \\return g
+    , struct {
+        fn check(p: *const @import("bytecode.zig").Proto) !void {
+            // `g` and the call's scratch, not `A` and `S`.
+            try testing.expect(p.num_registers <= 2);
+            try testing.expectEqual(@as(usize, 0), p.protos[0].upvalues.len);
+        }
+    }.check);
+    // A table is a value, not a constant: `T` keeps its register and the
+    // closure captures it.
+    try rootProto(
+        \\local T <const> = {}
+        \\local function g() return T end
+        \\return g
+    , struct {
+        fn check(p: *const @import("bytecode.zig").Proto) !void {
+            try testing.expectEqual(@as(usize, 1), p.protos[0].upvalues.len);
+        }
+    }.check);
+    // An unused folded string's escapes are still checked.
+    try expectCompileError("local S <const> = \"\\q\"", .invalid_escape, "invalid escape sequence", "\"\\q\"");
+}
+
 test "doc 76: a <const> global and a <const> * refuse assignment, _G does not" {
     try expectCompileError("global <const> x\nx = 1", .assign_to_const, "attempt to assign to const variable 'x'", "x");
     try expectCompileError("global <const> *\ny = 1", .assign_to_const, "attempt to assign to const variable 'y'", "y");

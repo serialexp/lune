@@ -971,6 +971,17 @@ test "session: a persisted <const> cannot be assigned, and a <close> local stays
     try testing.expectEqualStrings("7\n7\nclosed\nnil\n", r.out.written());
 }
 
+test "session: a constant <const> folds in its own line and persists for the next ones" {
+    const r = try Rig.init(testing.allocator);
+    defer r.deinit(testing.allocator);
+    // Doc 76 D8: the line's own uses fold; the cell still carries the value.
+    _ = try r.feed("local k <const> = 3; local function twice() return k * 2 end; print(twice())");
+    _ = try r.feed("k + 1");
+    _ = try r.feed("twice()");
+    try testing.expectEqualStrings("6\n4\n6\n", r.out.written());
+    try testing.expectEqualStrings("", r.err.written());
+}
+
 test "session: persisted locals survive a garbage collection" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);

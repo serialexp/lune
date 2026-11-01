@@ -57,7 +57,7 @@ land; move whole phases to Done once everything inside them is checked.
   compile errors; the compiler reads it all from the resolver (§3.2, §3.4,
   §4).
   - [x] all of the above
-  - [ ] constant `<const>` locals folded (D8, §4.2)
+  - [x] constant `<const>` locals folded (D8, §4.2)
 - [ ] **Phase 3b — `<close>` in traces** (§6.4).
   - [x] `tbc`, `tfor_prep`, `close` and `ret_close` recorded while the
     values are nil or false, so loops with a generic `for` inside stay
@@ -201,6 +201,18 @@ register and a move. The resolver marks the binding; the compiler emits the
 constant where it would read the register. A closure capturing it gets the
 constant too, not an upvalue. A `<const>` global is never folded: another
 chunk may write it (§4.1).
+
+What folds, exactly (`Binding.value`, `resolve.zig`): `nil`, a boolean, a
+number with an optional minus, a string, or the name of a local that folds
+itself, through parentheses. As in 5.4, a statement folds only when it has
+one value per name: `local a <const>, b = 1` folds nothing. A folded name is
+its literal everywhere the compiler looks for one, so `x * N` takes the
+constant-operand form and `t[S]` a `get_field`. A folded string's escapes are
+still checked at its declaration, used or not.
+
+At a REPL's top level (doc 75 §6) a folded local still gets its cell: the
+line's own uses fold, and later lines, which see it as an outer local, read
+the cell.
 
 ## 5. Frozen tables
 

@@ -83,6 +83,10 @@ pub const Binding = struct {
     func: u32,
     /// Some function other than the declaring one refers to it.
     captured: bool = false,
+    /// Doc 76 D8: a `<const>` local whose value is a constant (`nil`, a
+    /// boolean, a number, a string, or another such local) stands for that
+    /// literal, which every use compiles to; the local gets no register.
+    value: ?*const ast.Expr = null,
 };
 
 pub const Occurrence = struct {
@@ -399,6 +403,35 @@ const Walker = struct {
         try self.res.occurrences.append(self.gpa, .{ .span = span, .binding = id, .access = access, .declared = declared });
     }
 
+    /// Doc 76 D8: the literal `e` is, through parentheses, as a constant
+    /// `<const>` local's value: `nil`, a boolean, a number (a minus included),
+    /// a string, or a name meaning a local that folds itself. Null for
+    /// anything else. A name is looked up past the bindings from `hidden`
+    /// on, the statement's own names, which its values cannot see.
+    fn constantValueBelow(self: *const Walker, e: *const ast.Expr, hidden: usize) ?*const ast.Expr {
+        var cur = e;
+        while (cur.data == .paren) cur = cur.data.paren;
+        return switch (cur.data) {
+            .nil, .bool, .int, .float, .string_raw => cur,
+            .unary => |u| blk: {
+                var operand = u.operand;
+                while (operand.data == .paren) operand = operand.data.paren;
+                break :blk if (u.op == .neg and (operand.data == .int or operand.data == .float)) cur else null;
+            },
+            .name => |name| blk: {
+                var at = self.heads.get(name) orelse break :blk null;
+                while (self.entries.items[at].what == .local and self.entries.items[at].binding >= hidden) {
+                    at = self.entries.items[at].prev;
+                    if (at == no_entry) break :blk null;
+                }
+                const entry = self.entries.items[at];
+                if (entry.what != .local) break :blk null;
+                break :blk self.res.bindings.items[entry.binding].value;
+            },
+            else => null,
+        };
+    }
+
     /// Whether `name` means the global of that name here: no local of that
     /// name is in scope (a `global` declaration of it may be).
     fn namesGlobal(self: *const Walker, name: []const u8) bool {
@@ -473,7 +506,15 @@ const Walker = struct {
             .local => |l| {
                 // The values are evaluated before the names exist.
                 try self.exprList(l.values);
+                const first: usize = self.res.bindings.items.len;
                 for (l.names) |n| try self.declare(.local, n.name, n.name_span, s.span.end, n.attrib);
+                // Doc 76 D8, as 5.4: only a name with a value of its own
+                // folds; with more names than values, or fewer, none does.
+                if (l.names.len == l.values.len) {
+                    for (l.names, l.values, first..) |n, v, id| {
+                        if (n.attrib == .@"const") self.res.bindings.items[id].value = self.constantValueBelow(v, first);
+                    }
+                }
             },
             .local_function => |lf| {
                 // Declared first: the body can call itself.
