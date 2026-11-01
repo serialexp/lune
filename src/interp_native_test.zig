@@ -2517,12 +2517,14 @@ test "for alias: the visible variable shares the index's home and every exit wri
 
 test "for alias: a body that starts with a loop jumping back to it binds nothing" {
     // The `while` header is the `for` body's first instruction, so its
-    // back-edge arrives at the `for` anchor with `i` reassigned: the visible
-    // variable is not the index there.
+    // back-edge arrives at the `for` anchor too. Before `for` variables were
+    // read-only (doc 76 D6) that loop could reassign `i`, leaving the
+    // visible variable unequal to the index there; the check stays
+    // structural, so it does not depend on what the inner loop writes.
     const src =
         \\local s = 0
         \\for i = 1, 20000 do
-        \\  while i % 7 ~= 0 do i = i + 1 end
+        \\  while s % 7 ~= 0 do s = s + 1 end
         \\  s = s + i
         \\end
         \\print(s)
@@ -2531,7 +2533,7 @@ test "for alias: a body that starts with a loop jumping back to it binds nothing
     // Checked on the bytecode first: binding there runs the loop forever.
     try testing.expect(!try forBodyExclusive(gpa, src));
     try testing.expect(try forBodyExclusive(gpa, "local s = 0 for i = 1, 9 do s = s + i end"));
-    try expectProgram(src, "200070003\n");
+    try expectProgram(src, "200069997\n");
     if (comptime !nativegen.is_x64_linux) return;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -2539,7 +2541,7 @@ test "for alias: a body that starts with a loop jumping back to it binds nothing
     var sink = io.Writer.fixed(&buf);
     var chunk = try runNativeForTrace(&vm, gpa, src, &sink);
     defer chunk.deinit();
-    try testing.expectEqualStrings("200070003\n", sink.buffered());
+    try testing.expectEqualStrings("200069997\n", sink.buffered());
     try testing.expect(vm.trace.registry.cache.items.len != 0);
     for (vm.trace.registry.cache.items) |tr| try testing.expect(tr.code.for_alias == null);
 }
