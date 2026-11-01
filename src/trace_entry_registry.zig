@@ -101,6 +101,15 @@ pub const EntryRegistry = struct {
         self.entry_patch_free.deinit(self.gpa);
     }
 
+    /// Advance `image_gen`, never onto all-ones: that is the "no cached
+    /// image" sentinel of the frame and closure memos (`CODE_CACHE_GEN_INVALID`,
+    /// `Closure.code_memo_none`), so a memo whose generation matches the live
+    /// one is always a real fill.
+    fn bumpImageGen(self: *EntryRegistry) void {
+        self.image_gen +%= 1;
+        if (self.image_gen == std.math.maxInt(u64)) self.image_gen = 0;
+    }
+
     pub inline fn codeFor(self: *const EntryRegistry, proto: *const Proto) []const Instr {
         if (self.code_images.count() == 0) return proto.code;
         return self.code_images.get(.of(proto)) orelse proto.code;
@@ -113,7 +122,7 @@ pub const EntryRegistry = struct {
                 self.code_images.removeByPtr(gop.key_ptr);
                 return err;
             };
-            self.image_gen +%= 1;
+            self.bumpImageGen();
         }
         return gop.value_ptr.*;
     }
@@ -201,7 +210,7 @@ pub const EntryRegistry = struct {
         patched.op = patched_op;
         patched.b = idx;
         img[patch_pc] = patched;
-        self.image_gen +%= 1;
+        self.bumpImageGen();
         return .installed;
     }
 
@@ -293,7 +302,7 @@ pub const EntryRegistry = struct {
         self.entry_patches.clearRetainingCapacity();
         self.entry_patch_free.clearRetainingCapacity();
         self.entry_patch_dirty = 0;
-        self.image_gen +%= 1;
+        self.bumpImageGen();
     }
 };
 

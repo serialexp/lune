@@ -3255,13 +3255,16 @@ pub const Vm = struct {
     /// wraps. On 2026-10-01 inlining the push into `.call` cost scalar ~4%
     /// wall from code placement alone. Doc 69 P3 (2026-10-23) re-measured it
     /// with the rest of P3: scalar ~−3% cycles, recursive-fib −24%.
+    /// The frame's code cache comes from the closure's memo, as `.call`'s
+    /// does, so a host's callback hashes for its image once, not once per
+    /// call.
     pub inline fn pushFrameTrusted(self: *Vm, closure: *const Closure, nreg: usize, base: usize, ret_dest: u16, ret_count: u16, varargs_base: usize, varargs_count: usize) void {
-        self.pushFrameImage(closure, nreg, base, ret_dest, ret_count, varargs_base, varargs_count, &.{}, CODE_CACHE_GEN_INVALID);
+        const code = self.closureCode(closure, closure.proto);
+        self.pushFrameImage(closure, nreg, base, ret_dest, ret_count, varargs_base, varargs_count, code, self.trace.registry.entry_registry.image_gen);
     }
 
     /// `pushFrameTrusted` with the frame's doc-20 code cache filled: `code`
-    /// is `closure`'s image at generation `code_gen` (the sentinel generation
-    /// stores as an invalid cache, as `cachedCodeFor` would leave it).
+    /// is `closure`'s image at generation `code_gen`.
     inline fn pushFrameImage(self: *Vm, closure: *const Closure, nreg: usize, base: usize, ret_dest: u16, ret_count: u16, varargs_base: usize, varargs_count: usize, code: []const Instr, code_gen: u64) void {
         std.debug.assert(self.final_cut == null);
         std.debug.assert(self.depth < max_call_depth);
@@ -5266,18 +5269,47 @@ pub const Vm = struct {
     /// push-time defaults invalidate on slot reuse.
     inline fn cachedCodeFor(self: *Vm, frame: *CallFrame, proto: *const Proto) []const Instr {
         const gen = self.trace.registry.entry_registry.image_gen;
-        // Doc 54 P0: `gen == INVALID` (a 2⁶⁴-bump wrap onto the sentinel) must
-        // neither hit (a sentinel-gen frame is INVALID, not "cached at gen
-        // maxInt") nor fill (the fill would be indistinguishable from
-        // invalid). One predictable compare; the cache simply never hits for
-        // that one generation — fail closed.
-        if (frame.code_cache_gen == gen and gen != CODE_CACHE_GEN_INVALID)
-            return frame.code_cache;
+        // Doc 54 P0: a sentinel-gen frame is INVALID, never "cached at gen
+        // maxInt"; `bumpImageGen` keeps `image_gen` off the sentinel, so a
+        // match is a fill.
+        if (frame.code_cache_gen == gen) return frame.code_cache;
         const img = self.trace.codeFor(proto);
-        if (gen != CODE_CACHE_GEN_INVALID) {
-            frame.code_cache = img;
-            frame.code_cache_gen = gen;
-        }
+        frame.code_cache = img;
+        frame.code_cache_gen = gen;
+        return img;
+    }
+
+    /// `cl`'s doc-20 fetch image through the closure's memo
+    /// (`Closure.code_memo`): the `codeFor` hash is paid once per (closure,
+    /// image generation), not on every call. With no image at all (no trace
+    /// patched yet, or no JIT) the canonical code is the answer and the memo
+    /// is not consulted, which is cheaper than its check. An image keeps its
+    /// address until `dropEntryPatchState` frees it, and that, a new image and
+    /// every patch install bump `image_gen` (never onto the memo's
+    /// `code_memo_none`, `bumpImageGen`), so a memo of the live generation is
+    /// the image.
+    ///
+    /// The fill is cold, and a tier-0 call with no image costs what it did
+    /// before the memo (fib). A `noinline` fill or image path cost such a
+    /// call 2–8 instructions (register allocation in `enterCallee`).
+    inline fn closureCode(self: *Vm, cl: *const Closure, cp: *const Proto) []const Instr {
+        comptime std.debug.assert(Closure.code_memo_none == CODE_CACHE_GEN_INVALID);
+        std.debug.assert(cl.proto == cp);
+        const reg = &self.trace.registry.entry_registry;
+        if (reg.code_images.count() == 0) return cp.code;
+        const gen = reg.image_gen;
+        if (cl.code_memo_gen == gen) return cl.code_memo[0..cp.code.len];
+        return fillMemo(reg, cl, cp, gen);
+    }
+
+    inline fn fillMemo(reg: *const @import("trace_entry_registry.zig").EntryRegistry, cl: *const Closure, cp: *const Proto, gen: u64) []const Instr {
+        @branchHint(.cold);
+        const img = reg.codeFor(cp);
+        // A memo, not closure state: the closure's identity and what it
+        // runs are unchanged.
+        const m = @constCast(cl);
+        m.code_memo = img.ptr;
+        m.code_memo_gen = gen;
         return img;
     }
 
@@ -10384,7 +10416,7 @@ pub const Vm = struct {
         // region context `pushFrameVararg` would have stored twice.
         // The callee's image goes into its frame's cache at the push, the
         // fill `cachedCodeFor` would make on the fresh frame's miss.
-        const code = self.trace.codeFor(cp);
+        const code = self.closureCode(cl, cp);
         self.pushFrameImage(cl, cp.num_registers, callee_base, ret_dest, ret_count, va_base, va_count, code, self.trace.registry.entry_registry.image_gen);
         const regs = loadFrame(st, vm, depth + 1, &self.frames[depth], cl, callee_base, code);
         if (shift == 0) {

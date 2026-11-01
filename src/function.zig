@@ -137,6 +137,15 @@ pub const Closure = struct {
     /// own allocation (LuaJIT's `GCfuncL.uvptr`), so `upvalue(i)` reaches a
     /// cell without loading this slice's pointer.
     upvalues: []*Upvalue = &.{},
+    /// The doc-20 fetch image of `proto` (`proto.code.len` instructions) as
+    /// of the entry registry's `image_gen` `code_memo_gen`: a memo, so a call
+    /// hashes for its image once per (closure, image generation) rather than
+    /// on every push (`Vm.closureCode`, its only reader and writer).
+    /// `code_memo_none` = nothing memoized. Transient; keyframes omit it.
+    code_memo: [*]const bytecode.Instr = undefined,
+    code_memo_gen: u64 = code_memo_none,
+
+    pub const code_memo_none: u64 = std.math.maxInt(u64);
 
     /// Allocate a closure for `proto` with room for `n_upvalues` cells (the
     /// caller fills `upvalues[i]`). Raw allocation only; the heap GC-links it.

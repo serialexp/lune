@@ -21,6 +21,14 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
 
 ### Done
 
+- [x] **A Lua call hashes for its code image once per closure, not per
+  push** (2026-11-01, §5.10.6 after the table; Bart picked a memo on the
+  closure). `Closure.code_memo` holds the image as of an `image_gen`;
+  `.call` and the host's pushes fill the frame's cache from it. `two`
+  1262 → 1219 a call with the flag on (1228 before its traces compiled),
+  `cb` −12. JIT on: binary-trees −0.60%, spectral-norm −0.43%;
+  `--trace`: co_pingpong_d150 −1.0%, recursive-fib −0.71%; tier-0 flat
+  (worst +0.07%).
 - [x] **The entry alias on every root, one home for a `for`'s index and
   its visible variable** (2026-11-01, §5.10.6 after "The entry alias").
   Ordinary roots bind too, and native code gives the visible variable no
@@ -199,12 +207,6 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   - The §8.1 probe A/B of the entry lease (from Phase 2b), with the flag
     on.
   - Turn `Config.trace_host_calls` on once the budget is met.
-- [ ] **Decision — a Lua call hashes for its code image once any proto
-  has one** (§5.10.6, after the table). `EntryRegistry.codeFor` is free
-  until some proto in the VM has a patched entry image; from then on every
-  frame push probes `code_images`, image or not. `two` pays it on every
-  callback (+34 a call once its host traces compile natively);
-  binary-trees spends 1.3% of its instructions there. Options are for Bart.
 - [ ] **A precise host trace native refuses still runs on tier-1a**
   (§5.10.6, last paragraph). No probe shape reaches it since §5.10.7
   except `two`, until its bool argument compiled (2026-11-01); a shape
@@ -1805,6 +1807,34 @@ accepted "one map probe per call" when it put the images in a VM-local
 map, to keep `Proto.code` canonical. Removing the probe means caching the
 image pointer somewhere VM-local that a push already reads; the options
 are for Bart (Outstanding).
+
+*The per-closure memo (2026-11-01).* Bart picked a memo on the closure
+over one on the proto: `Closure.code_memo` is the image's address,
+`code_memo_gen` the `image_gen` it was read at. `Vm.closureCode` returns
+`proto.code` while no image exists, as `codeFor` does; otherwise the memo
+on a generation match and a `codeFor` fill (cold) on a miss. The `.call`
+arm (`enterCallee`) and `pushFrameTrusted`, through which the host's
+`callValue` pushes, both fill the new frame's doc 44 D9 cache from it, so
+a callback no longer starts with an empty cache. The memo is sound because
+an image keeps its address until `dropEntryPatchState` frees it, and that,
+a new image and every patch install bump `image_gen`.
+`EntryRegistry.bumpImageGen` skips the all-ones value, the "nothing
+cached" sentinel of both the frame cache and the memo, so a matching
+generation is always a fill. That also makes `cachedCodeFor`'s two
+sentinel checks (doc 54 P0's wrap guard) dead, and they are gone. The
+memo is transient; keyframes omit it, and a restored closure starts empty.
+
+Measured (instruction counts, ReleaseFast): `two` 1262 → 1219 a call with
+the flag on, `cb` 1124 → 1112, `min` unchanged (365.0 a call, slopes at 1M
+and 3M). A probe that patches one loop, then runs recursive fib: tier-1a
+3889 → 3861 a call, tier-0 unchanged. Suite, JIT on: binary-trees −0.60%,
+co_pingpong_d20 −0.49%, spectral-norm −0.43%; `--trace`: co_pingpong_d150
+−1.02%, binary-trees −0.81%, recursive-fib −0.71%; tier-0 worst +0.07%
+(str_gmatch; `proc_pipe` swings ±3% run to run in both binaries). The
+first attempts put more code on the call path and cost tier-0 2–8
+instructions a call with no image at all, register allocation in
+`enterCallee` rather than work: an inline hit with a cold inline fill,
+plus the dead sentinel checks gone, is what came out even.
 
 **Where `min`'s 369 go** (callgrind, a baseline-CPU build so valgrind runs):
 

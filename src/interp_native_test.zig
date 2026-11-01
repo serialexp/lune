@@ -2545,6 +2545,41 @@ test "for alias: a body that starts with a loop jumping back to it still binds" 
     try testing.expect(bound);
 }
 
+test "closure memo: a call once images exist fills its closure's memo with the live image" {
+    // The hot loop's entry patch makes the first image, so the calls after
+    // it take the memo path (`Vm.closureCode`) rather than the no-image
+    // shortcut: `f` from a `.call`, `h` from the host (`callValue`).
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const src =
+        \\local s = 0
+        \\for i = 1, 1000 do s = s + i end
+        \\function f(x) return x + s end
+        \\function h(x) return x * 2 end
+        \\g = f(1) + f(2)
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [16]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa, src, &sink);
+    defer chunk.deinit();
+    try testing.expectEqual(@as(i64, 1001003), vm.globals.get(try vm.heap.internValue("g")).asInt());
+    const reg = &vm.trace.registry.entry_registry;
+    try testing.expect(reg.code_images.count() > 0);
+    const cl = function.Closure.fromHeader(vm.globals.get(try vm.heap.internValue("f")).asHeap());
+    try testing.expectEqual(reg.image_gen, cl.code_memo_gen);
+    try testing.expectEqual(reg.codeFor(cl.proto).ptr, cl.code_memo);
+    const hv = vm.globals.get(try vm.heap.internValue("h"));
+    const hc = function.Closure.fromHeader(hv.asHeap());
+    try testing.expectEqual(function.Closure.code_memo_none, hc.code_memo_gen);
+    var res: [1]Value = undefined;
+    _ = try vm.callValue(hv, &.{Value.int(21)}, &res);
+    try testing.expectEqual(@as(i64, 42), res[0].asInt());
+    try testing.expectEqual(reg.image_gen, hc.code_memo_gen);
+    try testing.expectEqual(reg.codeFor(hc.proto).ptr, hc.code_memo);
+}
+
 test "for alias: a body that may write the index or the visible variable binds nothing" {
     // The compiler emits no such body (doc 76 D6), so it is built by hand:
     // R[0..3] the control block, R[3] the visible variable.

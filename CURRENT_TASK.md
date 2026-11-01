@@ -15,7 +15,8 @@ DOC 63 TYPED CARRIED LOADS DONE (2026-10-30, coral-marten). Doc 63 §5.10.7.
 - Item 2 follow-up (Bart: "try it first, revert if negative") — DONE: memory places are base + displacement (Place.Mem), and an evicted prologue-only slot's home is its own slab payload cell (Loc.slab, [rsi + slot*8]) instead of a frame cell, so the prologue's per-entry cell store is gone. Valid also when rsi is given to body values: only the prologue and exit code read it, and both see rsi as the slab. nsieve-bit-fp -0.15% (was item 2's +0.05%), nsieve-bit -0.08%, spectral-norm -0.04%; nbody +0.008% (compile; locToPlace/placeOfRef must stay inline).
 - `two` +9 — DONE (2a24788): a fixed tier-1a warm-up divided by N; the refused bool slot compiles. Exposed: every frame push hashes for its code image once any proto has one (`EntryRegistry.codeFor`, +34/call on `two`, binary-trees 1.3%) — options for Bart, doc 63 Outstanding.
 - One home for a for's index and visible variable — DONE (2026-11-01): bindEntry on every root (CFG-checked; fixed a hang on a body starting with a while), SlotClass.alias in native. sieve_int -4.1%, nsieve -3.9%, grid_matmul -3.4% JIT on.
-- Still open: the budget (min 368, parked by Bart), nest (a)/(b)/(c), codeFor, home coalescing at the loop's own guard (TODO.md).
+- codeFor per push — DONE (2026-11-01): per-closure memo (Closure.code_memo, Bart picked it over per-proto), used by enterCallee and pushFrameTrusted; image_gen skips the sentinel so cachedCodeFor's checks went. two 1262 -> 1219, --trace co_pingpong_d150 -1.0%, JIT binary-trees -0.6%, tier-0 flat.
+- Still open: the budget (min 368, parked by Bart), nest (a)/(b)/(c), home coalescing at the loop's own guard (TODO.md).
 
 DOC 63 PHASE 3 PART 1 DONE (2026-10-29, coral-marten): native lowering of the four host ops. Doc 63 §5.10.6.
 - Host traces compile natively; the shim is Vm.nativeHostCallFn (site by index, trace via the published TraceState.executing). Flag still OFF.

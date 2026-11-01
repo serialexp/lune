@@ -62,10 +62,12 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       at today's numbers; find where the 9 go. **Explained (2026-11-01):** a
       fixed warm-up cost on tier-1a divided by N, not a per-call one; the
       refused bool slot now compiles (doc 63 §5.10.6).
-- [ ] **A Lua call hashes for its code image once any proto has one**
+- [x] **A Lua call hashes for its code image once any proto has one**
       (`EntryRegistry.codeFor` on every frame push). `two` +34 a call once
-      its host traces compile, binary-trees 1.3%. Options for Bart, doc 63
-      Outstanding.
+      its host traces compile, binary-trees 1.3%. **Done (2026-11-01):** a
+      per-closure memo (`Closure.code_memo`, Bart's pick) fills `.call`'s
+      and the host's frame caches; `two` 1262 → 1219, tier-0 flat (doc 63
+      §5.10.6).
 - [ ] **Home coalescing stops at the loop's own guard.** "Win 2" in
       `nativegen_alloc.zig` computes a carried slot's update into its home
       only when no side exit follows it, and a loop's own condition guard

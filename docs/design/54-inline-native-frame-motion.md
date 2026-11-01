@@ -32,6 +32,10 @@ design codex-approved ×7 rounds; amendment codex-approved ×3 rounds.
     `CallFrame` offsets travel via `FrameMotionAbi`, comptime-derived in
     `interp.zig` with pinned-width asserts and published through the
     seed ctx next to the new `descent_ok` byte.
+    *Follow-up (2026-11-01, doc 63 §5.10.6, the per-closure memo):*
+    `EntryRegistry.bumpImageGen` now skips the sentinel, so `image_gen`
+    never reaches it; `cachedCodeFor`'s two sentinel checks were dead and
+    are gone. Frames still invalidate by storing the sentinel.
   - **descent-gate sabotage is a unit matrix, not an integration run**:
     a healthy single run can never observe `descent_ok = 0` — the
     top-level epoch resets region receipts before any episode (verified:
