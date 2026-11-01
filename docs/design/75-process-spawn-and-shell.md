@@ -144,7 +144,7 @@ land; move whole phases to Done once everything inside them is checked.
     the dispatcher and are interrupted) has no check. It needs a back-edge
     poll in `irinterp`'s `.loop` arm and in nativegen's `.loop` terminal, with
     an exit the dispatcher resumes from at the anchor. JIT is off by default,
-    so this only affects `--trace` sessions.
+    so this only affects `--trace` sessions. Designed in doc 77.
   - [ ] Windows console and wasm: plain lines only until Phase 6.
 - [ ] **Phase 5 — shell ergonomics.** Command-position sugar, globbing,
   completion (from the LSP symbol index), job control. Scope decided after
