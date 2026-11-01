@@ -49,6 +49,10 @@ const usage =
     \\mahina — a Lua-shaped language (tier-0 interpreter)
     \\
     \\usage:
+    \\  mahina [options]                start the REPL (doc 75 §6): edited lines and
+    \\                                  history on a terminal, plain lines from a
+    \\                                  pipe; `cd`, `export`, `unset` and `exit` are
+    \\                                  shell shortcuts
     \\  mahina [options] <script.lua>   run a script file
     \\  mahina [options] -e <chunk>     run a chunk given inline
     \\  mahina viz [viz options] [trace.mahinatrace]
@@ -266,7 +270,7 @@ pub fn main(init: std.process.Init) u8 {
     // Leading options precede the script / `-e`; the first non-option argument
     // ends flag parsing.
     var topts: TraceOpts = .{};
-    const first = while (pending orelse it.next()) |arg| : (pending = null) {
+    const first: ?[]const u8 = while (pending orelse it.next()) |arg| : (pending = null) {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             mahina.io.print("{s}", .{usage});
             return 0;
@@ -384,10 +388,7 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--time")) {
             topts.time = true;
         } else break arg;
-    } else {
-        mahina.io.eprint("{s}", .{usage});
-        return 2;
-    };
+    } else null;
 
     // Native codegen exists for one target; elsewhere the flag would silently
     // measure tier-1a, so say so (stderr: program output stays identical).
@@ -400,7 +401,11 @@ pub fn main(init: std.process.Init) u8 {
     // flag parsing (which only compares argv strings), before first use.
     const gpa = if (mem_stats) mem_tracker.allocator() else init.gpa;
 
-    if (std.mem.eql(u8, first, "-e")) {
+    // No script and no `-e`: the REPL (doc 75 §6). Its program arguments are
+    // none; `arg[0]` is the interpreter's name.
+    const script = first orelse return replMain(gpa, init.gpa, init.io, topts, init.environ_map);
+
+    if (std.mem.eql(u8, script, "-e")) {
         // argv strings are already NUL-terminated, so this is a `[:0]const u8`.
         const chunk = it.next() orelse {
             mahina.io.eprint("mahina: error: -e requires a chunk argument\n", .{});
@@ -415,17 +420,39 @@ pub fn main(init: std.process.Init) u8 {
     }
 
     // Otherwise the first non-option argument is a script path.
-    const source = mahina.io.readFileZ(gpa, init.io, first) catch |err| {
-        mahina.io.eprint("mahina: error: cannot read '{s}': {s}\n", .{ first, @errorName(err) });
+    const source = mahina.io.readFileZ(gpa, init.io, script) catch |err| {
+        mahina.io.eprint("mahina: error: cannot read '{s}': {s}\n", .{ script, @errorName(err) });
         return 1;
     };
     defer gpa.free(source);
     // Program argv for a script: arg[0] = the script path, then trailing user args.
     var prog_argv: std.ArrayList([]const u8) = .empty;
     defer prog_argv.deinit(gpa);
-    prog_argv.append(gpa, first) catch return 1;
+    prog_argv.append(gpa, script) catch return 1;
     while (it.next()) |a| prog_argv.append(gpa, a) catch return 1;
-    return runSource(gpa, init.gpa, init.io, first, source, topts, init.environ_map, prog_argv.items);
+    return runSource(gpa, init.gpa, init.io, script, source, topts, init.environ_map, prog_argv.items);
+}
+
+/// `mahina` with no script: a read-eval-print loop on a VM that lives for the
+/// session, on the terminal (edited, with history) or on piped lines.
+fn replMain(gpa: std.mem.Allocator, thread_gpa: std.mem.Allocator, io: mahina.io.Io, topts: TraceOpts, env_map: *std.process.Environ.Map) u8 {
+    var vm = mahina.interp.Vm.init(gpa) catch |err| {
+        mahina.io.eprint("mahina: error: vm init failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer vm.deinit();
+    var real_sys = mahina.host_system.RealSystem.init(gpa, io, env_map);
+    defer real_sys.deinit();
+    var aio_host = mahina.aio_host.AioHost.init(thread_gpa, io);
+    defer aio_host.deinit();
+    if (configureVm(&vm, topts, &real_sys, &aio_host, &.{"mahina"})) |code| return code;
+
+    var session = mahina.repl.Session.init(gpa, &vm, mahina.io.stderrWriter());
+    defer session.deinit();
+    return mahina.repl.interactive(.{ .gpa = gpa, .io = io, .env = env_map }, &session) catch |err| {
+        mahina.io.eprint("mahina: error: {s}\n", .{@errorName(err)});
+        return 1;
+    };
 }
 
 /// `mahina --version`: what this binary is and what it can do here.
@@ -562,6 +589,72 @@ fn vizMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
     return 0;
 }
 
+/// Everything a fresh VM needs from the CLI before it runs anything: the
+/// tracing options, the clock and entropy, the real OS behind `io`/`os`/`proc`
+/// (`real_sys`, which the caller keeps alive and deinitialises), `aio`, the
+/// `arg` table and the effect-log settings. The exit code if it cannot.
+fn configureVm(vm: *mahina.interp.Vm, topts: TraceOpts, real_sys: *mahina.host_system.RealSystem, aio_host: *mahina.aio_host.AioHost, argv: []const []const u8) ?u8 {
+    const gpa = real_sys.gpa;
+    // Opt into the tracing JIT before running. Off by default ⇒ identical to the
+    // pre-Phase-5 path; `--trace` ⇒ record *and* execute hot loops via tier-1a;
+    // `--trace-record-only` ⇒ record but tier-0 executes everything.
+    vm.trace.config.enabled = topts.enabled;
+    vm.trace.config.execute = topts.execute;
+    vm.trace.config.optimize = topts.optimize;
+    vm.trace.config.native_codegen = topts.native_codegen;
+    vm.trace.config.record_aborts = topts.dump_aborts;
+    vm.trace.config.debug_log = topts.jit_debug;
+    vm.trace.config.coverage = topts.coverage;
+    if (topts.hotguard) |v| vm.trace.config.hotguard = v;
+    if (topts.silent_budget) |v| vm.trace.config.silent_budget = v;
+    vm.trace.config.exit_side_native = topts.exit_side_native;
+    // Inject the native clock. The interpreter holds no platform clock of its own
+    // (so the VM core stays portable, incl. wasm); the host that builds the VM —
+    // here, the CLI — supplies one. This is the single place the OS clock syscall
+    // lives now.
+    if (topts.system.clock) vm.setClockSource(.{ .ctx = &clock_ctx, .nowNs = &nativeClockNs });
+    // Inject the native seed source for `random()`. The VM owns the PRNG; the host
+    // supplies only the one nondeterministic seed (OS entropy here).
+    if (topts.system.random) vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &nativeRandomSeed };
+    // The real OS behind `io`/`os` and `require`/`loadfile`/`dofile` (doc 65
+    // §5): every group unless `--system` says otherwise. Module loading is
+    // not a group, so the system is wired whatever the groups. `real_sys`
+    // outlives `vm.run` below.
+    vm.system = real_sys.system();
+    vm.enableSystem(topts.system) catch |err| {
+        mahina.io.eprint("mahina: error: vm init failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    // Doc 73 §7.6: `aio`'s operations, on worker threads started by the
+    // first file operation. Deinit (before the VM's) drops what is still in
+    // flight when the program ends.
+    vm.enableAio(aio_host.host()) catch |err| {
+        mahina.io.eprint("mahina: error: vm init failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    // Fill the global `arg` table from the program's command line (load-time host
+    // input; keeps the exec core deterministic). `arg[0]` = script path.
+    vm.populateArgs(argv) catch |err| {
+        // A non-UTF-8 arg raises a located `LuaError` whose message lives in
+        // `pending_error` (load-time, so `describeFault` sees no frame and would
+        // only print the error name) — render the value directly.
+        if (vm.pending_error) |ev| {
+            var fault_arena = std.heap.ArenaAllocator.init(gpa);
+            defer fault_arena.deinit();
+            const msg = mahina.interp.Vm.renderErrorValue(ev, fault_arena.allocator()) catch @errorName(err);
+            mahina.io.eprint("mahina: error: {s}\n", .{msg});
+        } else {
+            mahina.io.eprint("mahina: error: populating arg table failed: {s}\n", .{@errorName(err)});
+        }
+        return 1;
+    };
+    // `--emit-effects` records the nondeterministic-input log during the run.
+    if (topts.effects_path != null) vm.effect_mode = .record;
+    vm.effect_log_limit = topts.effect_log_limit;
+    vm.io_errors = if (topts.lua_io_errors) .lua else .raise;
+    return null;
+}
+
 /// Parse, compile, and run one source chunk. Returns the process exit code.
 /// `name` labels the chunk in diagnostics (a file path or a synthetic name).
 /// `topts` controls the tracing-JIT recorder (off by default).
@@ -590,67 +683,11 @@ fn runSource(gpa: std.mem.Allocator, thread_gpa: std.mem.Allocator, io: mahina.i
         return 1;
     };
     defer vm.deinit();
-    // Opt into the tracing JIT before running. Off by default ⇒ identical to the
-    // pre-Phase-5 path; `--trace` ⇒ record *and* execute hot loops via tier-1a;
-    // `--trace-record-only` ⇒ record but tier-0 executes everything.
-    vm.trace.config.enabled = topts.enabled;
-    vm.trace.config.execute = topts.execute;
-    vm.trace.config.optimize = topts.optimize;
-    vm.trace.config.native_codegen = topts.native_codegen;
-    vm.trace.config.record_aborts = topts.dump_aborts;
-    vm.trace.config.debug_log = topts.jit_debug;
-    vm.trace.config.coverage = topts.coverage;
-    if (topts.hotguard) |v| vm.trace.config.hotguard = v;
-    if (topts.silent_budget) |v| vm.trace.config.silent_budget = v;
-    vm.trace.config.exit_side_native = topts.exit_side_native;
-    // Inject the native clock. The interpreter holds no platform clock of its own
-    // (so the VM core stays portable, incl. wasm); the host that builds the VM —
-    // here, the CLI — supplies one. This is the single place the OS clock syscall
-    // lives now.
-    if (topts.system.clock) vm.setClockSource(.{ .ctx = &clock_ctx, .nowNs = &nativeClockNs });
-    // Inject the native seed source for `random()`. The VM owns the PRNG; the host
-    // supplies only the one nondeterministic seed (OS entropy here).
-    if (topts.system.random) vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &nativeRandomSeed };
-    // The real OS behind `io`/`os` and `require`/`loadfile`/`dofile` (doc 65
-    // §5): every group unless `--system` says otherwise. Module loading is
-    // not a group, so the system is wired whatever the groups. `real_sys`
-    // outlives `vm.run` below.
     var real_sys = mahina.host_system.RealSystem.init(gpa, io, env_map);
     defer real_sys.deinit();
-    vm.system = real_sys.system();
-    vm.enableSystem(topts.system) catch |err| {
-        mahina.io.eprint("mahina: error: vm init failed: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    // Doc 73 §7.6: `aio`'s operations, on worker threads started by the
-    // first file operation. Deinit (before the VM's) drops what is still in
-    // flight when the program ends.
     var aio_host = mahina.aio_host.AioHost.init(thread_gpa, io);
     defer aio_host.deinit();
-    vm.enableAio(aio_host.host()) catch |err| {
-        mahina.io.eprint("mahina: error: vm init failed: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-    // Fill the global `arg` table from the program's command line (load-time host
-    // input; keeps the exec core deterministic). `arg[0]` = script path.
-    vm.populateArgs(argv) catch |err| {
-        // A non-UTF-8 arg raises a located `LuaError` whose message lives in
-        // `pending_error` (load-time, so `describeFault` sees no frame and would
-        // only print the error name) — render the value directly.
-        if (vm.pending_error) |ev| {
-            var fault_arena = std.heap.ArenaAllocator.init(gpa);
-            defer fault_arena.deinit();
-            const msg = mahina.interp.Vm.renderErrorValue(ev, fault_arena.allocator()) catch @errorName(err);
-            mahina.io.eprint("mahina: error: {s}\n", .{msg});
-        } else {
-            mahina.io.eprint("mahina: error: populating arg table failed: {s}\n", .{@errorName(err)});
-        }
-        return 1;
-    };
-    // `--emit-effects` records the nondeterministic-input log during the run.
-    if (topts.effects_path != null) vm.effect_mode = .record;
-    vm.effect_log_limit = topts.effect_log_limit;
-    vm.io_errors = if (topts.lua_io_errors) .lua else .raise;
+    if (configureVm(&vm, topts, &real_sys, &aio_host, argv)) |code| return code;
 
     // --- compile --- (pass the builtin globals so the unknown-global lint
     // doesn't flag `print`/`clock`).
@@ -695,29 +732,12 @@ fn runSource(gpa: std.mem.Allocator, thread_gpa: std.mem.Allocator, io: mahina.i
         var fault_arena = std.heap.ArenaAllocator.init(gpa);
         defer fault_arena.deinit();
         if (vm.describeFault(err, fault_arena.allocator())) |fault| {
-            // A self-located message (a raised Lua value) already carries its
-            // `chunk:line:` prefix — print it verbatim, Lua-style. The type-name
-            // faults are not self-located and get the " at chunk:line" suffix.
-            // The suffix names the chunk the faulting instruction is in: the
-            // script for its own code, the loaded file's path for a fault inside
-            // a `require`d / `dofile`d / `load`ed chunk.
-            if (fault.self_located)
-                mahina.io.eprint("mahina: runtime error: {s}\n", .{fault.message})
-            else
-                mahina.io.eprint("mahina: runtime error: {s} at {s}:{d}\n", .{ fault.message, fault.chunk, fault.line });
-            // A traceback only adds signal when control crossed a call boundary.
-            // Rows read as Lua's: `chunk:line: in function 'f'`.
-            if (fault.frames.len > 1) {
-                mahina.io.eprint("stack traceback:\n", .{});
-                for (fault.frames) |f| {
-                    if (f.native)
-                        mahina.io.eprint("    [C]: in function '{s}{s}{s}'\n", .{ f.module, f.dot(), f.name })
-                    else if (f.main_chunk)
-                        mahina.io.eprint("    {s}:{d}: in main chunk\n", .{ f.chunk, f.line })
-                    else
-                        mahina.io.eprint("    {s}:{d}: in function '{s}'\n", .{ f.chunk, f.line, f.name });
-                }
-            }
+            // The suffix names the chunk the faulting instruction is in: the script
+            // for its own code, the loaded file's path for a fault inside a
+            // `require`d / `dofile`d / `load`ed chunk.
+            const w = mahina.io.stderrWriter();
+            mahina.repl.writeFault(w, fault, "mahina: runtime error: ") catch {};
+            w.flush() catch {};
         } else |_| {
             mahina.io.eprint("mahina: runtime error: {s}\n", .{@errorName(err)});
         }

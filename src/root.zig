@@ -39,6 +39,9 @@ pub const io = @import("io.zig");
 /// referenced by the wasm build).
 pub const system = @import("system.zig");
 pub const host_system = @import("host_system.zig");
+/// The REPL (doc 75 §6): the session logic and the line editor under it.
+pub const lineedit = @import("lineedit.zig");
+pub const repl = @import("repl.zig");
 /// The CLI's `aio` host (doc 73 §7.6): worker threads and timers.
 pub const aio_host = @import("aio_host.zig");
 /// The wasm playground's `aio` host: sleeps on a virtual clock.
@@ -174,6 +177,8 @@ test {
     _ = io;
     _ = system;
     _ = host_system;
+    _ = lineedit;
+    _ = repl;
     _ = aio_host;
     _ = aio_virtual;
     _ = @import("file.zig");

@@ -110,6 +110,22 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Phase 4 — the REPL.** Interactive loop: prompt, line editing,
   history, multi-line chunks, `cd`/env builtins on an authoritative host
   environment (§6). Never recordable. Depends on Phase 4a.
+  - [x] Core loop (`src/repl.zig`, `src/lineedit.zig`; `mahina` with no
+    script): own raw-mode editor (POSIX; decided 2026-11-01), history file
+    (`$XDG_STATE_HOME/mahina/history`, else `~/.local/state/mahina/history`),
+    cwd prompt, multi-line chunks (a parse error at the end of the input
+    waits for more), expressions print their values (`__show`), runtime
+    errors reported and the session goes on, piped stdin runs the same lines
+    without prompts or editing. Shortcuts `cd`, `export`, `unset`, `exit`
+    (keyword + whitespace, rest not starting with `= ( [ : ,`, and only while
+    no global of that name exists) translate to `os.chdir`/`os.setenv` Lua;
+    words support quotes, `\`, `~`, `$NAME`, `${NAME}`, `cd -`.
+  - [ ] Top-level `local`s persist between lines (decided 2026-11-01: they
+    must; it needs the resolver, so it waits for doc 76 Phase 1: earlier lines'
+    locals as root-proto upvalues, new ones handed back to the session).
+  - [ ] Ctrl-C interrupts a running Lua line (needs a VM interrupt poll; a
+    running child already gets it, §6). Today it ends the REPL.
+  - [ ] Windows console and wasm: plain lines only until Phase 6.
 - [ ] **Phase 5 — shell ergonomics.** Command-position sugar, globbing,
   completion (from the LSP symbol index), job control. Scope decided after
   Phase 4.
