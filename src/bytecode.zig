@@ -122,6 +122,13 @@ pub const OpCode = enum(u8) {
     ///             original semantics first (from `patch.orig`); only a taken
     ///             back-edge enters the bound trace.
     jloop,
+    /// `a, aux`    doc 76 §6.3: a generic `for` with a closing value enters:
+    ///             R[a] = R[a+4] (the explist's fourth value, below the
+    ///             control registers now at R[a+1..a+3]), checked as `tbc`
+    ///             checks it, named `(for state)`; then `pc += aux`, the
+    ///             forward jump to the test block that a plain `jmp` is for a
+    ///             loop without one. Lua 5.4's `OP_TFORPREP`.
+    tfor_prep,
     /// `a, aux`    generic-for test+continue. The preceding `call` has already
     ///             written the loop variables into R[a+3..]. If the first loop
     ///             variable R[a+3] is **not nil** (Lua stops only on nil; `false`
@@ -158,6 +165,10 @@ pub const OpCode = enum(u8) {
     get_global,
     /// `a, b`      G[K[b]] = R[a]
     set_global,
+    /// `a, b`      G[K[b]] = R[a], raising "global 'K[b]' already defined"
+    ///             when G[K[b]] is not nil (doc 76 §3.3, 5.5's `ERRNNIL`):
+    ///             `global x = v` and `global function x`.
+    def_global,
 
     // ---- functions (Increment D) ----
     /// `a, b`      R[a] = closure(protos[b])  capturing upvalues
@@ -171,11 +182,27 @@ pub const OpCode = enum(u8) {
     ///             into the cell so it outlives the registers about to be freed.
     ///             Emitted at block/loop-scope exit and `break`.
     close_upvalues,
+    /// `a, b`      doc 76 §6: `local x <close> = v` is in `R[a]`: raise "variable 'K[b]' got a
+    ///             non-closable value" unless it is nil, false, or has a
+    ///             `__close` metamethod. The variable is live from the next
+    ///             instruction (`Proto.tbc_vars`).
+    tbc,
+    /// `a`         doc 76 §6: close the to-be-closed variables of this frame
+    ///             that are live here in registers `>= a`, highest first:
+    ///             `__close(v, nil)` for each one that is not nil or false.
+    ///             An error in one is passed to the rest, then raised. Emitted
+    ///             where such a variable's scope ends and at a `break`; open
+    ///             upvalues are `close_upvalues`'s. A `return` is `ret_close`.
+    close,
     /// `a, b, c`   call R[a] with `b` args in R[a+1..a+1+b], want `c` results
     ///             written back starting at R[a]. `c == max_results` means "all".
     call,
     /// `a, b`      return `b` values from R[a..a+b]. `b == 0` is "no values".
     ret,
+    /// `a, b`      doc 76 §6: `ret`, after closing every to-be-closed variable
+    ///             of the frame live here, as `close 0` would. A `return` in
+    ///             the scope of one compiles to it.
+    ret_close,
 
     // ---- varargs (Phase 3d2) — read the current frame's `...` cursor ----
     /// `a`         R[a] = the first vararg, or nil if there are none. Emitted
@@ -380,7 +407,7 @@ pub const set_list_batch: u16 = 64;
 /// transient `Vm.reg_top`: a `call`, `ret` or `set_list` with `b =
 /// all_results`. Each reads `R[a ..)` up to the top.
 pub inline fn isMultretConsumer(ins: Instr) bool {
-    return (ins.op == .call or ins.op == .ret or ins.op == .set_list) and ins.b == all_results;
+    return (ins.op == .call or ins.op == .ret or ins.op == .ret_close or ins.op == .set_list) and ins.b == all_results;
 }
 
 /// Doc 66 P5: the immediate operand of `eq_p`/`ne_p`.
@@ -805,9 +832,9 @@ pub const LoopExtent = struct {
 /// back-edge from the instruction right above its header:
 ///  - numeric `for`: `for_prep` at `header − 1` names its `for_loop` in `aux`;
 ///    the `for_loop`'s taken edge returns to `header` (`compileNumericFor`);
-///  - generic `for`: a forward `jmp` at `header − 1` enters the test block,
-///    an `itern` followed by the `tfor_loop` returning to `header`
-///    (`compileGenericFor`);
+///  - generic `for`: a forward `jmp` (or, with a closing value, `tfor_prep`)
+///    at `header − 1` enters the test block, an `itern` followed by the
+///    `tfor_loop` returning to `header` (`compileGenericFor`);
 ///  - `while`/`repeat`: the `loop` marker at `header − 1` (below).
 /// Each link is checked, so anything else is null. That one back-edge per
 /// header is unique is a property of compiler output (each loop owns its
@@ -817,8 +844,8 @@ pub const LoopExtent = struct {
 /// two marker kinds is NOT `[header, back_edge]` — the marker sits at the top
 /// and the code that closes the loop sits below the body:
 ///  - numeric `for`: `[header, the for_loop]`;
-///  - generic `for`: `[header, the tfor_loop]` (the forward `jmp` to the test
-///    block at `header − 1` runs only on entry, like `for_prep`);
+///  - generic `for`: `[header, the tfor_loop]` (the forward `jmp`/`tfor_prep`
+///    to the test block at `header − 1` runs only on entry, like `for_prep`);
 ///  - `while`: `[C, E − 1]`, where `E` is the marker's exit pc and `C` is the
 ///    first condition instruction — the target of the backward `jmp` that
 ///    closes the loop at `E − 1`. The condition sits BELOW the header, so a
@@ -845,7 +872,7 @@ pub fn loopExtentFor(proto: *const Proto, header: u32) ?LoopExtent {
             if (code[back].op != .for_loop or loopHeaderOf(code[back], back) != header) return null;
             return .{ .start = header, .end = back, .back_edge_pc = back, .back_edge_op = .for_loop };
         },
-        .jmp => {
+        .jmp, .tfor_prep => {
             const t = jumpTargetOf(entry, i);
             if (t <= i or t >= @as(i64, @intCast(code.len))) return null;
             // Doc 66 P1: the test block is exactly `itern; tfor_loop`.
@@ -1112,6 +1139,37 @@ pub const UpvalDesc = struct {
     index: u16,
 };
 
+/// A to-be-closed variable (doc 76 §6): register `reg` holds it from
+/// `start`, just after its `tbc` (or `tfor_prep`), to `end`, the `close`
+/// (or `ret_close`) that ends its scope. A `close` inside the range (a
+/// `break`'s) or a `ret_close` closes it early; `close` closes the variables
+/// at or above its operand that are `openAt` it, `ret_close` all of them.
+pub const TbcVar = struct {
+    reg: u16,
+    start: u32,
+    end: u32,
+
+    /// Whether the variable is in scope at instruction `pc`, the closing one
+    /// included.
+    pub inline fn openAt(self: TbcVar, pc: usize) bool {
+        return pc >= self.start and pc <= self.end;
+    }
+
+    /// Whether this variable is still to be closed when its frame is at
+    /// instruction `pc` of `code`: in scope, and not one the instruction at
+    /// `pc` is closing or has closed (an error raised there comes from those
+    /// closes, which have run every one of them).
+    pub fn isLiveAt(self: TbcVar, code: []const Instr, pc: usize) bool {
+        if (!self.openAt(pc)) return false;
+        const ins = code[pc];
+        return switch (ins.op) {
+            .close => self.reg < ins.a,
+            .ret_close => false,
+            else => true,
+        };
+    }
+};
+
 /// Doc 56 §4.2: per-pc register liveness of one proto, computed once at
 /// compile time by `bc_liveness.compute`. `liveIn(pc, r)` is true when the
 /// value in register `r` just BEFORE `pc` executes may be read on some path
@@ -1181,6 +1239,11 @@ pub const Proto = struct {
     /// Upvalue capture plan: how a `closure` of this proto fills its cells from
     /// the enclosing frame. Empty for functions that capture nothing.
     upvalues: []const UpvalDesc = &.{},
+    /// Doc 76 §6: the to-be-closed variables, in the order their `tbc`s
+    /// appear, so the ones in scope at any pc are nested and in register
+    /// order. An error unwinding through a frame closes the ones live at
+    /// its instruction; so do `close`, from its operand up, and `ret_close`.
+    tbc_vars: []const TbcVar = &.{},
     /// Global-access cache: one hash-slot hint per constant, used by
     /// `get_global`/`set_global` for the global named by `constants[i]`
     /// (`Table.getHinted`). A hint only: every use re-checks it, so it never
@@ -1241,14 +1304,14 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
     switch (instr.op) {
         .halt => {},
         .jmp => try w.print(" {d:>4}", .{instr.aux}),
-        .load_nil, .close_upvalues, .vararg_first, .vararg_len, .vararg_spread => try w.print(" r{d}", .{instr.a}),
+        .load_nil, .close_upvalues, .close, .vararg_first, .vararg_len, .vararg_spread => try w.print(" r{d}", .{instr.a}),
         .new_table => try w.print(" r{d}  {d}", .{ instr.a, instr.c }),
         .set_list => if (instr.b == all_results)
             try w.print(" r{d}  *  r{d}  {d}", .{ instr.a, instr.c, instr.aux })
         else
             try w.print(" r{d}  {d}  r{d}  {d}", .{ instr.a, instr.b, instr.c, instr.aux }),
         .load_int => try w.print(" r{d}  {d}", .{ instr.a, instr.aux }),
-        .jmp_if_false, .jmp_if_true, .jmp_if_not_nil, .for_prep, .for_loop => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
+        .jmp_if_false, .jmp_if_true, .jmp_if_not_nil, .for_prep, .tfor_prep, .for_loop => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
         // Doc 58: the loop kind and the exit offset (a fall-through op).
         .loop => try w.print(" {s}  exit {d:>4}", .{
             if (instr.b == @intFromEnum(LoopKind.repeat_loop)) "repeat" else "while",
@@ -1263,10 +1326,13 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .len,
         .get_global,
         .set_global,
+        .def_global,
+        .tbc,
         .closure,
         .get_upval,
         .set_upval,
         .ret,
+        .ret_close,
         .vararg_get,
         .intrinsic,
         => try w.print(" r{d}  {d}", .{ instr.a, instr.b }),

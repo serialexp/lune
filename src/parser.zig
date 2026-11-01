@@ -265,6 +265,7 @@ const Parser = struct {
                     return;
                 },
                 .keyword_local,
+                .keyword_global,
                 .keyword_if,
                 .keyword_while,
                 .keyword_repeat,
@@ -290,6 +291,7 @@ const Parser = struct {
         try self.enter();
         return switch (self.currentTag()) {
             .keyword_local => self.parseLocal(),
+            .keyword_global => self.parseGlobal(),
             .keyword_if => self.parseIf(),
             .keyword_while => self.parseWhile(),
             .keyword_repeat => self.parseRepeat(),
@@ -336,40 +338,128 @@ const Parser = struct {
             };
         }
 
-        var names: std.ArrayList(ast.TypedName) = .empty;
-        while (true) {
-            const name_tok = try self.expect(.identifier, .expected_variable_name);
-            const ty = try self.parseOptionalType();
-            try names.append(self.arena, .{
-                .name = name_tok.lexeme(self.source),
-                .name_span = .{ .start = name_tok.start, .end = name_tok.end },
-                .type = ty,
-            });
-            if (!self.match(.comma)) break;
-        }
+        const names = try self.parseAttNameList(.local);
+        const values = try self.parseDeclValues(local_pos);
+        return .{
+            .span = self.spanFrom(start),
+            .data = .{ .local = .{ .names = names, .values = values } },
+        };
+    }
 
-        var values: []const *Expr = &.{};
-        if (self.match(.assign)) {
-            const value_start = self.current().start;
-            values = self.parseExprList() catch |e| switch (e) {
-                Error.ParseError => blk: {
-                    if (self.too_deep) return e;
-                    // The names parsed, so keep the declaration: dropping it
-                    // would turn every later use of them into a global.
-                    const skipped = self.synchronize(local_pos, value_start);
-                    const lost = try self.newExpr(skipped, .err);
-                    const one = try self.arena.alloc(*Expr, 1);
-                    one[0] = lost;
-                    break :blk one;
-                },
-                else => return e,
+    /// `global attnamelist ['=' explist]`, `global [attrib] '*'` or
+    /// `global function Name funcbody` (doc 76 §3.1, Lua 5.5 §3.3.7).
+    fn parseGlobal(self: *Parser) Error!Stmt {
+        const global_pos = self.pos;
+        const start = self.advance().start; // 'global'
+
+        const is_async = self.match(.keyword_async);
+        if (is_async and !self.check(.keyword_function)) return self.fail(.expected_function_after_async);
+        const fn_tok = self.current();
+        if (self.match(.keyword_function)) {
+            const name_tok = try self.expect(.identifier, .expected_function_name);
+            const body = try self.parseFunctionBody(fn_tok);
+            body.is_async = is_async;
+            return .{
+                .span = self.spanFrom(start),
+                .data = .{ .global_function = .{ .name = name_tok.lexeme(self.source), .name_span = tokSpan(name_tok), .body = body } },
             };
         }
 
+        if (self.check(.star) or (self.check(.lt) and self.peekAt(3).tag == .star)) {
+            const attrib = try self.parseAttrib(.none, .global);
+            _ = try self.expect(.star, .expected_variable_name);
+            return .{ .span = self.spanFrom(start), .data = .{ .global_all = .{ .attrib = attrib } } };
+        }
+
+        const names = try self.parseAttNameList(.global);
+        const values = try self.parseDeclValues(global_pos);
         return .{
             .span = self.spanFrom(start),
-            .data = .{ .local = .{ .names = try names.toOwnedSlice(self.arena), .values = values } },
+            .data = .{ .global = .{ .names = names, .values = values } },
         };
+    }
+
+    const DeclKind = enum { local, global };
+
+    /// `[attrib] Name [attrib] [':' Type] {',' Name [attrib] [':' Type]}`: a
+    /// prefixed attribute applies to every name, a postfixed one to its own
+    /// name instead (Lua 5.5 §3.3.7).
+    fn parseAttNameList(self: *Parser, kind: DeclKind) Error![]const ast.TypedName {
+        const prefix = try self.parseAttrib(.none, kind);
+        var names: std.ArrayList(ast.TypedName) = .empty;
+        var closing = false;
+        while (true) {
+            const name_tok = try self.expect(.identifier, .expected_variable_name);
+            const attrib_tok = self.current();
+            const attrib = try self.parseAttrib(prefix, kind);
+            if (attrib == .close) {
+                // Lua's rule: one to-be-closed variable per list.
+                if (closing) self.reportAt(.multiple_close, if (attrib_tok.tag == .lt) attrib_tok else name_tok);
+                closing = true;
+            }
+            const ty = try self.parseOptionalType();
+            try names.append(self.arena, .{
+                .name = name_tok.lexeme(self.source),
+                .name_span = tokSpan(name_tok),
+                .type = ty,
+                .attrib = attrib,
+            });
+            if (!self.match(.comma)) break;
+        }
+        return try names.toOwnedSlice(self.arena);
+    }
+
+    /// `['<' Name '>']`, or `default` when there is none. A misspelt or
+    /// misplaced attribute is reported and parsing goes on as if it were
+    /// absent: the declaration itself is sound.
+    fn parseAttrib(self: *Parser, default: ast.Attrib, kind: DeclKind) Error!ast.Attrib {
+        const open = self.current();
+        if (!self.match(.lt)) return default;
+        const name_tok = try self.expect(.identifier, .expected_attribute_name);
+        _ = try self.expect(.gt, .expected_attribute_close);
+        const name = name_tok.lexeme(self.source);
+        const attrib: ast.Attrib = if (std.mem.eql(u8, name, "const"))
+            .@"const"
+        else if (std.mem.eql(u8, name, "close"))
+            .close
+        else {
+            self.reportAt(.unknown_attribute, name_tok);
+            return default;
+        };
+        if (attrib == .close and kind == .global) {
+            self.reportSpan(.global_close, .{ .start = open.start, .end = self.lastEnd() }, open.line);
+            return default;
+        }
+        return attrib;
+    }
+
+    /// `['=' explist]` of a declaration. A broken list keeps the declaration
+    /// (its values become one error node): dropping it would turn every later
+    /// use of the names into an undeclared global.
+    fn parseDeclValues(self: *Parser, decl_pos: u32) Error![]const *Expr {
+        if (!self.match(.assign)) return &.{};
+        const value_start = self.current().start;
+        return self.parseExprList() catch |e| switch (e) {
+            Error.ParseError => {
+                if (self.too_deep) return e;
+                const skipped = self.synchronize(decl_pos, value_start);
+                const lost = try self.newExpr(skipped, .err);
+                const one = try self.arena.alloc(*Expr, 1);
+                one[0] = lost;
+                return one;
+            },
+            else => return e,
+        };
+    }
+
+    /// Report an error at `t` without unwinding: what follows still parses.
+    fn reportAt(self: *Parser, code: diag.Code, t: Token) void {
+        self.reportSpan(code, tokSpan(t), t.line);
+    }
+
+    fn reportSpan(self: *Parser, code: diag.Code, span: Span, line: u32) void {
+        self.diags.report(code, span.start, span.end, line);
+        self.had_error = true;
     }
 
     /// Map a compound-assignment operator token to its underlying binary op, or
@@ -1138,6 +1228,71 @@ test "doc 73 §7: async and await are reserved, and async takes a function" {
         defer tree.deinit();
         try testing.expect(diags.hasErrors());
     }
+}
+
+test "doc 76: attributes on local names, prefixed and postfixed" {
+    var tree = try parseOk("local a <const>, b, c <close> = 1, 2, f()\nlocal <const> x, y <close>: T = 3, g()");
+    defer tree.deinit();
+    const first = tree.root[0].data.local.names;
+    try testing.expectEqual(ast.Attrib.@"const", first[0].attrib);
+    try testing.expectEqual(ast.Attrib.none, first[1].attrib);
+    try testing.expectEqual(ast.Attrib.close, first[2].attrib);
+    const second = tree.root[1].data.local.names;
+    try testing.expectEqual(ast.Attrib.@"const", second[0].attrib); // the prefix
+    try testing.expectEqual(ast.Attrib.close, second[1].attrib); // its own instead
+    try testing.expectEqualStrings("T", second[1].type.?.path[0]);
+}
+
+test "doc 76: the forms of a global declaration" {
+    const src =
+        \\global x
+        \\global <const> a, b = 1, 2
+        \\global *
+        \\global <const> *
+        \\global function f() end
+        \\global async function g() end
+    ;
+    var tree = try parseOk(src);
+    defer tree.deinit();
+    const x = tree.root[0].data.global;
+    try testing.expectEqualStrings("x", x.names[0].name);
+    try testing.expectEqual(@as(usize, 0), x.values.len);
+    const ab = tree.root[1].data.global;
+    try testing.expectEqual(ast.Attrib.@"const", ab.names[1].attrib);
+    try testing.expectEqual(@as(usize, 2), ab.values.len);
+    try testing.expectEqual(ast.Attrib.none, tree.root[2].data.global_all.attrib);
+    try testing.expectEqual(ast.Attrib.@"const", tree.root[3].data.global_all.attrib);
+    try testing.expectEqualStrings("f", tree.root[4].data.global_function.name);
+    try testing.expect(tree.root[5].data.global_function.body.is_async);
+    try testing.expectEqualStrings("global function f() end", spanText(src, tree.root[4].span));
+}
+
+test "doc 76: global is reserved, and attributes are checked" {
+    const cases = [_]struct { src: [:0]const u8, code: diag.Code }{
+        .{ .src = "local global = 1", .code = .expected_variable_name },
+        .{ .src = "global = 1", .code = .expected_variable_name },
+        .{ .src = "local x <constant> = 1", .code = .unknown_attribute },
+        .{ .src = "global x <close> = 1", .code = .global_close },
+        .{ .src = "global <close> *", .code = .global_close },
+        .{ .src = "local a <close>, b <close> = f(), g()", .code = .multiple_close },
+        .{ .src = "local <close> a, b = f(), g()", .code = .multiple_close },
+        .{ .src = "local x <const = 1", .code = .expected_attribute_close },
+        .{ .src = "local x <> = 1", .code = .expected_attribute_name },
+    };
+    for (cases) |c| {
+        var diags = Diagnostics.init(testing.allocator);
+        defer diags.deinit();
+        var tree = try parse(testing.allocator, c.src, &diags);
+        defer tree.deinit();
+        try testing.expectEqual(c.code, diags.list.items[0].code);
+    }
+    // A misspelt attribute costs one diagnostic; the declaration stands.
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parse(testing.allocator, "local x <cnst> = 1\nprint(x)", &diags);
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 1), diags.count());
+    try testing.expectEqualStrings("x", tree.root[0].data.local.names[0].name);
 }
 
 test "error recovery: bad statement, then a good one" {

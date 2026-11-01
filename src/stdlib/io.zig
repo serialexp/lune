@@ -48,6 +48,9 @@ pub const methods_module = "@file";
 /// so it is a GC root and keyframe-restorable by name).
 const lines_iter_name = "@io_lines_iter";
 
+/// The file metatable's `__close` (doc 76 §6), hidden the same way.
+pub const file_close_name = "@io_file_close";
+
 /// The longest numeral `read("n")` collects (Lua's `L_MAXLENNUM`); a longer
 /// one fails the read.
 const max_numeral = 200;
@@ -998,6 +1001,20 @@ fn fileCloseN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize
     return closeHandle(vm, try fileArg(vm, args, 0), out, false);
 }
 
+/// The file metatable's `__close(file, err)`: a to-be-closed variable
+/// holding the file went out of scope (`local f <close>`, the file
+/// `io.lines` opened as a generic `for`'s closing value). Closes it unless
+/// it already is, or is a standard stream, which stays open, as Lua's
+/// `f_gc` does.
+fn fileCloseMetaN(ctx: *anyopaque, args: []const Value, _: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    const f = (if (args.len > 0) fileOf(args[0]) else null) orelse return 0;
+    if (f.closed or f.isStdStream()) return 0;
+    var discard: [2]Value = undefined;
+    _ = try closeHandle(vm, f, &discard, false);
+    return 0;
+}
+
 /// `io.close([file])`: the file, or the default output.
 fn ioCloseN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
@@ -1079,4 +1096,6 @@ pub const natives = [_]function.BaseNative{
     entry("file.close", &fileCloseN, methods_module, "close", .none),
     // The hidden `lines` iterator.
     .{ .name = lines_iter_name, .func = single(&linesIterN), .multi = &linesIterN },
+    // The hidden `__close` of the file metatable.
+    .{ .name = file_close_name, .func = single(&fileCloseMetaN), .multi = &fileCloseMetaN },
 };

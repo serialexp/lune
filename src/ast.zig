@@ -71,11 +71,25 @@ pub const Ident = struct {
     span: Span,
 };
 
-/// A name optionally annotated with a type (function params, `local` names).
+/// A variable attribute, `<const>` or `<close>` (doc 76 §3.1, §4, §6).
+pub const Attrib = enum {
+    none,
+    /// `<const>`: the variable cannot be assigned again.
+    @"const",
+    /// `<close>`: the value's `__close` runs when the variable goes out of
+    /// scope. Read-only too, as in Lua.
+    close,
+};
+
+/// A name optionally annotated with a type (function params, `local` and
+/// `global` names), and for a declared variable its attribute.
 pub const TypedName = struct {
     name: []const u8,
     name_span: Span,
     type: ?*TypeExpr = null,
+    /// The attribute in effect for this name: its own postfixed one, else the
+    /// list's prefixed one (`local <const> a, b <close>`).
+    attrib: Attrib = .none,
 };
 
 pub const Param = TypedName;
@@ -190,6 +204,13 @@ pub const Stmt = struct {
         local: struct { names: []const TypedName, values: []const *Expr },
         /// `local function f() ... end`
         local_function: struct { name: []const u8, name_span: Span, body: *FunctionBody },
+        /// `global a <const>, b = e1, e2` (doc 76 §3). No `values` means no
+        /// initializer: `global x` declares and leaves `x` as it is.
+        global: struct { names: []const TypedName, values: []const *Expr },
+        /// `global *` or `global <const> *`: every name not declared so far.
+        global_all: struct { attrib: Attrib },
+        /// `global function f() ... end`
+        global_function: struct { name: []const u8, name_span: Span, body: *FunctionBody },
         /// `t1, t2 = e1, e2` (targets are assignable exprs).
         assign: struct { targets: []const *Expr, values: []const *Expr },
         /// `target OP= value` (single target). The compiler evaluates `target`'s

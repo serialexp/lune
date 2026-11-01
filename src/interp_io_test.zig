@@ -154,6 +154,22 @@ test "io: write, seek, append and io.lines against the host" {
     try testing.expectEqualStrings("one\n2\n3.5\nfour\n", host.contentOf("o.txt").?);
 }
 
+test "io: a file to-be-closed is closed with its scope, by an io.lines loop's break too (doc 76 §6)" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    try host.put("o.txt", "one\ntwo\n");
+    try expectOut(&host,
+        \\for l in io.lines("o.txt") do io.write(l) break end
+        \\print()
+        \\do local f <close> = io.open("o.txt") io.write(f:read("l")) end
+        \\print()
+        \\do local f <close> = io.open("o.txt") f:close() end
+        \\do local s <close> = io.stdout end
+        \\print("still open")
+    , "one\none\nstill open\n");
+    try testing.expectEqual(@as(usize, 0), host.handles.count());
+}
+
 test "io: binary writes take byte arrays" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();

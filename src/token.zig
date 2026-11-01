@@ -43,6 +43,8 @@ pub const Token = struct {
         keyword_false,
         keyword_for,
         keyword_function,
+        /// Doc 76: Lua 5.5's, reserved outright (D2).
+        keyword_global,
         keyword_if,
         keyword_in,
         keyword_local,
@@ -142,6 +144,7 @@ pub const Token = struct {
                 .keyword_false => "false",
                 .keyword_for => "for",
                 .keyword_function => "function",
+                .keyword_global => "global",
                 .keyword_if => "if",
                 .keyword_in => "in",
                 .keyword_local => "local",
@@ -222,6 +225,7 @@ pub const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
     .{ "false", .keyword_false },
     .{ "for", .keyword_for },
     .{ "function", .keyword_function },
+    .{ "global", .keyword_global },
     .{ "if", .keyword_if },
     .{ "in", .keyword_in },
     .{ "local", .keyword_local },
@@ -244,6 +248,7 @@ pub fn identifierTag(text: []const u8) Token.Tag {
 test "keyword lookup distinguishes keywords from identifiers" {
     try std.testing.expectEqual(Token.Tag.keyword_function, identifierTag("function"));
     try std.testing.expectEqual(Token.Tag.keyword_end, identifierTag("end"));
+    try std.testing.expectEqual(Token.Tag.keyword_global, identifierTag("global"));
     try std.testing.expectEqual(Token.Tag.identifier, identifierTag("foo"));
     try std.testing.expectEqual(Token.Tag.identifier, identifierTag("endx"));
     try std.testing.expectEqual(Token.Tag.identifier, identifierTag("End"));

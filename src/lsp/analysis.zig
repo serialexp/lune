@@ -98,7 +98,7 @@ pub fn analyse(
 
     var heap = gc.Heap.init(gpa);
     defer heap.deinit();
-    compiler.checkChunk(gpa, a, &heap, source, tree.root, &res, &diags, .{
+    compiler.checkChunk(gpa, &heap, source, tree.root, &res, &diags, .{
         .known_globals = known_globals,
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -109,7 +109,9 @@ pub fn analyse(
     try abandon.check();
 
     // Every allocation from `a` is made before `arena` is copied into the result.
+    // The sink owns the messages it formatted, and goes with this frame.
     const diagnostics = try a.dupe(diag.Diagnostic, diags.list.items);
+    for (diagnostics) |*d| d.message = try a.dupe(u8, d.message);
     const comments = try a.dupe(lexer.Comment, trivia.comments.items);
     return .{
         .arena = arena,

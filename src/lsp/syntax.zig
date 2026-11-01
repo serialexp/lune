@@ -42,12 +42,15 @@ const NodeCollector = struct {
 
     fn stmt(self: *NodeCollector, s: *const ast.Stmt) std.mem.Allocator.Error!void {
         try self.add(s.span, switch (s.data) {
-            .do, .while_, .repeat, .if_, .numeric_for, .generic_for, .function_decl, .local_function => true,
+            .do, .while_, .repeat, .if_, .numeric_for, .generic_for, .function_decl, .local_function, .global_function => true,
             else => false,
         });
         switch (s.data) {
             .local => |l| try self.exprs(l.values),
             .local_function => |lf| try self.block(lf.body.body),
+            .global => |g| try self.exprs(g.values),
+            .global_all => {},
+            .global_function => |gf| try self.block(gf.body.body),
             .assign => |asg| {
                 try self.exprs(asg.targets);
                 try self.exprs(asg.values);
@@ -182,6 +185,19 @@ const SymbolCollector = struct {
                 .selection = lf.name_span,
                 .children = try self.bodyOf(lf.body.body),
             }),
+            .global => |g| {
+                for (g.names, 0..) |n, i| {
+                    const value: ?*const ast.Expr = if (i < g.values.len) g.values[i] else null;
+                    try out.append(self.a, try self.declared(n.name, n.name_span, s.span, value, .variable));
+                }
+            },
+            .global_function => |gf| try out.append(self.a, .{
+                .name = gf.name,
+                .kind = .function,
+                .range = s.span,
+                .selection = gf.name_span,
+                .children = try self.bodyOf(gf.body.body),
+            }),
             .function_decl => |fd| {
                 const last = if (fd.name.method) |m| m.span else fd.name.path[fd.name.path.len - 1].span;
                 try out.append(self.a, .{
@@ -201,7 +217,7 @@ const SymbolCollector = struct {
             },
             .numeric_for => |nf| try self.block(nf.body, out),
             .generic_for => |gf| try self.block(gf.body, out),
-            .assign, .compound_assign, .call, .return_, .break_, .err => {},
+            .assign, .compound_assign, .call, .return_, .break_, .global_all, .err => {},
         }
     }
 

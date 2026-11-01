@@ -130,7 +130,7 @@ test "gc: a string only a trace's constant pool names is swept as in tier-0 (doc
         \\for k = 1, 5000 do local junk = {} end
         \\local again = tostring(7)
         \\print({})
-    , "2000\ntable: 0x1498\n", "2000\ntable: 0x1c67\n", .{});
+    , "2000\ntable: 0x149b\n", "2000\ntable: 0x1c6a\n", .{});
 }
 
 // Doc 61 §8 determinism. Each program leaves a heap value in a register
@@ -139,15 +139,17 @@ test "gc: a string only a trace's constant pool names is swept as in tier-0 (doc
 // keeps it alive across the collection, skips the re-intern allocation and
 // prints a lower id. Every trace mode must print its GC discipline's id.
 
-/// The inner loop's `i` (R[a+3]) holds a string at its last iteration. It
-/// is dead after the loop, so the linked loop-done flush may leave the slab
-/// copy stale; the masked walk does not root it. `PRE` runs before `f`.
+/// The inner loop's `s` holds a string at its last iteration. It is dead
+/// after the loop, so the linked loop-done flush may leave the slab copy
+/// stale; the masked walk does not root it. (It was the control variable
+/// `i` itself, R[a+3], until doc 76 D6 made `i` read-only.) `PRE` runs
+/// before `f`.
 fn linkedForSource(comptime pre: []const u8) [:0]const u8 {
     return
     \\local function f(n)
     \\  local c = 0
     \\  for j = 1, 40 do
-    \\    for i = 1, n do i = tostring(i) c = c + #i end
+    \\    for i = 1, n do local s = tostring(i) c = c + #s end
     \\  end
     \\  return c
     \\end
@@ -178,12 +180,12 @@ const LoopDone = struct {
 // completion is never linked.
 const cli_hotloop = (trace.TraceConfig{}).hotloop;
 
-test "doc 61 §8: a linked numeric-for whose control variable holds a string agrees in every tier" {
-    try expectProgramByGc(linkedForSource(""), "2040\ntable: 0x14b5\n", "2040\ntable: 0x1947\n", .{ .hotloop = cli_hotloop, .inspect = &LoopDone.linked });
+test "doc 61 §8: a linked numeric-for whose body leaves a dead string agrees in every tier" {
+    try expectProgramByGc(linkedForSource(""), "2040\ntable: 0x14b8\n", "2040\ntable: 0x194a\n", .{ .hotloop = cli_hotloop, .inspect = &LoopDone.linked });
 }
 
 test "doc 61 §8: the same linked numeric-for over a non-maskable proto declines the flush and agrees" {
-    try expectProgramByGc(linkedForSource("unmask(f)\n"), "2040\ntable: 0x14b7\n", "2040\ntable: 0x1949\n", .{ .hotloop = cli_hotloop, .setup = &util.installUnmask, .inspect = &LoopDone.declined });
+    try expectProgramByGc(linkedForSource("unmask(f)\n"), "2040\ntable: 0x14ba\n", "2040\ntable: 0x194c\n", .{ .hotloop = cli_hotloop, .setup = &util.installUnmask, .inspect = &LoopDone.declined });
 }
 
 /// The native leg reached the chain's call A: a linked burst ran the inner
@@ -242,7 +244,7 @@ test "doc 61 §8: a φ the dead-φ filter drops leaves the same heap in every ti
         \\for k = 1, 5000 do local junk = {} end
         \\local x = string.char(1400)
         \\print({})
-    , "table: 0x17ba\n", "table: 0x17ba\n", .{});
+    , "table: 0x17bd\n", "table: 0x17bd\n", .{});
 }
 
 /// Doc 61 §9b witness: an ordinary (non-precise) allocating trace ran, and
@@ -278,7 +280,7 @@ test "doc 61 §9b: an allocating trace's dropped φ leaves the same heap in ever
         \\for k = 1, 5000 do local junk = {} end
         \\local x = tostring(1400)
         \\print({})
-    , "table: 0x1626\n", "table: 0xb0d6\n", .{ .inspect = &ranAllocatingTrace });
+    , "table: 0x1629\n", "table: 0xb0d9\n", .{ .inspect = &ranAllocatingTrace });
 }
 
 // Site 3's exit-snapshot programs live with the register probe

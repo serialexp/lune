@@ -1608,7 +1608,7 @@ test "doc 66 P1: `itern` steps a table exactly as the `next` native does" {
         \\for k, v in next, { 1, 2, 3 }, 1 do io.write(k, v, " ") end
         \\for k, v in next, { 1, 2, 3 }, 2.0 do io.write(k, v, " ") end
         \\local m = { 1, p = "P", q = "Q" }
-        \\for k, v in next, m, next(m, 1) do io.write(k, v, " ") end
+        \\for k, v in next, m, (next(m, 1)) do io.write(k, v, " ") end
         \\local grid = { { 1, 2 }, { 3, 4 } }
         \\grid[1][1] = 10
         \\local rows = 0
@@ -3605,23 +3605,24 @@ test "doc 61 §5 site 2: a non-maskable proto keeps every φ" {
 }
 
 /// Doc 61 §5 site 5: the inner loop's control variable `i` (r12, `R[a+3]`)
-/// holds a string at its last iteration and is dead after the loop, so the
-/// linked loop-done flush may skip it. Every eighth outer trip, `reg`
-/// collects and reads r12 after the loop; the probe's condition is computed
-/// before the loop and the call sits at r9, so nothing after the loop
-/// writes r12 first. A maskable `f` has it scrubbed in every tier, a
-/// non-maskable one has the final iteration's "30" in every tier. `PRE`
-/// runs before `f`.
+/// is dead after the loop, so the linked loop-done flush may skip it. Every
+/// eighth outer trip, `reg` collects and reads r12 after the loop; the
+/// probe's condition is computed before the loop and the call sits at r9,
+/// so nothing after the loop writes r12 first. A maskable `f` has it
+/// scrubbed in every tier, a non-maskable one has the final iteration's 30
+/// in every tier. (`i` is read-only, doc 76 D6, so it holds a number, which
+/// the scrub clears as it would a string; `tostring` keeps the trace
+/// allocating.) `PRE` runs before `f`.
 fn linkedForProbeSource(comptime pre: []const u8) [:0]const u8 {
     return
     \\local function f(n)
     \\  local c, same, nils = 0, 0, 0
     \\  for j = 1, 40 do
     \\    local probe = j % 8 == 0
-    \\    for i = 1, n do i = tostring(i) c = c + #i end
+    \\    for i = 1, n do c = c + #tostring(i) end
     \\    if probe then
     \\      local v = reg(12)
-    \\      if v == tostring(n) then same = same + 1 elseif v == nil then nils = nils + 1 end
+    \\      if v == n then same = same + 1 elseif v == nil then nils = nils + 1 end
     \\    end
     \\  end
     \\  return c, same, nils

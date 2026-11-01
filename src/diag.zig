@@ -61,6 +61,11 @@ pub const Code = enum(u16) {
     expected_assign_after_key = 133,
     expected_rbrace = 134,
     nesting_too_deep = 135,
+    expected_attribute_name = 136,
+    expected_attribute_close = 137,
+    unknown_attribute = 138,
+    global_close = 139,
+    multiple_close = 140,
 
     // ---- compiler ----
     function_too_large = 201,
@@ -72,6 +77,8 @@ pub const Code = enum(u16) {
     too_many_parameters = 207,
     too_many_nested_functions = 208,
     too_many_arguments = 209,
+    undeclared_variable = 210,
+    assign_to_const = 211,
 
     // ---- string literals ----
     hex_escape_digits = 301,
@@ -144,6 +151,11 @@ pub const Code = enum(u16) {
             .expected_assign_after_key => "expected '=' after table key",
             .expected_rbrace => "expected '}' to close table",
             .nesting_too_deep => "too deeply nested (more than 200 levels)",
+            .expected_attribute_name => "expected attribute name after '<'",
+            .expected_attribute_close => "expected '>' to close attribute",
+            .unknown_attribute => "unknown attribute (expected 'const' or 'close')",
+            .global_close => "a global cannot be to-be-closed",
+            .multiple_close => "more than one to-be-closed variable in one list",
 
             .function_too_large => "function too large (2^31 instruction limit)",
             .too_many_registers => "function needs too many registers",
@@ -154,6 +166,8 @@ pub const Code = enum(u16) {
             .too_many_parameters => "too many parameters",
             .too_many_nested_functions => "too many nested functions",
             .too_many_arguments => "too many arguments",
+            .undeclared_variable => "variable not declared (a 'global' declaration is in scope)",
+            .assign_to_const => "cannot assign to a const variable",
 
             .hex_escape_digits => "\\x escape needs exactly two hex digits",
             .hex_escape_not_ascii => "\\x escape must be ASCII (<= 0x7F); use \\u{...} for a code point or a byte array for a raw byte",
@@ -183,8 +197,9 @@ pub const Diagnostic = struct {
     severity: Severity,
     code: Code,
     /// Human-readable. Usually `code.message()`; a diagnostic that names
-    /// something (the unknown-global lint) formats its own. Whoever added it
-    /// keeps the bytes alive for as long as the sink is read.
+    /// something (the unknown-global lint) formats its own through
+    /// `Diagnostics.addFmt`, and the sink owns that text: it lives as long as
+    /// the sink, whatever became of what was being compiled.
     message: []const u8,
     /// Byte span into the source: `[start, end)`.
     start: u32,
@@ -199,6 +214,8 @@ pub const Diagnostic = struct {
 pub const Diagnostics = struct {
     list: std.ArrayList(Diagnostic) = .empty,
     gpa: std.mem.Allocator,
+    /// The messages `addFmt` formatted.
+    owned: std.ArrayList([]u8) = .empty,
     /// A diagnostic was lost to an allocation failure: what is here is not the
     /// whole story, so a client must not present it as a clean result.
     incomplete: bool = false,
@@ -209,6 +226,8 @@ pub const Diagnostics = struct {
 
     pub fn deinit(self: *Diagnostics) void {
         self.list.deinit(self.gpa);
+        for (self.owned.items) |m| self.gpa.free(m);
+        self.owned.deinit(self.gpa);
     }
 
     pub fn add(self: *Diagnostics, d: Diagnostic) void {
@@ -218,6 +237,24 @@ pub const Diagnostics = struct {
         self.list.append(self.gpa, d) catch {
             self.incomplete = true;
         };
+    }
+
+    /// Add `d` with a message formatted from `fmt` and `args`, which the sink
+    /// keeps. Like `add`, a failed allocation drops it and marks the sink
+    /// incomplete.
+    pub fn addFmt(self: *Diagnostics, d: Diagnostic, comptime fmt: []const u8, args: anytype) void {
+        const msg = std.fmt.allocPrint(self.gpa, fmt, args) catch {
+            self.incomplete = true;
+            return;
+        };
+        self.owned.append(self.gpa, msg) catch {
+            self.gpa.free(msg);
+            self.incomplete = true;
+            return;
+        };
+        var with = d;
+        with.message = msg;
+        self.add(with);
     }
 
     /// Report an error with the code's own message.
@@ -270,6 +307,13 @@ test "a related span travels with its diagnostic" {
     const r = diags.list.items[0].related.?;
     try std.testing.expectEqual(@as(u32, 0), r.start);
     try std.testing.expectEqualStrings("'if' opened here", r.label);
+}
+
+test "a formatted message belongs to the sink" {
+    var diags = Diagnostics.init(std.testing.allocator);
+    defer diags.deinit();
+    diags.addFmt(.{ .severity = .warning, .code = .undefined_global, .message = undefined, .start = 0, .end = 1, .line = 1 }, "undefined global '{s}'", .{"x"});
+    try std.testing.expectEqualStrings("undefined global 'x'", diags.list.items[0].message);
 }
 
 test "an allocation failure marks the sink incomplete instead of vanishing" {

@@ -207,7 +207,7 @@ fn closeEnter(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
     switch (statusOf(vm, co)) {
         .running => return raise(vm, "cannot close a running coroutine"),
         .normal => return raise(vm, "cannot close a normal coroutine"),
-        .suspended => vm.closeCoroutine(co),
+        .suspended => try vm.closeCoroutine(co),
         .dead => {},
     }
     if (out.len == 0) return 0;

@@ -1745,6 +1745,16 @@ pub const RecordingSession = struct {
             // Doc 30 c4: the generic-for back-edge — mirrors the CONTINUE
             // direction (first loop var non-nil → publish it as ctrl).
             .tfor_loop => try self.recTForLoop(instr, regs, pc),
+            // Doc 76 §6: a trace runs a to-be-closed scope only while its
+            // values are nil or false, which need no `__close` (a generic
+            // `for`'s closing value, nearly always): pinned so, `tbc` and
+            // `close` record nothing else. A closable value aborts.
+            .tbc => _ = try self.pinUnclosable(instr.a, regs),
+            .close => try self.recCloseScope(proto, pc - 1, instr.a, regs),
+            // `tbc` of the closing value as it moves down, then the jump,
+            // which records nothing (as `jmp`).
+            .tfor_prep => if (try self.pinUnclosable(instr.a + 4, regs))
+                self.setReg(instr.a, try self.refOf(instr.a + 4)),
             // Nested-loop trace linking (doc 15, Phase 2). A continuation recording
             // re-reaching an inner numeric-`for`'s `for_prep` whose loop header
             // already has a root trace records `for_prep`'s pre-decrement and closes
@@ -1763,22 +1773,7 @@ pub const RecordingSession = struct {
             // (doc 27) instead of aborting.
             .call => try self.recCall(instr, regs, proto, multret),
             .itern => try self.recItern(instr, regs, proto, multret),
-            .ret => if (self.inline_depth == 0)
-                // Depth-0 return. A one-shot recording (`.head`/`.cont`,
-                // doc 44) CLOSES here — the one-shot terminal, set before
-                // tier-0 executes the ret — unless the ret window is dynamic
-                // (`b == all_results` reads `multret_top`, which trace
-                // execution never sets: refused, codex round-1 change 4). A
-                // loop root still aborts (LLEAVE): it must not leave the loop.
-                (if (isOneShotKind(self.kind))
-                    (if (instr.b == bytecode.all_results)
-                        self.closeDynamicTerminal(.return_interp, instr.a, multret)
-                    else
-                        self.closeHeadTerminal(.return_interp, 0))
-                else
-                    self.abort(.cross_frame))
-            else
-                try self.recReturn(instr, multret),
+            .ret, .ret_close => try self.recRet(instr, regs, proto, pc, multret),
             // `.halt` ends the top-level chunk; never a return from an inlined
             // callee. Always a barrier.
             .halt => self.abort(.cross_frame),
@@ -3611,6 +3606,51 @@ pub const RecordingSession = struct {
         try self.guardNum(rb, vb, .operand_type, f.lhs_od);
         try self.guardNum(rc, vc, .operand_type, f.rhs_od);
         return try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
+    }
+
+    /// `ret`, and doc 76's `ret_close` once its closes are known to close
+    /// nothing (`recCloseScope`).
+    fn recRet(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, multret: ?u32) !void {
+        if (instr.op == .ret_close) {
+            try self.recCloseScope(proto, pc - 1, 0, regs);
+            if (!self.active) return;
+        }
+        if (self.inline_depth > 0) return self.recReturn(instr, multret);
+        // Depth-0 return. A one-shot recording (`.head`/`.cont`, doc 44)
+        // CLOSES here — the one-shot terminal, set before tier-0 executes the
+        // ret — unless the ret window is dynamic (`b == all_results` reads
+        // `multret_top`, which trace execution never sets: refused, codex
+        // round-1 change 4). A loop root still aborts (LLEAVE): it must not
+        // leave the loop.
+        if (!isOneShotKind(self.kind)) return self.abort(.cross_frame);
+        if (instr.b == bytecode.all_results)
+            self.closeDynamicTerminal(.return_interp, instr.a, multret)
+        else
+            self.closeHeadTerminal(.return_interp, 0);
+    }
+
+    /// Doc 76 §6: the to-be-closed value in `reg` is nil or false when the
+    /// trace runs, pinned with a guard unless it is a constant. Any other
+    /// value aborts the recording (its `__close` is a call no trace makes),
+    /// and so does a typed producer, which no guard pins; returns false then.
+    fn pinUnclosable(self: *RecordingSession, reg: u16, regs: RegWindow) !bool {
+        const v = regs.get(reg);
+        if (v.isTruthy() or try self.pinPrim(try self.refOf(reg), v, .a) == null) {
+            self.abort(.nyi_opcode);
+            return false;
+        }
+        return true;
+    }
+
+    /// Doc 76 §6: `close from` at instruction `cur` of `proto` (or
+    /// `ret_close`, from 0). The trace runs it only while it closes nothing:
+    /// every to-be-closed value in scope there, from `from` up, is pinned to
+    /// nil or false.
+    fn recCloseScope(self: *RecordingSession, proto: *const Proto, cur: u32, from: u16, regs: RegWindow) !void {
+        for (proto.tbc_vars) |tv| {
+            if (tv.reg < from or !tv.openAt(cur)) continue;
+            if (!try self.pinUnclosable(tv.reg, regs)) return;
+        }
     }
 
     /// `jmp_if_false`/`jmp_if_true`: pin the *observed* truthiness of the tested

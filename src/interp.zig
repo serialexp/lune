@@ -113,6 +113,12 @@ pub const Error = error{
     /// `for_prep` before the loop runs, as Lua 5.4's `forprep` does; without
     /// it the loop never ends.
     ForStepZero,
+    /// Doc 76 §3.3: `global x = v` (a `def_global`) found `x` already set, as
+    /// Lua 5.5's `ERRNNIL` does.
+    GlobalDefined,
+    /// Doc 76 §6: a `tbc` found a value that is not nil, false, or a value
+    /// with a `__close` metamethod.
+    NonClosable,
     /// Replay's recorded `unicode_version` effect (S-C) names a Unicode version
     /// that differs from the one this binary's case table was compiled against.
     /// `upper`/`lower` would map differently, breaking byte-identical replay, so
@@ -835,6 +841,9 @@ const MetamethodNames = struct {
     call: Value = Value.nil(),
     /// `"__tostring"` — `tostring(v)` / `print(v)`; must return a string.
     tostring: Value = Value.nil(),
+    /// `"__close"` — a to-be-closed variable's value going out of scope:
+    /// `h(value, err)` (doc 76 §6).
+    close: Value = Value.nil(),
 };
 
 pub const Vm = struct {
@@ -1464,6 +1473,7 @@ pub const Vm = struct {
         const fmt = try self.heap.newTable();
         try fmt.set(self.gpa, self.mm.index, Value.heap(&methods.header));
         try fmt.set(self.gpa, try self.heap.internValue("__name"), try self.heap.internValue("FILE*"));
+        try fmt.set(self.gpa, self.mm.close, self.globals.get(try self.heap.internValue(stdio.file_close_name)));
         self.file_metatable = fmt;
         const out = try self.newStdStream(system.stdout_id, .stdout, .write, "stdout");
         _ = try self.newStdStream(system.stderr_id, .stderr, .write, "stderr");
@@ -2806,6 +2816,11 @@ pub const Vm = struct {
             Error.DivisionByZero => try arena.dupe(u8, "attempt to perform integer division or modulo by zero"),
             Error.MetatableChainLoop => try arena.dupe(u8, "'__index' chain too long; possible loop"),
             Error.ForStepZero => try arena.dupe(u8, "'for' step is zero"),
+            Error.GlobalDefined => try std.fmt.allocPrint(arena, "global '{s}' already defined", .{string.String.fromHeader(proto.constants[instr.b].asHeap()).bytes()}),
+            Error.NonClosable => try std.fmt.allocPrint(arena, "variable '{s}' got a non-closable value", .{if (instr.op == .tfor_prep)
+                "(for state)"
+            else
+                string.String.fromHeader(proto.constants[instr.b].asHeap()).bytes()}),
             // Doc 66 P3: the register and constant forms alike, over the
             // operands in source order.
             else => if (bytecode.arithFormOf(instr.op)) |f| blk: {
@@ -3726,6 +3741,128 @@ pub const Vm = struct {
         };
     }
 
+    // ---- doc 76 §6: to-be-closed variables ----
+
+    /// `close` (`from` its operand) or `ret_close` (`from` 0) at instruction
+    /// `pc` of the top frame: close the frame's to-be-closed variables in
+    /// scope there in registers `>= from`, highest first, `__close(v, nil)`
+    /// for each that is not nil or false. An error one raises is passed to
+    /// the rest, then raised.
+    fn closeTop(self: *Vm, pc: usize, from: u16) Error!void {
+        const slot = try self.parkTemp(Value.nil());
+        const raised = try self.closeFrameVars(self.depth - 1, pc, from, false, slot);
+        const err = self.unparkTemp(slot);
+        if (raised) {
+            self.pending_error = err;
+            return Error.LuaError;
+        }
+    }
+
+    /// `ret_close`'s closes, at instruction `pc`. For `return f()` the
+    /// values wait in the multret span `ret_close` consumes, which may reach
+    /// past the frame's window: `stack_top` covers it while the closes make
+    /// calls of their own, and the span is pending again for `ret` after.
+    fn closeForReturn(self: *Vm, pc: usize, multret: bool) Error!void {
+        const saved_top = self.stack_top;
+        const span_top = self.reg_top;
+        if (multret) {
+            std.debug.assert(self.reg_top_pending);
+            self.reg_top_pending = false;
+            self.stack_top = @max(saved_top, span_top);
+        }
+        // An error leaves `stack_top` raised for the catcher, and nothing
+        // pending: a fault never does.
+        try self.closeTop(pc, 0);
+        self.stack_top = saved_top;
+        if (multret) self.setPendingTop(span_top);
+    }
+
+    /// Close the to-be-closed variables of frame `fi`, at instruction `fpc`,
+    /// in registers `>= from`, highest first: `__close(v, err)` for each one
+    /// that is not nil or false. `unwinding`: for an error unwinding through
+    /// the frame, so the ones `TbcVar.isLiveAt` `fpc`; else for the `close`
+    /// or `ret_close` at `fpc`, so the ones `openAt` it. `err` is the value
+    /// in stack slot `err_slot`, rooted by the caller; an error a `__close`
+    /// raises replaces it there, for the rest. Returns whether one did.
+    fn closeFrameVars(self: *Vm, fi: u32, fpc: usize, from: u16, unwinding: bool, err_slot: usize) Error!bool {
+        const proto = self.frames[fi].closure.proto;
+        const base = self.frames[fi].base;
+        var raised = false;
+        var i = proto.tbc_vars.len;
+        while (i > 0) {
+            i -= 1;
+            const tv = proto.tbc_vars[i];
+            if (tv.reg < from) continue;
+            if (!(if (unwinding) tv.isLiveAt(proto.code, fpc) else tv.openAt(fpc))) continue;
+            const v = self.regGet(base + tv.reg);
+            if (!v.isTruthy()) continue;
+            if (try self.callClose(v, self.regGet(err_slot))) |e| {
+                self.regSet(err_slot, e);
+                raised = true;
+            }
+        }
+        return raised;
+    }
+
+    /// Call `v`'s `__close(v, err)`, protected: an error it raises is
+    /// returned as a value once its frames, their own to-be-closed variables
+    /// closed first, are discarded, as `pcall`'s would be. An error nothing
+    /// may catch propagates.
+    fn callClose(self: *Vm, v: Value, err: Value) Error!?Value {
+        const handler = self.metamethod(v, self.mm.close);
+        // The metamethod can be gone since the `tbc` checked for it.
+        if (!self.isCallable(handler)) {
+            var msg_buf: [64]u8 = undefined;
+            return try self.heap.internValue(std.fmt.bufPrint(&msg_buf, "attempt to call a {s} value (metamethod 'close')", .{handler.typeName()}) catch unreachable);
+        }
+        const entry_depth = self.depth;
+        const entry_top = self.stack_top;
+        const entry_in_flight = entry_depth > 0 and self.frames[entry_depth - 1].in_flight;
+        _ = self.callValue(handler, &.{ v, err }, &.{}) catch |e| {
+            if (!catchable(e)) return e;
+            const errval = self.pending_error orelse try self.synthErrorValue(e);
+            self.pending_error = null;
+            self.reg_top_pending = false;
+            const final = (try self.closeUnwound(entry_depth, errval, &.{}, true)) orelse errval;
+            self.unwindTo(entry_depth, entry_top);
+            if (entry_depth > 0) self.frames[entry_depth - 1].in_flight = entry_in_flight;
+            return final;
+        };
+        return null;
+    }
+
+    /// Doc 76 §6.3: before a catcher discards frames `[lo, depth)`, close
+    /// their to-be-closed variables, top frame first, passing `err`. `keep`
+    /// are values the catcher holds off the stack (an `xpcall` handler's
+    /// results): rooted meanwhile, and put back after, since the closes'
+    /// calls may use the scratch they sit in. `at_fault`: the top frame is
+    /// at the instruction that raised (an error unwinding), not suspended
+    /// past a call (`coroutine.close`). Returns the error a `__close` raised
+    /// last, or null if none did.
+    fn closeUnwound(self: *Vm, lo: u32, err: Value, keep: []Value, at_fault: bool) Error!?Value {
+        const top = self.depth;
+        for (self.frames[lo..top]) |*f| {
+            if (f.closure.proto.tbc_vars.len != 0) break;
+        } else return null;
+        const slot = self.stack_top;
+        if (slot + 1 + keep.len > self.regCapacity()) return Error.StackOverflow;
+        self.regSet(slot, err);
+        for (keep, 0..) |v, k| self.regSet(slot + 1 + k, v);
+        self.stack_top = slot + 1 + keep.len;
+        var raised = false;
+        var i = top;
+        while (i > lo) {
+            i -= 1;
+            const f = &self.frames[i];
+            if (f.closure.proto.tbc_vars.len == 0) continue;
+            const fpc: usize = if ((at_fault and i == top - 1) or f.in_flight) f.pc else f.pc -| 1;
+            if (try self.closeFrameVars(i, fpc, 0, true, slot)) raised = true;
+        }
+        for (keep, 0..) |*v, k| v.* = self.regGet(slot + 1 + k);
+        self.stack_top = slot;
+        return if (raised) self.regGet(slot) else null;
+    }
+
     /// `pcall(f, ...)`/`xpcall(f, h, ...)` (`args` as the natives get them)
     /// protected in Zig: `f` runs through `callValue`, so nothing it runs can
     /// be suspended. For a callee without a frame to tag (a native, a callable
@@ -3779,6 +3916,13 @@ pub const Vm = struct {
                     break :blk 1;
                 };
             } else if (results.len > 0) results[0] = errval;
+            // Doc 76 §6.3: the faulting frames' `__close`s get the error the
+            // call returns, and an error one raises replaces it.
+            const kept = results[0..@min(n, results.len)];
+            if (try self.closeUnwound(entry_depth, if (kept.len > 0) kept[0] else errval, kept, true)) |e2| {
+                n = 1;
+                if (results.len > 0) results[0] = e2;
+            }
             // Discard the faulting (and handler) frames, closing their open
             // upvalues first so an escaped closure keeps its value once
             // `stack_top` drops below their slots.
@@ -4509,6 +4653,12 @@ pub const Vm = struct {
                 break :blk 1;
             };
         } else out[0] = errval;
+        // Doc 76 §6.3: the discarded frames' `__close`s get the error the
+        // call returns, and an error one raises replaces it.
+        if (try self.closeUnwound(p, out[0], out[0..n], true)) |e2| {
+            out[0] = e2;
+            n = 1;
+        }
         // Discard the protected frame and the frames above it. Each sits
         // at or above the end of its window, so that is where their open
         // upvalues start; the parent (suspended at its `.call`) survives.
@@ -4691,12 +4841,18 @@ pub const Vm = struct {
             return false;
         }
         // The value comes from the faulting frames, still live.
-        const errval = self.pending_error orelse self.synthErrorValue(e) catch |e2| {
+        const raw = self.pending_error orelse self.synthErrorValue(e) catch |e2| {
             self.leaveUntil(entry_ctx);
             return e2;
         };
         self.pending_error = null;
         self.reg_top_pending = false;
+        // Doc 76 §6.3: the coroutine's `__close`s run as it dies.
+        const closed = self.closeUnwound(0, raw, &.{}, true) catch |e2| {
+            self.leaveUntil(entry_ctx);
+            return e2;
+        };
+        const errval = closed orelse raw;
         // What `catchProtected` does: the JIT forgets the raise.
         self.trace.abortRaised();
         self.trace.clearPendingExitAnchor();
@@ -4743,9 +4899,25 @@ pub const Vm = struct {
     }
 
     /// `coroutine.close` of suspended coroutine `co`: discard its frames,
-    /// closing their upvalues, and free its stack.
-    pub fn closeCoroutine(self: *Vm, co: *coroutine.Thread) void {
+    /// closing their upvalues, and free its stack. Doc 76 §6.3: its pending
+    /// to-be-closed variables close first, on its own stack, as if it ran;
+    /// an error one raises becomes `co.death`, which `close` returns.
+    pub fn closeCoroutine(self: *Vm, co: *coroutine.Thread) Error!void {
         std.debug.assert(co.status == .suspended);
+        for (co.saved.frames[0..co.saved.depth]) |*f| {
+            if (f.closure.proto.tbc_vars.len != 0) break;
+        } else return self.discardCoroutine(co);
+        const r = self.current;
+        self.switchInto(co);
+        co.death = self.closeUnwound(0, Value.nil(), &.{}, false) catch |e| {
+            self.leaveUntil(r);
+            return e;
+        };
+        self.leaveRunning(.dead);
+    }
+
+    /// `closeCoroutine` of a coroutine with nothing to close.
+    fn discardCoroutine(self: *Vm, co: *coroutine.Thread) void {
         // A cell reads its slot through its lane pointers, wherever the
         // stack is.
         for (co.saved.open_upvalues.items) |ou| ou.cell.closeWith(ou.cell.get());
@@ -4807,13 +4979,18 @@ pub const Vm = struct {
                 self.leaveUntil(co.resumer);
                 return e;
             }
-            const errval = self.pending_error orelse self.synthErrorValue(e) catch |e2| {
+            const raw = self.pending_error orelse self.synthErrorValue(e) catch |e2| {
                 self.leaveUntil(co.resumer);
                 return e2;
             };
             self.pending_error = null;
             self.reg_top_pending = false;
-            co.death = errval;
+            // Doc 76 §6.3: the coroutine's `__close`s run as it dies.
+            const closed = self.closeUnwound(0, raw, &.{}, true) catch |e2| {
+                self.leaveUntil(co.resumer);
+                return e2;
+            };
+            co.death = closed orelse raw;
             self.leaveRunning(.dead);
             return null;
         };
@@ -7946,10 +8123,15 @@ pub const Vm = struct {
             .intrinsic => opIntrinsic(mode),
             .get_global => opGetGlobal(mode),
             .set_global => opSetGlobal(mode),
+            .def_global => opDefGlobal(mode),
             .closure => opClosure(mode),
             .get_upval => opGetUpval(mode),
             .set_upval => opSetUpval(mode),
             .close_upvalues => opCloseUpvalues(mode),
+            .tbc => opTbc(mode),
+            .tfor_prep => opTforPrep(mode),
+            .close => opClose(mode),
+            .ret_close => opRetClose(mode),
             .loop => opLoop(mode),
             .call => opCall(mode),
             .ret, .halt => opRet(mode),
@@ -9869,6 +10051,25 @@ pub const Vm = struct {
         }.h;
     }
 
+    /// Doc 76 §3.3: `set_global`, refusing a global that is already set.
+    fn opDefGlobal(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const v = regs.get(instr.a);
+                const key = st.proto.constants[instr.b];
+                const hints = st.proto.global_slot_hints;
+                const hint: ?*u32 = if (instr.b < hints.len) &hints[instr.b] else null;
+                const old = if (hint) |h_| vm.globals.getHinted(key, h_) else vm.globals.get(key);
+                if (!old.isNil()) return parkErr(st, Error.GlobalDefined);
+                const stored = if (hint) |h_| vm.globals.setHinted(vm.gpa, key, v, h_) else vm.globals.set(vm.gpa, key, v);
+                stored catch |e| return parkErr(st, e);
+                vm.heap.writeBarrier(&vm.globals.header, v);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
     // ---- functions ----
     fn opClosure(comptime mode: ExecMode) *const HandlerFn {
         return struct {
@@ -9929,6 +10130,90 @@ pub const Vm = struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 vm.closeUpvaluesFrom(st.base + instr.a);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Doc 76 §6: `tbc a, b`, where a to-be-closed variable is declared.
+    fn opTbc(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const v = regs.get(instr.a);
+                if (v.isTruthy() and vm.metamethod(v, vm.mm.close).isNil()) return parkErr(st, Error.NonClosable);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Doc 76 §6.3: `tfor_prep a, aux`, a generic `for` with a closing value
+    /// entering: `tbc` of R[a+4] moved to R[a], then the jump to the test.
+    fn opTforPrep(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const v = regs.get(@as(usize, instr.a) + 4);
+                regs.set(instr.a, v);
+                if (v.isTruthy() and vm.metamethod(v, vm.mm.close).isNil()) return parkErr(st, Error.NonClosable);
+                return dispatchTail(mode, st, applyJump(pc, instr.aux), vm);
+            }
+        }.h;
+    }
+
+    /// Whether the to-be-closed variables of `proto` in scope at `pc`, in
+    /// registers `>= from` of window `regs`, are all nil or false, so that
+    /// closing them runs nothing. The common case by far: a generic `for`'s
+    /// closing value is nearly always nil.
+    inline fn closesNothing(proto: *const Proto, regs: RegWindow, pc: usize, from: u16) bool {
+        for (proto.tbc_vars) |tv| {
+            if (tv.reg >= from and tv.openAt(pc) and regs.get(tv.reg).isTruthy()) return false;
+        }
+        return true;
+    }
+
+    /// Doc 76 §6: `close a`, where to-be-closed variables go out of scope.
+    /// Call-free unless a `__close` has to run (`opCloseSlow`).
+    fn opClose(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                if (!closesNothing(st.proto, regs, pc - 1, instr.a))
+                    return @call(.always_tail, opCloseSlow(mode), .{ st, pc, instr, vm, tags, payloads });
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    fn opCloseSlow(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                @branchHint(.cold); // keep outlined — see gcTrampoline's note
+                vm.closeTop(pc - 1, instr.a) catch |e| return parkErr(st, e);
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// Doc 76 §6: `ret_close a, b`, a `return` in the scope of to-be-closed
+    /// variables: they close, then it is `ret`. Straight to `ret` when that
+    /// runs nothing.
+    fn opRetClose(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                if (!closesNothing(st.proto, regs, pc - 1, 0))
+                    return @call(.always_tail, opRetCloseSlow(mode), .{ st, pc, instr, vm, tags, payloads });
+                return @call(.always_tail, opRet(mode), .{ st, pc, instr, vm, tags, payloads });
+            }
+        }.h;
+    }
+
+    fn opRetCloseSlow(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                @branchHint(.cold); // keep outlined — see gcTrampoline's note
+                vm.closeForReturn(pc - 1, instr.b == bytecode.all_results) catch |e| return parkErr(st, e);
+                return @call(.always_tail, opRet(mode), .{ st, pc, instr, vm, tags, payloads });
             }
         }.h;
     }
@@ -10485,10 +10770,10 @@ pub const Vm = struct {
                 // `return unpack(t)`) returns everything the
                 // immediately-preceding multret call left, from `a` up to
                 // `reg_top`.
-                const ret_count: u16 = if (instr.op == .ret and instr.b == bytecode.all_results) blk: {
+                const ret_count: u16 = if (instr.op != .halt and instr.b == bytecode.all_results) blk: {
                     self.reg_top_pending = false;
                     break :blk @intCast(self.reg_top - (base + a));
-                } else if (instr.op == .ret) instr.b else 0;
+                } else if (instr.op != .halt) instr.b else 0;
                 const result: FrameResult = .{ .reg = @intCast(a), .count = ret_count };
                 if (self.depth == st.stop_depth) {
                     // Doc 73: the body frame of a coroutine this dispatch
@@ -11804,6 +12089,8 @@ pub fn catchable(e: Error) bool {
         Error.Unimplemented,
         Error.MetatableChainLoop,
         Error.ForStepZero,
+        Error.GlobalDefined,
+        Error.NonClosable,
         => true,
         Error.OutOfMemory,
         Error.EffectLogExhausted,
@@ -12433,6 +12720,7 @@ test {
     _ = @import("interp_os_test.zig");
     _ = @import("interp_proc_test.zig");
     _ = @import("interp_lua_compat_test.zig");
+    _ = @import("interp_attrib_test.zig");
     _ = @import("interp_modules_test.zig");
     _ = @import("interp_replay_test.zig");
     _ = @import("interp_dispatch_test.zig");

@@ -21,6 +21,9 @@
 //!   * a register captured by any child closure (`UpvalDesc.in_stack`) is
 //!     live at EVERY pc — an open upvalue aliases the register, and any call
 //!     may read it through the closure;
+//!   * so is a register holding a to-be-closed variable (doc 76 §6): a
+//!     `close`, or an error unwinding through the frame at any pc in its
+//!     scope, reads it;
 //!   * a multret CONSUMER (`call`/`ret` with `b == all_results`) reads
 //!     `R[a..num_registers)`;
 //!   * writes whose extent is dynamic (`call` with `c == all_results`,
@@ -240,11 +243,22 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.use(ins.c);
             e.succ[0] = next;
         },
-        .set_global, .set_upval => {
+        .set_global, .def_global, .set_upval => {
             e.use(a);
             e.succ[0] = next;
         },
         .close_upvalues => e.succ[0] = next, // reads captured regs only
+        .tbc => {
+            e.use(a);
+            e.succ[0] = next;
+        },
+        .tfor_prep => {
+            e.use(a + 4);
+            e.kill(a, a + 1);
+            e.succ[0] = jumpTarget(pc, ins.aux, code_len);
+        },
+        // Reads to-be-closed registers only, which are pinned live.
+        .close => e.succ[0] = next,
         // Doc 58: a loop marker reads and writes nothing and always falls
         // through; its `aux` is the loop's exit offset, not a branch.
         .loop => e.succ[0] = next,
@@ -312,7 +326,8 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.use(ins.c);
             e.succ[0] = next;
         },
-        .ret => {
+        // `ret_close`'s closes read only to-be-closed registers, pinned.
+        .ret, .ret_close => {
             e.useRange(a, if (ins.b == bytecode.all_results) to_top else a + @as(u32, ins.b));
             // No successor: the frame is gone.
         },
@@ -337,6 +352,7 @@ pub fn compute(
     code: []const Instr,
     num_registers: u16,
     children: []const *const Proto,
+    tbc_vars: []const bytecode.TbcVar,
 ) std.mem.Allocator.Error!RegLiveness {
     if (num_registers == 0 or code.len == 0) return .{};
     const words: usize = (@as(usize, num_registers) + 63) / 64;
@@ -360,11 +376,7 @@ pub fn compute(
         var r: u32 = 0;
         while (r < num_registers) : (r += 1) setBit(valid, r);
     }
-    for (children) |child| {
-        for (child.upvalues) |uv| {
-            if (uv.in_stack and uv.index < num_registers) setBit(captured, uv.index);
-        }
-    }
+    markPinned(captured, num_registers, children, tbc_vars);
 
     // Effects are re-decoded on each use rather than cached: an `Effect`
     // array is ~48 bytes per instruction of fresh memory, and page-faulting
@@ -530,7 +542,9 @@ fn visit(
 /// first free register, so it always holds on compiled code; a proto that
 /// fails it (hand-built) is scanned whole and keeps every JIT store.
 /// Captured registers are exempt: an open one is rooted by its upvalue
-/// alias, and a closed one is never read through the stack.
+/// alias, and a closed one is never read through the stack. So are
+/// to-be-closed ones: in a variable's scope every call sits above it, and
+/// before its declaration its register holds nothing it needs.
 /// O(calls × words), no allocation beyond `words` scratch words.
 pub fn maskable(
     scratch: std.mem.Allocator,
@@ -538,17 +552,14 @@ pub fn maskable(
     live: RegLiveness,
     num_registers: u16,
     children: []const *const Proto,
+    tbc_vars: []const bytecode.TbcVar,
 ) std.mem.Allocator.Error!bool {
     if (!live.available()) return false;
     const words: usize = live.words;
     const captured = try scratch.alloc(u64, words);
     defer scratch.free(captured);
     @memset(captured, 0);
-    for (children) |child| {
-        for (child.upvalues) |uv| {
-            if (uv.in_stack and uv.index < num_registers) setBit(captured, uv.index);
-        }
-    }
+    markPinned(captured, num_registers, children, tbc_vars);
     for (code, 0..) |code_ins, pc| {
         const ins = bytecode.callOperandsOf(code_ins) orelse continue;
         if (ins.c == bytecode.all_results) {
@@ -579,6 +590,19 @@ pub fn maskable(
         }
     }
     return true;
+}
+
+/// Set in `mask` every register live at every pc whatever the code does: the
+/// ones a child closure captures and the ones holding a to-be-closed variable.
+fn markPinned(mask: []u64, num_registers: u16, children: []const *const Proto, tbc_vars: []const bytecode.TbcVar) void {
+    for (children) |child| {
+        for (child.upvalues) |uv| {
+            if (uv.in_stack and uv.index < num_registers) setBit(mask, uv.index);
+        }
+    }
+    for (tbc_vars) |v| {
+        if (v.reg < num_registers) setBit(mask, v.reg);
+    }
 }
 
 /// The base `p` of a dynamic producer at `i` (`call` with `c = all_results`,
@@ -638,7 +662,7 @@ fn survivorsOfConsumer(code: []const Instr, producers: []const u64, bits: []cons
     var j = consumer;
     while (true) {
         const ins = code[j];
-        if (ins.op == .ret or j + 1 >= code.len) return;
+        if (ins.op == .ret or ins.op == .ret_close or j + 1 >= code.len) return;
         const after = bits[(j + 1) * words ..][0..words];
         if (testBit(producers, j)) {
             const a: u32 = ins.a;
@@ -693,7 +717,7 @@ fn liveSet(l: RegLiveness, pc: u32, n: u16) u64 {
 }
 
 fn computeT(code: []const Instr, n: u16, children: []const *const Proto) !RegLiveness {
-    return compute(testing.allocator, testing.allocator, code, n, children);
+    return compute(testing.allocator, testing.allocator, code, n, children, &.{});
 }
 
 fn freeT(l: RegLiveness) void {
@@ -1030,7 +1054,7 @@ test "wide windows span several words; an over-budget proto gets no table" {
 fn maskableT(code: []const Instr, n: u16, children: []const *const Proto) !bool {
     const l = try computeT(code, n, children);
     defer freeT(l);
-    return maskable(testing.allocator, code, l, n, children);
+    return maskable(testing.allocator, code, l, n, children, &.{});
 }
 
 test "doc 61: a register live across a call above its results fails the call-layout check" {
@@ -1118,7 +1142,7 @@ test "doc 61 §5 (B): a consumer that is also a producer must feed an adjacent c
 }
 
 test "doc 61: a proto without liveness is not maskable; the check spans words" {
-    try testing.expect(!try maskable(testing.allocator, &.{}, .{}, 0, &.{}));
+    try testing.expect(!try maskable(testing.allocator, &.{}, .{}, 0, &.{}, &.{}));
     // r130 live across a call based at r70, two words up.
     const wide = [_]Instr{
         Instr.opAx(.load_int, 130, 1), // 0

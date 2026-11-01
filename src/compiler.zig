@@ -119,13 +119,14 @@ pub fn compileWithOptions(
     try session.init(gpa, source, root, opts.known_globals, null);
     defer session.deinit(gpa);
 
-    var c = session.compiler(arena.allocator(), arena.allocator(), gpa, heap, source, diags);
+    var c = session.compiler(arena.allocator(), gpa, heap, source, diags);
     c.is_vararg = opts.vararg_root;
     defer c.deinitScratch();
 
+    if (try c.reportProblems()) return Error.CompileError;
     try c.compileBlock(root);
     // Implicit `return` (no values) at the end of the chunk.
-    _ = try c.emit(Instr.opAB(.ret, 0, 0));
+    try c.emitFinalReturn();
 
     // Post-pass: warn about reads of a global that is never assigned anywhere in
     // the chunk and isn't a builtin. Skipped when the compile already has errors
@@ -148,15 +149,16 @@ pub fn compileWithOptions(
         .name = "main",
         .main_chunk = true,
         .is_vararg = c.is_vararg,
+        .tbc_vars = c.tbc_vars.items,
         // Doc 56 §4.2: per-pc register liveness, from the finished code.
-        .reg_live = try bc_liveness.compute(c.arena, c.scratch, c.code.items, c.max_reg, c.protos.items),
+        .reg_live = try bc_liveness.compute(c.arena, c.scratch, c.code.items, c.max_reg, c.protos.items, c.tbc_vars.items),
         // Doc 58 §4.8: the CFG's dominator tree, from the finished code.
         .dom = try bc_dom.compute(c.arena, c.scratch, c.code.items),
     };
     // Doc 61 §5: from the finished code and its liveness. The compiler's
     // register allocation guarantees the call layout, so only a proto too
     // large for a liveness table may come out unmaskable.
-    proto.maskable = try bc_liveness.maskable(c.scratch, proto.code, proto.reg_live, proto.num_registers, proto.protos);
+    proto.maskable = try bc_liveness.maskable(c.scratch, proto.code, proto.reg_live, proto.num_registers, proto.protos, proto.tbc_vars);
     std.debug.assert(proto.maskable or !proto.reg_live.available());
     // Assign every proto a stable, unique id (pre-order over the proto tree,
     // root = `id_base`). This is the proto's serialization identity — a trace's
@@ -182,9 +184,6 @@ pub fn compileWithOptions(
 /// bytecode is assembled: a chunk compiled this way would be meaningless.
 pub fn checkChunk(
     gpa: std.mem.Allocator,
-    /// Owns the text of the diagnostics that name something; it must outlive
-    /// `diags`.
-    messages: std.mem.Allocator,
     heap: *gc.Heap,
     source: [:0]const u8,
     root: ast.Block,
@@ -200,11 +199,12 @@ pub fn checkChunk(
     try session.init(gpa, source, root, opts.known_globals, resolved);
     defer session.deinit(gpa);
 
-    var c = session.compiler(arena.allocator(), messages, gpa, heap, source, diags);
+    var c = session.compiler(arena.allocator(), gpa, heap, source, diags);
     c.is_vararg = opts.vararg_root;
     c.recover = true;
     defer c.deinitScratch();
 
+    _ = try c.reportProblems();
     try c.compileBlock(root);
     try c.warnUnknownGlobals();
 }
@@ -251,7 +251,6 @@ const Session = struct {
     fn compiler(
         self: *Session,
         arena: std.mem.Allocator,
-        messages: std.mem.Allocator,
         scratch: std.mem.Allocator,
         heap: *gc.Heap,
         source: [:0]const u8,
@@ -259,7 +258,6 @@ const Session = struct {
     ) Compiler {
         return .{
             .arena = arena,
-            .messages = messages,
             .scratch = scratch,
             .heap = heap,
             .source = source,
@@ -424,10 +422,6 @@ const Compiler = struct {
     res: *const resolve.Resolution,
     /// `checkChunk`: a statement that fails to compile is skipped.
     recover: bool = false,
-    /// Where messages that must be formatted (the unknown-global lint) live:
-    /// the chunk's arena when compiling, the caller's when checking, so they
-    /// outlive the compile.
-    messages: std.mem.Allocator,
 
     /// The lexically-enclosing function being compiled, if this is a nested
     /// function body. Used to detect references to an outer function's locals
@@ -463,6 +457,12 @@ const Compiler = struct {
     protos: std.ArrayList(*Proto) = .empty,
     /// This function's upvalue capture plan (arena-owned) → `Proto.upvalues`.
     upvalues: std.ArrayList(UpvalDesc) = .empty,
+    /// Doc 76 §6: this function's to-be-closed variables (arena-owned) →
+    /// `Proto.tbc_vars`, in `tbc` order.
+    tbc_vars: std.ArrayList(bytecode.TbcVar) = .empty,
+    /// The ones in scope, as indices into `tbc_vars`: nested, so in register
+    /// order. Each one's `end` is set when its scope closes.
+    open_tbc: std.ArrayList(u32) = .empty,
 
     /// Fixed parameter count of the function being compiled.
     num_params: u8 = 0,
@@ -477,6 +477,7 @@ const Compiler = struct {
     fn deinitScratch(self: *Compiler) void {
         self.const_index.deinit(self.scratch);
         self.locals.deinit(self.scratch);
+        self.open_tbc.deinit(self.scratch);
         for (self.loops.items) |*lp| lp.breaks.deinit(self.scratch);
         self.loops.deinit(self.scratch);
     }
@@ -684,15 +685,61 @@ const Compiler = struct {
         self.scope_depth += 1;
     }
 
-    /// Whether a local of the innermost open scope is captured, so that
-    /// `endScope` would close it.
-    fn scopeHasCaptured(self: *const Compiler) bool {
+    /// Whether a local of the innermost open scope is captured or to be
+    /// closed, so that `endScope` would emit a close.
+    fn scopeNeedsClose(self: *const Compiler) bool {
         var n = self.locals.items.len;
         while (n > 0 and self.locals.items[n - 1].depth >= self.scope_depth) {
             n -= 1;
-            if (self.locals.items[n].captured) return true;
+            if (self.locals.items[n].captured or self.hasOpenTbc(self.locals.items[n].reg)) return true;
         }
         return false;
+    }
+
+    /// Doc 76 §6: make the variable `name` in `reg` to-be-closed, from the
+    /// instruction after its `tbc`.
+    fn declareTbc(self: *Compiler, reg: u16, name: []const u8) Error!void {
+        const at = try self.emit(Instr.opAB(.tbc, reg, try self.stringConstant(name)));
+        try self.openTbc(reg, at);
+    }
+
+    /// Open the scope of the to-be-closed variable in `reg` after the
+    /// instruction at `at`, which made it one (`tbc`, or `tfor_prep`).
+    fn openTbc(self: *Compiler, reg: u16, at: usize) Error!void {
+        try self.open_tbc.append(self.scratch, @intCast(self.tbc_vars.items.len));
+        try self.tbc_vars.append(self.arena, .{ .reg = reg, .start = @intCast(at + 1), .end = undefined });
+    }
+
+    /// Whether a to-be-closed variable in a register `>= reg` is in scope.
+    /// They nest, so the last one in has the highest register.
+    fn hasOpenTbc(self: *const Compiler, reg: u16) bool {
+        const open = self.open_tbc.items;
+        return open.len > 0 and self.tbc_vars.items[open[open.len - 1]].reg >= reg;
+    }
+
+    /// End the scope of the to-be-closed variables in registers `>= reg`
+    /// with a `close` there, if there are any.
+    fn endTbcFrom(self: *Compiler, reg: u16) Error!void {
+        if (!self.hasOpenTbc(reg)) return;
+        const at: u32 = @intCast(try self.emit(Instr.opA(.close, reg)));
+        while (self.hasOpenTbc(reg)) {
+            self.tbc_vars.items[self.open_tbc.pop().?].end = at;
+        }
+    }
+
+    /// Return `b` values from `R[a..]`: `ret_close` in the scope of a
+    /// to-be-closed variable, which closes them first.
+    fn emitRet(self: *Compiler, a: u16, b: u16) Error!void {
+        _ = try self.emit(Instr.opAB(if (self.open_tbc.items.len > 0) .ret_close else .ret, a, b));
+    }
+
+    /// The `return` (no values) a function body falls off the end into. It
+    /// ends the scope of the body's own to-be-closed variables.
+    fn emitFinalReturn(self: *Compiler) Error!void {
+        const at: u32 = @intCast(self.code.items.len);
+        try self.emitRet(0, 0);
+        for (self.open_tbc.items) |i| self.tbc_vars.items[i].end = at;
+        self.open_tbc.clearRetainingCapacity();
     }
 
     fn endScope(self: *Compiler) Error!void {
@@ -711,6 +758,9 @@ const Compiler = struct {
             self.next_reg -= 1; // local registers are contiguous at the top
         }
         self.locals.items.len = n;
+        // Doc 76 §6: run the scope's `__close`s, which may still read a
+        // captured local through its open cell.
+        try self.endTbcFrom(self.next_reg);
         // If a closing local was captured, snapshot its cell before the register
         // is reused (so each loop iteration / block gets a distinct binding).
         if (any_captured) _ = try self.emit(Instr.opA(.close_upvalues, self.next_reg));
@@ -889,14 +939,36 @@ const Compiler = struct {
         }
     }
 
+    /// Report the scoping rules the resolver found broken (doc 76 §3.2,
+    /// §4.1) as errors, each naming its variable as Lua 5.5's do. Returns
+    /// whether there were any.
+    fn reportProblems(self: *Compiler) Error!bool {
+        for (self.res.problems.items) |p| {
+            const d: diag.Diagnostic = .{
+                .severity = .@"error",
+                .code = switch (p.code) {
+                    .undeclared => .undeclared_variable,
+                    .assign_to_const => .assign_to_const,
+                },
+                .message = undefined,
+                .start = p.span.start,
+                .end = p.span.end,
+                .line = self.lineOf(p.span.start),
+            };
+            switch (p.code) {
+                .undeclared => self.diags.addFmt(d, "variable '{s}' not declared", .{p.name}),
+                .assign_to_const => self.diags.addFmt(d, "attempt to assign to const variable '{s}'", .{p.name}),
+            }
+        }
+        return self.res.problems.items.len > 0;
+    }
+
     /// Emit a warning for every global *read* of a name that is never assigned
     /// anywhere in the chunk and isn't a host builtin. In mahina (Lua/Luau
     /// semantics) such a name is a `nil`-valued global, so it compiles fine and
     /// only errors at runtime when used — most often it's a typo for a local.
     /// This is a warning, not an error: a global may legitimately be defined by
-    /// another chunk or the host. Messages are allocated in the compile arena, so
-    /// they live as long as the returned `Chunk` (callers consume `diags` before
-    /// the chunk is freed).
+    /// another chunk or the host. `diags` owns the messages.
     fn warnUnknownGlobals(self: *Compiler) Error!void {
         const u = self.globals_usage;
         // A store through the globals table (`_G.x = …`, `function _G.x()`)
@@ -913,17 +985,18 @@ const Compiler = struct {
         try self.collectWords(&hidden, u.failed.items);
         for (u.reads.items) |r| {
             if (u.writes.contains(r.name)) continue;
+            // `global x` says it exists (doc 76 §3.2).
+            if (self.res.occurrenceAt(r.start)) |o| if (o.declared) continue;
             if (u.isKnown(r.name)) continue;
             if (hidden.contains(r.name)) continue;
-            const msg = try std.fmt.allocPrint(self.messages, "undefined global '{s}' (never assigned; reads as nil)", .{r.name});
-            self.diags.add(.{
+            self.diags.addFmt(.{
                 .severity = .warning,
                 .code = .undefined_global,
-                .message = msg,
+                .message = undefined,
                 .start = r.start,
                 .end = r.end,
                 .line = self.lineOf(r.start),
-            });
+            }, "undefined global '{s}' (never assigned; reads as nil)", .{r.name});
         }
     }
 
@@ -963,12 +1036,16 @@ const Compiler = struct {
             const depth = self.scope_depth;
             const n_locals = self.locals.items.len;
             const n_loops = self.loops.items.len;
+            const n_tbc = self.tbc_vars.items.len;
+            const n_open_tbc = self.open_tbc.items.len;
             self.compileStmt(stmt) catch |e| switch (e) {
                 Error.CompileError => {
                     self.next_reg = next_reg;
                     self.scope_depth = depth;
                     self.locals.items.len = n_locals;
                     self.loops.items.len = n_loops;
+                    self.tbc_vars.items.len = n_tbc;
+                    self.open_tbc.items.len = n_open_tbc;
                     try self.globals_usage.failed.append(self.scratch, stmt.span);
                 },
                 else => return e,
@@ -996,6 +1073,10 @@ const Compiler = struct {
             .call => |call_expr| try self.compileCallStmt(call_expr),
             .function_decl => |fd| try self.compileFunctionDecl(fd),
             .local_function => |lf| try self.compileLocalFunction(lf),
+            .global => |g| try self.compileGlobal(g),
+            // Compile-time only: the resolver applied it.
+            .global_all => {},
+            .global_function => |gf| try self.compileGlobalFunction(gf),
             .err => {}, // dropped by the parser's recovery; already reported
             .generic_for => |gf| try self.compileGenericFor(gf),
         }
@@ -1009,6 +1090,10 @@ const Compiler = struct {
         // reads the outer `x`).
         for (l.names, 0..) |nm, j| {
             try self.declareLocal(nm.name_span, @intCast(start + j));
+        }
+        // Doc 76 §6: the parser allows one `<close>` per list.
+        for (l.names, 0..) |nm, j| {
+            if (nm.attrib == .close) try self.declareTbc(@intCast(start + j), nm.name);
         }
     }
 
@@ -1399,10 +1484,7 @@ const Compiler = struct {
     }
 
     fn compileReturn(self: *Compiler, exprs: []const *ast.Expr) Error!void {
-        if (exprs.len == 0) {
-            _ = try self.emit(Instr.opAB(.ret, 0, 0));
-            return;
-        }
+        if (exprs.len == 0) return self.emitRet(0, 0);
         const mark = self.next_reg;
         const base = self.next_reg;
         const n = exprs.len;
@@ -1415,7 +1497,7 @@ const Compiler = struct {
                 try self.compileExprTo(e, r);
             }
             try self.compileCallInPlace(exprs[n - 1], bytecode.all_results);
-            _ = try self.emit(Instr.opAB(.ret, base, bytecode.all_results));
+            try self.emitRet(base, bytecode.all_results);
         } else if (exprs[n - 1].data == .vararg) {
             // `return a, ...` — forward every leading value then spread the rest.
             try self.requireVararg(exprs[n - 1].span);
@@ -1424,18 +1506,18 @@ const Compiler = struct {
                 try self.compileExprTo(e, r);
             }
             try self.compileSpreadInPlace();
-            _ = try self.emit(Instr.opAB(.ret, base, bytecode.all_results));
+            try self.emitRet(base, bytecode.all_results);
         } else if (n == 1) {
             // One value: a local returns from its own register, with no
             // `move` into a temporary.
             const r = try self.operandReg(exprs[0]);
-            _ = try self.emit(Instr.opAB(.ret, r, 1));
+            try self.emitRet(r, 1);
         } else {
             for (exprs) |e| {
                 const r = try self.alloc1();
                 try self.compileExprTo(e, r);
             }
-            _ = try self.emit(Instr.opAB(.ret, base, @intCast(n)));
+            try self.emitRet(base, @intCast(n));
         }
         self.freeTo(mark);
     }
@@ -1702,7 +1784,7 @@ const Compiler = struct {
         self.beginScope();
         try self.compileBlock(r.body);
         const mark = self.next_reg;
-        if (!self.scopeHasCaptured() and !hasFunction(r.cond)) {
+        if (!self.scopeNeedsClose() and !hasFunction(r.cond)) {
             // Doc 66: nothing in the scope needs closing, so `cond` compiles
             // to a chain of branches straight back to the marker when it is
             // false (LuaJIT `parse_repeat`), falling through to the exit. Its
@@ -1716,11 +1798,13 @@ const Compiler = struct {
         } else {
             // A captured local must be closed on both edges, after every
             // operand has run, so the test is one branch after the close.
-            // `endScope` emits at most a `close_upvalues`, which moves
-            // captured values to their cells without changing a register,
-            // so the branch after it still reads the operands. Testing after
-            // the close is not observable: a value written before it is
-            // copied, one written after goes to the cell.
+            // `endScope` emits at most a `close` and a `close_upvalues`. The
+            // second moves captured values to their cells without changing a
+            // register, and the first runs its `__close`s above the frame's
+            // window, so the branch after them still reads the operands.
+            // Testing after the close is not observable: a value written
+            // before it is copied, one written after goes to the cell; and
+            // Lua too runs the `__close`s once the condition is known.
             const ins = if (try self.compareBranch(r.cond, false)) |cmp|
                 cmp
             else
@@ -1785,19 +1869,32 @@ const Compiler = struct {
     /// the next `ctrl`. The iterator call window is `base+3,4,5` (doc 66 P1:
     /// `itern` is that call's shorthand), so even for `n < 3` we reserve
     /// `3 + max(n,3)` registers.
+    ///
+    /// Doc 76 §6.3 (D5): an explist that may have a fourth value (one ending
+    /// in a call or `...`, or with four or more expressions) also gives the
+    /// loop a closing value, to-be-closed for the loop's run. It takes the
+    /// register below the control registers, which then start one up, and
+    /// the forward jump becomes a `tfor_prep`, which moves it there and
+    /// checks it as it enters (Lua 5.4's `OP_TFORPREP`): one dispatch.
     fn compileGenericFor(self: *Compiler, gf: anytype) Error!void {
-        const base = self.next_reg;
+        const first = self.next_reg;
         const n: u16 = @intCast(gf.names.len);
+        const last = gf.exprs[gf.exprs.len - 1];
+        const closing = gf.exprs.len >= 4 or last.isCall() or last.data == .vararg;
 
-        // [f, s, ctrl] from the explist, multret-adjusted to exactly 3.
-        try self.compileValuesInto(gf.exprs, base, 3);
-        // Reserve the loop-variable / iterator-call window (>= 3 slots).
+        // [f, s, ctrl] from the explist, multret-adjusted to exactly 3, or
+        // [f, s, ctrl, closing], with the closing value then moved below.
+        const base = if (closing) try self.alloc1() + 1 else first;
+        try self.compileValuesInto(gf.exprs, base, if (closing) 4 else 3);
+        // Reserve the loop-variable / iterator-call window (>= 3 slots); with
+        // a closing value its first slot already is.
         const window: u16 = @max(n, 3);
-        var w: u16 = 0;
+        var w: u16 = @intFromBool(closing);
         while (w < window) : (w += 1) _ = try self.alloc1();
 
         // Jump forward to the test block (mirrors for_prep's forward jump).
-        const prep = try self.emitJump(.jmp, 0);
+        const prep = if (closing) try self.emitJump(.tfor_prep, first) else try self.emitJump(.jmp, 0);
+        if (closing) try self.openTbc(first, prep);
         const body_start = self.code.items.len;
 
         // Loop vars at base+3 are the lowest capturable registers in the loop
@@ -1820,17 +1917,24 @@ const Compiler = struct {
         _ = try self.emit(Instr.opABC(.itern, base, 0, n));
         try self.emitJumpTo(.tfor_loop, base, body_start);
 
+        // Both exits, the end of the iteration and a `break`, close the
+        // closing value here.
         self.patchBreaks(loop_idx);
-        self.freeTo(base); // release control + variable/window registers
+        try self.endTbcFrom(first);
+        self.freeTo(first); // release control + variable/window registers
     }
 
     fn compileBreak(self: *Compiler, span: ast.Span) Error!void {
         if (self.loops.items.len == 0) return self.fail(span, .break_outside_loop);
         const loop_idx = self.loops.items.len - 1;
         // The fall-through scope-exit close does not run on the break path, so
-        // close the loop scope's upvalues here before jumping out. (A no-op at
-        // runtime if nothing in the loop was captured.)
-        _ = try self.emit(Instr.opA(.close_upvalues, self.loops.items[loop_idx].scope_base));
+        // close the loop scope's to-be-closed variables and upvalues here
+        // before jumping out. (The second is a no-op at runtime if nothing in
+        // the loop was captured.) The scopes end where they are written: this
+        // path just leaves them early.
+        const scope_base = self.loops.items[loop_idx].scope_base;
+        if (self.hasOpenTbc(scope_base)) _ = try self.emit(Instr.opA(.close, scope_base));
+        _ = try self.emit(Instr.opA(.close_upvalues, scope_base));
         const j = try self.emitJump(.jmp, 0);
         try self.loops.items[loop_idx].breaks.append(self.scratch, j);
     }
@@ -2129,7 +2233,6 @@ const Compiler = struct {
             .globals_usage = self.globals_usage,
             .res = self.res,
             .recover = self.recover,
-            .messages = self.messages,
             .parent = self,
         };
         defer child.deinitScratch();
@@ -2144,7 +2247,7 @@ const Compiler = struct {
 
         try child.compileBlock(body.body);
         // Implicit `return` (no values) if control reaches the end.
-        _ = try child.emit(Instr.opAB(.ret, 0, 0));
+        try child.emitFinalReturn();
 
         // Doc 58 §4.2: the two loop closers, and the earlier links of a
         // `repeat` test (doc 66), are the only backward jumps.
@@ -2159,16 +2262,17 @@ const Compiler = struct {
             .is_vararg = child.is_vararg,
             .protos = child.protos.items,
             .upvalues = child.upvalues.items,
+            .tbc_vars = child.tbc_vars.items,
             .global_slot_hints = try zeroedHints(self.arena, child.constants.items.len),
             .name = body.name orelse name,
             // Doc 56 §4.2: per-pc register liveness, from the finished code.
-            .reg_live = try bc_liveness.compute(self.arena, self.scratch, child.code.items, child.max_reg, child.protos.items),
+            .reg_live = try bc_liveness.compute(self.arena, self.scratch, child.code.items, child.max_reg, child.protos.items, child.tbc_vars.items),
             // Doc 58 §4.8: the CFG's dominator tree, from the finished code.
             .dom = try bc_dom.compute(self.arena, self.scratch, child.code.items),
         };
         // Doc 61 §5: from the finished code and its liveness (see the
         // main chunk for why this holds).
-        proto.maskable = try bc_liveness.maskable(self.scratch, proto.code, proto.reg_live, proto.num_registers, proto.protos);
+        proto.maskable = try bc_liveness.maskable(self.scratch, proto.code, proto.reg_live, proto.num_registers, proto.protos, proto.tbc_vars);
         std.debug.assert(proto.maskable or !proto.reg_live.available());
 
         if (self.protos.items.len > std.math.maxInt(u16)) return self.fail(body.span, .too_many_nested_functions);
@@ -2212,6 +2316,40 @@ const Compiler = struct {
         const r = try self.alloc1();
         try self.declareLocal(lf.name_span, r); // visible inside its own body
         try self.compileFunction(lf.body, lf.name, r);
+    }
+
+    /// `global a, b = e1, e2` (doc 76 §3.3): the values, then for each name,
+    /// last first as 5.5's `initglobal` does, a `def_global` that raises if
+    /// the global is already set and stores it otherwise. A declaration
+    /// without values compiles to nothing.
+    fn compileGlobal(self: *Compiler, g: anytype) Error!void {
+        if (g.values.len == 0) return;
+        const start = self.next_reg;
+        const n: u16 = @intCast(g.names.len);
+        try self.compileValuesInto(g.values, start, n);
+        var j = g.names.len;
+        while (j > 0) {
+            j -= 1;
+            try self.defineGlobal(g.names[j].name, g.names[j].name_span, @intCast(start + j));
+        }
+        self.freeTo(start);
+    }
+
+    /// `global function f()`: `f` is declared before the body, so the body can
+    /// call itself, and defined as `global f = function …` is.
+    fn compileGlobalFunction(self: *Compiler, gf: anytype) Error!void {
+        const mark = self.next_reg;
+        const r = try self.alloc1();
+        try self.compileFunction(gf.body, gf.name, r);
+        try self.defineGlobal(gf.name, gf.name_span, r);
+        self.freeTo(mark);
+    }
+
+    fn defineGlobal(self: *Compiler, name: []const u8, span: ast.Span, src: u16) Error!void {
+        const k = try self.stringConstant(name);
+        self.cur_span = span; // the fault names this global
+        _ = try self.emit(Instr.opAB(.def_global, src, k));
+        try self.globals_usage.writes.put(name, {});
     }
 
     /// A call used as a statement: evaluate for effects, discard results.
@@ -3685,8 +3823,7 @@ test "LineTable: empty source and a trailing newline" {
 }
 
 /// Compile `src` with an explicit known-globals set and run `check` against the
-/// resulting diagnostics while the chunk (and its arena-allocated warning
-/// messages) is still alive.
+/// resulting diagnostics while the chunk is still alive.
 fn checkGlobals(
     src: [:0]const u8,
     known: []const []const u8,
@@ -3883,12 +4020,12 @@ test "constant pool: many distinct constants fill the pool exactly, the next is 
 
 /// `checkChunk` over `src`, which may be damaged, with a bare heap as the
 /// language server has it. Returns nothing: callers read `diags`.
-fn checkSource(src: [:0]const u8, messages: std.mem.Allocator, diags: *Diagnostics) !void {
+fn checkSource(src: [:0]const u8, diags: *Diagnostics) !void {
     var tree = try parser.parse(testing.allocator, src, diags);
     defer tree.deinit();
     var heap = gc.Heap.init(testing.allocator);
     defer heap.deinit();
-    try checkChunk(testing.allocator, messages, &heap, src, tree.root, null, diags, .{ .known_globals = &.{"print"} });
+    try checkChunk(testing.allocator, &heap, src, tree.root, null, diags, .{ .known_globals = &.{"print"} });
 }
 
 fn countCode(diags: *const Diagnostics, code: diag.Code) usize {
@@ -3908,9 +4045,8 @@ test "doc 74 P2: checkChunk goes on after a statement that fails to compile" {
     ;
     var diags = Diagnostics.init(testing.allocator);
     defer diags.deinit();
-    var text_arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer text_arena.deinit();
-    try checkSource(src, text_arena.allocator(), &diags);
+
+    try checkSource(src, &diags);
     // Both `break`s and the bad escape, not only the first.
     try testing.expectEqual(@as(usize, 2), countCode(&diags, .break_outside_loop));
     try testing.expectEqual(@as(usize, 1), countCode(&diags, .invalid_escape));
@@ -3927,9 +4063,8 @@ test "doc 74 P2: the unknown-global lint runs on a damaged chunk and stays quiet
     ;
     var diags = Diagnostics.init(testing.allocator);
     defer diags.deinit();
-    var text_arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer text_arena.deinit();
-    try checkSource(src, text_arena.allocator(), &diags);
+
+    try checkSource(src, &diags);
     // `never_defined` is flagged; `hidden` may be defined in the dropped text;
     // `failed_name`'s statement is the one the bad escape cut short.
     try testing.expectEqual(@as(usize, 1), countCode(&diags, .undefined_global));
@@ -3941,8 +4076,7 @@ test "doc 74 P2: the unknown-global lint runs on a damaged chunk and stays quiet
 test "doc 74 P2: a clean chunk checks clean, as it compiles clean" {
     var diags = Diagnostics.init(testing.allocator);
     defer diags.deinit();
-    var text_arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer text_arena.deinit();
-    try checkSource("local function f(n) if n < 2 then return n end return f(n - 1) + f(n - 2) end\nreturn f(10)", text_arena.allocator(), &diags);
+
+    try checkSource("local function f(n) if n < 2 then return n end return f(n - 1) + f(n - 2) end\nreturn f(10)", &diags);
     try testing.expectEqual(@as(usize, 0), diags.count());
 }

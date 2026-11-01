@@ -1,6 +1,6 @@
 # 76 — Global declarations, attributes and frozen tables — Design
 
-Status: draft, not yet implemented
+Status: in progress (Phases 0, 2 and 3 landed)
 Owner: Bart
 Last updated: 2026-11-01
 
@@ -15,8 +15,10 @@ land; move whole phases to Done once everything inside them is checked.
   as Lua 5.5 §3.3.7 has them, as written. `_G.x` stays for code coming from
   Lua, and the resolver already reads it as the global `x` (doc 74).
 - [x] **D2 — `global` is reserved** (§3.1): decided 2026-10-30 — a reserved
-  word outright, as 5.5 has it by default; no contextual escape like 5.5's
-  `LUA_COMPAT_GLOBAL`. A program using `global` as a name adjusts.
+  word outright, with no contextual escape. Note: 5.5's default build defines
+  `LUA_COMPAT_GLOBAL` (`luaconf.h`), which keeps `global` usable as a name
+  where a declaration can't start, so reserving it outright is stricter than
+  stock 5.5. A program using `global` as a name adjusts.
 - [x] **D3 — const is not frozen** (§4, §5): decided 2026-10-31 — `<const>`
   forbids assigning the variable again and nothing else, as in Lua and JS.
   Freezing a table is a separate run-time call, `table.freeze`, as Luau's and
@@ -34,24 +36,32 @@ land; move whole phases to Done once everything inside them is checked.
   `table.freeze`, as Luau's.
 - [x] **D8 — `<const>` locals with a constant value are folded** (§4.2):
   decided 2026-11-01 — as 5.4: no register, the constant in every use.
+- [x] **Phase 0 — syntax.** `global` reserved; attributes on `local` and
+  `global` names (prefix and postfix); `global *`, `global <attrib> *`,
+  `global function`; the AST to carry them (§3).
+- [x] **Phase 2 — `global x = v` and `global function f`** raise a run-time
+  error when the global is already non-nil (§3.3).
+- [x] **Phase 3 — `<close>`.** Scope exit, `break`, `return`, error unwind
+  through `pcall`, `coroutine.close`, a coroutine dying; the generic
+  `for`'s closing value via `tfor_prep`; `io.lines`'s file closed by it
+  (§6).
 
 ### Outstanding
 
-- [ ] **Phase 0 — syntax.** `global` reserved; attributes on `local` and
-  `global` names (prefix and postfix); `global *`, `global <attrib> *`,
-  `global function`; the AST to carry them (§3).
 - [ ] **Phase 1 — the resolver owns the declarations.** Global declarations
   as scoped bindings; the strict scope; `<const>` checks, `for` control
   variables included; undeclared names and assignments to a const as
-  compile errors; constant `<const>` locals folded; the compiler reads it
-  all from the resolver (§3.2, §3.4, §4).
-- [ ] **Phase 2 — `global x = v` and `global function f`** raise a run-time
-  error when the global is already non-nil (§3.3).
-- [ ] **Phase 3 — `<close>`.** Scope exit, `break`, `return`, error unwind
-  through `pcall`, `coroutine.close`; the generic `for`'s closing value
-  (§6). The recorder aborts at a to-be-closed variable at first.
-- [ ] **Phase 3b — `<close>` in traces.** Record the close as a call, so a
-  hot loop with a to-be-closed variable inside stays native (§6.4).
+  compile errors; the compiler reads it all from the resolver (§3.2, §3.4,
+  §4).
+  - [x] all of the above
+  - [ ] constant `<const>` locals folded (D8, §4.2)
+- [ ] **Phase 3b — `<close>` in traces** (§6.4).
+  - [x] `tbc`, `tfor_prep`, `close` and `ret_close` recorded while the
+    values are nil or false, so loops with a generic `for` inside stay
+    native
+  - [ ] a value with a `__close` recorded as the call, not an abort
+- [ ] **`<close>` gaps against 5.4** (§6.2, TODO.md): pending closes on an
+  uncaught top-level error; a `__close` that yields.
 - [ ] **Phase 4 — `table.freeze` / `table.isfrozen` / `table.clone`.**
   The table's `readonly` bit; every store path checks it, the JIT's
   included; keyframes carry it; inventory rows (§5).
@@ -118,8 +128,8 @@ attrib ::= '<' Name '>'
 `global` joins the reserved words (D2). The attribute names are `const` and
 `close`; any other is a compile error. A prefixed attribute applies to every
 name in the list, a postfixed one to its own name. `<close>` is for locals
-only. A list holds at most one to-be-closed variable (5.4's rule; to confirm
-5.5 keeps it).
+only. A list holds at most one to-be-closed variable (5.4's rule, which 5.5
+keeps).
 
 ### 3.2 Scoping
 
@@ -138,10 +148,11 @@ only. A list holds at most one to-be-closed variable (5.4's rule; to confirm
 - Declarations are compile-time only. `_G.x = 1` still writes `x`, const or
   not; another chunk or function can change any global.
 
-In the resolver (doc 74 §6.3) a declared global becomes a binding with a
-scope, like a local; its uses resolve to it by the usual innermost-wins
-rule, and the binding still names the global `x` (one entry per name in the
-symbol index, `navigation.globalNamed`). The undefined-global *warning*
+In the resolver (doc 74 §6.3) a declared global becomes a scope entry, like
+a local's; its uses resolve to it by the usual innermost-wins rule. The
+entry points at the global's one binding, so every declaration and use of
+`x` stays one name in the symbol index (`navigation.globalNamed`), not a
+binding per declaration. The undefined-global *warning*
 (`compiler.zig` `warnUnknownGlobals`) stays for code outside any declaration;
 inside one, the same situation is the error above.
 
@@ -149,9 +160,10 @@ inside one, the same situation is the error above.
 
 - `global x` with no value leaves `x` as it is (a local starts as `nil`).
 - `global x = v` raises a run-time error if `x` is already non-nil, then
-  assigns. With several names, each is checked before any is assigned
-  (5.5 does the check per name; to confirm against its source before
-  implementing).
+  assigns. With several names, the values are all evaluated first, then the
+  names are checked and assigned one at a time, last name first, as 5.5's
+  `initglobal` does: in `global a, b = 1, 2` with `a` already set, `b` is
+  assigned before `a`'s check raises.
 - `global function f () … end` is `global f; global f = function () … end`:
   the same error if `f` is set.
 
@@ -175,8 +187,9 @@ local first.
 A `<const>` local or global cannot be assigned after its declaration: `x = …`,
 `x += …` and `function x()` on it are compile errors, found by the resolver
 (it knows which binding each assignment hits). What the variable holds is
-untouched (D3). A `<const>` local needs an initializer; a `<const>` global
-without one declares a read-only global name. For a global, only this chunk's
+untouched (D3). A `<const>` local without an initializer is allowed and is
+`nil` for good, as in 5.4; a `<const>` global without one declares a
+read-only global name. For a global, only this chunk's
 syntax is bound; `_G.x = 1` and other chunks may still write it.
 
 ### 4.2 Constants (D8)
@@ -271,17 +284,39 @@ the other pending closes still run.
 
 ### 6.2 Implementation
 
-- A `tbc` instruction after the declaration checks `v` and marks its
-  register in the frame's to-be-closed list.
-- `close_upvalues` becomes `close`: it closes upvalues as now and calls
-  `__close` on every marked register at or above its operand, newest first.
-  Block ends, `break` and `return` already emit it where upvalues need it;
-  they will also emit it where a to-be-closed variable is in scope. A
-  `return` closes after its values are evaluated, before the frame is left.
-- Error unwind: the dispatch loop's unwind to a `pcall`/`xpcall` frame
-  (doc 68) runs the pending closes of every frame it discards, with the
-  error, before handing the error over.
+- A `tbc` instruction after the declaration checks `v`. Which registers are
+  to-be-closed where is static: `Proto.tbc_vars` lists each one's register
+  and pc range (`bytecode.TbcVar`), so the frame keeps no list and a
+  function without one pays nothing.
+- A new `close a` calls `__close` on every to-be-closed variable live there
+  at or above `a`, newest first. `close_upvalues` stays its own instruction:
+  most scopes close upvalues and no to-be-closed variable, and keeping them
+  apart keeps that path as it was. Block ends and `break` emit `close` where
+  a to-be-closed variable is in scope.
+- A `return` in such a scope compiles to `ret_close`, which closes every
+  live one after the values are evaluated, then is `ret`. A plain `ret`
+  stays check-free.
+- `close` and `ret_close` first test whether every value they would close is
+  nil or false, and go on without a call when so: the generic `for`'s
+  closing value (§6.3) nearly always is.
+- Error unwind: the unwind to a `pcall`/`xpcall` frame (doc 68) runs the
+  pending closes of every frame it discards, with the error, before handing
+  the error over. An error raised in a `__close` replaces the error passed
+  to the closes after it, as in 5.4. The closes run after `xpcall`'s message
+  handler has seen the original error, and an error in a `__close` reaches
+  the `xpcall` result without passing the handler again.
 - `coroutine.close(co)` runs a suspended coroutine's pending closes (doc 73).
+  **Deviation from 5.4:** a coroutine that dies of an error closes its
+  pending variables as it dies, with the error. 5.4 leaves them pending
+  until `coroutine.close`, which a program can forget; closing at death
+  keeps "closed by any route" true.
+- **Gap:** a `__close` cannot yield yet. A yield inside one raises "attempt
+  to yield across a C-call boundary", where 5.4 suspends the coroutine
+  mid-close (TODO.md). The close runs as a nested call (`Vm.callClose`), not
+  as a resumable frame.
+- An error that nothing catches ends the program without running pending
+  closes yet (TODO.md); lua.c runs them, because its `pcall` around the
+  chunk does.
 - Determinism: closes run in a fixed order at fixed points; nothing new for
   replay.
 
@@ -290,19 +325,38 @@ the other pending closes still run.
 As 5.4 and 5.5: the explist is adjusted to four values; the fourth, the
 closing value, behaves like a `<close>` variable of the loop and is closed
 when the loop ends, by any route (normal end, `break`, `return`, error).
-`nil` or `false` means nothing to close. mahina takes three today
-(`compiler.zig` `compileGenericFor`); the fourth costs one more reserved slot
-per loop and a `tbc` only when the value is not nil (checked at run time, so
-a loop without one pays a nil test once per loop, not per iteration). It
-lets `for l in io.lines(f)`-style iterators close their file. The recorder's
-treatment is §6.4's.
+`nil` or `false` means nothing to close. It lets `for l in io.lines(f)`
+close the file it opened (its 4th value; a file's `__close` closes it).
+
+Only an explist that can have a fourth value gets a closing value: four or
+more expressions, or a last expression that is a call or `...`
+(`compiler.zig` `compileGenericFor`). `for k, v in next, t do` keeps today's
+code. With one, the closing value takes the register below the control
+registers, and the loop's entry jump becomes `tfor_prep a, aux`: it moves
+the fourth value down to `R[a]`, checks it as `tbc` does, and jumps to the
+test block. That is Lua 5.4's `OP_TFORPREP`, and one dispatch, as the entry
+`jmp` was. A `close` at the loop's exit, where `break`s land too, closes it.
+Per loop run (not per iteration) that costs one more result from the
+explist's call, the `tfor_prep` check and the `close`. On tier 0, an
+`ipairs` loop over an empty table runs about 90 more instructions per run
+(≈ +4% on a microbenchmark made of short `pairs`/`ipairs` loops). The
+dispatches themselves are tier 0's general cost (doc 69).
+
+A to-be-closed `for` state is named `(for state)` in errors, as 5.4 names it.
+
+The numeric `for`'s and the generic `for`'s first variable are read-only
+(D6), so the loop's own registers cannot be reassigned by the body.
 
 ### 6.4 In traces
 
-At first the recorder aborts at `tbc`, so a loop body declaring a
-to-be-closed variable runs on tier 0. That is a coverage gap, not a design:
-Phase 3b records the close as the call it is (a `__close` lookup guard and a
-call), at the scope exit it happens at.
+The recorder records `tbc`, `tfor_prep`, `close` and `ret_close` while the
+values they would close are nil or false: it pins each one so (a guard on a
+slot it loads), and the instructions record nothing else. A loop with a
+generic `for` inside, or a function with a `<close>` local holding `nil`,
+stays native. A value that has a `__close` aborts the recording, so such a
+scope runs on tier 0. Recording the close as the call it is (a `__close`
+lookup guard and a call, at the scope exit it happens at) is what's left
+of Phase 3b.
 
 ## 7. The language server
 
@@ -317,10 +371,11 @@ call), at the scope exit it happens at.
 
 ## 8. Open questions for review
 
-None; Q1–Q4 became D5–D8 (2026-11-01). Two details to confirm against the
-reference sources while implementing: whether 5.5 checks every name of
-`global a, b = …` before assigning any (§3.3), and whether Luau refuses a
-store into a frozen table before `__newindex` dispatch (§5.1).
+None; Q1–Q4 became D5–D8 (2026-11-01). Of the two details to confirm
+against the reference sources: 5.5 checks and assigns the names of
+`global a, b = …` one at a time, last first (§3.3). Whether Luau refuses a
+store into a frozen table before `__newindex` dispatch (§5.1) is still to
+check, in Phase 4.
 
 ## References
 

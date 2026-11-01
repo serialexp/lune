@@ -141,11 +141,9 @@ fn stages(gpa: std.mem.Allocator, io: std.Io, text: []const u8, reps: usize) !St
         var res = try mahina.resolve.resolve(gpa, tree.root, @intCast(source.len));
         defer res.deinit();
         const t2 = now(io);
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        defer arena.deinit();
         var heap = mahina.gc.Heap.init(gpa);
         defer heap.deinit();
-        mahina.compiler.checkChunk(gpa, arena.allocator(), &heap, source, tree.root, &res, &diags, .{ .known_globals = known }) catch {};
+        mahina.compiler.checkChunk(gpa, &heap, source, tree.root, &res, &diags, .{ .known_globals = known }) catch {};
         const t3 = now(io);
         r.parse = @min(r.parse, @as(u64, @intCast(t1 - t0)));
         r.resolve = @min(r.resolve, @as(u64, @intCast(t2 - t1)));

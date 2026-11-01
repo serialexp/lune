@@ -133,6 +133,11 @@ const Collector = struct {
                 if (i >= l.values.len or !self.isModuleAt(n.name_span.start)) continue;
                 if (l.values[i].data == .table) try self.fields(l.values[i].data.table);
             },
+            // `global M = { ... }`, for a global module.
+            .global => |g| for (g.names, 0..) |n, i| {
+                if (i >= g.values.len or !self.isModuleAt(n.name_span.start)) continue;
+                if (g.values[i].data == .table) try self.fields(g.values[i].data.table);
+            },
             .assign => |asg| for (asg.targets, 0..) |t, i| {
                 const value: ?*const ast.Expr = if (i < asg.values.len) asg.values[i] else null;
                 switch (t.data) {
@@ -164,7 +169,7 @@ const Collector = struct {
             },
             .numeric_for => |nf| try self.block(nf.body),
             .generic_for => |gf| try self.block(gf.body),
-            .local_function, .compound_assign, .call, .return_, .break_, .err => {},
+            .local_function, .global_all, .global_function, .compound_assign, .call, .return_, .break_, .err => {},
         }
     }
 };
