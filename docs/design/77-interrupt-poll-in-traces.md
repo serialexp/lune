@@ -30,7 +30,7 @@ land; move whole sections to Done once everything inside them is checked.
   already unambiguous (`exit_instr = maxInt`, reason `.normal`, kind
   `.interrupt`). E1 not taken.
 - [x] **Phase 0 — measure the cost** (numbers under "Measured cost"). Cycles per iteration of the byte poll
-  (`movabs` + `cmp byte [rax], 0` + `jne`) on an arithmetic, a table and a
+  (now paced to every 16th trip) on an arithmetic, a table and a
   call loop; `just bench` over the whole board; `-Djit-debug` receipts
   identical to master.
 - [x] **Phase 1 — tier-1a.** Poll in `irinterp`'s `.loop` arm after the
@@ -67,19 +67,38 @@ land; move whole sections to Done once everything inside them is checked.
 
 ## Measured cost (2026-11-02, ReleaseFast, `--jit-native`, perf stat)
 
-The poll is 3 instructions per back-edge (`movabs`, `cmp byte`, `jne`).
+First version: `movabs` + `cmp byte` + `jne` on every back-edge (3
+instructions per lap). Current version: the byte is read only every 16th trip,
+paced by the existing `rbx` trip counter:
 
-| program | instructions | cycles |
+```
+inc rbx
+test rbx, 15         ; INTERRUPT_POLL_LAPS - 1
+jne loop_top         ; hot path, replaces the unconditional jmp
+movabs rax, &flag; cmp byte [rax], 0; jne interrupt_exit
+jmp loop_top
+```
+
+`rbx` is chain-cumulative and counts trips, so it only paces the check; Ctrl-C
+lands within 16 trips. Cycles, 5 interleaved runs per program on a Ryzen 9
+9900X:
+
+| program | every lap | every 16th lap |
 |---|---|---|
-| `while n < 4e8 do n = n + 1; x = x + n end` | 4.00G → 5.20G | 403M → 802M (2.0x) |
-| `bench/sieve_int.lua` | 466M → 523M | 82.7M → 88.9M (+7%) |
-| `bench/pi_leibniz.lua` | 1.751G → 1.901G | 1.929G → 1.931G (0%) |
-| `bench/grid_matmul.lua` | 465M → 489M | 97.5M → 97.8M (+0.3%) |
+| `bench/sieve_int.lua` | +10% (92.7M vs 83M) | +7% (90M vs 83.6M); instructions +5% |
+| `bench/pi_leibniz.lua` | 0% | 0% |
+| `bench/grid_matmul.lua` | 0% | 0% |
+| `bench/field_hash.lua` | not measured | +1% |
+| `while n < 4e8 do n = n + 1; x = x + n end` | 2.0x | 2.0x |
 
-The two-instruction-per-lap loop is the worst case (the loop was already one
-cycle per lap); real loops pay between 0 and 7%. A cheaper sequence (no
-`movabs`, e.g. a flag reachable from a register the trace already holds)
-is a possible follow-up, not done.
+The last row is not a poll cost. Sweeping the loop head's offset with padding
+moved that loop between 1.0 and 2.7 cycles per lap with the poll in place: the
+one-cycle loop is at the mercy of front-end alignment, so it measures
+alignment, not the poll. The remaining cost on `sieve_int` is the single
+fused `test`+`jne` per lap on a loop of only a few instructions. Loops that
+call, allocate or index tables return to the dispatcher anyway and show no
+cost. Code alignment of loop heads (LuaJIT aligns them) is a possible
+follow-up.
 
 ## Why this exists
 

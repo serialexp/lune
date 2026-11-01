@@ -66,6 +66,10 @@ const bytecode = @import("bytecode.zig");
 
 const layout = @import("nativegen_layout.zig");
 const ArrLayout = layout.ArrLayout;
+/// Doc 77: a `.loop` back-edge reads the host's interrupt byte once per this
+/// many trips (a power of two, so the pacing test is one `test rbx, mask`).
+const INTERRUPT_POLL_LAPS: i32 = 16;
+
 const TAG_NIL = layout.TAG_NIL;
 const TAG_INT = layout.TAG_INT;
 const TAG_BOOL = layout.TAG_BOOL;
@@ -2446,8 +2450,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // top of an iteration. One byte, one predictable branch. The
                 // byte is the host's (`Heap.requestInterrupt`), never a
                 // counter the program moves. No heap (a bare test page) means
-                // no host to ask.
+                // no host to ask. Only every `INTERRUPT_POLL_LAPS`-th trip
+                // reads it: `rbx` already counts trips (chain-cumulative, so
+                // it only paces the check, it decides nothing), and the hot
+                // path then costs one `test` fused with the back-edge branch,
+                // with no `movabs` and no load. Latency to Ctrl-C is at most
+                // that many trips.
                 if (heap) |h| {
+                    try a.testRegImm32(.rbx, INTERRUPT_POLL_LAPS - 1);
+                    try a.jcc(.ne, loop_top);
                     try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.interrupt_requested))));
                     try a.cmpByteMemImm(.rax, 0, 0);
                     try a.jcc(.ne, interrupt_exit);

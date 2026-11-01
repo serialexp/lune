@@ -792,6 +792,15 @@ pub const Assembler = struct {
         try self.imm32(v);
     }
 
+    /// `test reg, imm32` — REX.W F7 /0 id (imm sign-extended to 64). Sets ZF/SF
+    /// from `reg & imm`; writes nothing.
+    pub fn testRegImm32(self: *Assembler, reg: Reg, v: i32) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0xF7);
+        try self.modrmReg(0, reg.lo());
+        try self.imm32(v);
+    }
+
     /// `or reg, imm32` — REX.W 81 /1 id (imm sign-extended to 64).
     pub fn orRegImm32(self: *Assembler, reg: Reg, v: i32) !void {
         try self.rex(true, false, false, reg.hi());
@@ -1179,6 +1188,19 @@ test "enc: mov qword [base+disp], imm32" {
     try expectEnc(&.{ 0x48, 0xC7, 0x07, 0x02, 0, 0, 0 }, struct { // mov qword [rdi], 2
         fn f(a: *Assembler) !void {
             try a.movMemImm32(.rdi, 0, 2);
+        }
+    }.f);
+}
+
+test "enc: test reg, imm32" {
+    try expectEnc(&.{ 0x48, 0xF7, 0xC3, 0x0F, 0, 0, 0 }, struct { // test rbx, 15
+        fn f(a: *Assembler) !void {
+            try a.testRegImm32(.rbx, 15);
+        }
+    }.f);
+    try expectEnc(&.{ 0x49, 0xF7, 0xC1, 0x0F, 0, 0, 0 }, struct { // test r9, 15
+        fn f(a: *Assembler) !void {
+            try a.testRegImm32(.r9, 15);
         }
     }.f);
 }
