@@ -1,9 +1,9 @@
 # 77 — Recording metamethods — Design
 
-Status: draft, reviewed (Codex and Antigravity, 2026-11-01); open questions
-for Bart in §11
+Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
+decided; not yet implemented (Phase 4 waits on doc 68 P2)
 Owner: Bart
-Last updated: 2026-11-01
+Last updated: 2026-11-02
 
 ## Implementation status
 
@@ -65,9 +65,8 @@ _(nothing yet)_
   TODO.md's `guard_no_metatable` entry.
 - [ ] **Phase 7 — measured** (§10): the Phase 0 programs after each phase,
   and `just bench` on the pinned pool.
-- [ ] **Defer — allocating handlers** (Q5, §2.1): a handler that builds a
-  table (`return setmetatable({...}, V)`) needs inlining in precise
-  recordings plus a recorded `setmetatable`.
+- [ ] **Defer — allocating handlers** (Q5, §2.1): doc 78 (allocation in
+  inlined calls), parked.
 - [ ] **Defer — hash insertion on trace.** An absent string-key store
   aborts today, metatable or not (§5.3).
 - [ ] **Defer — `__concat`.** `concat` itself does not record yet.
@@ -81,7 +80,8 @@ _(nothing yet)_
   access path.
 - [x] **Q4 decided** (Bart, 2026-11-02): a "metatable allowed" bit, merged
   with AND.
-- [ ] **Open questions** (§11): Q5 decided.
+- [x] **Q5 decided** (Bart, 2026-11-02): (a), allocation-free handlers;
+  allocation in inlined calls is doc 78, written and parked.
 
 ## 1. Why this exists
 
@@ -137,8 +137,9 @@ precise mode refuses inlining (`trace_recorder.zig` ~1889, ~4572); and
 limit of the inlining model, not of this doc's metamethod work. v1 covers
 handlers that do not build tables (in-place updates, accessors, proxies,
 comparisons on fields, `__close`), and its benchmarks say so rather than
-substitute an allocation-free handler for the conventional one. Q5 asks
-whether the precise-inlining design comes into this doc.
+substitute an allocation-free handler for the conventional one. Q5
+(decided) leaves that to doc 78, which covers allocation in every inlined
+call.
 
 ## Non-goals
 
@@ -554,6 +555,10 @@ callouts per iteration for an invariant receiver.
   allocation-free handlers only, precise inlining a later doc; (b) bring
   inlining into precise recordings and a recorded `setmetatable` into this
   doc, so the conventional vector type is covered.
+  **Decided (Bart, 2026-11-02): (a).** Allocation inside an inlined call is
+  not a metamethod problem (a plain `local function vec(x, y) return {x =
+  x, y = y} end` hits the same wall), so it gets one design for every
+  inlined call: doc 78, written now and parked until Bart picks it up.
 
 ## 12. Review (2026-11-01)
 
