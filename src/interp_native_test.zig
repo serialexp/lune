@@ -2455,8 +2455,8 @@ fn forAliasClass(gpa: std.mem.Allocator, tr: *const trace.Trace) !?nativegen.Slo
 }
 const nativegen = @import("nativegen.zig");
 
-/// `forBodyEntryExclusive` for the one numeric `for` in `source`'s main chunk.
-fn forBodyExclusive(gpa: std.mem.Allocator, source: [:0]const u8) !bool {
+/// `forBodyKeepsAlias` for the one numeric `for` in `source`'s main chunk.
+fn forBodyKeeps(gpa: std.mem.Allocator, source: [:0]const u8) !bool {
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
     var diags = diag.Diagnostics.init(gpa);
@@ -2469,7 +2469,7 @@ fn forBodyExclusive(gpa: std.mem.Allocator, source: [:0]const u8) !bool {
     defer chunk.deinit();
     const code = chunk.proto.code;
     for (code, 0..) |ins, pc| {
-        if (ins.op == .for_prep) return @import("trace_recorder.zig").RecordingSession.forBodyEntryExclusive(code, @intCast(pc));
+        if (ins.op == .for_prep) return @import("trace_recorder.zig").RecordingSession.forBodyKeepsAlias(code, @intCast(pc));
     }
     return error.NoNumericFor;
 }
@@ -2515,12 +2515,11 @@ test "for alias: the visible variable shares the index's home and every exit wri
     }
 }
 
-test "for alias: a body that starts with a loop jumping back to it binds nothing" {
+test "for alias: a body that starts with a loop jumping back to it still binds" {
     // The `while` header is the `for` body's first instruction, so its
-    // back-edge arrives at the `for` anchor too. Before `for` variables were
-    // read-only (doc 76 D6) that loop could reassign `i`, leaving the
-    // visible variable unequal to the index there; the check stays
-    // structural, so it does not depend on what the inner loop writes.
+    // back-edge arrives at the `for` anchor too. Nothing in the body writes
+    // `i` (doc 76 D6 makes it read-only), so the visible variable is the
+    // index there as well.
     const src =
         \\local s = 0
         \\for i = 1, 20000 do
@@ -2530,9 +2529,8 @@ test "for alias: a body that starts with a loop jumping back to it binds nothing
         \\print(s)
     ;
     const gpa = testing.allocator;
-    // Checked on the bytecode first: binding there runs the loop forever.
-    try testing.expect(!try forBodyExclusive(gpa, src));
-    try testing.expect(try forBodyExclusive(gpa, "local s = 0 for i = 1, 9 do s = s + i end"));
+    try testing.expect(try forBodyKeeps(gpa, src));
+    try testing.expect(try forBodyKeeps(gpa, "local s = 0 for i = 1, 9 do s = s + i end"));
     try expectProgram(src, "200069997\n");
     if (comptime !nativegen.is_x64_linux) return;
     var vm = try Vm.init(gpa);
@@ -2542,6 +2540,39 @@ test "for alias: a body that starts with a loop jumping back to it binds nothing
     var chunk = try runNativeForTrace(&vm, gpa, src, &sink);
     defer chunk.deinit();
     try testing.expectEqualStrings("200069997\n", sink.buffered());
-    try testing.expect(vm.trace.registry.cache.items.len != 0);
-    for (vm.trace.registry.cache.items) |tr| try testing.expect(tr.code.for_alias == null);
+    var bound = false;
+    for (vm.trace.registry.cache.items) |tr| bound = bound or tr.code.for_alias != null;
+    try testing.expect(bound);
+}
+
+test "for alias: a body that may write the index or the visible variable binds nothing" {
+    // The compiler emits no such body (doc 76 D6), so it is built by hand:
+    // R[0..3] the control block, R[3] the visible variable.
+    const RS = @import("trace_recorder.zig").RecordingSession;
+    const writes = [_]Instr{
+        .{ .op = .move, .a = 3, .b = 5 }, // the visible variable
+        .{ .op = .move, .a = 0, .b = 5 }, // the index
+        .{ .op = .call, .a = 2, .b = 1, .c = 1 }, // a call based below it
+    };
+    for (writes) |w| {
+        const code = [_]Instr{
+            .{ .op = .for_prep, .a = 0, .aux = 1 },
+            w,
+            .{ .op = .for_loop, .a = 0, .aux = -2 },
+        };
+        try testing.expect(!RS.forBodyKeepsAlias(&code, 0));
+    }
+    // Writes above it, a call based past it included, keep the binding.
+    const keeps = [_]Instr{
+        .{ .op = .move, .a = 4, .b = 3 },
+        .{ .op = .call, .a = 4, .b = 1, .c = 1 },
+    };
+    for (keeps) |w| {
+        const code = [_]Instr{
+            .{ .op = .for_prep, .a = 0, .aux = 1 },
+            w,
+            .{ .op = .for_loop, .a = 0, .aux = -2 },
+        };
+        try testing.expect(RS.forBodyKeepsAlias(&code, 0));
+    }
 }

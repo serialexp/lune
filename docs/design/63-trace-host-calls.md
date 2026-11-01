@@ -1734,6 +1734,18 @@ instruction and binds only when there is none. Without `goto` nothing
 outside a loop's body jumps into it, so the body is enough; adding
 `goto` must widen the scan to the proto.
 
+*Follow-up (2026-11-01, Bart).* Doc 76 D6 then made `for` variables
+read-only, so source can no longer reassign `i`, and a loop at the
+body's start re-arrives with the two still equal. The jump scan refused
+those bodies for nothing. `forBodyKeepsAlias` asks the property the
+binding rests on instead: no instruction in the body may write the index
+or the visible variable (`bc_liveness.mayWrite`). It refuses only bytecode
+the compiler does not emit, and still runs once per recording, never at
+run time. `goto` is no reason to widen it: Lua's cannot jump into a
+block. `mayWrite` became `inline`: with the recorder as a second caller
+LLVM stopped inlining it into `bc_names`, +0.37% on pcall_faults in
+tier-0. `bench/` is neutral against HEAD with it.
+
 `bench/` instruction counts against HEAD, JIT on: sieve_int −4.1%,
 nsieve −3.9%, grid_matmul −3.4%, grid_matmul_f64 −3.2%, nsieve-bit
 −2.6%, array3d −1.1%, nothing worse than +0.06% except proc_capture

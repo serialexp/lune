@@ -1625,9 +1625,11 @@ pub const RecordingSession = struct {
     /// failures, not mid-body deopts.
     /// LuaJIT's `rec_for_loop` entry binding: a root anchored at a numeric
     /// `for` body starts with the visible variable `R[a+3]` equal to the index
-    /// `R[a]` when tier-0 can arrive there only through `for_prep` and the
-    /// loop's own `for_loop`, as both copy one into the other
-    /// (`forBodyEntryExclusive`). So the visible variable's entry value is
+    /// `R[a]` whenever the body never writes either (`forBodyKeepsAlias`):
+    /// `for_prep` and the loop's own `for_loop` copy one into the other, and
+    /// any other arrival (a loop whose header is the body's first
+    /// instruction) comes from inside the body. So the visible variable's
+    /// entry value is
     /// the index's ref, carrying the type proof the index gets, instead of a
     /// slot_load of its own. `.input`, not `.def`: the binding is not a
     /// write, so it adds no φ and no back-edge store. The trace records the
@@ -1642,30 +1644,31 @@ pub const RecordingSession = struct {
         if (prep.op != .for_prep) return;
         const vis: usize = @as(usize, prep.a) + 3;
         if (vis >= self.anchor_num_registers) return;
-        if (!forBodyEntryExclusive(code, pc - 1)) return;
+        if (!forBodyKeepsAlias(code, pc - 1)) return;
         std.debug.assert(self.reg_map[vis].state == .undef);
         const idx = try self.refOf(prep.a);
         self.reg_map[vis] = .{ .ref = idx, .state = .input };
         self.entry_state = .for_alias;
     }
 
-    /// Whether tier-0 reaches the body of the numeric `for` whose `for_prep`
-    /// is at `prep_pc` only from that `for_prep` and the loop's `for_loop`.
-    /// A loop whose header is the body's first instruction (`for ... do
-    /// while c do ... end ... end`) jumps there too, with the visible
-    /// variable possibly reassigned. Only the body itself can: without
-    /// `goto`, nothing outside a loop jumps into it, so the scan covers the
-    /// body, O(body) as recording one iteration of it is. Adding `goto` must
-    /// widen it to the whole proto.
-    pub fn forBodyEntryExclusive(code: []const bytecode.Instr, prep_pc: u32) bool {
+    /// Whether no instruction in the body of the numeric `for` whose
+    /// `for_prep` is at `prep_pc` may write its index or its visible
+    /// variable (`bc_liveness.mayWrite`, which over-approximates). Then the
+    /// two are equal at every pc of the body's first instruction: the `for`
+    /// sets them equal on both its own arrivals, and nothing outside a block
+    /// jumps into it (Lua's `goto` cannot either). The source cannot assign
+    /// them (doc 76 D6), so this refuses only bytecode the compiler does not
+    /// emit; it runs once a recording, O(body) as recording one iteration
+    /// is.
+    pub fn forBodyKeepsAlias(code: []const bytecode.Instr, prep_pc: u32) bool {
         const body: u32 = prep_pc + 1;
         const loop_pc: i64 = @as(i64, body) + code[prep_pc].aux;
         if (loop_pc < body or loop_pc >= code.len or code[@intCast(loop_pc)].op != .for_loop) return false;
+        const index = code[prep_pc].a;
         var p: u32 = body;
         while (p < loop_pc) : (p += 1) {
-            for (bc_liveness.successors(code[p], p, code.len)) |s| {
-                if (s == body) return false;
-            }
+            if (bc_liveness.mayWrite(code[p], p, code.len, index) or
+                bc_liveness.mayWrite(code[p], p, code.len, index + 3)) return false;
         }
         return true;
     }

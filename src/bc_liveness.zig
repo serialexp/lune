@@ -125,8 +125,11 @@ pub fn successors(ins: Instr, pc: u32, code_len: usize) [2]?u32 {
 /// base up, a numeric `for` its index and loop variable, `itern` its
 /// fallback's copies — and so does any patched-image opcode. For the
 /// variable naming of runtime errors (`bc_names`), where a missed write
-/// would name the wrong value.
-pub fn mayWrite(ins: Instr, pc: u32, code_len: usize, reg: u16) bool {
+/// would name the wrong value. `inline`: `bc_names` asks it per
+/// instruction of a backward walk on every named fault, and a second
+/// caller (the recorder's `forBodyKeepsAlias`) left LLVM an out-of-line
+/// call there (+0.37% on pcall_faults, tier-0).
+pub inline fn mayWrite(ins: Instr, pc: u32, code_len: usize, reg: u16) bool {
     const a: u32 = ins.a;
     const r: u32 = reg;
     switch (ins.op) {
