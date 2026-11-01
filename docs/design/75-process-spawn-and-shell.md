@@ -84,9 +84,29 @@ land; move whole phases to Done once everything inside them is checked.
   stderr down the pipe (`|&`); every stage is in one process group, so a
   timeout ends them all; all programs are found on `PATH` before the first
   starts; a pipeline has at most 64 stages; a stage table is just its argv.
-- [ ] **Phase 3 — `inherit`, handles, background jobs.** Non-recording mode
-  only (§5): `inherit` stdio, `proc.spawn` returning a handle (`pid`, `wait`,
-  `kill`). All fatal in record mode. Q11 and Q12 are decided (§5.3, §6).
+- [x] **Phase 3 — `inherit`, handles, background jobs.** Non-recording mode
+  only (§5): `inherit` stdio, `proc.spawn` returning a job (`pid`, `wait`,
+  `poll`, `kill`). All fatal in record mode. Q11 and Q12 are decided (§5.3, §6).
+  Landed: Ctrl-C forwarding to the children's group while a call waits
+  (`proc_host.Interrupt`), the terminal's foreground group for a child that
+  inherits stdin from a terminal, stdout/stderr flushed before an inheriting
+  child writes, `Job` as the one runner (`run` = start + wait; `spawn` = start,
+  then `advance` whenever the program looks), VM close terminates jobs
+  (SIGTERM, 500 ms, SIGKILL). Decisions made in the implementation:
+  - A job's `stdout`/`stderr` default to the parent's, not `capture`: nothing
+    reads a background job's pipes between looks, so a captured one would stall
+    on a full pipe. Captured streams are drained when the job is waited on or
+    polled; a child that fills the pipe in between waits for that look.
+  - `proc.spawn` takes one program (no background pipelines yet) and the same
+    options as `proc.run`; `timeout` counts from the spawn and is enforced
+    whenever the job is looked at (it cannot fire while the program never looks).
+  - `job:kill(sig)` signals the group by name (`"TERM"` default, `"SIG"` prefix
+    optional) and answers false, without signalling, once every program has been
+    reaped (a reaped pid may be recycled).
+  - A foreground child that stops (Ctrl-Z) is killed and reported as ended by
+    the stopping signal: stopped-child handling is job control (Phase 5).
+  - A job survives only in its host; a restored VM's job answers "the job is
+    gone".
 - [ ] **Phase 4 — the REPL.** Interactive loop: prompt, line editing,
   history, multi-line chunks, `cd`/env builtins on an authoritative host
   environment (§6). Never recordable. Depends on Phase 4a.

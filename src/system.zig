@@ -261,6 +261,15 @@ pub const HostSystem = struct {
         /// Run a program to completion (doc 75). Blocks. The result's slices
         /// are valid until the next host call.
         proc: ?*const fn (ctx: *anyopaque, req: ProcRequest) ProcResult = null,
+        /// Start a program in the background (`proc.spawn`, doc 75 Phase 3)
+        /// and return at once. The host owns the job from here: it ends the
+        /// ones still running when the VM closes.
+        proc_spawn: ?*const fn (ctx: *anyopaque, req: ProcRequest) ProcSpawned = null,
+        /// Look at a background job; with `block`, wait for it to end. A
+        /// finished job answers the same every time, until the VM closes.
+        proc_job: ?*const fn (ctx: *anyopaque, job: ProcJobId, block: bool) ProcJobState = null,
+        /// Signal a background job's whole process group, by name.
+        proc_kill: ?*const fn (ctx: *anyopaque, job: ProcJobId, signal: []const u8) ProcKill = null,
 
         // ---- time ----
         /// Wall-clock seconds since the Unix epoch.
@@ -345,6 +354,9 @@ pub const ProcDone = struct {
     timed_out: bool,
     /// A captured stream lost earlier bytes to `max_bytes`.
     truncated: bool,
+    /// Which streams were captured: the others are absent from the result.
+    stdout_captured: bool = true,
+    stderr_captured: bool = true,
 };
 
 /// Why a stage could not be started.
@@ -352,6 +364,34 @@ pub const ProcFail = struct {
     /// Which stage (0-based).
     stage: u32 = 0,
     class: ErrorClass,
+};
+
+/// A background job's number, assigned by the host.
+pub const ProcJobId = u32;
+
+/// A background program that started, or why it could not be.
+pub const ProcSpawned = union(enum) {
+    job: struct { id: ProcJobId, pid: i32 },
+    fail: ProcFail,
+};
+
+pub const ProcJobState = union(enum) {
+    running,
+    done: ProcDone,
+    /// The host has no such job (it was never spawned here, or the VM was
+    /// restored from a snapshot).
+    gone,
+    /// The job could not be followed (out of memory).
+    fail: ErrorClass,
+};
+
+pub const ProcKill = enum {
+    sent,
+    /// Every program had already ended: nothing was signalled, since a
+    /// finished program's pid may belong to someone else by now.
+    finished,
+    gone,
+    bad_signal,
 };
 
 /// The programs ran, or one could not be started (the others were ended).

@@ -93,9 +93,10 @@ const Options = struct {
         return true;
     }
 
-    /// The program name of stage `i`.
-    fn program(self: *const Options, i: usize) []const u8 {
-        return self.stages.items[i][0];
+    /// The program names, for messages; `buf` holds them.
+    fn names(self: *const Options, buf: *[max_stages][]const u8) Names {
+        for (self.stages.items, 0..) |argv, i| buf[i] = argv[0];
+        return .{ .list = buf[0..self.stages.items.len], .timeout_s = self.timeout_s };
     }
 };
 
@@ -332,11 +333,11 @@ fn encodeFailure(gpa: std.mem.Allocator, fail: system.ProcFail, list: *std.Array
     try list.append(gpa, @intFromEnum(fail.class));
 }
 
-fn encode(gpa: std.mem.Allocator, o: *const Options, done: system.ProcDone, list: *std.ArrayList(u8)) !void {
+fn encode(gpa: std.mem.Allocator, done: system.ProcDone, list: *std.ArrayList(u8)) !void {
     var flags: u8 = 0;
     if (done.truncated) flags |= flag_truncated;
-    if (o.capturesStdout()) flags |= flag_stdout;
-    if (o.capturesStderr()) flags |= flag_stderr;
+    if (done.stdout_captured) flags |= flag_stdout;
+    if (done.stderr_captured) flags |= flag_stderr;
     if (done.timed_out) flags |= flag_timed_out;
     try list.append(gpa, tag_done);
     try list.append(gpa, @intCast(done.stages.len));
@@ -457,29 +458,35 @@ fn resultTable(vm: *Vm, f: *const Finished, focus: usize, pipeline: bool, root_s
     return t;
 }
 
-/// The programs' names, joined as a pipeline reads.
-fn programs(vm: *Vm, o: *const Options) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(vm.gpa);
-    for (0..o.stages.items.len) |i| {
-        if (i > 0) try buf.appendSlice(vm.gpa, " | ");
-        try buf.appendSlice(vm.gpa, o.program(i));
+/// What a message about a call names: its programs, and its timeout.
+const Names = struct {
+    list: []const []const u8,
+    timeout_s: ?f64,
+
+    /// The programs' names, joined as a pipeline reads.
+    fn joined(self: Names, vm: *Vm) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(vm.gpa);
+        for (self.list, 0..) |name, i| {
+            if (i > 0) try buf.appendSlice(vm.gpa, " | ");
+            try buf.appendSlice(vm.gpa, name);
+        }
+        return buf.toOwnedSlice(vm.gpa);
     }
-    return buf.toOwnedSlice(vm.gpa);
-}
+};
 
 /// Raise the failure of programs that ended badly: the result's fields plus
 /// `kind`, `program` and `message`, with a `__tostring` that gives the
 /// message, so an uncaught one still prints (doc 75 §3.3).
-fn raiseFailure(vm: *Vm, o: *const Options, f: *const Finished, pipeline: bool) anyerror {
+fn raiseFailure(vm: *Vm, names: Names, f: *const Finished, pipeline: bool) anyerror {
     const timed_out = f.timed_out;
     const focus = f.failing() orelse f.n - 1;
     const t = try resultTable(vm, f, focus, pipeline, true);
     const st = f.stages[focus];
-    const program: []u8 = if (timed_out) try programs(vm, o) else try vm.gpa.dupe(u8, o.program(focus));
+    const program: []u8 = if (timed_out) try names.joined(vm) else try vm.gpa.dupe(u8, names.list[focus]);
     defer vm.gpa.free(program);
     const kind: []const u8, const message: []u8 = if (timed_out)
-        .{ "timeout", try std.fmt.allocPrint(vm.gpa, "command '{s}' timed out after {d} seconds", .{ program, o.timeout_s orelse 0 }) }
+        .{ "timeout", try std.fmt.allocPrint(vm.gpa, "command '{s}' timed out after {d} seconds", .{ program, names.timeout_s orelse 0 }) }
     else if (st.signaled)
         .{ "signal", try std.fmt.allocPrint(vm.gpa, "command '{s}' was killed by {s}", .{ program, st.signal }) }
     else
@@ -541,16 +548,18 @@ fn execute(vm: *Vm, o: *const Options, pipeline: bool, out: []Value) anyerror!us
             .{ .fail = .{ .class = .other } };
         switch (result) {
             .fail => |fail| try encodeFailure(vm.gpa, fail, &scratch),
-            .done => |done| try encode(vm.gpa, o, done, &scratch),
+            .done => |done| try encode(vm.gpa, done, &scratch),
         }
         try interp.recordHostBytes(vm, .proc_run, scratch.items);
         break :blk scratch.items;
     };
 
+    var name_buf: [max_stages][]const u8 = undefined;
+    const names = o.names(&name_buf);
     switch (try decode(rec, o.stages.items.len)) {
-        .start_failed => |sf| return startFailure(vm, o, sf.stage, sf.class),
+        .start_failed => |sf| return startFailure(vm, names, sf.stage, sf.class),
         .done => |*f| {
-            if (o.check and !f.ok()) return raiseFailure(vm, o, f, pipeline);
+            if (o.check and !f.ok()) return raiseFailure(vm, names, f, pipeline);
             const t = try resultTable(vm, f, f.n - 1, pipeline, !pipeline);
             return io.putResults(out, &.{Value.heap(&t.header)});
         },
@@ -574,15 +583,166 @@ fn pipeN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 }
 
 /// A program that could not be started raises whatever `check` says.
-fn startFailure(vm: *Vm, o: *const Options, stage: usize, class: system.ErrorClass) anyerror {
-    const msg = try std.fmt.allocPrint(vm.gpa, "cannot run '{s}': {s}", .{ o.program(stage), class.text() });
+fn startFailure(vm: *Vm, names: Names, stage: usize, class: system.ErrorClass) anyerror {
+    const msg = try std.fmt.allocPrint(vm.gpa, "cannot run '{s}': {s}", .{ names.list[stage], class.text() });
     defer vm.gpa.free(msg);
     return vm.raiseLocatedError(msg, 1);
+}
+
+// ---------------------------------------------------------------------------
+// proc.spawn: background jobs
+// ---------------------------------------------------------------------------
+
+/// `proc.spawn(argv_and_options)`: start one program and return a job at once
+/// (doc 75 Phase 3). The options are `proc.run`'s, except that stdout and
+/// stderr default to the parent's: a background job nobody reads from would
+/// otherwise stall on a full pipe. `timeout` counts from the spawn and is
+/// enforced whenever the job is looked at. The job has `pid`, `program`,
+/// `check`, `timeout` and the methods `wait()`, `poll()` and `kill([signal])`.
+///
+/// A job is never recordable: whether it is ever waited on cannot be known at
+/// the call, so a recording refuses it outright (§5).
+fn spawnN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    var o: Options = .{ .stdout = .inherit, .stderr = .inherit };
+    defer o.deinit(vm.gpa);
+    try parseRun(vm, args, &o);
+    if (vm.effect_mode != .off) return error.ProcNotRecordable;
+    if (o.stdout == .inherit or o.stderr == .inherit) io.flushStandardStreams(vm);
+
+    var name_buf: [max_stages][]const u8 = undefined;
+    const names = o.names(&name_buf);
+    const spawned: system.ProcSpawned = if (vm.system) |sys|
+        if (sys.vtable.proc_spawn) |spawn| spawn(sys.ctx, o.request()) else .{ .fail = .{ .class = .other } }
+    else
+        .{ .fail = .{ .class = .other } };
+    const job = switch (spawned) {
+        .fail => |f| return startFailure(vm, names, f.stage, f.class),
+        .job => |j| j,
+    };
+
+    const t = try vm.heap.newTableSized(5);
+    try put(vm, t, "id", Value.int(job.id));
+    try put(vm, t, "pid", Value.int(job.pid));
+    try put(vm, t, "program", try vm.heap.internValue(names.list[0]));
+    try put(vm, t, "check", Value.boolean(o.check));
+    if (o.timeout_s) |secs| try put(vm, t, "timeout", Value.float(secs));
+    const methods = try vm.heap.newTableSized(3);
+    inline for (.{ .{ "wait", "proc.job_wait" }, .{ "poll", "proc.job_poll" }, .{ "kill", "proc.job_kill" } }) |m| {
+        const f = try vm.heap.newNativeFrom(interp.templateOf(m[1]));
+        try methods.set(vm.gpa, try vm.heap.internValue(m[0]), Value.heap(&f.header));
+    }
+    const meta = try vm.heap.newTableSized(1);
+    try meta.set(vm.gpa, try vm.heap.internValue("__index"), Value.heap(&methods.header));
+    t.metatable = meta;
+    return io.putResults(out, &.{Value.heap(&t.header)});
+}
+
+/// The job a method was called on.
+const JobRef = struct {
+    id: system.ProcJobId,
+    program: []const u8,
+    check: bool,
+    timeout_s: ?f64,
+};
+
+fn jobRef(vm: *Vm, args: []const Value) anyerror!JobRef {
+    const t = (if (args.len >= 1) io.asByteArray(args[0]) else null) orelse
+        return vm.badArg(1, "job", if (args.len >= 1) args[0] else null);
+    const id = t.get(try vm.heap.internValue("id"));
+    const program = interp.strBytes(t.get(try vm.heap.internValue("program")));
+    const check = t.get(try vm.heap.internValue("check"));
+    if (!id.isInt() or id.asInt() < 0 or program == null) return vm.badArgReason(1, "not a job (use job:method())");
+    const timeout = t.get(try vm.heap.internValue("timeout"));
+    return .{
+        .id = @intCast(id.asInt()),
+        .program = program.?,
+        .check = !(check.isBool() and !check.asBool()),
+        .timeout_s = if (timeout.isFloat()) timeout.asFloat() else if (timeout.isInt()) @as(f64, @floatFromInt(timeout.asInt())) else null,
+    };
+}
+
+/// Ask the host about a job; a missing capability is a failure like any.
+fn jobState(vm: *Vm, ref: JobRef, block: bool) system.ProcJobState {
+    const sys = vm.system orelse return .gone;
+    const look = sys.vtable.proc_job orelse return .gone;
+    return look(sys.ctx, ref.id, block);
+}
+
+/// A job's state as the call's result: nil while it runs, the result table
+/// (or the raised failure) once it has ended.
+fn jobResult(vm: *Vm, ref: JobRef, state: system.ProcJobState, out: []Value) anyerror!usize {
+    switch (state) {
+        .running => return io.putResults(out, &.{Value.nil()}),
+        .gone => return vm.raiseLocatedError("the job is gone: the host does not know it (a restored VM cannot follow one)", 1),
+        .fail => |c| {
+            const msg = try std.fmt.allocPrint(vm.gpa, "cannot follow '{s}': {s}", .{ ref.program, c.text() });
+            defer vm.gpa.free(msg);
+            return vm.raiseLocatedError(msg, 1);
+        },
+        .done => |done| {
+            var scratch: std.ArrayList(u8) = .empty;
+            defer scratch.deinit(vm.gpa);
+            try encode(vm.gpa, done, &scratch);
+            const decoded = try decode(scratch.items, 1);
+            const f = &decoded.done;
+            const names: Names = .{ .list = &.{ref.program}, .timeout_s = ref.timeout_s };
+            if (ref.check and !f.ok()) return raiseFailure(vm, names, f, false);
+            const t = try resultTable(vm, f, 0, false, true);
+            return io.putResults(out, &.{Value.heap(&t.header)});
+        },
+    }
+}
+
+/// `job:wait()`: block until it ends; its result, or the raised failure.
+fn jobWaitN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    if (vm.effect_mode != .off) return error.ProcNotRecordable;
+    const ref = try jobRef(vm, args);
+    return jobResult(vm, ref, jobState(vm, ref, true), out);
+}
+
+/// `job:poll()`: nil while it runs, else as `wait`.
+fn jobPollN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    if (vm.effect_mode != .off) return error.ProcNotRecordable;
+    const ref = try jobRef(vm, args);
+    return jobResult(vm, ref, jobState(vm, ref, false), out);
+}
+
+/// `job:kill([signal])`: signal the job's whole process group (default
+/// `"TERM"`; `"INT"`, `"SIGKILL"`...). True when a signal was sent, false
+/// when the job had already ended.
+fn jobKillN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    if (vm.effect_mode != .off) return error.ProcNotRecordable;
+    const ref = try jobRef(vm, args);
+    const sig: []const u8 = if (args.len >= 2 and !args[1].isNil())
+        interp.strBytes(args[1]) orelse return vm.badArg(2, "string", args[1])
+    else
+        "TERM";
+    const sys = vm.system orelse return vm.raiseLocatedError("the job is gone: the host does not know it (a restored VM cannot follow one)", 1);
+    const kill = sys.vtable.proc_kill orelse return vm.raiseLocatedError("the job is gone: the host does not know it (a restored VM cannot follow one)", 1);
+    switch (kill(sys.ctx, ref.id, sig)) {
+        .sent => return io.putResults(out, &.{Value.boolean(true)}),
+        .finished => return io.putResults(out, &.{Value.boolean(false)}),
+        .gone => return vm.raiseLocatedError("the job is gone: the host does not know it (a restored VM cannot follow one)", 1),
+        .bad_signal => {
+            const msg = try std.fmt.allocPrint(vm.gpa, "unknown signal '{s}'", .{sig});
+            defer vm.gpa.free(msg);
+            return vm.badArgReason(2, msg);
+        },
+    }
 }
 
 pub const natives = [_]function.BaseNative{
     .{ .name = "proc.run", .func = io.single(&runN), .multi = &runN, .module = "proc", .field = "run", .groups = .{ .proc = true } },
     .{ .name = "proc.pipe", .func = io.single(&pipeN), .multi = &pipeN, .module = "proc", .field = "pipe", .groups = .{ .proc = true } },
-    // The `__tostring` of a failure; made by `raiseFailure`, not installed.
+    .{ .name = "proc.spawn", .func = io.single(&spawnN), .multi = &spawnN, .module = "proc", .field = "spawn", .groups = .{ .proc = true } },
+    // The methods of a job and the `__tostring` of a failure; made by
+    // `spawnN` and `raiseFailure`, not installed.
+    .{ .name = "proc.job_wait", .func = io.single(&jobWaitN), .multi = &jobWaitN, .manual = true },
+    .{ .name = "proc.job_poll", .func = io.single(&jobPollN), .multi = &jobPollN, .manual = true },
+    .{ .name = "proc.job_kill", .func = io.single(&jobKillN), .multi = &jobKillN, .manual = true },
     .{ .name = "proc.error_tostring", .func = &errorToString, .manual = true },
 };

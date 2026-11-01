@@ -151,15 +151,20 @@ test "proc: a signal and a timeout are results too, and raise by default" {
 test "proc: streams that are not captured are absent" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
-    host.proc_result = .{ .done = .{ .stages = &stage_ok, .stdout = "", .timed_out = false, .truncated = false } };
+    host.proc_result = .{ .done = .{ .stages = &stage_ok, .stdout = "", .timed_out = false, .truncated = false, .stdout_captured = false, .stderr_captured = false } };
     const r = try recordReplay(&host,
         \\local r = proc.run({"x", stdout = "null", stderr = "merge"})
         \\print(r.stdout, r.stderr)
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("nil\tnil\n", r.out);
+    host.proc_result = .{ .done = .{ .stages = &stage_ok, .stdout = "", .timed_out = false, .truncated = false, .stderr_captured = false } };
+    const s = try recordReplay(&host,
         \\local s = proc.run({"x", stderr = "null"})
         \\print(type(s.stdout), s.stderr)
     );
-    defer r.deinit(testing.allocator);
-    try testing.expectEqualStrings("nil\tnil\ntable\tnil\n", r.out);
+    defer s.deinit(testing.allocator);
+    try testing.expectEqualStrings("table\tnil\n", s.out);
 }
 
 test "proc: a program that cannot be started raises, whatever check says, and replays the same" {
@@ -427,5 +432,91 @@ test "proc.pipe: the table is checked, and the shared rules apply to every stage
     try testing.expectError(error.ProcNotRecordable, run(testing.allocator, .{ .host = &host, .mode = .record }, "proc.pipe({{'a'}, {'b'}, stderr = 'inherit'})"));
     // The worst case grows with the stages: three stderr captures of 64 KiB.
     try testing.expectError(error.EffectLogLimit, run(testing.allocator, .{ .host = &host, .mode = .record, .limit = 3 * 1024 }, "proc.pipe({{'a'}, {'b'}, {'c'}, max_bytes = 1024, stdout = 'null'})"));
+    try testing.expectEqual(@as(usize, 0), host.proc_calls);
+}
+
+const job_done_out = system.ProcJobState{ .done = .{ .stages = &stage_exit3, .stdout = "out", .timed_out = false, .truncated = false, .stderr_captured = true } };
+const job_done_ok = system.ProcJobState{ .done = .{ .stages = &stage_ok, .stdout = "fine\n", .timed_out = false, .truncated = false } };
+
+test "proc.spawn: a job has a pid and methods, and is only ever live" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.job_states = &.{ .running, .running, job_done_ok };
+    const r = try run(testing.allocator, .{ .host = &host },
+        \\local j = proc.spawn({"sleep", "1"})
+        \\print(j.pid, j.program, j.check, j.timeout, type(j.wait), type(j.poll), type(j.kill))
+        \\print(j:poll(), j:poll())
+        \\local r = j:wait()
+        \\print(r.ok, r.code, string.decode(r.stdout))
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("4242\tsleep\ttrue\tnil\tfunction\tfunction\tfunction\nnil\tnil\ntrue\t0\tfine\n\n", r.out);
+    try testing.expectEqual(@as(usize, 1), host.job_blocked);
+    // stdout is the parent's unless asked for.
+    try testing.expect(host.proc_stdout_inherit);
+}
+
+test "proc.spawn: a job that ended badly raises on wait unless check is false" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.job_states = &.{job_done_out};
+    const r = try run(testing.allocator, .{ .host = &host },
+        \\local j = proc.spawn({"tool", timeout = 5})
+        \\local ok, e = pcall(j.wait, j)
+        \\print(ok, e.kind, e.code, e.program, string.decode(e.stdout), tostring(e))
+        \\local q = proc.spawn({"tool", check = false})
+        \\print(q:wait().code, q.timeout, j.timeout)
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("false\texit\t3\ttool\tout\tcommand 'tool' exited with status 3\n3\tnil\t5\n", r.out);
+    // The last spawn had no timeout; one with a timeout hands it to the host.
+    try testing.expectEqual(@as(?u64, null), host.proc_timeout_ns);
+    const t = try run(testing.allocator, .{ .host = &host }, "proc.spawn({'x', timeout = 5})");
+    defer t.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u64, 5_000_000_000), host.proc_timeout_ns);
+}
+
+test "proc.spawn: kill names the signal, and says whether it was sent" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    const r = try run(testing.allocator, .{ .host = &host },
+        \\local j = proc.spawn({"x"})
+        \\print(j:kill(), j:kill("SIGINT"))
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("true\ttrue\n", r.out);
+    try testing.expectEqualStrings("SIGINT", host.kill_signal[0..host.kill_signal_len]);
+    host.kill_result = .finished;
+    const f = try run(testing.allocator, .{ .host = &host }, "print(proc.spawn({'x'}):kill())");
+    defer f.deinit(testing.allocator);
+    try testing.expectEqualStrings("false\n", f.out);
+    host.kill_result = .bad_signal;
+    const b = try run(testing.allocator, .{ .host = &host }, "print(pcall(proc.spawn({'x'}).kill, proc.spawn({'x'}), 'NOPE'))");
+    defer b.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, b.out, "unknown signal 'NOPE'") != null);
+}
+
+test "proc.spawn: a job the host does not know is gone, and a spawn that fails raises" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.job_states = &.{.gone};
+    const g = try run(testing.allocator, .{ .host = &host }, "print(pcall(proc.spawn({'x'}).wait, proc.spawn({'x'})))");
+    defer g.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, g.out, "the job is gone") != null);
+    host.spawn_result = .{ .fail = .{ .class = .not_found } };
+    const f = try run(testing.allocator, .{ .host = &host }, "print(pcall(proc.spawn, {'nope'}))");
+    defer f.deinit(testing.allocator);
+    try testing.expect(std.mem.endsWith(u8, f.out, "cannot run 'nope': not found\n"));
+}
+
+test "proc.spawn: a recording refuses a job outright, and a job's methods are live-only" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    try testing.expectError(error.ProcNotRecordable, run(testing.allocator, .{ .host = &host, .mode = .record }, "proc.spawn({'x'})"));
+    var log: interp.EffectLog = .{};
+    defer log.deinit(testing.allocator);
+    const empty = try effectser.encodeFile(testing.allocator, &log);
+    defer testing.allocator.free(empty);
+    try testing.expectError(error.ProcNotRecordable, run(testing.allocator, .{ .mode = .replay, .log = empty }, "proc.spawn({'x'})"));
     try testing.expectEqual(@as(usize, 0), host.proc_calls);
 }

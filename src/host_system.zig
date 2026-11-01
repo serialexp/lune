@@ -16,6 +16,13 @@ const proc_host = @import("proc_host.zig");
 const Io = std.Io;
 const HostSystem = seam.HostSystem;
 
+/// A background program and what it has written so far; boxed so the job's
+/// pointer to its capture stays put.
+const JobBox = struct {
+    job: proc_host.Job,
+    cap: proc_host.Capture,
+};
+
 pub const RealSystem = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -33,6 +40,9 @@ pub const RealSystem = struct {
     zone: ?ZoneSource = null,
     /// What the last `proc` result points into (doc 75).
     proc_capture: proc_host.Capture = .{},
+    /// Background programs (`proc.spawn`), by the number the VM holds.
+    jobs: std.AutoHashMapUnmanaged(seam.ProcJobId, *JobBox) = .empty,
+    next_job: seam.ProcJobId = 1,
 
     /// For the CLI, with the process environment from `Init`.
     pub fn init(gpa: std.mem.Allocator, io: Io, env_map: ?*std.process.Environ.Map) RealSystem {
@@ -42,6 +52,15 @@ pub const RealSystem = struct {
     pub fn deinit(self: *RealSystem) void {
         self.dropLast();
         self.proc_capture.deinit(self.gpa);
+        // Programs still running when the VM closes do not outlive it.
+        var job_it = self.jobs.valueIterator();
+        while (job_it.next()) |box| {
+            box.*.job.terminate();
+            box.*.job.deinit();
+            box.*.cap.deinit(self.gpa);
+            self.gpa.destroy(box.*);
+        }
+        self.jobs.deinit(self.gpa);
         if (self.zone) |*z| z.deinit(self.gpa);
         var it = self.handles.valueIterator();
         while (it.next()) |h| {
@@ -60,6 +79,9 @@ pub const RealSystem = struct {
         .getenv = &getenv,
         .environ = &environ,
         .proc = if (proc_host.supported) &procRun else null,
+        .proc_spawn = if (proc_host.supported) &procSpawn else null,
+        .proc_job = if (proc_host.supported) &procJob else null,
+        .proc_kill = if (proc_host.supported) &procKill else null,
         .open = &open,
         .tmpfile = &tmpfile,
         .fill = &fill,
@@ -602,6 +624,53 @@ pub const RealSystem = struct {
         return proc_host.run(self.gpa, threaded.io(), self.env_map, req, &self.proc_capture);
     }
 
+    /// `proc.spawn` (doc 75 Phase 3): start the programs and keep the job.
+    fn procSpawn(ctx: *anyopaque, req: seam.ProcRequest) seam.ProcSpawned {
+        const self = of(ctx);
+        var threaded: std.Io.Threaded = .init(self.gpa, .{ .async_limit = .nothing });
+        defer threaded.deinit();
+        const box = self.gpa.create(JobBox) catch return .{ .fail = .{ .class = .other } };
+        box.cap = .{};
+        box.job = proc_host.Job.init(self.gpa, &box.cap);
+        if (proc_host.start(&box.job, threaded.io(), self.env_map, req, true)) |fail| {
+            box.job.deinit();
+            box.cap.deinit(self.gpa);
+            self.gpa.destroy(box);
+            return .{ .fail = fail };
+        }
+        const id = self.next_job;
+        self.jobs.put(self.gpa, id, box) catch {
+            box.job.terminate();
+            box.job.deinit();
+            box.cap.deinit(self.gpa);
+            self.gpa.destroy(box);
+            return .{ .fail = .{ .class = .other } };
+        };
+        self.next_job += 1;
+        return .{ .job = .{ .id = id, .pid = box.job.pid() } };
+    }
+
+    fn procJob(ctx: *anyopaque, id: seam.ProcJobId, block: bool) seam.ProcJobState {
+        const self = of(ctx);
+        const box = self.jobs.get(id) orelse return .gone;
+        const finished = if (block) blk: {
+            box.job.wait();
+            break :blk true;
+        } else box.job.poll();
+        if (!finished) return .running;
+        return switch (box.job.result()) {
+            .done => |d| .{ .done = d },
+            .fail => |f| .{ .fail = f.class },
+        };
+    }
+
+    fn procKill(ctx: *anyopaque, id: seam.ProcJobId, signal: []const u8) seam.ProcKill {
+        const self = of(ctx);
+        const box = self.jobs.get(id) orelse return .gone;
+        const sig = proc_host.parseSignal(signal) orelse return .bad_signal;
+        return if (box.job.signal(sig)) .sent else .finished;
+    }
+
     fn getenv(ctx: *anyopaque, name: []const u8) ?[]const u8 {
         const self = of(ctx);
         if (self.env_map) |m| return m.get(name);
@@ -902,4 +971,56 @@ test "proc forwards Ctrl-C to the children's group and goes on waiting" {
     });
     try testing.expectEqualStrings("SIGINT", r.done.stages[0].status.signaled);
     try testing.expect(!r.done.timed_out);
+}
+
+test "proc jobs run in the background, are looked at, and end with the host" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+    defer sys.deinit();
+    const quick = RealSystem.procSpawn(&sys, .{
+        .stages = &.{&.{ "/bin/sh", "-c", "read x; echo got $x; exit 2" }},
+        .stdin = .{ .bytes = "in\n" },
+        .max_bytes = 64,
+    }).job;
+    // It is a separate process: a second job can run beside it.
+    const slow = RealSystem.procSpawn(&sys, .{
+        .stages = &.{&.{ "/bin/sh", "-c", "sleep 30" }},
+        .max_bytes = 64,
+    }).job;
+    try testing.expect(quick.pid > 0 and slow.pid > 0 and quick.pid != slow.pid);
+
+    const done = RealSystem.procJob(&sys, quick.id, true).done;
+    try testing.expectEqualStrings("got in\n", done.stdout);
+    try testing.expectEqual(@as(u32, 2), done.stages[0].status.exited);
+    // A finished job answers the same again, and cannot be signalled.
+    try testing.expectEqualStrings("got in\n", RealSystem.procJob(&sys, quick.id, false).done.stdout);
+    try testing.expectEqual(seam.ProcKill.finished, RealSystem.procKill(&sys, quick.id, "TERM"));
+
+    try testing.expect(RealSystem.procJob(&sys, slow.id, false) == .running);
+    try testing.expectEqual(seam.ProcKill.bad_signal, RealSystem.procKill(&sys, slow.id, "NOPE"));
+    try testing.expectEqual(seam.ProcKill.sent, RealSystem.procKill(&sys, slow.id, "SIGTERM"));
+    const killed = RealSystem.procJob(&sys, slow.id, true).done;
+    try testing.expectEqualStrings("SIGTERM", killed.stages[0].status.signaled);
+    try testing.expect(RealSystem.procJob(&sys, 999, false) == .gone);
+}
+
+test "proc jobs still running when the host closes are ended, and a job's timeout is enforced on look" {
+    if (!proc_host.supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var pid: i32 = 0;
+    {
+        var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
+        defer sys.deinit();
+        pid = RealSystem.procSpawn(&sys, .{
+            .stages = &.{&.{ "/bin/sh", "-c", "sleep 30" }},
+            .max_bytes = 64,
+        }).job.pid;
+        const limited = RealSystem.procSpawn(&sys, .{
+            .stages = &.{&.{ "/bin/sh", "-c", "sleep 30" }},
+            .max_bytes = 64,
+            .timeout_ns = 50_000_000,
+        }).job;
+        try testing.expect(RealSystem.procJob(&sys, limited.id, true).done.timed_out);
+    }
+    // The host's deinit reaped it: there is no such child to signal any more.
+    try testing.expect(std.posix.system.kill(pid, @enumFromInt(0)) != 0);
 }

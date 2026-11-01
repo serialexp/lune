@@ -575,6 +575,18 @@ pub const Job = struct {
         }
     }
 
+    /// Block until the job ends. Ctrl-C meanwhile goes to its group.
+    pub fn wait(self: *Job) void {
+        Interrupt.acquire();
+        defer Interrupt.release();
+        _ = self.advance(true, false);
+    }
+
+    /// One look at the job: whether it has ended.
+    pub fn poll(self: *Job) bool {
+        return self.advance(false, false);
+    }
+
     /// What the finished job did. Slices point into `cap`.
     pub fn result(self: *Job) seam.ProcResult {
         if (self.failed) return .{ .fail = .{ .class = .other } };
@@ -597,11 +609,24 @@ pub const Job = struct {
             .stdout = if (self.stdout_captured) self.cap.out.finish() else "",
             .timed_out = self.dl.timed_out,
             .truncated = truncated,
+            .stdout_captured = self.stdout_captured,
+            .stderr_captured = self.stderr_captured,
         } };
     }
 };
 
 const Reaped = union(enum) { exited: u32, signaled: u32 };
+
+/// The signal a name stands for (`"TERM"` or `"SIGTERM"`), or null.
+pub fn parseSignal(name: []const u8) ?posix.SIG {
+    const bare = if (std.mem.startsWith(u8, name, "SIG")) name[3..] else name;
+    const info = @typeInfo(posix.SIG).@"enum";
+    inline for (info.field_names, info.field_values) |field, value| {
+        if (std.mem.eql(u8, field, bare) and @intFromEnum(@as(posix.SIG, @enumFromInt(value))) > 0)
+            return @enumFromInt(value);
+    }
+    return null;
+}
 
 /// One non-blocking look at whether `pid` has ended.
 fn tryReap(pid: posix.pid_t) ?Reaped {
@@ -882,6 +907,14 @@ pub fn run(gpa: Allocator, io: Io, host_env: ?*const std.process.Environ.Map, re
 }
 
 const testing = std.testing;
+
+test "signals are found by name, with or without the prefix" {
+    try testing.expectEqual(posix.SIG.TERM, parseSignal("TERM").?);
+    try testing.expectEqual(posix.SIG.INT, parseSignal("SIGINT").?);
+    try testing.expect(parseSignal("NOPE") == null);
+    try testing.expect(parseSignal("") == null);
+    try testing.expect(parseSignal("SIG") == null);
+}
 
 test "Tail keeps the latest bytes and says when it dropped some" {
     var t: Tail = .{};

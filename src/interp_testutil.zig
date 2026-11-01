@@ -332,6 +332,17 @@ pub const FakeHost = struct {
     proc_calls: usize = 0,
     proc_argc: usize = 0,
     proc_stages: usize = 0,
+    proc_stdout_inherit: bool = false,
+    /// Background jobs: what `proc_spawn` answers, the states `proc_job`
+    /// walks through (the last one repeats), and what `proc_kill` answers.
+    spawn_result: seam.ProcSpawned = .{ .job = .{ .id = 7, .pid = 4242 } },
+    job_states: []const seam.ProcJobState = &.{.running},
+    job_looks: usize = 0,
+    job_blocked: usize = 0,
+    kill_result: seam.ProcKill = .sent,
+    kill_signal: [16]u8 = undefined,
+    kill_signal_len: usize = 0,
+    kill_calls: usize = 0,
     proc_max_bytes: usize = 0,
     proc_timeout_ns: ?u64 = null,
 
@@ -547,6 +558,37 @@ pub const FakeHost = struct {
         return self.proc_result;
     }
 
+    fn procSpawnFn(ctx: *anyopaque, req: seam.ProcRequest) seam.ProcSpawned {
+        const self = of(ctx);
+        self.calls += 1;
+        self.proc_calls += 1;
+        self.proc_stages = req.stages.len;
+        self.proc_max_bytes = req.max_bytes;
+        self.proc_timeout_ns = req.timeout_ns;
+        self.proc_stdout_inherit = req.stdout == .inherit;
+        return self.spawn_result;
+    }
+
+    fn procJobFn(ctx: *anyopaque, id: seam.ProcJobId, block: bool) seam.ProcJobState {
+        const self = of(ctx);
+        _ = id;
+        self.calls += 1;
+        if (block) self.job_blocked += 1;
+        const i = @min(self.job_looks, self.job_states.len - 1);
+        self.job_looks += 1;
+        return self.job_states[i];
+    }
+
+    fn procKillFn(ctx: *anyopaque, id: seam.ProcJobId, signal: []const u8) seam.ProcKill {
+        const self = of(ctx);
+        _ = id;
+        self.calls += 1;
+        self.kill_calls += 1;
+        self.kill_signal_len = @min(signal.len, self.kill_signal.len);
+        @memcpy(self.kill_signal[0..self.kill_signal_len], signal[0..self.kill_signal_len]);
+        return self.kill_result;
+    }
+
     fn environFn(ctx: *anyopaque, visit: seam.EnvVisitFn, visit_ctx: *anyopaque) void {
         const self = of(ctx);
         self.calls += 1;
@@ -592,6 +634,9 @@ pub const FakeHost = struct {
         .localZone = &localZoneFn,
         .environ = &environFn,
         .proc = &procFn,
+        .proc_spawn = &procSpawnFn,
+        .proc_job = &procJobFn,
+        .proc_kill = &procKillFn,
     };
 
     pub fn system(self: *FakeHost) HostSystem {
