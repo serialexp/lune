@@ -48,6 +48,9 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Phase 4 — `table.freeze` / `table.isfrozen` / `table.clone`.**
   The table's `readonly` bit; every store path checks it, the JIT's
   included; keyframes carry it; inventory rows (§5).
+- [x] **Phase 5 — language server.** The keyword, attributes and
+  declarations in completion, semantic tokens, hover, definition and rename;
+  the strict-scope errors as diagnostics (§7).
 
 ### Outstanding
 
@@ -65,9 +68,6 @@ land; move whole phases to Done once everything inside them is checked.
   - [ ] a value with a `__close` recorded as the call, not an abort
 - [ ] **`<close>` gaps against 5.4** (§6.2, TODO.md): pending closes on an
   uncaught top-level error; a `__close` that yields.
-- [ ] **Phase 5 — language server.** The keyword, attributes and
-  declarations in completion, semantic tokens, hover, definition and rename;
-  the strict-scope errors as diagnostics (§7).
 - [ ] **Phase 6 — measured.** A table-store benchmark before and after the
   `readonly` check, and the suite (`just bench`) (§5.4).
   - [x] store microbenchmarks, user instructions, local (§5.4)
@@ -441,6 +441,25 @@ of Phase 3b.
   global is still one name (doc 74, "Globals across files").
 - The compiler's new errors (undeclared name in a strict scope, assignment to
   a const) are diagnostics like any other, with the resolver's spans.
+
+As built (`src/lsp/`):
+
+- The resolver marks each occurrence `readonly` when the name cannot be
+  assigned there, and records every `global x` declaration with its scope
+  (`Resolution.declarations`); `declarationOf` finds the one covering an
+  occurrence. `Occurrence` stays 16 bytes.
+- Semantic tokens: an attribute's word has the `modifier` type; a
+  `readonly` modifier marks `<const>`/`<close>` locals, `for` control
+  variables, `<const>` globals and names under `global <const> *`.
+- Completion offers `const` and `close` alone inside `<…>` in a `local` or
+  `global` name list, read off the text so a half-typed line works. A global
+  only declared is offered like an assigned one. In a strict scope
+  (`Resolution.strictAt`: a `global x` in scope and no `global *`) only the
+  globals declared there are offered, host ones included, since any other
+  free name is an error there.
+- Hover on a variable that is no library name shows its declaration as
+  code (`local N <const> = 10`, the folded constant included), and notes
+  that a `for` control variable is read-only.
 
 ## 8. Open questions for review
 

@@ -688,11 +688,20 @@ pub const Server = struct {
     fn hover(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
         const p = jsonrpc.decodeParams(protocol.TextDocumentPositionParams, a, params) catch |e| return self.badParams(id, e, out);
         const c = (try self.cursor(id, p.textDocument.uri, p.position, out)) orelse return;
-        const named = (try library.hoverAt(a, c.an, c.offset)) orelse return out.result(id, @as(?u8, null));
         const oa = out.arena.allocator();
+        if (try library.hoverAt(a, c.an, c.offset)) |named| {
+            return out.result(id, protocol.Hover{
+                .contents = .{ .kind = protocol.MarkupKind.markdown, .value = try library.markdown(oa, named.entry, c.settings.system) },
+                .range = c.index.toRange(c.an.source, named.span.start, named.span.end, self.encoding),
+            });
+        }
+        // A variable: its kind and attributes (doc 76 §7). The implicit
+        // `self` has no text to hover.
+        const occ = navigation.occurrenceAt(c.an, c.offset) orelse return out.result(id, @as(?u8, null));
+        if (occ.span.end == occ.span.start) return out.result(id, @as(?u8, null));
         try out.result(id, protocol.Hover{
-            .contents = .{ .kind = protocol.MarkupKind.markdown, .value = try library.markdown(oa, named.entry, c.settings.system) },
-            .range = c.index.toRange(c.an.source, named.span.start, named.span.end, self.encoding),
+            .contents = .{ .kind = protocol.MarkupKind.markdown, .value = try navigation.describe(oa, c.an, occ) },
+            .range = c.index.toRange(c.an.source, occ.span.start, occ.span.end, self.encoding),
         });
     }
 
@@ -1993,6 +2002,20 @@ test "requests: an unopened document is invalid params; initialize advertises th
 }
 
 // ---- the library over the wire (doc 74 §7.3) ----
+
+test "hover(doc 76): a variable that is no library name shows its kind and attribute" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    h.server.known_globals = &.{"print"};
+    try h.open();
+    const hover = try askAt(&h, "local n <const> = 4\nprint(n)", "textDocument/hover", 1, 6, "");
+    const result = hover.object.get("result").?.object;
+    try testing.expectEqualStrings("```mahina\nlocal n <const> = 4\n```", result.get("contents").?.object.get("value").?.string);
+    try testing.expectEqual(@as(i64, 6), result.get("range").?.object.get("start").?.object.get("character").?.integer);
+    // Off any name, still nothing.
+    const gap = try askAt(&h, "local n <const> = 4\nprint(n)", "textDocument/hover", 0, 17, "");
+    try testing.expect(gap.object.get("result").? == .null);
+}
 
 test "library: hover, signature help, and members after a dot, from the stdlib table" {
     var h = Harness.init(.{});

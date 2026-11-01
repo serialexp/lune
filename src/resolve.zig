@@ -98,8 +98,36 @@ pub const Occurrence = struct {
     qualified: bool = false,
     /// A global named by a `global x` declaration in scope (or its own
     /// declaration): the program says it exists, so the unknown-global lint
-    /// keeps quiet about it.
+    /// keeps quiet about it. `Resolution.declarationOf` finds which.
     declared: bool = false,
+    /// The name cannot be assigned here (doc 76 §3.4, §4): a `<const>` or
+    /// `<close>` local, a `for` control variable, a global declared
+    /// `<const>`, or a free name under a `global <const> *`.
+    readonly: bool = false,
+
+    // A file has one per name token, and the symbol index keeps them for
+    // every file of a workspace: the flags ride in padding.
+    comptime {
+        std.debug.assert(@sizeOf(Occurrence) == 16);
+    }
+};
+
+/// A `global x` declaration (doc 76 §3.2) and the text it covers.
+pub const GlobalDeclaration = struct {
+    binding: BindingId,
+    /// The declared name.
+    span: Span,
+    attrib: ast.Attrib,
+    /// Where its scope ends, as `Binding.scope_end`.
+    scope_end: u32 = std.math.maxInt(u32),
+};
+
+/// A `global *` or `global <const> *` (doc 76 §3.2) and the text it covers.
+pub const GlobalAll = struct {
+    /// Where the statement starts.
+    start: u32,
+    attrib: ast.Attrib,
+    scope_end: u32 = std.math.maxInt(u32),
 };
 
 /// A scoping rule the program breaks (doc 76 §3.2, §4.1); a compile error.
@@ -130,12 +158,42 @@ pub const Resolution = struct {
     damaged: std.ArrayList(Span) = .empty,
     /// The scoping rules broken, in tree order.
     problems: std.ArrayList(Problem) = .empty,
+    /// Every `global x` declaration, in tree order.
+    declarations: std.ArrayList(GlobalDeclaration) = .empty,
+    /// Every `global *`, in tree order.
+    global_alls: std.ArrayList(GlobalAll) = .empty,
 
     pub fn deinit(self: *Resolution) void {
         self.bindings.deinit(self.gpa);
         self.occurrences.deinit(self.gpa);
         self.damaged.deinit(self.gpa);
         self.problems.deinit(self.gpa);
+        self.declarations.deinit(self.gpa);
+        self.global_alls.deinit(self.gpa);
+    }
+
+    /// Whether a free name at `offset` has to be declared (doc 76 §3.2): a
+    /// `global x` is in scope there and no `global *` is. A cursor at a
+    /// scope's end, just before its closing keyword, is still in it.
+    pub fn strictAt(self: *const Resolution, offset: u32) bool {
+        for (self.global_alls.items) |g| if (g.start <= offset and offset <= g.scope_end) return false;
+        for (self.declarations.items) |d| if (d.span.start <= offset and offset <= d.scope_end) return true;
+        return false;
+    }
+
+
+    /// The `global` declaration that makes the name at `occ` the global:
+    /// the innermost one in scope there, its own for a declaring name. Null
+    /// for an undeclared global and for anything else. A file has few, so
+    /// a scan.
+    pub fn declarationOf(self: *const Resolution, occ: *const Occurrence) ?*const GlobalDeclaration {
+        if (!occ.declared) return null;
+        var best: ?*const GlobalDeclaration = null;
+        for (self.declarations.items) |*d| {
+            if (d.binding != occ.binding or d.span.start > occ.span.start or occ.span.start >= d.scope_end) continue;
+            if (best == null or d.span.start > best.?.span.start) best = d;
+        }
+        return best;
     }
 
     pub fn binding(self: *const Resolution, id: BindingId) *const Binding {
@@ -240,6 +298,9 @@ const Entry = struct {
     /// The entry this one shadows, `no_entry` if none.
     prev: u32,
     what: What = .local,
+    /// For `global x`, its index in `Resolution.declarations`; for
+    /// `global *`, in `Resolution.global_alls`.
+    decl: u32 = 0,
 
     const What = enum {
         /// A local, parameter or loop variable.
@@ -293,11 +354,12 @@ const Walker = struct {
                 .global, .global_const => self.named_globals -= 1,
                 .all, .all_const => {
                     _ = self.collectives.pop();
+                    self.res.global_alls.items[e.decl].scope_end = scope_end;
                     continue;
                 },
             }
             const b = &self.res.bindings.items[e.binding];
-            if (e.what == .local) b.scope_end = scope_end;
+            if (e.what == .local) b.scope_end = scope_end else self.res.declarations.items[e.decl].scope_end = scope_end;
             if (e.prev == no_entry) {
                 _ = self.heads.remove(b.name);
             } else {
@@ -319,7 +381,7 @@ const Walker = struct {
             .func = self.func,
         });
         try self.push(name, .{ .binding = id, .prev = undefined });
-        try self.res.occurrences.append(self.gpa, .{ .span = decl, .binding = id, .access = .declare });
+        try self.res.occurrences.append(self.gpa, .{ .span = decl, .binding = id, .access = .declare, .readonly = attrib != .none });
     }
 
     /// Put `entry` in scope as the innermost meaning of `name`.
@@ -335,14 +397,18 @@ const Walker = struct {
     /// global `x`, read-only when `<const>`.
     fn declareGlobal(self: *Walker, name: []const u8, span: Span, attrib: ast.Attrib) std.mem.Allocator.Error!void {
         const id = try self.global(name);
-        try self.push(name, .{ .binding = id, .prev = undefined, .what = if (attrib == .@"const") .global_const else .global });
+        const decl: u32 = @intCast(self.res.declarations.items.len);
+        try self.res.declarations.append(self.gpa, .{ .binding = id, .span = span, .attrib = attrib });
+        try self.push(name, .{ .binding = id, .prev = undefined, .what = if (attrib == .@"const") .global_const else .global, .decl = decl });
         self.named_globals += 1;
-        try self.res.occurrences.append(self.gpa, .{ .span = span, .binding = id, .access = .declare, .declared = true });
+        try self.res.occurrences.append(self.gpa, .{ .span = span, .binding = id, .access = .declare, .declared = true, .readonly = attrib == .@"const" });
     }
 
-    /// `global *` or `global <const> *`.
-    fn declareAll(self: *Walker, attrib: ast.Attrib) std.mem.Allocator.Error!void {
-        try self.entries.append(self.gpa, .{ .binding = no_entry, .prev = no_entry, .what = if (attrib == .@"const") .all_const else .all });
+    /// `global *` or `global <const> *`, the statement starting at `start`.
+    fn declareAll(self: *Walker, attrib: ast.Attrib, start: u32) std.mem.Allocator.Error!void {
+        const decl: u32 = @intCast(self.res.global_alls.items.len);
+        try self.res.global_alls.append(self.gpa, .{ .start = start, .attrib = attrib });
+        try self.entries.append(self.gpa, .{ .binding = no_entry, .prev = no_entry, .what = if (attrib == .@"const") .all_const else .all, .decl = decl });
         try self.collectives.append(self.gpa, attrib == .@"const");
     }
 
@@ -374,17 +440,18 @@ const Walker = struct {
     fn use(self: *Walker, name: []const u8, span: Span, access: Access) std.mem.Allocator.Error!void {
         const writes = access == .write or access == .read_write;
         var declared = false;
+        var readonly = false;
         const id = if (self.heads.get(name)) |top| blk: {
             const e = self.entries.items[top];
             switch (e.what) {
                 .local => {
                     const b = &self.res.bindings.items[e.binding];
                     if (b.func != self.func) b.captured = true;
-                    if (writes and b.attrib != .none) try self.problem(.assign_to_const, name, span);
+                    readonly = b.attrib != .none;
                 },
                 .global, .global_const => {
                     declared = true;
-                    if (writes and e.what == .global_const) try self.problem(.assign_to_const, name, span);
+                    readonly = e.what == .global_const;
                 },
                 .all, .all_const => unreachable, // never a head
             }
@@ -394,13 +461,14 @@ const Walker = struct {
             // innermost deciding whether it is read-only; else any named
             // declaration in scope makes it an error.
             if (self.collectives.items.len > 0) {
-                if (writes and self.collectives.items[self.collectives.items.len - 1]) try self.problem(.assign_to_const, name, span);
+                readonly = self.collectives.items[self.collectives.items.len - 1];
             } else if (self.named_globals > 0) {
                 try self.problem(.undeclared, name, span);
             }
             break :blk try self.global(name);
         };
-        try self.res.occurrences.append(self.gpa, .{ .span = span, .binding = id, .access = access, .declared = declared });
+        if (writes and readonly) try self.problem(.assign_to_const, name, span);
+        try self.res.occurrences.append(self.gpa, .{ .span = span, .binding = id, .access = access, .declared = declared, .readonly = readonly });
     }
 
     /// Doc 76 D8: the literal `e` is, through parentheses, as a constant
@@ -527,7 +595,7 @@ const Walker = struct {
                 try self.exprList(g.values);
                 for (g.names) |n| try self.declareGlobal(n.name, n.name_span, n.attrib);
             },
-            .global_all => |ga| try self.declareAll(ga.attrib),
+            .global_all => |ga| try self.declareAll(ga.attrib, s.span.start),
             .global_function => |gf| {
                 // Declared first: the body can call itself.
                 try self.declareGlobal(gf.name, gf.name_span, .none);

@@ -1,5 +1,5 @@
-//! Definition, references, highlights and rename, read off the resolver's
-//! binding index (doc 74 §7.2).
+//! Definition, references, highlights, rename and a variable's hover text,
+//! read off the resolver's binding index (doc 74 §7.2, doc 76 §7).
 //!
 //! Everything here is LSP-free: byte spans in, byte spans out. The cost of a
 //! request is one pass over the occurrence array (sorted by position, so the
@@ -25,20 +25,59 @@ fn writes(access: resolve.Access) bool {
     return access == .write or access == .read_write;
 }
 
-/// Where the name is declared. A global is declared where it is first
-/// assigned; one nothing assigns (a host built-in, a typo) has no definition.
+/// Where the name is declared. A global under a `global x` declaration is
+/// declared there (doc 76 §7); any other global where it is first assigned,
+/// and one nothing assigns (a host built-in, a typo) has no definition.
 pub fn definition(an: *const Analysis, occ: *const Occurrence) ?Span {
     const b = an.res.binding(occ.binding);
     if (b.kind != .global) return b.decl_span;
+    if (an.res.declarationOf(occ)) |d| return d.span;
     const first = an.res.occurrenceAt(b.decl_span.start) orelse return null;
     return if (writes(first.access)) first.span else null;
 }
 
-/// Whether `occ` is the occurrence that declares its binding.
+/// Whether `occ` declares its binding: a local's declaration, a `global x`
+/// name, or the first assignment of a global.
 fn declares(an: *const Analysis, occ: *const Occurrence) bool {
+    if (occ.access == .declare) return true;
     const b = an.res.binding(occ.binding);
-    if (b.kind != .global) return occ.access == .declare;
-    return occ.span.start == b.decl_span.start and writes(occ.access);
+    return b.kind == .global and occ.span.start == b.decl_span.start and writes(occ.access);
+}
+
+/// What hover says about the name at `occ` (doc 76 §7): its kind and
+/// attribute, as the declaration would spell it, and a folded `<const>`
+/// local's constant. A library name's own hover (`library.hoverAt`) comes
+/// first; this is for the rest.
+pub fn describe(a: std.mem.Allocator, an: *const Analysis, occ: *const Occurrence) std.mem.Allocator.Error![]const u8 {
+    const b = an.res.binding(occ.binding);
+    const attrib: ast.Attrib = if (b.kind == .global)
+        (if (an.res.declarationOf(occ)) |d| d.attrib else .none)
+    else
+        b.attrib;
+    const kind = switch (b.kind) {
+        .local => "local",
+        .param => "parameter",
+        .self => "self",
+        .for_var => "for variable",
+        .local_function => "local function",
+        .global => "global",
+    };
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "```mahina\n");
+    if (b.kind == .self) {
+        try out.appendSlice(a, "self");
+    } else {
+        try out.print(a, "{s} {s}", .{ kind, b.name });
+    }
+    switch (attrib) {
+        .none => {},
+        .@"const" => if (b.kind != .for_var) try out.appendSlice(a, " <const>"),
+        .close => try out.appendSlice(a, " <close>"),
+    }
+    if (b.value) |v| try out.print(a, " = {s}", .{an.source[v.span.start..v.span.end]});
+    try out.appendSlice(a, "\n```");
+    if (b.kind == .for_var and attrib == .@"const") try out.appendSlice(a, "\nRead-only: a `for` control variable.");
+    return out.toOwnedSlice(a);
 }
 
 /// Every occurrence of `binding`, in source order. The implicit `self` of a
@@ -233,6 +272,60 @@ test "navigation: a global is defined where it is first assigned, a built-in now
     const refs = try references(testing.allocator, &f.an, f.occ("g)", 0).binding, false);
     defer testing.allocator.free(refs);
     try testing.expectEqual(@as(usize, 2), refs.len); // the assignment is the declaration
+}
+
+test "navigation(doc 76): a declared global is defined at the declaration in scope, which rename covers" {
+    var f = try Fixture.init(
+        \\global print
+        \\global g = 1
+        \\print(g)
+        \\do
+        \\  global <const> g
+        \\  print(g)
+        \\end
+        \\print(g)
+    );
+    defer f.deinit();
+    const outer = f.at("g = 1", 0);
+    const inner = f.at("g\n", 0);
+    try testing.expectEqual(outer, definition(&f.an, f.occ("g)", 0)).?.start);
+    try testing.expectEqual(inner, definition(&f.an, f.occ("g)", 1)).?.start);
+    try testing.expectEqual(outer, definition(&f.an, f.occ("g)", 2)).?.start);
+    try testing.expectEqual(inner, definition(&f.an, f.occ("g\n", 0)).?.start);
+    const binding = f.occ("g)", 0).binding;
+    const all = try references(testing.allocator, &f.an, binding, true);
+    defer testing.allocator.free(all);
+    try testing.expectEqual(@as(usize, 5), all.len);
+    const uses = try references(testing.allocator, &f.an, binding, false);
+    defer testing.allocator.free(uses);
+    try testing.expectEqual(@as(usize, 3), uses.len); // both declarations are declarations
+    try testing.expectEqual(Check.ok, try f.check("g)", 0, "h"));
+}
+
+test "navigation(doc 76): hover names the kind, the attribute and a folded constant" {
+    var f = try Fixture.init(
+        \\local N <const> = 10
+        \\local t <close> = nil
+        \\local plain = N
+        \\for i = 1, N do end
+        \\global <const> G
+        \\print(G, t, plain, undeclared)
+    );
+    defer f.deinit();
+    const a = testing.allocator;
+    const cases = [_]struct { needle: []const u8, n: usize, want: []const u8 }{
+        .{ .needle = "N", .n = 1, .want = "```mahina\nlocal N <const> = 10\n```" },
+        .{ .needle = "t,", .n = 0, .want = "```mahina\nlocal t <close>\n```" },
+        .{ .needle = "plain", .n = 0, .want = "```mahina\nlocal plain\n```" },
+        .{ .needle = "i =", .n = 0, .want = "```mahina\nfor variable i\n```\nRead-only: a `for` control variable." },
+        .{ .needle = "G,", .n = 0, .want = "```mahina\nglobal G <const>\n```" },
+        .{ .needle = "undeclared", .n = 0, .want = "```mahina\nglobal undeclared\n```" },
+    };
+    for (cases) |c| {
+        const text = try describe(a, &f.an, f.occ(c.needle, c.n));
+        defer a.free(text);
+        try testing.expectEqualStrings(c.want, text);
+    }
 }
 
 test "navigation: the implicit self has no text to list" {

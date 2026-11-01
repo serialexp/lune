@@ -183,6 +183,24 @@ test "analysis: syntax errors and compile errors are reported together" {
     try testing.expectEqual(@as(usize, 1), lint);
 }
 
+test "analysis(doc 76): the strict scope's and const's errors are diagnostics over the name" {
+    const src = "global x\ny = 1\nlocal k <const> = 1\nk = 2";
+    var an = try analyse(testing.allocator, src, &known, .{});
+    defer an.deinit();
+    var undeclared: ?diag.Diagnostic = null;
+    var assigned: ?diag.Diagnostic = null;
+    for (an.diagnostics) |d| switch (d.code) {
+        .undeclared_variable => undeclared = d,
+        .assign_to_const => assigned = d,
+        else => {},
+    };
+    try testing.expectEqualStrings("y", src[undeclared.?.start..undeclared.?.end]);
+    try testing.expectEqual(diag.Severity.@"error", undeclared.?.severity);
+    try testing.expectEqual(@as(u32, 9), undeclared.?.start);
+    try testing.expectEqualStrings("k", src[assigned.?.start..assigned.?.end]);
+    try testing.expectEqual(@as(u32, 35), assigned.?.start);
+}
+
 test "analysis: comments are kept in source order, with their bytes" {
     var an = try analyse(testing.allocator, "-- one\nx = 1 --[[ two ]]", &known, .{});
     defer an.deinit();

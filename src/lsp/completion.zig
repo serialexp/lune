@@ -66,6 +66,7 @@ pub fn complete(
         .string, .comment => return &.{},
     }
     if (afterMemberAccess(an.source, offset)) return memberItems(a, an, offset, enabled);
+    if (inAttribute(an, offset)) return &attribute_items;
     const under = an.res.occurrenceCovering(offset);
     if (under) |o| if (o.access == .declare) return &.{}; // naming something new
 
@@ -93,12 +94,23 @@ pub fn complete(
         });
     }
 
-    // Globals the file assigns. One that is only read is a typo as likely as a
-    // definition elsewhere, so it is not offered; nor is the name being typed.
+    // Globals the file assigns or declares (`global x`, doc 76). One that is
+    // only read is a typo as likely as a definition elsewhere, so it is not
+    // offered; nor is the name being typed.
+    // In a strict scope (doc 76 §3.2) a free name must be declared, so only
+    // the globals declared there are offered. `declared` holds every global
+    // a declaration names, or in a strict scope those declared at the cursor.
+    const strict = an.res.strictAt(offset);
+    var declared: std.StringHashMapUnmanaged(void) = .empty;
+    for (an.res.declarations.items) |d| {
+        if (!strict or (d.span.start <= offset and offset <= d.scope_end)) try declared.put(a, bindings[d.binding].name, {});
+    }
     for (bindings, 0..) |b, id| {
         if (b.kind != .global) continue;
+        const is_declared = declared.contains(b.name);
+        if (strict and !is_declared) continue;
         const first = an.res.occurrenceAt(b.decl_span.start) orelse continue;
-        if (first.access != .write and first.access != .read_write) continue;
+        if (first.access != .write and first.access != .read_write and !is_declared) continue;
         if (under) |u| if (u.binding == id and onlyOccurrence(an, @intCast(id))) continue;
         if ((try seen.getOrPut(a, b.name)).found_existing) continue;
         try items.append(a, .{ .label = b.name, .kind = .variable, .detail = "global", .rank = 1 });
@@ -107,6 +119,7 @@ pub fn complete(
     for (known_globals) |g| {
         // Some host names are compiler intrinsics (`@codes_iter`) no source can spell.
         if (!navigation.isIdentifier(g)) continue;
+        if (strict and !declared.contains(g)) continue;
         if ((try seen.getOrPut(a, g)).found_existing) continue;
         try items.append(a, .{ .label = g, .kind = .variable, .detail = "built-in global", .rank = 2 });
     }
@@ -116,6 +129,39 @@ pub fn complete(
         try items.append(a, .{ .label = k, .kind = .keyword, .detail = "keyword", .rank = 3 });
     }
     return items.items;
+}
+
+/// What goes between `<` and `>` after a declared name (doc 76 §4, §6).
+const attribute_items = [_]Item{
+    .{ .label = "const", .kind = .keyword, .detail = "attribute", .rank = 0 },
+    .{ .label = "close", .kind = .keyword, .detail = "attribute", .rank = 0 },
+};
+
+/// The cursor is in an attribute: in the identifier after a `<` in the name
+/// list of a `local` or `global` statement (`local x <co|`, `local <|`).
+/// Read off the text, since the statement being typed may not parse yet:
+/// back from the `<`, over names, commas and finished attributes, to the
+/// keyword, on the same line.
+fn inAttribute(an: *const Analysis, offset: u32) bool {
+    const src = an.source;
+    var i: usize = @min(offset, src.len);
+    while (i > 0 and library.isIdentByte(src[i - 1])) i -= 1;
+    while (i > 0 and (src[i - 1] == ' ' or src[i - 1] == '\t')) i -= 1;
+    if (i == 0 or src[i - 1] != '<') return false;
+    i -= 1;
+    while (i > 0) {
+        switch (src[i - 1]) {
+            ' ', '\t', ',', '<', '>' => i -= 1,
+            else => {
+                const end = i;
+                while (i > 0 and library.isIdentByte(src[i - 1])) i -= 1;
+                if (i == end) return false;
+                const word = src[i..end];
+                if (std.mem.eql(u8, word, "local") or std.mem.eql(u8, word, "global")) return true;
+            },
+        }
+    }
+    return false;
 }
 
 /// After `lib.`: the library's members. A function has its signature as detail;
@@ -246,6 +292,29 @@ test "completion: a member in a system group the host does not enable is not off
     try testing.expect(find(stdio_only, "read") != null);
     try testing.expect(find(stdio_only, "write") != null);
     try testing.expect(find(try complete(a, &an, &known, .all, 7), "open") != null);
+}
+
+test "completion(doc 76): attribute names after a declared name's <, and declared globals" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "local x <|", "local x <co|", "local <|", "local a <const>, b <|", "global g <|", "global <|" }) |src| {
+        const items = try completeAt(a, src);
+        try testing.expectEqual(@as(usize, 2), items.len);
+        try testing.expect(find(items, "const") != null and find(items, "close") != null);
+    }
+    // A comparison is not an attribute.
+    try testing.expect(find(try completeAt(a, "local y = 1\nprint(y <|"), "y") != null);
+    try testing.expect(find(try completeAt(a, "local z = y <|"), "while") != null);
+    // A global only declared is a name the program says exists.
+    try testing.expectEqualStrings("global", find(try completeAt(a, "global g\nglobal *\n|"), "g").?.detail);
+    // In a strict scope only declared globals, host ones included; a
+    // `global *` lifts it, and so does leaving the declaration's block.
+    const strict = try completeAt(a, "global print, g\nh = 1\n|");
+    try testing.expect(find(strict, "print") != null and find(strict, "g") != null);
+    try testing.expect(find(strict, "pairs") == null and find(strict, "h") == null);
+    try testing.expect(find(try completeAt(a, "global g\nglobal *\n|"), "pairs") != null);
+    try testing.expect(find(try completeAt(a, "do global g end\n|"), "pairs") != null);
 }
 
 test "completion: a global that is only read, or is being typed, is not offered" {
