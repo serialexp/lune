@@ -66,8 +66,9 @@ land; move whole phases to Done once everything inside them is checked.
     values are nil or false, so loops with a generic `for` inside stay
     native
   - [ ] a value with a `__close` recorded as the call, not an abort
-- [ ] **`<close>` gaps against 5.4** (§6.2, TODO.md): pending closes on an
-  uncaught top-level error; a `__close` that yields.
+- [ ] **`<close>` gaps against 5.4** (§6.2, TODO.md).
+  - [x] pending closes run on an uncaught top-level error
+  - [ ] a `__close` that yields
 - [ ] **Phase 6 — measured.** A table-store benchmark before and after the
   `readonly` check, and the suite (`just bench`) (§5.4).
   - [x] store microbenchmarks, user instructions, local (§5.4)
@@ -387,9 +388,15 @@ the other pending closes still run.
   to yield across a C-call boundary", where 5.4 suspends the coroutine
   mid-close (TODO.md). The close runs as a nested call (`Vm.callClose`), not
   as a resumable frame.
-- An error that nothing catches ends the program without running pending
-  closes yet (TODO.md); lua.c runs them, because its `pcall` around the
-  chunk does.
+- An error that nothing catches runs the pending closes before the program
+  ends, as lua.c's `pcall` around the chunk does. `Vm.exec` does it, so
+  `run`, `start`, a resumed run and a REPL line share it: it closes the main
+  stack's frames top first with the error value (a bare fault's located
+  message, as `pcall` gives), leaving the frames for the host's report. An
+  error a `__close` raises becomes the reported one; its traceback is the
+  original fault's, since the close's frames are gone by then (lua.c's
+  message handler runs again for it). Errors no `pcall` may catch (out of
+  memory, an interrupt, `os.exit`) close nothing, as in 5.4.
 - Determinism: closes run in a fixed order at fixed points; nothing new for
   replay.
 

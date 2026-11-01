@@ -7,10 +7,12 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 - [ ] **Lua 5.5 global declarations, attributes and frozen tables.**
       Designed in doc 76 (decisions D1–D8 there); its status list tracks
       the phases.
-- [ ] **An uncaught error skips pending `__close`s** (doc 76 §6.2). An
-      error that reaches the top of the main chunk ends the program without
-      closing its to-be-closed variables; lua.c closes them, because it runs
-      the chunk under `pcall`. Run the top-level unwind's closes too.
+- [ ] **A caught bare fault drops Lua's variable suffix** (seen
+      2026-11-01). `pcall(function() local t = nil; return t.x end)` gives
+      "main:1: attempt to index a nil value"; 5.4 says "... (local 't')".
+      `synthErrorValue` builds the caught value from `describeFault`'s
+      message, which leaves `faultVarInfo`'s suffix to the reporter, so
+      `pcall`, a `__close`'s error argument and the top-level report all lack it.
 - [ ] **A `__close` cannot yield** (doc 76 §6.2). 5.4 suspends a coroutine
       mid-close; mahina raises "attempt to yield across a C-call boundary",
       because `Vm.callClose` runs the close as a nested call. Needs the close

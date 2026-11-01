@@ -4471,7 +4471,7 @@ pub const Vm = struct {
         self.heap.bumpHostEpoch();
         // After a stop inside a coroutine, the dispatch resumes it; the main
         // stack is the context this dispatch belongs to either way.
-        var outcome = try self.execWith(1, null);
+        var outcome = self.execWith(1, null) catch |err| return self.closeUncaught(err);
         // The main chunk returned, having started tasks: run them.
         if (outcome == .finished and self.depth == 0 and root_base_ok and !draining and self.task_lib != null)
             outcome = try self.startTaskDrain(outcome.finished);
@@ -4496,6 +4496,25 @@ pub const Vm = struct {
             }
         }
         return outcome;
+    }
+
+    /// Doc 76 §6.2: an error that leaves the main stack closes its pending
+    /// to-be-closed variables, top frame first, as the `pcall` `lua.c` runs a
+    /// chunk under does. The frames stay, so the host still reports where the
+    /// error happened; an error a `__close` raises replaces it, reported as
+    /// raised (its own traceback is gone with the close's frames). Returns the
+    /// error the run ends with.
+    fn closeUncaught(self: *Vm, err: Error) Error {
+        if (!catchable(err) or self.current != null or self.depth == 0) return err;
+        const saved = self.pending_error;
+        const errval = saved orelse (self.synthErrorValue(err) catch |e| return e);
+        const raised = self.closeUnwound(0, errval, &.{}, true) catch |e| return e;
+        if (raised) |e2| {
+            self.pending_error = e2;
+            return Error.LuaError;
+        }
+        self.pending_error = saved;
+        return err;
     }
 
     /// `exec`, bounded by a stop depth. The dispatch loop returns `.finished` the

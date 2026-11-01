@@ -387,6 +387,39 @@ test "doc 76: an error in __close is passed to the rest, then raised" {
     , "false\tin b\nc:nil a:in b\nfalse\tin b\na:in b\nfalse\tin b\na:in b\n");
 }
 
+test "doc 76: an uncaught error closes the variables it unwinds through" {
+    const loud =
+        \\local function loud(name)
+        \\  return setmetatable({}, { __close = function(_, err) print(name, err) end })
+        \\end
+        \\
+    ;
+    try testutil.expectProgramFault(loud ++
+        \\local m <close> = loud("m")
+        \\local function f()
+        \\  local a <close> = loud("a")
+        \\  for i = 1, 100 do end
+        \\  error("boom", 0)
+        \\end
+        \\f()
+        \\
+    , "a\tboom\nm\tboom\n", "boom", .{});
+    // A bare fault's closes get its located message, as `pcall` would.
+    try testutil.expectProgramFault(loud ++
+        \\local m <close> = loud("m")
+        \\local t = nil
+        \\print(t.x)
+        \\
+    , "m\tmain:6: attempt to index a nil value\n", "attempt to index a nil value", .{});
+    // An error a `__close` raises is the one the program ends with.
+    try testutil.expectProgramFault(loud ++
+        \\local m <close> = loud("m")
+        \\local b <close> = setmetatable({}, { __close = function() error("in b", 0) end })
+        \\error("first", 0)
+        \\
+    , "m\tin b\n", "in b", .{});
+}
+
 test "doc 76: a value that cannot be closed is refused where it is declared" {
     try expectProgram(
         \\print(pcall(function() local x <close> = 42 end))
