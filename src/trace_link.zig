@@ -1489,6 +1489,9 @@ pub fn rowSilentKind(kind: trace_exec.LedgerKind) ?nativegen.SilentSiteKind {
         // Doc 45 D6: precise exits carry no patch window — a precise trace
         // is never a chain source, so there is no exit branch to patch.
         .precise_deopt, .precise_error => null,
+        // Doc 77: the interrupt stub returns to `shared_exit` through no
+        // slot, so there is no exit branch to patch.
+        .interrupt => null,
         // Doc 56 Phase 6: an exit adapter's row (its site is on the
         // adapter's page).
         .exit_side => .exit_side,

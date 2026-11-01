@@ -1,8 +1,8 @@
 # 77 — Interrupting traced loops — Design
 
-Status: draft; tiebreak made on 2026-11-01 (P1 on the interrupt byte + E2 with its own exit reason), awaiting Bart's confirmation. Tier-0 interrupt landed in 24340e8.
+Status: implemented 2026-11-02 (P1 on the interrupt byte + E2 with its own ledger kind) for tier-1a and native x64; remaining tests listed under Outstanding. Tier-0 interrupt landed in 24340e8.
 Owner: Bart
-Last updated: 2026-11-01
+Last updated: 2026-11-02
 
 ## Implementation status
 
@@ -22,36 +22,64 @@ land; move whole sections to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **D1 — the poll.** Proposed: P1 reading `Heap.interrupt_requested` (the
-  byte), at the back-edge. P2 and P3 dropped. Awaiting Bart.
-- [ ] **D2 — the exit.** Proposed: E2 with its own `ExitReason.interrupted`
-  and `LedgerKind.interrupt`. E1 not taken. Awaiting Bart.
-- [ ] **Phase 0 — measure the cost.** Cycles per iteration of the byte poll
+- [x] **D1 — the poll.** P1 reading `Heap.interrupt_requested` (the byte), at
+  the back-edge. P2 and P3 dropped.
+- [x] **D2 — the exit.** E2 with its own `LedgerKind.interrupt = 13`. No
+  `ExitReason.interrupted` was added: the ledger's debug assertion requires
+  `ledger_reason == exit_reason` and pairs reasons with kinds, and the row is
+  already unambiguous (`exit_instr = maxInt`, reason `.normal`, kind
+  `.interrupt`). E1 not taken.
+- [x] **Phase 0 — measure the cost** (numbers under "Measured cost"). Cycles per iteration of the byte poll
   (`movabs` + `cmp byte [rax], 0` + `jne`) on an arithmetic, a table and a
   call loop; `just bench` over the whole board; `-Djit-debug` receipts
   identical to master.
-- [ ] **Phase 1 — tier-1a.** Poll in `irinterp`'s `.loop` arm, result with
-  `exit_reason = .interrupted`.
-- [ ] **Phase 2 — dispatcher.** An early arm for `.interrupted`: account the
-  laps, re-arm the headroom (see Q4), resume tier-0 at the anchor.
-- [ ] **Phase 3 — native x64.** The poll in the `.loop` arm, its own exit
+- [x] **Phase 1 — tier-1a.** Poll in `irinterp`'s `.loop` arm after the
+  commit; a productive `exit_instr = maxInt` exit.
+- [x] **Phase 2 — dispatcher.** No change was needed: it already tolerates a
+  productive `maxInt` exit and resumes tier-0, whose prologue parks the
+  interrupt. (Planned: an early arm for `.interrupted`: account the
+  laps, re-arm the headroom (see Q4), resume tier-0 at the anchor.)
+- [x] **Phase 3 — native x64.** The poll in the `.loop` arm, its own exit
   stub (carried-homes flush, `exit_target = shared_exit`, no slot dispatch),
   the new ledger row kind and its `replayLedger` arms.
-- [ ] **Phase 4 — tests.** An interrupt delivered to a trace that is already
-  running (the current tests request before the run), per loop shape, in
-  tier-1a and native; peeled and instability-unrolled loops; a loop entered
-  through a chain (ledger length > 1); an interrupt during recording; the
-  VM running another line afterwards; registers coherent (parallel-φ swaps,
-  write-only values). Behaviour asserted by counts, a generous watchdog for
+- [ ] **Phase 4 — tests.** Done: an interrupt delivered to a trace that is
+  already running (a thread waits for `trace.entries > 0`), for arithmetic,
+  call, table-write and `for` loops, in tier-1a and native, then the VM
+  running another line (`interp_interrupt_test.zig`); pty runs of the REPL
+  keep session locals. Not yet: peeled and instability-unrolled loops; a loop
+  entered through a chain (ledger length > 1); an interrupt during recording;
+  injecting the lost-zero race (Q4); registers coherent (parallel-φ swaps,
+  write-only values). Allocating loops (`{}`, string concat) do not trace
+  today (`new_table` / `set_list` abort), so they are interruptible only
+  through tier-0. Behaviour asserted by counts, a generous watchdog for
   hangs, no wall-clock bounds (Rule #22).
-- [ ] **Phase 5 — bench.** `just bench` plus the full emitted sequence's code
-  size and register pressure.
-- [ ] **Q1 — tiering counts.** Resolved in principle (no change when
-  uninterrupted); Phase 0 confirms it with receipts.
+- [ ] **Phase 5 — bench.** `just bench` over the whole board is not run yet
+  (see "Measured cost" for the targeted numbers); code size and register
+  pressure of the full sequence are not measured.
+- [x] **Q1 — tiering counts.** No change when uninterrupted: `-Djit-debug`
+  receipts of `sieve_int` and `field_hash` are byte-identical to the
+  pre-change build; the other boards differ only by stdout/stderr
+  interleaving, which also differs between two runs of the same binary.
 - [ ] **Q4 — the lost zero.** Resolved in design (re-arm on delivery);
   Phase 4 tests it by injecting the race.
 - [ ] **Defer — other architectures.** Native code is x64 only today; any
   later backend carries the poll from the start.
+
+## Measured cost (2026-11-02, ReleaseFast, `--jit-native`, perf stat)
+
+The poll is 3 instructions per back-edge (`movabs`, `cmp byte`, `jne`).
+
+| program | instructions | cycles |
+|---|---|---|
+| `while n < 4e8 do n = n + 1; x = x + n end` | 4.00G → 5.20G | 403M → 802M (2.0x) |
+| `bench/sieve_int.lua` | 466M → 523M | 82.7M → 88.9M (+7%) |
+| `bench/pi_leibniz.lua` | 1.751G → 1.901G | 1.929G → 1.931G (0%) |
+| `bench/grid_matmul.lua` | 465M → 489M | 97.5M → 97.8M (+0.3%) |
+
+The two-instruction-per-lap loop is the worst case (the loop was already one
+cycle per lap); real loops pay between 0 and 7%. A cheaper sequence (no
+`movabs`, e.g. a flag reachable from a register the trace already holds)
+is a possible follow-up, not done.
 
 ## Why this exists
 

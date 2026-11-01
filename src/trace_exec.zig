@@ -292,6 +292,13 @@ pub const LedgerKind = enum(u32) {
     /// ledger can contain it until Phase 5 adds the direct jump and its
     /// replay arm.
     exit_side = 12,
+    /// Doc 77: the `.loop` back-edge saw `Heap.interrupt_requested`. The laps
+    /// up to this row are committed (`cum`), the carried homes are flushed, and
+    /// the slab is coherent at the owner's anchor: the same state a coarse
+    /// deopt leaves, but with no guard identity (`exit_instr = maxInt`,
+    /// reason `.normal`). Always terminal and never a chain source: the stub
+    /// returns to `shared_exit`, never through a slot.
+    interrupt = 13,
 
     /// Whether a row of this kind proves the burst COMMITTED guest work at
     /// that exit, independent of the `cum` back-edge counter. `cum` counts
@@ -321,6 +328,9 @@ pub const LedgerKind = enum(u32) {
             .seed_capacity_decline,
             .precise_deopt,
             .precise_error,
+            // The laps it ends are already in `cum`; the exit itself commits
+            // nothing further.
+            .interrupt,
             => false,
         };
     }
@@ -406,6 +416,7 @@ test "execution contract wire ordinals and capacity" {
     try std.testing.expectEqual(@as(u32, 10), @intFromEnum(LedgerKind.precise_deopt));
     try std.testing.expectEqual(@as(u32, 11), @intFromEnum(LedgerKind.precise_error));
     try std.testing.expectEqual(@as(u32, 12), @intFromEnum(LedgerKind.exit_side));
+    try std.testing.expectEqual(@as(u32, 13), @intFromEnum(LedgerKind.interrupt));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(LedgerOutcome.normal));
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(LedgerOutcome.yielded));
     try std.testing.expectEqual(@as(usize, 32), LEDGER_CAP);

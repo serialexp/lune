@@ -1479,6 +1479,15 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     // becomes nonzero at exactly the same event either way.
                     completed += 1 + @as(usize, @intFromBool(t.peeled and completed == 0));
                     if (record) rec.commit();
+                    // Doc 77: the back-edge is the interrupt safepoint. State is
+                    // committed and coherent; exit as a productive `maxInt` exit
+                    // (the dispatcher resumes tier-0, whose prologue parks the
+                    // interrupt). Re-asserting re-zeroes a headroom an allocation
+                    // may have overwritten.
+                    if (ctx.heap) |h| if (h.interruptPending()) {
+                        h.requestInterrupt();
+                        break :iter ExecResult{ .completed = completed, .exit_instr = std.math.maxInt(u32) };
+                    };
                     continue :iter;
                 },
 

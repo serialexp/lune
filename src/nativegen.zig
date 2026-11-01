@@ -947,6 +947,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     const loop_top = try a.label();
     const deopt_exit = try a.label();
     const prologue_fail = try a.label();
+    // Doc 77: the `.loop` back-edge's interrupt exit; bound after the
+    // prologue-fail stub iff a back-edge referenced it.
+    const interrupt_exit = try a.label();
+    var interrupt_used = false;
 
     // Doc 22 §B.2: the SEED PROLOGUE. A seeded page resolves its own entry inputs
     // (upvalue / global / hash_cell seeds) by calling the VM's C-ABI seeding twin
@@ -2435,6 +2439,20 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 }
                 try emitParallelMove(a, moves, done);
                 try a.incReg(.rbx);
+                // Doc 77: the only bound on a trace that loops on its own
+                // back-edge is a guard failing, and in a pure loop none does.
+                // After the shuffle every carried home holds the next
+                // iteration's inputs, so the state equals a guard exit at the
+                // top of an iteration. One byte, one predictable branch. The
+                // byte is the host's (`Heap.requestInterrupt`), never a
+                // counter the program moves. No heap (a bare test page) means
+                // no host to ask.
+                if (heap) |h| {
+                    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.interrupt_requested))));
+                    try a.cmpByteMemImm(.rax, 0, 0);
+                    try a.jcc(.ne, interrupt_exit);
+                    interrupt_used = true;
+                }
                 try a.jmp(loop_top);
             },
             .link => {
@@ -3182,6 +3200,31 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
     // ledger entry — never a chain source, no cap needed.
     try emitLedgerAppend(a, trace_id, .prologue_fail);
     try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
+
+    // INTERRUPT (doc 77): a `.loop` back-edge saw `Heap.interrupt_requested`
+    // after committing its iteration, so `rbx` already counts it and the
+    // carried homes hold the next iteration's inputs. Flush them (a peeled
+    // trace needs no skip: at least one back-edge has been taken), report no
+    // guard identity (`exit_instr = -1`, reason stays `.normal`), and return
+    // to `shared_exit` through no slot, so no arm can carry control past the
+    // dispatcher. Re-zero `gc_headroom` from here (the main thread, no race)
+    // so tier-0's next safepoint reaches the trampoline even when the
+    // handler's own zero lost to an allocation's decrement.
+    if (interrupt_used) {
+        a.bind(interrupt_exit);
+        // Every exit stub's head: re-establish the ABI registers (rdx is the
+        // live `*NativeResult`; a trace may have given it to a body value).
+        try emit.emitAbiRestore(a, xalloc);
+        try emit.emitCarriedHomesFlush(a, t, kinds, xalloc);
+        // After the flush: rax/rcx may hold carried homes before it. A qword
+        // `mov [rax], imm32` zeroes the i64 headroom with rax alone.
+        try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&heap.?.gc_headroom))));
+        try a.movMemImm32(.rax, 0, 0);
+        try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
+        try emitLedgerAppend(a, trace_id, .interrupt);
+        try emitReturn(a, frame, callee[0..callee_len], shared_exit, trace_id, null);
+    }
 
     // SEED DECLINE exits (doc 22 §B.2): the entry seed prologue's callout declined
     // before the body ran — cloned from `prologue_fail` above (same pre-commit

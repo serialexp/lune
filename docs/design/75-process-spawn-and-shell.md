@@ -139,7 +139,9 @@ land; move whole phases to Done once everything inside them is checked.
     `Error.Interrupted` (not catchable, so `pcall` cannot stop it). The hot
     path gains no instruction. The REPL prints `interrupted`, unwinds, and the
     session's locals survive. A running child already gets Ctrl-C (§6).
-  - [ ] Ctrl-C in native/tier-1a traced loops. A trace that never leaves its
+  - [x] Ctrl-C in native/tier-1a traced loops (doc 77). The `.loop` back-edge
+    polls `Heap.interrupt_requested`; remaining tests are listed in doc 77.
+    Was: Ctrl-C in native/tier-1a traced loops. A trace that never leaves its
     loop (a pure arithmetic or call loop; table and allocating loops return to
     the dispatcher and are interrupted) has no check. It needs a back-edge
     poll in `irinterp`'s `.loop` arm and in nativegen's `.loop` terminal, with

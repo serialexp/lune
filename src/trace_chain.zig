@@ -1827,6 +1827,9 @@ pub fn replayLedgerFrom(
             // Doc 45 D6: precise exits are always terminal — never armed,
             // never fused, never chain members.
             .precise_deopt, .precise_error => @panic("replayLedger: precise row in a chain ledger"),
+            // Doc 77: the laps the back-edge committed before it saw the
+            // request, like a deopt's.
+            .interrupt => local,
             // Doc 56 §4.8: the parent's completed laps plus the interrupted
             // iteration, committed forward at `P` and never re-run.
             .exit_side => local + 1,
@@ -2478,6 +2481,31 @@ pub fn replayLedgerFrom(
                 if (isLoopDoneGuardIndex(owner, e.exit))
                     @panic("replayLedger: ordinary-mode inner loop-done in a linked fusion is unmodeled");
                 self.accountLedgerRow(owner, local, e.exit, region_consumed, .entered);
+                return .{ .return_result = .{
+                    .completed = if (linked_completed.* > 0) linked_completed.* else local,
+                    .resume_pc = cursor.link_pc,
+                } };
+            },
+            .interrupt => {
+                // Doc 77: the owner's `.loop` back-edge saw a pending
+                // interrupt after committing `local` laps. The stub flushed
+                // the carried homes, so the slab is coherent at the owner's
+                // anchor, as after a terminal inner-loop deopt, but there is
+                // no guard identity (`exit = -1`). Always terminal, never a
+                // chain source, never a forced yield.
+                if (!(e.reason == .normal and e.exit == std.math.maxInt(u32) and e.outcome == .normal and is_last))
+                    @panic("replayLedger: interrupt entry violates its static contract");
+                if (!ends_loop)
+                    @panic("replayLedger: interrupt row on an owner without a .loop terminal");
+                self.accountLedgerRow(owner, local, std.math.maxInt(u32), region_consumed, .entered);
+                if (entered_via_bridge or entered_via_handoff or entered_via_exit_side) {
+                    if (resume_pc.* != owner.code.anchor.pc)
+                        @panic("replayLedger: bridged successor interrupt resume mismatches its anchor");
+                    return .{ .return_result = .{
+                        .completed = linked_completed.* + local,
+                        .resume_pc = resume_pc.*,
+                    } };
+                }
                 return .{ .return_result = .{
                     .completed = if (linked_completed.* > 0) linked_completed.* else local,
                     .resume_pc = cursor.link_pc,
