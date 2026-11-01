@@ -150,6 +150,9 @@ pub const Error = error{
     /// program turns it into its own ending (the CLI's process status, the
     /// C API's `MH_EXIT`).
     Exit,
+    /// Doc 75 §4: Ctrl-C reached a running line (`Heap.requestInterrupt`).
+    /// An unwind no `pcall` may stop; the REPL reports it and goes on.
+    Interrupted,
 };
 
 /// Fixed VM register/call stack: every frame's register window is a slice of
@@ -2797,6 +2800,11 @@ pub const Vm = struct {
         if (err == Error.IoErrorModeMismatch) return .{
             .message = try arena.dupe(u8, "the recording was made under the other io error mode (--lua-io-errors); replay it under the same mode"),
             .self_located = true,
+        };
+        if (err == Error.Interrupted) return .{
+            .message = try arena.dupe(u8, "interrupted"),
+            .self_located = true,
+            .frames = try self.backtraceFrames(arena, .running),
         };
         // Doc 65 §7: not a fault; a host that reports it anyway says what
         // happened.
@@ -5496,6 +5504,12 @@ pub const Vm = struct {
                 // Doc 61 §4.1: publish the innermost frame's true next pc
                 // before collecting (step 6 would store the same value just
                 // after), so the collector reads `frame.pc` for every frame.
+                // Ctrl-C shares the gate (`Heap.requestInterrupt` zeroes
+                // `gc_headroom`): serve it before any collection.
+                if (vm.heap.interruptPending()) {
+                    st.frame.pc = pc;
+                    return parkErr(st, Error.Interrupted);
+                }
                 if (!vm.reg_top_pending) {
                     st.frame.pc = pc;
                     vm.collect();
@@ -12108,6 +12122,7 @@ fn narrowError(e: anyerror) Error {
         error.IoErrorModeMismatch => Error.IoErrorModeMismatch,
         error.ProcNotRecordable => Error.ProcNotRecordable,
         error.Exit => Error.Exit,
+        error.Interrupted => Error.Interrupted,
         else => Error.HostError,
     };
 }
@@ -12143,6 +12158,7 @@ pub fn catchable(e: Error) bool {
         Error.IoErrorModeMismatch,
         Error.ProcNotRecordable,
         Error.Exit,
+        Error.Interrupted,
         // A top-level `run`/`start` contract violation — it can never surface inside
         // a `pcall`/`xpcall` (those don't re-enter top-level), so it is unreachable
         // here; classified not-catchable for completeness (doc 17, H-3 / 9-A(ii)).
@@ -12760,6 +12776,7 @@ test {
     _ = @import("interp_effects_test.zig");
     _ = @import("interp_io_test.zig");
     _ = @import("interp_os_test.zig");
+    _ = @import("interp_interrupt_test.zig");
     _ = @import("interp_proc_test.zig");
     _ = @import("interp_lua_compat_test.zig");
     _ = @import("interp_attrib_test.zig");

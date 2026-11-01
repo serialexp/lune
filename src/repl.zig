@@ -22,6 +22,7 @@ const posix = std.posix;
 
 const interp = @import("interp.zig");
 const function = @import("function.zig");
+const gc = @import("gc.zig");
 const resolve = @import("resolve.zig");
 const compiler = @import("compiler.zig");
 const parser = @import("parser.zig");
@@ -478,6 +479,7 @@ pub const Session = struct {
         const kept = &self.chunks.items[self.chunks.items.len - 1];
         const outer_len = self.scope.items.len;
         var closure: ?*function.Closure = null;
+        vm.heap.clearInterrupt(); // a Ctrl-C that missed its line is stale
         const result = vm.runLine(kept.proto, self.cells.items, &closure);
         mio.flush();
         if (closure) |cl| try self.adopt(kept, cl, outer_len);
@@ -485,6 +487,13 @@ pub const Session = struct {
             if (e == error.Exit) {
                 vm.unwindTo(0, 0);
                 return .{ .exit = @truncate(@as(u32, @bitCast(vm.exit_status))) };
+            }
+            if (e == error.Interrupted) {
+                try self.err.writeAll("interrupted\n");
+                vm.heap.clearInterrupt();
+                vm.pending_error = null;
+                vm.unwindTo(0, 0);
+                return .done;
             }
             if (!interp.catchable(e)) return e;
             var arena = std.heap.ArenaAllocator.init(self.gpa);
@@ -588,6 +597,30 @@ pub const Terminal = if (tty_supported) struct {
     pub fn cooked(_: *@This()) void {}
     pub fn columns(_: *const @This()) usize {
         return 80;
+    }
+};
+
+/// Ctrl-C while a line runs (the terminal is cooked then; at the prompt ISIG
+/// is off and the editor sees the byte). The handler can only reach the heap
+/// through a global, so the REPL registers its VM's here.
+const Sigint = struct {
+    var heap: std.atomic.Value(?*gc.Heap) = .init(null);
+
+    fn handler(_: posix.SIG) callconv(.c) void {
+        if (heap.load(.acquire)) |h| h.requestInterrupt();
+    }
+
+    fn install(h: *gc.Heap) void {
+        if (!tty_supported) return;
+        heap.store(h, .release);
+        const act: posix.Sigaction = .{ .handler = .{ .handler = handler }, .mask = posix.sigemptyset(), .flags = 0 };
+        posix.sigaction(.INT, &act, null);
+    }
+
+    fn uninstall() void {
+        if (!tty_supported) return;
+        posix.sigaction(.INT, &.{ .handler = .{ .handler = posix.SIG.DFL }, .mask = posix.sigemptyset(), .flags = 0 }, null);
+        heap.store(null, .release);
     }
 };
 
@@ -705,6 +738,8 @@ pub fn interactive(cfg: Config, session: *Session) !u8 {
     const hist_path = if (term != null) try historyPath(cfg.gpa, cfg.env) else null;
     defer if (hist_path) |p| cfg.gpa.free(p);
     if (hist_path) |p| loadHistory(cfg, &hist, p);
+    if (term != null) Sigint.install(session.vm.heap);
+    defer if (term != null) Sigint.uninstall();
 
     var prompt: Writer.Allocating = .init(cfg.gpa);
     defer prompt.deinit();

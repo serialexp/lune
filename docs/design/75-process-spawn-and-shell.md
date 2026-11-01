@@ -132,8 +132,19 @@ land; move whole phases to Done once everything inside them is checked.
     (older closures keep theirs), as in a script. Locals of blocks and loops stay
     in registers. Constant folding of `<const>` locals (doc 76 D8) must skip
     these root-level ones: they have no register to fold away.
-  - [ ] Ctrl-C interrupts a running Lua line (needs a VM interrupt poll; a
-    running child already gets it, §6). Today it ends the REPL.
+  - [x] Ctrl-C interrupts a running Lua line in tier-0. The REPL's SIGINT
+    handler calls `Heap.requestInterrupt`, which sets a flag and zeroes
+    `gc_headroom`; the dispatch prologue's existing GC compare then sends the
+    next safepoint to the cold `gcTrampoline`, which raises
+    `Error.Interrupted` (not catchable, so `pcall` cannot stop it). The hot
+    path gains no instruction. The REPL prints `interrupted`, unwinds, and the
+    session's locals survive. A running child already gets Ctrl-C (§6).
+  - [ ] Ctrl-C in native/tier-1a traced loops. A trace that never leaves its
+    loop (a pure arithmetic or call loop; table and allocating loops return to
+    the dispatcher and are interrupted) has no check. It needs a back-edge
+    poll in `irinterp`'s `.loop` arm and in nativegen's `.loop` terminal, with
+    an exit the dispatcher resumes from at the anchor. JIT is off by default,
+    so this only affects `--trace` sessions.
   - [ ] Windows console and wasm: plain lines only until Phase 6.
 - [ ] **Phase 5 — shell ergonomics.** Command-position sugar, globbing,
   completion (from the LSP symbol index), job control. Scope decided after

@@ -187,6 +187,12 @@ pub const Heap = struct {
     /// skipped cycle) keeps counting down below zero; 2^63 allocations
     /// cannot wrap it. Debug builds re-derive the verdict in `shouldCollect`.
     gc_headroom: i64 = initial_gc_threshold,
+    /// Doc 75 §4: a Ctrl-C asked the running program to stop. Set from a
+    /// signal handler (`requestInterrupt`), which also zeroes `gc_headroom`
+    /// so the dispatch prologue's one GC compare sends the next safepoint to
+    /// the cold trampoline, where the VM raises `Error.Interrupted`. Not
+    /// part of any snapshot: it is the host's, not the program's.
+    interrupt_requested: bool = false,
     /// Doc 63 §5.6: moves whenever something a trace may rely on can have
     /// changed across a host call: guest execution, a collection, a host's
     /// structural change, or any C API entry not on the §5.6 exemption
@@ -708,7 +714,30 @@ pub const Heap = struct {
     }
 
     fn dueFromInputs(self: *const Heap) bool {
-        return self.gc_stress or self.object_count >= self.next_gc;
+        return self.gc_stress or self.interrupt_requested or self.object_count >= self.next_gc;
+    }
+
+    /// Ask the running program to stop at its next safepoint. Async-signal-
+    /// safe: two plain stores. An allocation's `gc_headroom` decrement racing
+    /// the store can undo the zeroing; the flag survives, `refreshHeadroom`
+    /// honours it, and a repeated request lands.
+    pub fn requestInterrupt(self: *Heap) void {
+        const flag: *volatile bool = &self.interrupt_requested;
+        flag.* = true;
+        const headroom: *volatile i64 = &self.gc_headroom;
+        headroom.* = 0;
+    }
+
+    pub fn interruptPending(self: *const Heap) bool {
+        const flag: *const volatile bool = &self.interrupt_requested;
+        return flag.*;
+    }
+
+    /// Forget a request (it was served, or arrived after its line ended).
+    pub fn clearInterrupt(self: *Heap) void {
+        const flag: *volatile bool = &self.interrupt_requested;
+        flag.* = false;
+        self.refreshHeadroom();
     }
 
     pub fn setGcStress(self: *Heap, on: bool) void {
@@ -742,7 +771,7 @@ pub const Heap = struct {
         const max: u64 = std.math.maxInt(i64);
         const count: u64 = self.object_count;
         const next: u64 = self.next_gc;
-        self.gc_headroom = if (self.gc_stress)
+        self.gc_headroom = if (self.gc_stress or self.interrupt_requested)
             0
         else if (count >= next)
             -@as(i64, @intCast(@min(count - next, max)))
