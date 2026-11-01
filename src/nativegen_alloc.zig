@@ -806,11 +806,11 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 // byte-exact: re-boxing payload bits under the checked tag
                 // reproduces the entry Value verbatim (TAG_HEAP boxing is
                 // type-agnostic, so any heap object — table, string —
-                // round-trips; int/float likewise under their checked tag).
+                // round-trips; int/float likewise under their checked tag,
+                // and bool too, whose 8 payload bytes are a canonical 0/1).
                 // An entry value of a different class refuses in the prologue
-                // → tier-1a, fail closed. `.bool` stays refused: the [RV-1]
-                // tag switch has no TAG_BOOL row for slot pins.
-                if (sk == .int or sk == .float or sk == .heap) {
+                // → tier-1a, fail closed.
+                if (sk == .int or sk == .float or sk == .heap or sk == .bool) {
                     s.kind = sk;
                 } else if (sk == .ptr) {
                     s.kind = .heap; // raw *GcHeader → TAG_HEAP boxing

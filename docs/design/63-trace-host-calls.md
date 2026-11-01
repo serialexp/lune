@@ -21,6 +21,14 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
 
 ### Done
 
+- [x] **`two`'s 9 instructions a call, explained** (2026-11-01, §5.10.6
+  after the table). Not a per-call cost: the steady-state slopes match to
+  the hundredth with the flag on and off. The flag-on run carries a fixed
+  ~1.7M instructions by call 2000, its warm-up host traces running on
+  tier-1a, and the probe divides fixed costs by N. Native refused those
+  traces because a bool copied into a slot before any read (the host's
+  argument `on`) was refused in the write-dominated carried case; it now
+  compiles (`nativegen_alloc.zig`, test in `capi_hosttrace_test.zig`).
 - [x] **Decision Q1 — amend the "a host call is a trace barrier"
   commitment.** Yes (Bart, 2026-10-10). The doc 00/02 amendments land
   with Phase 2c (Docs item).
@@ -185,11 +193,16 @@ checked. Every phase lands behind `just test`, the `-Djit-debug` gate,
   - The §8.1 probe A/B of the entry lease (from Phase 2b), with the flag
     on.
   - Turn `Config.trace_host_calls` on once the budget is met.
-- [ ] **`two` costs 9 instructions a call more with the flag on**
-  (§5.10.6). Not yet explained.
+- [ ] **Decision — a Lua call hashes for its code image once any proto
+  has one** (§5.10.6, after the table). `EntryRegistry.codeFor` is free
+  until some proto in the VM has a patched entry image; from then on every
+  frame push probes `code_images`, image or not. `two` pays it on every
+  callback (+34 a call once its host traces compile natively);
+  binary-trees spends 1.3% of its instructions there. Options are for Bart.
 - [ ] **A precise host trace native refuses still runs on tier-1a**
-  (§5.10.6, last paragraph). No probe shape reaches it since §5.10.7; a
-  shape that does wants the safety-net gate.
+  (§5.10.6, last paragraph). No probe shape reaches it since §5.10.7
+  except `two`, until its bool argument compiled (2026-11-01); a shape
+  that does wants the safety-net gate.
 - [ ] **Decision — suspended callbacks run at 2.3× tier-0** (§5.10.5). The
   one disturbing call's callback (`nest`) costs 21.9M instructions against
   9.5M in tier-0: a suspended VM dispatches `.full`, and every back-edge
@@ -1710,6 +1723,39 @@ The slopes: about 10 per argument and about 7 per global read, against
 tier-0's 27 and 93. The disturbing shapes stay at today's numbers except
 `two`, 9 instructions a call over (0.7%; instruction counts, so not
 noise; not yet explained). `w4`–`w16` and `wide` do not compile (below).
+
+*`two`, explained (2026-11-01).* The 9 are not per call. With the flag on
+and off, the instruction counts at N = 100k and 1M give the same slope,
+1228.46 a call, and callgrind's per-function slopes on a baseline-CPU
+build match to the hundredth. The flag-on run instead carries a fixed
+~1.7M instructions, all paid by call 2000. `tracecall.py` reports
+`(count(N) − count(0)) / N`, and `count(0)` never reaches the calm
+warm-up, so at N = 200k the fixed cost reads as 9 a call. The 1.7M is
+the warm-up's two host traces on tier-1a (`irinterp.executeCtx`,
+`flushPhiWriteback`): native refused both in `analyzeInner`. The host's
+second argument slot is written with the bool `on` before every call and
+never read, a write-dominated carried slot (doc 45 D6), and that case
+refused `.bool`, as the [RV-1] tag switch had no TAG_BOOL row back then.
+It has had one since doc 57. A bool's 8 payload bytes are a canonical
+0/1, so the entry value re-boxes exactly, and the slot now takes the
+store's kind like int, float and heap. Both traces compile, and the
+warm-up drops from 5.50M to 4.18M instructions by call 2000 (3.80M with
+the flag off). `bench/` is neutral: only precise recordings load a slot
+they never read.
+
+The steady state got worse, though: 1264 a call against 1228. All 36 are
+in one lookup. Once the warm-up's traces compile they install entry
+patches, so `EntryRegistry.code_images` is no longer empty. From then on,
+`codeFor` hashes on every frame push (`interp.zig`'s call path), and
+`two`'s host pushes a callback frame on every call after the 1,000th.
+The callback's proto has no image; the probe misses after the hash. This
+is not specific to host calls: binary-trees (JIT on) spends 12.5M of its
+970M instructions in the same `get`, about 1.3%, while recursive-fib's
+patched head takes doc 44 D9's image-first path and pays nothing. Doc 20
+accepted "one map probe per call" when it put the images in a VM-local
+map, to keep `Proto.code` canonical. Removing the probe means caching the
+image pointer somewhere VM-local that a push already reads; the options
+are for Bart (Outstanding).
 
 **Where `min`'s 369 go** (callgrind, a baseline-CPU build so valgrind runs):
 

@@ -68,6 +68,19 @@ fn hostCb(vm: ?*capi.VmBox, userdata: ?*anyopaque, args: ?[*]const mh_value, nar
     return .ok;
 }
 
+/// `hpick(x, keep)`: returns `x` when `keep` is truthy, else `-x`. Pure.
+fn hostPick(vm: ?*capi.VmBox, userdata: ?*anyopaque, args: ?[*]const mh_value, nargs: usize, results: ?[*]mh_value, max_results: usize, nresults: *usize) callconv(.c) Status {
+    _ = .{ vm, max_results };
+    const c: *Counter = @ptrCast(@alignCast(userdata.?));
+    c.calls += 1;
+    if (nargs != 2) return .err_api;
+    var x: i64 = 0;
+    if (capi.mh_value_int(args.?[0], &x) != .ok) return .err_api;
+    results.?[0] = capi.mh_int(if (capi.mh_value_truthy(args.?[1]) != 0) x else -x);
+    nresults.* = 1;
+    return .ok;
+}
+
 const program =
     \\function cbf(x) return x + 1000 end
     \\function loop_id(n) local s = 0 for i = 1, n do s = s + hid(i) end return s end
@@ -78,6 +91,12 @@ const program =
     \\  for i = 1, n do local r = hid(i) s = s + r + a * b - c a = a + 1 end
     \\  return s, a
     \\end
+    \\function loop_flag(n) local s, on = 0, n > 0 for i = 1, n do s = s + hpick(i, on) end return s end
+    \\function loop_last(n)
+    \\  local s, b = 0, nil
+    \\  for i = 1, n do b = i % 3 == 0 s = s + hid(i) end
+    \\  if b then return s end return -s
+    \\end
 ;
 
 const Fixture = struct {
@@ -85,6 +104,7 @@ const Fixture = struct {
     id: Counter = .{},
     fail: Counter = .{},
     cb: Counter = .{},
+    pick: Counter = .{},
 
     fn init(self: *Fixture, trace_host_calls: bool) !void {
         self.* = .{ .box = try capi.createVm(testing.allocator, .{}) };
@@ -93,6 +113,7 @@ const Fixture = struct {
         try testing.expectEqual(Status.ok, capi.mh_register_fn(self.box, s("hid"), &hostId, &self.id, null));
         try testing.expectEqual(Status.ok, capi.mh_register_fn(self.box, s("hfail"), &hostFail, &self.fail, null));
         try testing.expectEqual(Status.ok, capi.mh_register_fn(self.box, s("hcb"), &hostCb, &self.cb, null));
+        try testing.expectEqual(Status.ok, capi.mh_register_fn(self.box, s("hpick"), &hostPick, &self.pick, null));
         var n: usize = 0;
         try testing.expectEqual(Status.ok, capi.mh_eval(self.box, s(program), s("prog"), null, 0, &n));
     }
@@ -115,6 +136,14 @@ const Fixture = struct {
     fn hasHostTrace(self: *Fixture, sites: usize) bool {
         for (self.box.vm.trace.registry.cache.items) |t| {
             if (t.code.deopt_mode == .precise and t.code.host_sites.len == sites) return true;
+        }
+        return false;
+    }
+
+    /// Whether some precise trace with a host site compiled to native code.
+    fn hasNativeHostTrace(self: *Fixture) bool {
+        for (self.box.vm.trace.registry.cache.items) |t| {
+            if (t.code.deopt_mode == .precise and t.code.host_sites.len > 0 and t.native == .compiled) return true;
         }
         return false;
     }
@@ -179,4 +208,32 @@ test "doc 63 2c: a host that calls back disturbs once, then the loop runs withou
     try testing.expectEqual(control.cb.calls, traced.cb.calls);
     // The first disturbing call ended the native's tracing (Q4, threshold 1).
     try testing.expect(!traced.hasHostTrace(1));
+}
+
+test "doc 63: a bool written into a slot before any read compiles natively and flushes" {
+    // A precise recording loads the whole window, so a slot the body only
+    // writes gets a snapshot-only load: `hpick`'s argument slot, written with
+    // `on` before every call, and `b`, written before anything reads it. Both
+    // carry bools, which native used to refuse, leaving the trace on tier-1a.
+    var traced: Fixture = undefined;
+    try traced.init(true);
+    defer traced.deinit();
+    var control: Fixture = undefined;
+    try control.init(false);
+    defer control.deinit();
+    try testing.expectEqual(try control.evalInt("return loop_flag(3000)"), try traced.evalInt("return loop_flag(3000)"));
+    try testing.expect(traced.hasNativeHostTrace());
+    try testing.expectEqual(@as(u64, 3000), traced.pick.calls);
+    try testing.expectEqual(control.pick.calls, traced.pick.calls);
+
+    // `b`'s last value leaves through the loop's exit flush: true after
+    // 3000 iterations, false after 3001.
+    var last: Fixture = undefined;
+    try last.init(true);
+    defer last.deinit();
+    try testing.expectEqual(@as(i64, 4501500), try last.evalInt("return loop_last(3000)"));
+    try testing.expect(last.hasNativeHostTrace());
+    try testing.expectEqual(@as(i64, -4504501), try last.evalInt("return loop_last(3001)"));
+    try testing.expectEqual(@as(i64, -4504501), try control.evalInt("return loop_last(3001)"));
+    try testing.expectEqual(control.id.calls + 3000, last.id.calls);
 }

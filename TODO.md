@@ -27,9 +27,22 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       nsieve-bit −4.6% but nsieve +3.1%, sieve_int +3.2%, grid_matmul
       +1.3% (JIT on). Find what the alias changes in nsieve's trace before
       widening it.
-- [ ] **`two` costs 9 more instructions a call with the flag on** (1235
+- [x] **`two` costs 9 more instructions a call with the flag on** (1235
       against 1226, §8.1 probe). The design says the disturbing shapes stay
-      at today's numbers; find where the 9 go.
+      at today's numbers; find where the 9 go. **Explained (2026-11-01):** a
+      fixed warm-up cost on tier-1a divided by N, not a per-call one; the
+      refused bool slot now compiles (doc 63 §5.10.6).
+- [ ] **A Lua call hashes for its code image once any proto has one**
+      (`EntryRegistry.codeFor` on every frame push). `two` +34 a call once
+      its host traces compile, binary-trees 1.3%. Options for Bart, doc 63
+      Outstanding.
+- [ ] **Home coalescing stops at the loop's own guard.** "Win 2" in
+      `nativegen_alloc.zig` computes a carried slot's update into its home
+      only when no side exit follows it, and a loop's own condition guard
+      always does, so `s = s + i` computes into a temporary and moves it
+      home at the back-edge (one register and one move per carried value).
+      LuaJIT hints the φ's register instead. Look at what the coarse-deopt
+      flush needs to allow it.
 - [ ] **`guard_native` re-checks loop invariants every iteration.** The
       callee identity and the disturbance count cannot change while the
       epoch holds, so both could run once per entry. Hoisting needs the
