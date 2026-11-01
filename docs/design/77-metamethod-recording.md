@@ -47,7 +47,10 @@ _(nothing yet)_
   measured in emitted probes per iteration.
 - [ ] **Phase 3 — `__index` and `__newindex` tables** (§6.2): chains of
   table hops, bounded deterministically.
-- [ ] **Phase 4 — function metamethods as inlined calls** (§6).
+- [ ] **Phase 4 — function metamethods as inlined calls** (§6). Starts
+  after doc 68 P2 (Q1).
+  - [ ] doc 68 P2 landed: tier 0 runs metamethods as continuation frames,
+    and §6.3's pending-instruction stages mirror its `finish_op` stages
   - [ ] the pending-instruction stack (§6.3) and its stage transitions
   - [ ] the per-route exit contract (§7), with its exclusions tested
   - [ ] computed-callee upvalue access (§6.6)
@@ -72,7 +75,8 @@ _(nothing yet)_
 - [ ] **Defer — native metamethods without a recorded-builtin tag**, and
   native-valued handler fields (§6.6).
 - [ ] **Defer — metamethods of strings, files and other non-table values.**
-- [ ] **Open questions** (§11): Q1–Q5 decided.
+- [x] **Q1 decided** (Bart, 2026-11-01): doc 68 P2 before Phase 4.
+- [ ] **Open questions** (§11): Q2–Q5 decided.
 
 ## 1. Why this exists
 
@@ -512,6 +516,10 @@ callouts per iteration for an invariant receiver.
   gives tier 0. Codex: P2 first, so the two share one model. Antigravity:
   independent, the wins come sooner. Options: (a) independent; (b) P2
   before Phase 4 (Phases 1–3 need neither).
+  **Decided (Bart, 2026-11-01): (b).** Future wins and one maintained
+  model matter more than landing the first win sooner. Phase 4's stages
+  are built as the recorder's view of doc 68's `finish_op` stages, not as a
+  separate scheme.
 - **Q2 — `MAX_INDEX_CHAIN`.** Codex: 100, as LuaJIT, bounded additionally by
   the recording length limit, to avoid coverage cliffs. Antigravity: 4,
   since deeper hierarchies are rare and each hop costs guards.
