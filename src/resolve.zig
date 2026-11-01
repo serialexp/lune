@@ -180,13 +180,41 @@ pub const Resolution = struct {
     }
 };
 
+/// A local that an earlier chunk of a REPL session declared at its top level
+/// and this one can still see (doc 75 §6).
+pub const Outer = struct {
+    name: []const u8,
+    attrib: ast.Attrib = .none,
+};
+
 /// Resolve every name of a chunk. `source_len` bounds the chunk's own scope.
 pub fn resolve(gpa: std.mem.Allocator, root: ast.Block, source_len: u32) std.mem.Allocator.Error!Resolution {
+    return resolveWith(gpa, root, source_len, &.{});
+}
+
+/// `resolve` with `outer` already in scope around the chunk: binding `i` of
+/// the result is `outer[i]`, a local of the chunk's function (func 0) that
+/// has no declaring token, so no occurrence. A later name in `outer` shadows
+/// an earlier one, as a redeclaration does.
+pub fn resolveWith(gpa: std.mem.Allocator, root: ast.Block, source_len: u32, outer: []const Outer) std.mem.Allocator.Error!Resolution {
     var res = Resolution{ .gpa = gpa };
     errdefer res.deinit();
     var w = Walker{ .gpa = gpa, .res = &res };
     defer w.deinit();
 
+    for (outer) |o| {
+        const id: BindingId = @intCast(res.bindings.items.len);
+        try res.bindings.append(gpa, .{
+            .kind = .local,
+            .name = o.name,
+            .attrib = o.attrib,
+            .decl_span = .{ .start = 0, .end = 0 },
+            .visible_from = 0,
+            .scope_end = source_len,
+            .func = 0,
+        });
+        try w.push(o.name, .{ .binding = id, .prev = undefined });
+    }
     try w.block(root, source_len);
     try w.finish();
     return res;

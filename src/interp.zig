@@ -2373,6 +2373,16 @@ pub const Vm = struct {
     }
 
     pub fn run(self: *Vm, proto: *const Proto) Error!Value {
+        return self.runLine(proto, &.{}, null);
+    }
+
+    /// `run` for one line of a REPL session (doc 75 §6): the root closure's
+    /// upvalues are the cells of the session's locals. `carried` fills the
+    /// first of them; the rest are fresh cells holding nil, which the line's own
+    /// top-level `local`s assign. `line` receives the root closure as soon as it
+    /// exists (even when the run then fails), and the closure is kept as a GC
+    /// root for the VM's life, since the session holds its cells.
+    pub fn runLine(self: *Vm, proto: *const Proto, carried: []const *function.Upvalue, line: ?*?*function.Closure) Error!Value {
         // JIT coverage time attribution (gated): bracket the whole run for the
         // denominator (`run_cycles`) and seed `last_event_tsc` so the first tier-0
         // span isn't a bogus delta-from-zero. Host TSC only (0 on wasm). See
@@ -2389,7 +2399,14 @@ pub const Vm = struct {
         // The main chunk runs as a closure with no upvalues. It is GC-linked and
         // freed at `deinit`; its `proto` pointer is only dereferenced during this
         // call, so a stack-local test `Proto` is fine.
-        const top = try self.heap.newClosure(proto, 0);
+        const top = try self.heap.newClosure(proto, proto.upvalues.len);
+        for (top.upvalues, 0..) |*cell, i| {
+            cell.* = if (i < carried.len) carried[i] else try self.heap.newClosedUpvalue(Value.nil());
+        }
+        if (line) |out| {
+            out.* = top;
+            try self.host_refs.append(self.gpa, .{ .value = Value.heap(&top.header), .generation = 0 });
+        }
         try self.pushFrame(top, 0, 0, 0);
         // `run` never arms `suspend_ctl`, so `exec` always finishes here.
         const outcome = self.exec() catch |err| {

@@ -61,10 +61,28 @@ pub const Chunk = struct {
     /// Doc 73 §7.5: some proto in the tree runs an `intrinsic` (`async`
     /// or `await`), so the C API runs the chunk as a task.
     uses_tasks: bool = false,
+    /// A REPL chunk (`Options.repl`): the top-level locals it declared, in
+    /// order. The root proto has `Options.repl.outer.len + repl_exports.len`
+    /// upvalues, and export `i` lives in upvalue `outer.len + i`.
+    repl_exports: []const ReplExport = &.{},
 
     pub fn deinit(self: *Chunk) void {
         self.arena.deinit();
     }
+};
+
+/// A top-level local a REPL chunk declared, which later chunks see (doc 75 §6).
+pub const ReplExport = struct {
+    name: []const u8,
+    attrib: ast.Attrib,
+};
+
+/// Compile a chunk as one line of a REPL session. The locals of earlier lines
+/// are `outer` (binding `i` is root upvalue `i`); the top-level `local`s of this
+/// chunk, other than `<close>` ones, become further root upvalues instead of
+/// registers, so they outlive the chunk and closures share them.
+pub const Repl = struct {
+    outer: []const resolve.Outer = &.{},
 };
 
 /// Compile-time configuration. Currently just the set of globals the host
@@ -88,6 +106,8 @@ pub const Options = struct {
     /// runtime error's `chunk:line:` names. The CLI passes the script path,
     /// `load` its chunkname. Copied, so it may borrow a transient string.
     chunk_name: []const u8 = "main",
+    /// Compile as a REPL line; see `Repl`.
+    repl: ?Repl = null,
 };
 
 /// Compile a parsed chunk. String literals/names are interned into `heap`.
@@ -116,12 +136,19 @@ pub fn compileWithOptions(
     errdefer arena.deinit();
 
     var session: Session = undefined;
-    try session.init(gpa, source, root, opts.known_globals, null);
+    try session.init(gpa, source, root, opts.known_globals, null, if (opts.repl) |r| r.outer else &.{});
     defer session.deinit(gpa);
 
     var c = session.compiler(arena.allocator(), gpa, heap, source, diags);
     c.is_vararg = opts.vararg_root;
     defer c.deinitScratch();
+    if (opts.repl) |r| {
+        c.repl = true;
+        c.repl_outer = r.outer.len;
+        // Root upvalue `i` is the earlier line's local `i`: the VM hands the
+        // closure its cells, so the descriptors are never followed.
+        for (r.outer) |_| try c.upvalues.append(c.arena, .{ .in_stack = false, .index = 0 });
+    }
 
     if (try c.reportProblems()) return Error.CompileError;
     try c.compileBlock(root);
@@ -150,6 +177,7 @@ pub fn compileWithOptions(
         .main_chunk = true,
         .is_vararg = c.is_vararg,
         .tbc_vars = c.tbc_vars.items,
+        .upvalues = c.upvalues.items,
         // Doc 56 §4.2: per-pc register liveness, from the finished code.
         .reg_live = try bc_liveness.compute(c.arena, c.scratch, c.code.items, c.max_reg, c.protos.items, c.tbc_vars.items),
         // Doc 58 §4.8: the CFG's dominator tree, from the finished code.
@@ -172,7 +200,13 @@ pub fn compileWithOptions(
     // Moving `arena` is safe: code/constants/proto live in arena *heap* buffers,
     // not in the struct, so the pointers stay valid; only the `c.arena` handle
     // goes stale and we no longer use it.
-    return .{ .arena = arena, .proto = proto, .proto_count = next_id - opts.id_base, .uses_tasks = c.uses_tasks };
+    return .{
+        .arena = arena,
+        .proto = proto,
+        .proto_count = next_id - opts.id_base,
+        .uses_tasks = c.uses_tasks,
+        .repl_exports = c.repl_exports.items,
+    };
 }
 
 /// Check a parsed chunk for a tool (doc 74): everything `compileWithOptions`
@@ -196,7 +230,7 @@ pub fn checkChunk(
     defer arena.deinit();
 
     var session: Session = undefined;
-    try session.init(gpa, source, root, opts.known_globals, resolved);
+    try session.init(gpa, source, root, opts.known_globals, resolved, &.{});
     defer session.deinit(gpa);
 
     var c = session.compiler(arena.allocator(), gpa, heap, source, diags);
@@ -228,6 +262,7 @@ const Session = struct {
         root: ast.Block,
         known: []const []const u8,
         resolved: ?*const resolve.Resolution,
+        outer: []const resolve.Outer,
     ) Error!void {
         self.usage = .{ .writes = std.StringHashMap(void).init(gpa), .known = known };
         errdefer self.usage.deinit(gpa);
@@ -237,7 +272,7 @@ const Session = struct {
             self.owned = null;
             self.res = r;
         } else {
-            self.owned = try resolve.resolve(gpa, root, @intCast(source.len));
+            self.owned = try resolve.resolveWith(gpa, root, @intCast(source.len), outer);
             self.res = &self.owned.?;
         }
     }
@@ -422,6 +457,13 @@ const Compiler = struct {
     res: *const resolve.Resolution,
     /// `checkChunk`: a statement that fails to compile is skipped.
     recover: bool = false,
+    /// The root compiler of a REPL line (`Repl`): the number of earlier
+    /// locals (root upvalues `0..repl_outer`), the top-level locals this line
+    /// declared, and which root upvalue each of their bindings is.
+    repl: bool = false,
+    repl_outer: usize = 0,
+    repl_exports: std.ArrayList(ReplExport) = .empty,
+    repl_cells: std.AutoHashMapUnmanaged(resolve.BindingId, u16) = .empty,
 
     /// The lexically-enclosing function being compiled, if this is a nested
     /// function body. Used to detect references to an outer function's locals
@@ -476,6 +518,7 @@ const Compiler = struct {
 
     fn deinitScratch(self: *Compiler) void {
         self.const_index.deinit(self.scratch);
+        self.repl_cells.deinit(self.scratch);
         self.locals.deinit(self.scratch);
         self.open_tbc.deinit(self.scratch);
         for (self.loops.items) |*lp| lp.breaks.deinit(self.scratch);
@@ -772,6 +815,36 @@ const Compiler = struct {
         return self.res.bindingAt(span.start) orelse @panic("resolver missed a name");
     }
 
+    /// The root upvalue holding the REPL local `b`: an earlier line's (binding
+    /// `i` is upvalue `i`) or one this line declared at its top level.
+    fn replCell(self: *const Compiler, b: resolve.BindingId) ?u16 {
+        if (!self.repl) return null;
+        if (b < self.repl_outer) return @intCast(b);
+        return self.repl_cells.get(b);
+    }
+
+    /// Whether the `local` statement naming `names` is a REPL top-level one
+    /// whose variables live in root upvalues. A to-be-closed variable has to
+    /// close when its chunk ends, so a statement with one stays in registers.
+    fn replTopLevel(self: *const Compiler, attribs: anytype) bool {
+        if (!self.repl or self.parent != null or self.scope_depth != 0) return false;
+        for (attribs) |a| if (a == .close) return false;
+        return true;
+    }
+
+    /// Make the local the name token at `span` introduces a root upvalue: it
+    /// is visible from here on (a function body can name itself) and the
+    /// session keeps its cell. Returns the upvalue; the caller stores the value.
+    fn declareReplCell(self: *Compiler, span: ast.Span, name: []const u8, attrib: ast.Attrib) Error!u16 {
+        const b = self.bindingAt(span);
+        const idx: u16 = @intCast(self.upvalues.items.len);
+        try self.upvalues.append(self.arena, .{ .in_stack = false, .index = 0 });
+        try self.repl_cells.put(self.scratch, b, idx);
+        // The name outlives the tree it was parsed into: the chunk owns a copy.
+        try self.repl_exports.append(self.arena, .{ .name = try self.arena.dupe(u8, name), .attrib = attrib });
+        return idx;
+    }
+
     /// Declare the local the name token at `span` introduces, in `reg`.
     fn declareLocal(self: *Compiler, span: ast.Span, reg: u16) Error!void {
         const b = self.bindingAt(span);
@@ -808,7 +881,7 @@ const Compiler = struct {
     /// name is not visible in any enclosing function (→ a global).
     fn resolveUpvalue(self: *Compiler, b: resolve.BindingId) Error!?u16 {
         if (self.isGlobalBinding(b)) return null;
-        const parent = self.parent orelse return null;
+        const parent = self.parent orelse return self.replCell(b);
         if (parent.resolveLocalSlot(b)) |slot| {
             parent.locals.items[slot].captured = true;
             return try self.addUpvalue(.{ .in_stack = true, .index = parent.locals.items[slot].reg });
@@ -1086,6 +1159,21 @@ const Compiler = struct {
         const start = self.next_reg;
         const n_names: u16 = @intCast(l.names.len);
         try self.compileValuesInto(l.values, start, n_names);
+        // A REPL line's top-level locals outlive it: each goes to a fresh root
+        // upvalue (the session carries the cell to the next line).
+        var attribs: [256]ast.Attrib = undefined;
+        const few = l.names.len <= attribs.len;
+        if (few) for (l.names, 0..) |nm, j| {
+            attribs[j] = nm.attrib;
+        };
+        if (few and self.replTopLevel(attribs[0..l.names.len])) {
+            for (l.names, 0..) |nm, j| {
+                const idx = try self.declareReplCell(nm.name_span, nm.name, nm.attrib);
+                _ = try self.emit(Instr.opAB(.set_upval, @intCast(start + j), idx));
+            }
+            self.freeTo(start);
+            return;
+        }
         // Declare names only after the RHS is evaluated (Lua scoping: `local x = x`
         // reads the outer `x`).
         for (l.names, 0..) |nm, j| {
@@ -2314,6 +2402,13 @@ const Compiler = struct {
     /// refer to `f` (recursion), capturing it as an upvalue.
     fn compileLocalFunction(self: *Compiler, lf: anytype) Error!void {
         const r = try self.alloc1();
+        if (self.replTopLevel(&[_]ast.Attrib{.none})) {
+            const idx = try self.declareReplCell(lf.name_span, lf.name, .none); // visible inside its own body
+            try self.compileFunction(lf.body, lf.name, r);
+            _ = try self.emit(Instr.opAB(.set_upval, r, idx));
+            self.freeTo(r);
+            return;
+        }
         try self.declareLocal(lf.name_span, r); // visible inside its own body
         try self.compileFunction(lf.body, lf.name, r);
     }

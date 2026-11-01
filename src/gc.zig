@@ -653,6 +653,15 @@ pub const Heap = struct {
         return u;
     }
 
+    /// Allocate an already-closed upvalue holding `v` and register it with the
+    /// heap: a cell nothing has captured yet, such as a REPL line's new
+    /// top-level local (doc 75 §6).
+    pub fn newClosedUpvalue(self: *Heap, v: Value) std.mem.Allocator.Error!*Upvalue {
+        const u = try Upvalue.createClosed(self.gpa, v);
+        self.link(&u.header);
+        return u;
+    }
+
     /// Write barrier — invoked whenever a heap `Value` is stored into a heap
     /// `container`. A deliberate **no-op**: a stop-the-world mark-sweep needs no
     /// barrier (the mark phase sees the final heap state). The call sites remain

@@ -120,9 +120,18 @@ land; move whole phases to Done once everything inside them is checked.
     (keyword + whitespace, rest not starting with `= ( [ : ,`, and only while
     no global of that name exists) translate to `os.chdir`/`os.setenv` Lua;
     words support quotes, `\`, `~`, `$NAME`, `${NAME}`, `cd -`.
-  - [ ] Top-level `local`s persist between lines (decided 2026-11-01: they
-    must; it needs the resolver, so it waits for doc 76 Phase 1: earlier lines'
-    locals as root-proto upvalues, new ones handed back to the session).
+  - [x] Top-level `local`s persist between lines (decided 2026-11-01). Each
+    line is compiled with `compiler.Options.repl`: the session's earlier locals
+    are seeded into the resolver as func-0 locals (`resolve.resolveWith`,
+    binding `i` = root upvalue `i`), and this line's own top-level `local`s
+    (and `local function`s; not `<close>` ones, which close when their chunk
+    ends) become further root upvalues instead of registers. `Vm.runLine` hands
+    the root closure its cells (carried ones, fresh closed nil cells for new
+    ones) and roots the closure in `host_refs`, so the cells survive GC; the
+    session adopts the new cells after the run. A redeclaration is a new cell
+    (older closures keep theirs), as in a script. Locals of blocks and loops stay
+    in registers. Constant folding of `<const>` locals (doc 76 D8) must skip
+    these root-level ones: they have no register to fold away.
   - [ ] Ctrl-C interrupts a running Lua line (needs a VM interrupt poll; a
     running child already gets it, §6). Today it ends the REPL.
   - [ ] Windows console and wasm: plain lines only until Phase 6.

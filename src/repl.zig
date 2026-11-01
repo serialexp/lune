@@ -10,8 +10,9 @@
 //! that name exists: `cd`, `export`, `unset` and `exit`. They are translated
 //! to Lua (`os.chdir`, `os.setenv`) and run like any other chunk.
 //!
-//! Known limitation: each line is its own chunk, so a top-level `local` does
-//! not outlive its line yet (it needs resolver support).
+//! Each line is its own chunk, but the top-level `local`s of earlier lines stay
+//! visible: they are the root closure's upvalues (`compiler.Repl`), their cells
+//! carried from line to line by the session.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -20,6 +21,8 @@ const Writer = std.Io.Writer;
 const posix = std.posix;
 
 const interp = @import("interp.zig");
+const function = @import("function.zig");
+const resolve = @import("resolve.zig");
 const compiler = @import("compiler.zig");
 const parser = @import("parser.zig");
 const diag = @import("diag.zig");
@@ -292,8 +295,9 @@ fn translateInto(gpa: Allocator, w: *Writer, word: []const u8, rest: []const u8)
 
 /// Wraps an expression so that its values print as `print` does, and nothing
 /// prints when it has none. The expression starts on line 1, so errors point at
-/// the line the user typed.
-const show_prelude = "local function __show(...) if select('#', ...) > 0 then print(...) end end __show(";
+/// the line the user typed. (An anonymous function, not a `local`: a REPL
+/// chunk's top-level locals persist.)
+const show_prelude = "(function(...) if select('#', ...) > 0 then print(...) end end)(";
 
 pub const Outcome = union(enum) {
     /// The chunk is not finished; the next line continues it.
@@ -314,6 +318,12 @@ pub const Session = struct {
     chunks: std.ArrayList(compiler.Chunk) = .empty,
     /// The lines of the chunk being typed, joined by newlines.
     pending: std.ArrayList(u8) = .empty,
+    /// The top-level locals of the lines so far, newest declaration of each name
+    /// only: what the next chunk is compiled against (`resolve.Outer`, names
+    /// owned here) and the cell of each, which stay alive through the VM's
+    /// reference to the root closure that holds them.
+    scope: std.ArrayList(resolve.Outer) = .empty,
+    cells: std.ArrayList(*function.Upvalue) = .empty,
 
     pub fn init(gpa: Allocator, vm: *Vm, err: *Writer) Session {
         return .{ .gpa = gpa, .vm = vm, .err = err };
@@ -323,6 +333,32 @@ pub const Session = struct {
         for (self.chunks.items) |*c| c.deinit();
         self.chunks.deinit(self.gpa);
         self.pending.deinit(self.gpa);
+        for (self.scope.items) |o| self.gpa.free(o.name);
+        self.scope.deinit(self.gpa);
+        self.cells.deinit(self.gpa);
+    }
+
+    /// Keep the top-level locals the line `chunk` declared, from its root
+    /// closure `closure`; a name declared before is replaced in place (the
+    /// older cell lives on in the closures that captured it).
+    fn adopt(self: *Session, chunk: *const compiler.Chunk, closure: *function.Closure, outer_len: usize) !void {
+        for (chunk.repl_exports, 0..) |ex, i| {
+            const cell = closure.upvalues[outer_len + i];
+            var found: ?usize = null;
+            for (self.scope.items, 0..) |o, k| {
+                if (std.mem.eql(u8, o.name, ex.name)) found = k;
+            }
+            if (found) |k| {
+                self.scope.items[k].attrib = ex.attrib;
+                self.cells.items[k] = cell;
+            } else {
+                const name = try self.gpa.dupe(u8, ex.name);
+                errdefer self.gpa.free(name);
+                try self.scope.append(self.gpa, .{ .name = name, .attrib = ex.attrib });
+                errdefer _ = self.scope.pop();
+                try self.cells.append(self.gpa, cell);
+            }
+        }
     }
 
     /// Whether a chunk is half typed (the prompt should be the continuation).
@@ -389,6 +425,7 @@ pub const Session = struct {
         const chunk = compiler.compileWithOptions(self.gpa, self.vm.heap, src, tree.root, &diags, .{
             .known_globals = &interp.builtin_global_names,
             .chunk_name = name,
+            .repl = .{ .outer = self.scope.items },
         }) catch |e| switch (e) {
             error.OutOfMemory => return e,
             else => return self.failedWith(&diags, src, name, report),
@@ -438,8 +475,12 @@ pub const Session = struct {
     fn execute(self: *Session, chunk: compiler.Chunk) !Outcome {
         try self.chunks.append(self.gpa, chunk);
         const vm = self.vm;
-        const result = vm.run(self.chunks.items[self.chunks.items.len - 1].proto);
+        const kept = &self.chunks.items[self.chunks.items.len - 1];
+        const outer_len = self.scope.items.len;
+        var closure: ?*function.Closure = null;
+        const result = vm.runLine(kept.proto, self.cells.items, &closure);
         mio.flush();
+        if (closure) |cl| try self.adopt(kept, cl, outer_len);
         if (result) |_| return .done else |e| {
             if (e == error.Exit) {
                 vm.unwindTo(0, 0);
@@ -883,6 +924,65 @@ test "session: globals persist from one line to the next" {
     _ = try r.feed("inc()");
     _ = try r.feed("inc()");
     try testing.expectEqualStrings("1\n2\n", r.out.written());
+}
+
+test "session: top-level locals persist from line to line, and closures share them" {
+    const r = try Rig.init(testing.allocator);
+    defer r.deinit(testing.allocator);
+    _ = try r.feed("local n = 1");
+    _ = try r.feed("n = n + 1");
+    _ = try r.feed("n");
+    _ = try r.feed("local function bump() n = n + 1 return n end");
+    _ = try r.feed("bump()");
+    _ = try r.feed("n");
+    // A redeclaration is a new variable; the closure keeps the old one.
+    _ = try r.feed("local n = 100");
+    _ = try r.feed("n");
+    _ = try r.feed("bump()");
+    _ = try r.feed("local a, b = 1, 2");
+    _ = try r.feed("a + b");
+    try testing.expectEqualStrings("2\n3\n3\n100\n4\n3\n", r.out.written());
+    try testing.expectEqualStrings("", r.err.written());
+}
+
+test "session: locals of blocks and loops do not persist, and a recursive local function works" {
+    const r = try Rig.init(testing.allocator);
+    defer r.deinit(testing.allocator);
+    _ = try r.feed("do local hidden = 1 end");
+    _ = try r.feed("for i = 1, 2 do local inner = i end");
+    _ = try r.feed("hidden");
+    _ = try r.feed("inner");
+    _ = try r.feed("local function fact(k) if k <= 1 then return 1 end return k * fact(k - 1) end");
+    _ = try r.feed("fact(5)");
+    try testing.expectEqualStrings("nil\nnil\n120\n", r.out.written());
+}
+
+test "session: a persisted <const> cannot be assigned, and a <close> local stays in its chunk" {
+    const r = try Rig.init(testing.allocator);
+    defer r.deinit(testing.allocator);
+    _ = try r.feed("local c <const> = 7");
+    _ = try r.feed("c");
+    try testing.expectEqual(@as(usize, 0), r.err.written().len);
+    _ = try r.feed("c = 8");
+    try testing.expect(std.mem.indexOf(u8, r.err.written(), "const") != null);
+    _ = try r.feed("c");
+    _ = try r.feed("local g <close> = setmetatable({}, {__close = function() print('closed') end})");
+    _ = try r.feed("g");
+    try testing.expectEqualStrings("7\n7\nclosed\nnil\n", r.out.written());
+}
+
+test "session: persisted locals survive a garbage collection" {
+    const r = try Rig.init(testing.allocator);
+    defer r.deinit(testing.allocator);
+    _ = try r.feed("local keep = {1, 2, 3}");
+    _ = try r.feed("local function sum() local s = 0 for _, v in ipairs(keep) do s = s + v end return s end");
+    _ = try r.feed("for i = 1, 2000 do local junk = {i, tostring(i)} end");
+    r.vm.collect();
+    _ = try r.feed("sum()");
+    r.vm.collect();
+    _ = try r.feed("#keep");
+    try testing.expectEqualStrings("6\n3\n", r.out.written());
+    try testing.expectEqualStrings("", r.err.written());
 }
 
 test "session: cd, export, unset and exit run as shortcuts, but not over a global of that name" {
