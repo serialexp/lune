@@ -56,7 +56,12 @@ pub const GcFlags = packed struct(u8) {
     /// counterfeit). Doc 28 §2; not serialized (restore recomputes via
     /// `String.create`).
     str_ascii: bool = false,
-    _reserved: u5 = 0,
+    /// Meaningful for `.table` objects only: frozen by `table.freeze` (doc 76
+    /// §5), so every store into it raises. In the header rather than the
+    /// `Table` because every store already reads the header's type byte, the
+    /// same word. Keyframes carry it (`HeapTable.flags` bit 2).
+    readonly: bool = false,
+    _reserved: u4 = 0,
 };
 
 /// The common header at the start of *every* heap object. Concrete object
@@ -87,6 +92,25 @@ pub const GcHeader = extern struct {
 
     pub fn init(object_type: ObjectType) GcHeader {
         return .{ .type = object_type };
+    }
+
+    /// A table a store may write: `type == .table` and `flags.readonly`
+    /// clear (doc 76 §5), tested as one masked compare of the header's
+    /// leading word, which costs what the type test alone does. The store
+    /// fast lanes test this; a frozen table leaves them for `indexSet`,
+    /// which raises.
+    pub inline fn isWritableTable(self: *const GcHeader) bool {
+        const lead: *const u32 = @ptrCast(self);
+        return lead.* & writable_mask == writable_table;
+    }
+
+    // The leading word's bytes are `type, color, flags, _pad`, so a byte
+    // array bitcast gives the word in the target's own byte order.
+    const writable_mask: u32 = @bitCast([4]u8{ 0xFF, 0, @bitCast(GcFlags{ .readonly = true }), 0 });
+    const writable_table: u32 = @bitCast([4]u8{ @intFromEnum(ObjectType.table), 0, 0, 0 });
+    comptime {
+        std.debug.assert(@offsetOf(GcHeader, "type") == 0 and @sizeOf(ObjectType) == 1);
+        std.debug.assert(@offsetOf(GcHeader, "flags") == 2 and @sizeOf(GcFlags) == 1);
     }
 };
 

@@ -65,6 +65,10 @@ const Instr = bytecode.Instr;
 const Closure = function.Closure;
 const RegWindow = regwindow.RegWindow;
 
+/// Doc 76 §5: what a store into a frozen table raises (Luau's words), from an
+/// instruction (`Error.ReadonlyTable`) or a library function.
+pub const readonly_message = "attempt to modify a readonly table";
+
 /// Runtime errors surfaced to the host. A superset of `arith.Error` so pure
 /// numeric ops coerce in with a bare `try`.
 pub const Error = error{
@@ -119,6 +123,9 @@ pub const Error = error{
     /// Doc 76 §6: a `tbc` found a value that is not nil, false, or a value
     /// with a `__close` metamethod.
     NonClosable,
+    /// Doc 76 §5: a store into a table `table.freeze` froze, as Luau's
+    /// `luaG_readonlyerror`.
+    ReadonlyTable,
     /// Replay's recorded `unicode_version` effect (S-C) names a Unicode version
     /// that differs from the one this binary's case table was compiled against.
     /// `upper`/`lower` would map differently, breaking byte-identical replay, so
@@ -2718,6 +2725,12 @@ pub const Vm = struct {
         return self.raiseBadArg(n, reason);
     }
 
+    /// A library function's refusal to write a frozen table (doc 76 §5),
+    /// located at its caller as an instruction's `ReadonlyTable` is.
+    pub fn readonlyError(self: *Vm) Error {
+        return self.raiseLocatedError(readonly_message, 1);
+    }
+
     /// Raise `bytes` as the in-flight error value, prepending the `chunk:line:`
     /// location of the call site `level` frames up (Lua's `error(msg, level)`
     /// semantics: `level == 1` is the function that called `error`, `level == 2`
@@ -2833,6 +2846,7 @@ pub const Vm = struct {
             Error.DivisionByZero => try arena.dupe(u8, "attempt to perform integer division or modulo by zero"),
             Error.MetatableChainLoop => try arena.dupe(u8, "'__index' chain too long; possible loop"),
             Error.ForStepZero => try arena.dupe(u8, "'for' step is zero"),
+            Error.ReadonlyTable => try arena.dupe(u8, readonly_message),
             Error.GlobalDefined => try std.fmt.allocPrint(arena, "global '{s}' already defined", .{string.String.fromHeader(proto.constants[instr.b].asHeap()).bytes()}),
             Error.NonClosable => try std.fmt.allocPrint(arena, "variable '{s}' got a non-closable value", .{if (instr.op == .tfor_prep)
                 "(for state)"
@@ -9756,8 +9770,10 @@ pub const Vm = struct {
                 const container = regs.get(instr.a);
                 const key = regs.get(instr.b);
                 const val = regs.get(instr.c);
+                // A frozen table (doc 76 §5) takes neither lane: `indexSet`
+                // raises.
                 fast: {
-                    if (container.isHeap() and container.heapType() == .table and key.isInt()) {
+                    if (container.isHeap() and container.asHeap().isWritableTable() and key.isInt()) {
                         const tbl = table.Table.fromHeader(container.asHeap());
                         const i = key.asInt();
                         // A grid store is an outer row (re)assignment — a
@@ -9788,7 +9804,7 @@ pub const Vm = struct {
                     // rehash, no new key), and `__newindex` never fires for a
                     // present key. A deletion, a new key, and a grid take
                     // `indexSet`.
-                    if (container.isHeap() and container.heapType() == .table and key.isHeap() and !val.isNil()) {
+                    if (container.isHeap() and container.asHeap().isWritableTable() and key.isHeap() and !val.isNil()) {
                         const tbl = table.Table.fromHeader(container.asHeap());
                         if (!tbl.array.isGrid()) {
                             if (tbl.hash.liveHeapNode(key)) |n| {
@@ -9942,14 +9958,14 @@ pub const Vm = struct {
     /// Doc 66 P2: `set_field a, b, c` is `R[a][K[b]] = R[c]` with `K[b]` an
     /// interned string. The fast lane is `set_index`'s heap-key lane: a key
     /// live in the hash part takes a non-nil value in place. A deletion, a
-    /// new key and a grid take `opSetFieldSlow`.
+    /// new key, a grid and a frozen table take `opSetFieldSlow`.
     fn opSetField(comptime mode: ExecMode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const container = regs.get(instr.a);
                 const val = regs.get(instr.c);
-                if (container.isHeap() and container.heapType() == .table and !val.isNil()) {
+                if (container.isHeap() and container.asHeap().isWritableTable() and !val.isNil()) {
                     const tbl = table.Table.fromHeader(container.asHeap());
                     if (!tbl.array.isGrid()) {
                         if (tbl.hash.liveHeapNode(st.proto.constants[instr.b])) |n| {
@@ -10057,6 +10073,8 @@ pub const Vm = struct {
                 const v = regs.get(instr.a);
                 const key = st.proto.constants[instr.b];
                 const hints = st.proto.global_slot_hints;
+                // Doc 76 §5: `table.freeze(_G)` ends global assignment.
+                if (self.globals.isReadonly()) return parkErr(st, Error.ReadonlyTable);
                 const stored = if (instr.b < hints.len)
                     self.globals.setHinted(self.gpa, key, v, &hints[instr.b])
                 else
@@ -10079,6 +10097,7 @@ pub const Vm = struct {
                 const hint: ?*u32 = if (instr.b < hints.len) &hints[instr.b] else null;
                 const old = if (hint) |h_| vm.globals.getHinted(key, h_) else vm.globals.get(key);
                 if (!old.isNil()) return parkErr(st, Error.GlobalDefined);
+                if (vm.globals.isReadonly()) return parkErr(st, Error.ReadonlyTable);
                 const stored = if (hint) |h_| vm.globals.setHinted(vm.gpa, key, v, h_) else vm.globals.set(vm.gpa, key, v);
                 stored catch |e| return parkErr(st, e);
                 vm.heap.writeBarrier(&vm.globals.header, v);
@@ -11788,6 +11807,9 @@ pub const Vm = struct {
     ///   - `__newindex` is any other value → repeat the set on it (chained,
     ///     bounded), as Lua does: a table's raw slot, else its own
     ///     `__newindex`, else the fault.
+    /// A raw store into a frozen table raises `ReadonlyTable` (doc 76 §5.1).
+    /// As Luau's `luaV_settable`, only a store that would assign checks it:
+    /// an absent key with a `__newindex` dispatches.
     pub fn indexSet(self: *Vm, container: Value, key: Value, val: Value) Error!void {
         var cur = container;
         var hops: usize = 0;
@@ -11827,6 +11849,7 @@ pub const Vm = struct {
                 // it (the `or` skips `t.get`) so a plain `t[i] = v` never pays a
                 // redundant `Table.get` per store on the hot array-build path.
                 if (t.metatable == null or !t.get(key).isNil()) {
+                    if (t.isReadonly()) return Error.ReadonlyTable;
                     try t.set(self.gpa, key, val);
                     self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
                     return;
@@ -11834,6 +11857,7 @@ pub const Vm = struct {
                 const handler = self.metamethod(cur, self.mm.newindex);
                 if (handler.isNil()) {
                     // No `__newindex`: a plain raw store that creates the key.
+                    if (t.isReadonly()) return Error.ReadonlyTable;
                     try t.set(self.gpa, key, val);
                     self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
                     return;
@@ -12108,6 +12132,7 @@ pub fn catchable(e: Error) bool {
         Error.ForStepZero,
         Error.GlobalDefined,
         Error.NonClosable,
+        Error.ReadonlyTable,
         => true,
         Error.OutOfMemory,
         Error.EffectLogExhausted,

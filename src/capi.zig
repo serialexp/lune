@@ -423,6 +423,13 @@ fn oom(box: *VmBox) mh_status {
 /// Handle a fault from guest execution: render the located message while the
 /// faulting frames are live, then either restore the boundary (catchable —
 /// the `pcall` recipe, doc 59 §3.6) or mark the VM fatal (non-catchable).
+/// A host write into a table `table.freeze` froze (doc 76 §5): refused with
+/// the guest's message, as Luau's API raises; nothing ran, so nothing unwinds.
+fn readonlyRefused(box: *VmBox) mh_status {
+    setLastError(box, interp.readonly_message);
+    return .err_runtime;
+}
+
 fn guestFault(box: *VmBox, entry_depth: u32, entry_top: usize, err: interp.Error) mh_status {
     const vm = &box.vm;
     if (err == error.Exit) {
@@ -1302,6 +1309,7 @@ pub export fn mh_global_set(vm: ?*VmBox, name: mh_str, val: mh_value) mh_status 
     if (checkFatal(box)) |s| return s;
     const n = strSlice(name) orelse return badStr(box);
     const v = fromC(val) orelse return badValue(box);
+    if (box.vm.globals.isReadonly()) return readonlyRefused(box);
     parkClearIfIdle(box);
     if (park(box, v) != .ok) return .err_oom;
     const key = box.vm.heap.internValue(n) catch return oom(box);
@@ -1511,9 +1519,11 @@ pub export fn mh_register_fn(vm: ?*VmBox, name: mh_str, cfn: ?mh_host_fn, userda
         const mod = n[0..dot];
         const field = n[dot + 1 ..];
         const tbl = vmi.getOrCreateModuleTable(mod) catch return oom(box);
+        if (tbl.isReadonly()) return readonlyRefused(box);
         const fkey = vmi.heap.internValue(field) catch return oom(box);
         tbl.set(gpa, fkey, Value.heap(&native.header)) catch return oom(box);
     } else {
+        if (vmi.globals.isReadonly()) return readonlyRefused(box);
         const key = vmi.heap.internValue(n) catch return oom(box);
         vmi.globals.set(gpa, key, Value.heap(&native.header)) catch return oom(box);
     }
@@ -1619,7 +1629,8 @@ pub export fn mh_table_metatable_get(vm: ?*VmBox, tbl: mh_value, out: ?*mh_value
 }
 
 /// Set (table metatable) or clear (nil) a metatable. No `__metatable`
-/// protection in v1 (the host is trusted — it owns the VM).
+/// protection in v1 (the host is trusted — it owns the VM); a frozen table
+/// refuses, as Luau's `lua_setmetatable` (doc 76 §5).
 pub export fn mh_table_metatable_set(vm: ?*VmBox, tbl: mh_value, mt: mh_value) mh_status {
     const box = vm orelse return .err_api;
     bumpEpoch(box);
@@ -1630,6 +1641,7 @@ pub export fn mh_table_metatable_set(vm: ?*VmBox, tbl: mh_value, mt: mh_value) m
         setLastError(box, "value is not a table");
         return .err_api;
     };
+    if (t.isReadonly()) return readonlyRefused(box);
     if (mv.isNil()) {
         t.metatable = null;
         return .ok;

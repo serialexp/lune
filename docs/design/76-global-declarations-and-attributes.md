@@ -45,6 +45,9 @@ land; move whole phases to Done once everything inside them is checked.
   through `pcall`, `coroutine.close`, a coroutine dying; the generic
   `for`'s closing value via `tfor_prep`; `io.lines`'s file closed by it
   (§6).
+- [x] **Phase 4 — `table.freeze` / `table.isfrozen` / `table.clone`.**
+  The table's `readonly` bit; every store path checks it, the JIT's
+  included; keyframes carry it; inventory rows (§5).
 
 ### Outstanding
 
@@ -62,9 +65,6 @@ land; move whole phases to Done once everything inside them is checked.
   - [ ] a value with a `__close` recorded as the call, not an abort
 - [ ] **`<close>` gaps against 5.4** (§6.2, TODO.md): pending closes on an
   uncaught top-level error; a `__close` that yields.
-- [ ] **Phase 4 — `table.freeze` / `table.isfrozen` / `table.clone`.**
-  The table's `readonly` bit; every store path checks it, the JIT's
-  included; keyframes carry it; inventory rows (§5).
 - [ ] **Phase 5 — language server.** The keyword, attributes and
   declarations in completion, semantic tokens, hover, definition and rename;
   the strict-scope errors as diagnostics (§7).
@@ -214,18 +214,29 @@ chunk may write it (§4.1).
   `__metatable` field), as Luau's does.
 - Shallow: the keys, the values and the metatable keep their own state.
 - Permanent: there is no unfreeze. `table.isfrozen(t)` reports it.
-- A store into a frozen table errors even when the table has `__newindex`
-  and the key is absent: the table is not modified by the store itself, but
-  Luau checks before dispatch, and so do we. (To confirm against Luau's
-  `luaV_settable` before implementing.)
+- Only a store that would assign checks it. Luau's `luaV_settable` tests
+  `readonly` at the raw store, after the `__newindex` lookup, so a store of
+  an absent key into a frozen table with a `__newindex` dispatches to it,
+  and so does ours (`Vm.indexSet`).
+- The order of the other checks is Luau's too: `rawset` checks first;
+  `setmetatable` checks the protected metatable, then `readonly`;
+  `insert`/`remove`/`move` check their arguments, then error at the first
+  write; `sort` checks up front.
 - Freezing `_G` is allowed; after it, every global assignment errors.
+- The message is Luau's: "attempt to modify a readonly table".
 
 ### 5.2 Representation
 
-A `readonly: bool` on `Table` (Luau's own name for it). Not `frozen`:
-`ArrayPart.frozen` already means the array lane is committed (doc 47), a
-different thing. It rides in existing padding next to `no_grid`; the struct
-does not grow.
+A `readonly` bit (Luau's own name for it), in `GcFlags` in the object
+header, not a field on `Table`. Not `frozen`: `ArrayPart.frozen` already
+means the array lane is committed (doc 47), a different thing.
+
+The header, not the table's padding, because every store already tests the
+header's type byte. With `readonly` in the same 32-bit word,
+`GcHeader.isWritableTable()` is one masked compare (type == table and
+readonly clear), so the tier-0 fast lanes pay for the check exactly what
+they paid for the type test it replaces. A bit next to `no_grid` would be a
+second load from another field. The struct does not grow either way.
 
 Keyframes carry it as `HeapTable.flags` bit 2 (`table_flag_readonly`,
 `keyframeser.zig`), so a restored session refuses the same writes; a
@@ -234,18 +245,35 @@ nothing else.
 
 ### 5.3 Every store path
 
-Each must check the bit:
+Each checks the bit:
 
-- tier 0: `set_index`, `set_field`, `set_index2` (the fused grid store), and
-  `set_global`/`def_global` (the globals table can be frozen);
-- `rawset`, `setmetatable`, `table.insert`/`remove`/`move`/`sort`, and any
-  native that writes a table it did not just create;
-- the JIT: `hstore`, `astore`, `astore_append` and the hash-insert paths.
-  The recorder emits one guard per table reference that the bit is clear,
-  CSE'd and hoisted with the table's other loop-invariant guards, so a store
-  loop pays it once per entry, not per store. `table.freeze` inside a trace
-  is a call, an ordinary barrier, so a guard taken before it is not trusted
-  after it.
+- tier 0: `set_index` and `set_field` take their fast lanes only through
+  `isWritableTable()`; a frozen table falls to `Vm.indexSet`, which raises
+  `Error.ReadonlyTable` at the raw store. `set_global`/`def_global` check the
+  globals table.
+- `rawset`, `setmetatable`, `table.insert`/`remove`/`move`/`sort`,
+  `require`'s writes to `package.loaded`, and the `string.gmatch`/
+  `string.codes` iterators' writes to their state table. That state is a
+  table the program can reach and freeze; the fused gmatch fast path
+  (`stralloc.zig`) reports a frozen state as a bad layout, so tier 0 runs
+  the step and raises.
+- the C API: `mh_global_set`, `mh_register_fn` and `mh_table_metatable_set`
+  refuse with the same message; `mh_table_set` goes through `indexSet`.
+  There is no C entry that freezes.
+- the JIT. The recorder aborts (`readonly_table`) when the table it records
+  a store into is frozen, and every store's `guard_table` carries
+  `aux = GUARD_TABLE_WRITABLE`. `tropt` keys guards on `aux`, so a read's
+  plain guard on the same table does not absorb a store's. The native code
+  tests the header bit (`bt`): once in the entry prologue for a
+  loop-invariant table, which every entry stub reaches, and at the guard for
+  a table loaded in the loop. A read guard does not test it: reading a
+  frozen table stays native. The bit cannot change during a native run:
+  `table.freeze` is not a recorded builtin, so a call to it ends the trace,
+  and every host call and C API entry bumps the host epoch.
+- `set_index2` (the fused grid store) needs nothing. Grid inflation refuses
+  frozen rows, so a grid's cells are never in a frozen table. A store
+  through a frozen outer table that holds a grid writes a row, not the
+  outer table; reassigning a row goes through `set_index` and is refused.
 
 Fresh tables (constructors, `set_list`, `table.pack`, `table.create`) cannot
 be frozen yet and need no check. Grid inflation and deflation (doc 14)
@@ -265,9 +293,11 @@ profile pool.
 Luau's: `table.clone(t)` returns a new table with the same keys, values and
 metatable, never frozen, even if `t` was. Shallow. It errors if `t`'s
 metatable is protected (has `__metatable`), as Luau's does
-(`ltablib.cpp` `tclone`). It copies the representation as it stands (array
-part, hash part, grid), so the copy costs one allocation per part and no
-rehash. A `table` library function, deterministic; an inventory row.
+(`ltablib.cpp` `tclone`). Its argument is deflated from a grid first, as
+every library function's is. Then the array and hash parts are copied as
+they stand, capacity included, so the copy costs one allocation per part
+and no rehash (`Table.clone`). A `table` library function, deterministic;
+an inventory row.
 
 ## 6. `<close>`
 

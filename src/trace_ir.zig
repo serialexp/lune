@@ -60,6 +60,13 @@ pub const ObsType = enum(u8) { unknown, int, float, boolean, nil, heap };
 /// (`bytecode.OpCode`) plus the constructs unique to a linear trace: value
 /// *inputs* (`slot_load`/`konst`), *guards* (the runtime checks that keep the
 /// straight-line trace valid), and the `loop` back-edge marker.
+/// `guard_table`'s `aux` on a store's guard: the table must not be frozen
+/// (`GcFlags.readonly`, doc 76 §5). Freezing is a library call, never
+/// recorded, and a host call's epoch guard catches any re-entry that could
+/// freeze, so the bit holds for a whole native run: native code checks it
+/// once per entry for an invariant table.
+pub const GUARD_TABLE_WRITABLE: i32 = 1;
+
 pub const IrOp = enum(u8) {
     // ---- inputs ----
     /// `aux` = tier-0 register read at trace entry (a loop-variant input).
@@ -129,6 +136,9 @@ pub const IrOp = enum(u8) {
     /// so every trace assumes raw array access; the no-metatable half of this guard
     /// catches a `setmetatable` that lands between trace entries (chunk 2a) and
     /// side-exits to tier-0, which does full `__index`/`__newindex` dispatch.
+    /// `aux` = `GUARD_TABLE_WRITABLE` on a guard ahead of a store: the table
+    /// must also not be frozen (doc 76 §5), or tier-0 raises. 0 otherwise, so
+    /// a trace that only reads a frozen table still runs.
     guard_table,
     /// `a`=table value ref, `aux`=lane → the table's array lane equals `aux`
     /// (bails if a monotonic widen moved it past the recorded lane).

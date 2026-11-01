@@ -137,7 +137,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v18 (doc 73 §7.6): `Keyframe.aio_ops_id`, the `aio` operations in
 /// flight (a VM-level root, 1-based optional id), and `aio_next_id`, the
 /// next operation id.
-pub const snapshot_format_version: u32 = 18;
+///
+/// v19 (doc 76 §5): `HeapTable.flags` bit 2, `readonly`: a table
+/// `table.freeze` froze, so a restored session refuses the same stores. The
+/// field is unchanged; an older reader would drop the bit.
+pub const snapshot_format_version: u32 = 19;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -162,6 +166,8 @@ pub fn toSchemaValue(v: Value) schema.SnapValue {
 /// `HeapTable.flags` bits.
 const table_flag_frozen: u8 = 1 << 0;
 const table_flag_no_grid: u8 = 1 << 1;
+/// The table's `GcFlags.readonly` (doc 76 §5), not its array part's `frozen`.
+const table_flag_readonly: u8 = 1 << 2;
 
 /// A grid array part on the wire: every `rows × stride` cell, row-major.
 fn toSchemaGrid(a: std.mem.Allocator, ap: *const arr.ArrayPart) !schema.GridPart {
@@ -271,6 +277,7 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader, live: ?sy
             var flags: u8 = 0;
             if (t.array.frozen) flags |= table_flag_frozen;
             if (t.no_grid) flags |= table_flag_no_grid;
+            if (t.isReadonly()) flags |= table_flag_readonly;
             const kvs = try sortedHashEntries(a, t);
             const entries = try a.alloc(schema.TableEntry, kvs.len);
             for (kvs, 0..) |kv, i| {
@@ -1249,6 +1256,7 @@ pub fn restoreSnapshot(
                 }
                 t.array.frozen = ht.flags & table_flag_frozen != 0;
                 t.no_grid = ht.flags & table_flag_no_grid != 0;
+                t.header.flags.readonly = ht.flags & table_flag_readonly != 0;
                 // The rehash trigger depends on history and decides where later
                 // integer keys land, so `#t` and `next` order (Table.rehash).
                 // Below 4 no capture can produce it.

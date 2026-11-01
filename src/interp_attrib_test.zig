@@ -383,3 +383,158 @@ test "doc 76: coroutine.close runs the pending closes, and a dying coroutine run
         \\
     , "true\t1\ntrue\tk:nil\tdead\nfalse\tclosing\nfalse\tdead\nk2:dead\n");
 }
+
+test "doc 76: a frozen table refuses every store, raw and library ones too, and reads as before" {
+    // `refused` prints the line a refusal was raised at, or what else happened.
+    try expectProgram(
+        \\local function refused(f)
+        \\  local ok, e = pcall(f)
+        \\  io.write(ok and "stored" or e:match("^main:(%d+): attempt to modify a readonly table$") or e, " ")
+        \\end
+        \\local t = { 1, 2, x = 3 }
+        \\print(table.freeze(t) == t, table.isfrozen(t), table.isfrozen({}))
+        \\print(pcall(function() t[1] = 9 end))
+        \\refused(function() t.x = 9 end)
+        \\refused(function() t.new = 9 end)
+        \\refused(function() t[3] = 9 end)
+        \\refused(function() t.x = nil end)
+        \\refused(function() rawset(t, "x", 0) end)
+        \\refused(function() setmetatable(t, {}) end)
+        \\refused(function() table.insert(t, 5) end)
+        \\refused(function() table.remove(t) end)
+        \\refused(function() table.sort(t) end)
+        \\refused(function() table.move({ 7 }, 1, 1, 1, t) end)
+        \\print()
+        \\print(table.move(t, 1, 0, 1, t) == t)
+        \\print(t[1], t[2], t.x, #t)
+        \\
+    , "true\ttrue\tfalse\n" ++
+        "false\tmain:7: attempt to modify a readonly table\n" ++
+        "8 9 10 11 12 13 14 15 16 17 \n" ++
+        "true\n1\t2\t3\t2\n");
+}
+
+test "doc 76: freezing refuses a frozen table and a protected metatable, and is shallow" {
+    try expectProgram(
+        \\local t = table.freeze({ inner = {} })
+        \\print(pcall(table.freeze, t))
+        \\print(pcall(table.freeze, setmetatable({}, { __metatable = "locked" })))
+        \\t.inner.x = 1
+        \\print(t.inner.x, table.isfrozen(t.inner))
+        \\local mt = {}
+        \\local u = table.freeze(setmetatable({}, mt))
+        \\mt.__index = function() return "via mt" end
+        \\print(u.anything)
+        \\
+    , "false\tbad argument #1 to 'table.freeze' (table is already frozen)\n" ++
+        "false\tbad argument #1 to 'table.freeze' (table has a protected metatable)\n" ++
+        "1\tfalse\nvia mt\n");
+}
+
+test "doc 76: a store into a frozen table's absent key with __newindex dispatches, as Luau's" {
+    try expectProgram(
+        \\local seen = {}
+        \\local t = table.freeze(setmetatable({ here = 1 }, {
+        \\  __newindex = function(_, k, v) seen[#seen + 1] = k .. "=" .. v end,
+        \\}))
+        \\t.absent = 2
+        \\print(seen[1], rawget(t, "absent"))
+        \\print(pcall(function() t.here = 3 end))
+        \\local target = table.freeze({})
+        \\local chain = setmetatable({}, { __newindex = target })
+        \\print(pcall(function() chain.k = 1 end))
+        \\
+    , "absent=2\tnil\n" ++
+        "false\tmain:7: attempt to modify a readonly table\n" ++
+        "false\tmain:10: attempt to modify a readonly table\n");
+}
+
+test "doc 76: a frozen _G ends global assignment and definition" {
+    try expectProgram(
+        \\x = 1
+        \\table.freeze(_G)
+        \\print(pcall(function() x = 2 end))
+        \\print(pcall(load("global y = 1")))
+        \\print(pcall(function() _G.z = 1 end))
+        \\print(x, y, z)
+        \\
+    , "false\tmain:3: attempt to modify a readonly table\n" ++
+        "false\t(load):1: attempt to modify a readonly table\n" ++
+        "false\tmain:5: attempt to modify a readonly table\n" ++
+        "1\tnil\tnil\n");
+}
+
+test "doc 76: a frozen iterator state refuses the cursor store" {
+    try expectProgram(
+        \\local it = ("ab"):gmatch(".")
+        \\print(pcall(it, table.freeze({ "ab", ".", 0 })))
+        \\local state = { "ab", ".", 0 }
+        \\print(it(state), state[3])
+        \\
+    , "false\tattempt to modify a readonly table\na\t1\n");
+}
+
+test "doc 76: table.clone copies keys, values, metatable and order, and is never frozen" {
+    try expectProgram(
+        \\local mt = { __index = function(_, k) return "mt:" .. k end }
+        \\local t = setmetatable({ 10, 20, 30, a = 1, b = 2 }, mt)
+        \\t.b = nil
+        \\t.c = 3
+        \\table.freeze(t)
+        \\local c = table.clone(t)
+        \\print(table.isfrozen(c), getmetatable(c) == mt, c ~= t, #c, c.q)
+        \\local order_t, order_c = {}, {}
+        \\for k, v in pairs(t) do order_t[#order_t + 1] = tostring(k) .. "=" .. tostring(v) end
+        \\for k, v in pairs(c) do order_c[#order_c + 1] = tostring(k) .. "=" .. tostring(v) end
+        \\print(table.concat(order_t, " ") == table.concat(order_c, " "), #order_c)
+        \\c[1] = 99
+        \\c.d = 4
+        \\print(t[1], rawget(t, "d"), c[1], c.d)
+        \\print(pcall(table.clone, setmetatable({}, { __metatable = false })))
+        \\local nums = {}
+        \\for i = 1, 100 do nums[i] = i * 0.5 end
+        \\local copy = table.clone(nums)
+        \\copy[101] = 1
+        \\print(#nums, #copy, copy[100])
+        \\
+    , "false\ttrue\ttrue\t3\tmt:q\n" ++
+        "true\t5\n" ++
+        "10\tnil\t99\t4\n" ++
+        "false\tbad argument #1 to 'table.clone' (table has a protected metatable)\n" ++
+        "100\t101\t50\n");
+}
+
+test "doc 76: hot store loops refuse a table frozen between their runs, in every tier" {
+    // The traced tiers check a store's table once per entry (an invariant
+    // table) or per iteration (a row loaded in the loop).
+    try expectProgram(
+        \\local function fill(t, n) for i = 1, n do t[i] = i end end
+        \\local function bump(o, n) for i = 1, n do o.x = o.x + 1 end end
+        \\local function push(t, n) for i = 1, n do t[#t + 1] = i end end
+        \\local a, o, p = {}, { x = 0 }, {}
+        \\for r = 1, 40 do fill(a, 100); bump(o, 100); push(p, 2) end
+        \\table.freeze(a); table.freeze(o); table.freeze(p)
+        \\print(pcall(fill, a, 100))
+        \\print(pcall(bump, o, 100))
+        \\print(pcall(push, p, 2))
+        \\print(a[100], o.x, #p)
+        \\local m = {}
+        \\for i = 1, 60 do m[i] = { 0, "row" } end
+        \\local function rows(m) for i = 1, #m do m[i][1] = i end end
+        \\for r = 1, 40 do rows(m) end
+        \\for i = 1, 60 do m[i][1] = -1 end
+        \\table.freeze(m[41])
+        \\print(pcall(rows, m))
+        \\print(m[40][1], m[41][1], m[42][1])
+        \\local k = table.freeze({ 1, 2, 3 })
+        \\local s = 0
+        \\for r = 1, 200 do for i = 1, 3 do s = s + k[i] end end
+        \\print(s)
+        \\
+    , "false\tmain:1: attempt to modify a readonly table\n" ++
+        "false\tmain:2: attempt to modify a readonly table\n" ++
+        "false\tmain:3: attempt to modify a readonly table\n" ++
+        "100\t4000\t80\n" ++
+        "false\tmain:13: attempt to modify a readonly table\n" ++
+        "40\t-1\t-1\n1200\n");
+}

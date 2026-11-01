@@ -75,6 +75,7 @@ const VALUE_TAG_OFF = layout.VALUE_TAG_OFF;
 const VALUE_PAYLOAD_OFF = layout.VALUE_PAYLOAD_OFF;
 const TABLE_TYPE = layout.TABLE_TYPE;
 const HEADER_TYPE_OFF = layout.HEADER_TYPE_OFF;
+const HEADER_READONLY_BIT = layout.HEADER_READONLY_BIT;
 const METATABLE_OFF = layout.METATABLE_OFF;
 const FUNCTION_TYPE = layout.FUNCTION_TYPE;
 const CLOSURE_PROTO_OFF = layout.CLOSURE_PROTO_OFF;
@@ -1073,6 +1074,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         // change *within* a single native run.
         try a.cmpQwordMemImm8(preg, METATABLE_OFF, 0);
         try a.jcc(.ne, prologue_fail);
+        // A table the trace stores into must not be frozen (doc 76 §5). Once,
+        // here, like the metatable: freezing is a library call, never part
+        // of a native run.
+        if (s.writable) {
+            try a.btMemImm8(preg, 0, HEADER_READONLY_BIT);
+            try a.jcc(.b, prologue_fail);
+        }
         // Lane check only for array-accessed tables (s.lane >= 0). A hash-only table
         // (H1: href, no aref) has no pinned lane — skip it; the type + metatable checks
         // above already cover the hash path's validity, and the cell pointer was
@@ -1262,6 +1270,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     // known offset from *GcHeader since header is the first field).
                     try a.cmpQwordMemImm8(tbl_reg, METATABLE_OFF, 0);
                     try jccNativeExit(a, exit_labels, i, .ne);
+                    // A store's guard: not frozen (doc 76 §5).
+                    if (ins.aux & trace.GUARD_TABLE_WRITABLE != 0) {
+                        try a.btMemImm8(tbl_reg, 0, HEADER_READONLY_BIT);
+                        try jccNativeExit(a, exit_labels, i, .b);
+                    }
                 }
                 // else: .ptr → prologue-hoisted, no-op
             },

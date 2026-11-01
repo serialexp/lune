@@ -280,6 +280,13 @@ pub const Heap = struct {
         return t;
     }
 
+    /// `Table.clone`, registered with the heap.
+    pub fn cloneTable(self: *Heap, src: *const Table) std.mem.Allocator.Error!*Table {
+        const t = try src.clone(self.gpa);
+        self.link(&t.header);
+        return t;
+    }
+
     /// Attempt to flatten a `.value` array-of-rows table into a flat grid
     /// (doc 14, Phase 4). **STRICT homogeneous-numeric** precondition — inflate
     /// only when:
@@ -341,6 +348,10 @@ pub const Heap = struct {
             if (h.type != .table) return false; // typed_array/string/... ⇒ block
             const row = Table.fromHeader(h);
             if (row.metatable != null) return false;
+            // A grid's rows are its cells, written by the fused store with no
+            // per-row check, and deflation rebuilds them: a frozen row stays
+            // a table (doc 76 §5).
+            if (row.isReadonly()) return false;
             if (row.hash.count() != 0) return false;
             // Doc 18: a row's array part covers keys 0..asize-1; its grid-able
             // cells are keys 1..asize-1 (rowView is 1-based). A populated row

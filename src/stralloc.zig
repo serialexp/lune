@@ -275,6 +275,8 @@ pub noinline fn sgmSetposRuntime(state: *object.GcHeader, pos: i64) callconv(.c)
     // written; tier-0 replays).
     if (Value.heap(state).heapType() != .table) return string_std.MatchStatus.bad_type;
     const t = table_mod.Table.fromHeader(state);
+    // A frozen state (doc 76 §5) also writes nothing: tier-0 replays and raises.
+    if (t.isReadonly()) return string_std.MatchStatus.bad_layout;
     return if (t.setInLaneValueInt(3, pos)) string_std.MatchStatus.ok else string_std.MatchStatus.bad_layout;
 }
 

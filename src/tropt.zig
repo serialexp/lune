@@ -374,7 +374,7 @@ fn resolveFold(
 /// lanes emits two `guard_fits` on the same value `v` with different lanes, and
 /// dropping the second silently truncates the wider value into the narrower lane.
 /// So those auxes ARE part of the key. The remaining array guards
-/// (`guard_table`/`guard_bounds`/`guard_present`/`guard_append`) carry no `aux`.
+/// (`guard_bounds`/`guard_present`/`guard_append`) carry no `aux`.
 fn guardKeyAux(op: IrOp, aux: i32) i32 {
     return switch (op) {
         // `guard_hash` stashes the recorded hash population in `aux` — genuine
@@ -391,7 +391,9 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
         // `guard_sid` stashes the expected string's konst-pool id — semantic
         // identity (two pins expecting DIFFERENT strings must never be
         // deduplicated: doc 30 round-2 M01), so it joins the dedup-key auxes.
-        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_sid => aux,
+        // `guard_table`'s `GUARD_TABLE_WRITABLE` adds a check (not frozen,
+        // doc 76 §5): a read's plain guard must not swallow a store's.
+        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_sid, .guard_table => aux,
         else => 0,
     };
 }

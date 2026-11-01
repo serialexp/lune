@@ -371,12 +371,15 @@ fn requireCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
     // `loaded` after the loader call (it may have replaced `package.loaded`); a
     // loader that assigned `package.loaded[name]` itself is then honoured by the
     // re-fetch below.
+    // A frozen `package.loaded` (doc 76 §5) refuses the store as any table.
     const loaded = try requirePackageSubTable(vm, "loaded", "package.loaded");
     if (!result.isNil()) {
+        if (loaded.isReadonly()) return vm.readonlyError();
         try loaded.set(vm.gpa, name_val, result);
     }
     var cur = loaded.get(name_val);
     if (cur.isNil()) {
+        if (loaded.isReadonly()) return vm.readonlyError();
         try loaded.set(vm.gpa, name_val, Value.boolean(true));
         cur = Value.boolean(true);
     }

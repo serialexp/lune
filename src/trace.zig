@@ -139,6 +139,7 @@ pub const Ref = trace_ir.Ref;
 pub const ObsType = trace_ir.ObsType;
 pub const IrOp = trace_ir.IrOp;
 pub const PHI_INTERNAL = trace_ir.PHI_INTERNAL;
+pub const GUARD_TABLE_WRITABLE = trace_ir.GUARD_TABLE_WRITABLE;
 pub const IrInstr = trace_ir.IrInstr;
 pub const guardExitPc = trace_ir.guardExitPc;
 pub const isSideExitGuardOp = trace_ir.isSideExitGuardOp;

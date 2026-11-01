@@ -100,6 +100,38 @@ fn carriedReadIr(consts: []Value, full: []I) void {
 
 const CARRIED_READ_LEN = 23;
 
+test "nativegen(doc 76): a store's guard on a per-iteration table exits at the first frozen one, as the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    const key = try string.String.create(gpa, "v");
+    defer key.destroy(gpa);
+    const key_val = Value.heap(&key.header);
+
+    const N: usize = 32;
+    var elems: [N]*table.Table = undefined;
+    var built: usize = 0;
+    defer for (elems[0..built]) |e| e.destroy(gpa);
+    const container = try buildUniverse(gpa, key_val, &elems, &built);
+    defer container.destroy(gpa);
+
+    var consts: [2]Value = undefined;
+    var full: [CARRIED_READ_LEN]I = undefined;
+    carriedReadIr(&consts, &full);
+    consts[0] = key_val;
+    full[6].aux = trace.GUARD_TABLE_WRITABLE; // the dynamic guard, as a store's
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // Unfrozen, the bit changes nothing; one frozen element stops both the
+    // oracle and native code at the same iteration with the same registers.
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0) });
+    elems[10].header.flags.readonly = true;
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0) });
+    // The frozen table as the entry value: no iteration completes.
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[10].header), Value.int(0) });
+}
+
 test "nativegen(doc22 A): carried-heap read loop matches the interpreter" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;

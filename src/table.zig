@@ -119,6 +119,29 @@ pub const Table = struct {
         return self;
     }
 
+    /// A shallow copy (`table.clone`, doc 76 §5.5): the same keys, values and
+    /// metatable in a copy of each part's representation, and the same
+    /// rehash and grid history, so the copy behaves as this table would.
+    /// Never frozen: the header is fresh. Raw allocation, as `create`;
+    /// `Heap.cloneTable` links it. Not for a grid (a library function's
+    /// argument is deflated first).
+    pub fn clone(self: *const Table, gpa: std.mem.Allocator) std.mem.Allocator.Error!*Table {
+        var array = try self.array.clone(gpa);
+        errdefer array.deinit(gpa);
+        var hash = try self.hash.clone(gpa);
+        errdefer hash.deinit(gpa);
+        const out = try gpa.create(Table);
+        out.* = .{
+            .header = GcHeader.init(.table),
+            .array = array,
+            .hash = hash,
+            .metatable = self.metatable,
+            .rehash_threshold = self.rehash_threshold,
+            .no_grid = self.no_grid,
+        };
+        return out;
+    }
+
     pub fn destroy(self: *Table, gpa: std.mem.Allocator) void {
         self.array.deinit(gpa);
         self.hash.deinit(gpa);
@@ -126,6 +149,14 @@ pub const Table = struct {
     }
 
     /// Recover the concrete table from its embedded header (layout-independent).
+    /// Doc 76 §5: frozen by `table.freeze`; every store into it raises.
+    /// `Table`'s own mutators don't check it: the VM's store paths and the
+    /// library functions do, so a representation change (a rehash, a grid
+    /// inflation or deflation) stays allowed.
+    pub inline fn isReadonly(self: *const Table) bool {
+        return self.header.flags.readonly;
+    }
+
     pub fn fromHeader(h: *GcHeader) *Table {
         // `@alignCast`: no-op on native, required wasm32 alignment assertion (see
         // `String.fromHeader`). The object is allocated at `@alignOf(Table)`.

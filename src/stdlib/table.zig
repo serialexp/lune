@@ -77,17 +77,22 @@ inline fn given(args: []const Value, i: usize) bool {
 /// `table.insert(t, v)` — append at `#t+1`.
 /// `table.insert(t, pos, v)` — insert at `pos`, shifting `t[pos..#t]` up by one.
 /// Mutates `t`; returns nil. Wrong arity → `TypeError` (Lua: "wrong number of
-/// arguments to 'insert'").
+/// arguments to 'insert'"). A frozen `t` raises once the arguments check out
+/// (doc 76 §5): every insert writes.
 fn tInsert(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
     const n = t.length();
     switch (args.len) {
-        2 => try t.set(vm.gpa, Value.int(n + 1), args[1]),
+        2 => {
+            if (t.isReadonly()) return vm.readonlyError();
+            try t.set(vm.gpa, Value.int(n + 1), args[1]);
+        },
         3 => {
             const pos = try vm.intArg(args, 1);
             // Lua: 1 <= pos <= #t+1 ("position out of bounds").
             if (pos < 1 or pos > n + 1) return vm.badArgReason(2, "position out of bounds");
+            if (t.isReadonly()) return vm.readonlyError();
             var i = n;
             while (i >= pos) : (i -= 1) {
                 try t.set(vm.gpa, Value.int(i + 1), t.getInt(i));
@@ -102,7 +107,8 @@ fn tInsert(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// `table.remove(t, [pos])` — remove `t[pos]` (default `#t`), shift the tail down
 /// by one, and return the removed value. Follows Lua 5.4 `ltablib.c:tremove`
 /// edge handling (a `pos` other than `#t` must satisfy `1 <= pos <= #t+1`;
-/// removing from an empty list is a no-op returning nil).
+/// removing from an empty list is a no-op returning nil). It always stores
+/// the emptied slot, so a frozen `t` raises once `pos` checks out (doc 76 §5).
 fn tRemove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
@@ -112,6 +118,7 @@ fn tRemove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     if (pos != size) {
         if (pos < 1 or pos > size + 1) return vm.badArgReason(2, "position out of bounds");
     }
+    if (t.isReadonly()) return vm.readonlyError();
     const removed = t.getInt(pos);
     var i = pos;
     while (i < size) : (i += 1) {
@@ -159,7 +166,8 @@ fn tConcat(ctx: *anyopaque, args: []const Value) anyerror!Value {
 
 /// `table.move(a1, f, e, t, [a2])` — copy `a1[f..e]` into `a2` (default `a1`)
 /// starting at index `t`, handling overlap by copy direction. Returns `a2`.
-/// Mirrors Lua 5.4 `ltablib.c:tmove`.
+/// Mirrors Lua 5.4 `ltablib.c:tmove`; a frozen `a2` raises when there is
+/// something to move, after the range checks, as Luau's.
 fn tMove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const a1 = try tableArg(vm, args, 0);
@@ -171,6 +179,7 @@ fn tMove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     if (e >= f) {
         if (!(f > 0 or e < std.math.maxInt(i64) + f)) return vm.badArgReason(3, "too many elements to move");
         if (tpos > std.math.maxInt(i64) - (e - f)) return vm.badArgReason(4, "destination wrap around");
+        if (a2.isReadonly()) return vm.readonlyError();
         // Forward when ranges don't overlap-up (or different tables); else
         // backward to preserve overlapping source bytes.
         if (tpos > e or tpos <= f or a1 != a2) {
@@ -290,9 +299,11 @@ fn sortSiftDown(vm: *Vm, t: *Table, comp: ?Value, start: i64, end: i64) anyerror
 }
 
 /// `table.sort(list[, comp])` — sort `list[1..#list]` in place; returns nothing.
+/// A frozen `list` raises before anything else, even a short one, as Luau's.
 fn tSort(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
+    if (t.isReadonly()) return vm.readonlyError();
     const comp: ?Value = if (args.len >= 2 and !args[1].isNil()) args[1] else null;
     const n = t.length();
     if (n < 2) return Value.nil();
@@ -307,6 +318,46 @@ fn tSort(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return Value.nil();
 }
 
+// ---------------------------------------------------------------------------
+// table.freeze / table.isfrozen / table.clone — Luau's (doc 76 §5)
+// ---------------------------------------------------------------------------
+
+/// Whether `t`'s metatable is protected (has a `__metatable` field), which
+/// `freeze` and `clone` refuse, as Luau's `luaL_getmetafield` checks do.
+fn hasProtectedMetatable(vm: *Vm, t: *const Table) bool {
+    const mt = t.metatable orelse return false;
+    return !mt.get(vm.mm.metatable).isNil();
+}
+
+/// `table.freeze(t)` — make `t` read-only for good and return it: every later
+/// store into it raises, `rawset`, `setmetatable` and the `table` functions
+/// included. Shallow. Refuses a frozen `t` and a protected metatable.
+fn tFreeze(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const t = try tableArg(vm, args, 0);
+    if (t.isReadonly()) return vm.badArgReason(1, "table is already frozen");
+    if (hasProtectedMetatable(vm, t)) return vm.badArgReason(1, "table has a protected metatable");
+    t.header.flags.readonly = true;
+    return args[0];
+}
+
+/// `table.isfrozen(t)` — whether `table.freeze` froze `t`.
+fn tIsFrozen(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const t = try tableArg(vmOf(ctx), args, 0);
+    return Value.boolean(t.isReadonly());
+}
+
+/// `table.clone(t)` — a new table with `t`'s keys, values and metatable, never
+/// frozen. Shallow; a copy of each part's representation (`Table.clone`), so
+/// no rehash. Refuses a protected metatable.
+fn tClone(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const t = try tableArg(vm, args, 0);
+    if (hasProtectedMetatable(vm, t)) return vm.badArgReason(1, "table has a protected metatable");
+    const copy = try vm.heap.cloneTable(t);
+    return Value.heap(&copy.header);
+}
+
 pub const natives = [_]function.BaseNative{
     .{ .name = "table.insert", .func = &tInsert, .multi = function.noResults(&tInsert), .module = "table", .field = "insert" },
     .{ .name = "table.remove", .func = &tRemove, .module = "table", .field = "remove" },
@@ -315,6 +366,9 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "table.pack", .func = &tPack, .module = "table", .field = "pack" },
     .{ .name = "table.unpack", .func = &tUnpack1, .multi = &tUnpackN, .module = "table", .field = "unpack" },
     .{ .name = "table.sort", .func = &tSort, .multi = function.noResults(&tSort), .module = "table", .field = "sort" },
+    .{ .name = "table.freeze", .func = &tFreeze, .module = "table", .field = "freeze" },
+    .{ .name = "table.isfrozen", .func = &tIsFrozen, .module = "table", .field = "isfrozen" },
+    .{ .name = "table.clone", .func = &tClone, .module = "table", .field = "clone" },
 };
 
 // ---------------------------------------------------------------------------

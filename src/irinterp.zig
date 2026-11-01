@@ -794,8 +794,10 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // metatable between entries (or this is a different table than the
                 // one recorded), the raw `aload`/`astore` would skip
                 // `__index`/`__newindex` — so side-exit to tier-0 (full dispatch).
+                // A store's guard also wants the table unfrozen (doc 76 §5).
                 .guard_table => if (values[ins.a].isHeap() and values[ins.a].heapType() == .table and
-                    table.Table.fromHeader(values[ins.a].asHeap()).metatable == null)
+                    table.Table.fromHeader(values[ins.a].asHeap()).metatable == null and
+                    (ins.aux & trace_ir.GUARD_TABLE_WRITABLE == 0 or !table.Table.fromHeader(values[ins.a].asHeap()).isReadonly()))
                 {
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {

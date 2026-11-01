@@ -103,6 +103,43 @@ test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs
     while (k <= K) : (k += 1) try testing.expect(!t_n.getInt(k).asBool());
 }
 
+test "nativegen(doc 76): a store's table guard refuses a frozen table in the prologue, as the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 24;
+    var full: [13]I = undefined;
+    var consts: [2]Value = undefined;
+    var es: [0]u16 = undefined;
+    var tr = boolWriteTrace(&full, &consts, &es);
+    full[1].aux = trace.GUARD_TABLE_WRITABLE;
+    var ct = compile(gpa, &tr, 0) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+
+    // Writable: the whole run stores, as without the bit.
+    const t_w = try buildBoolTable(gpa, K);
+    defer t_w.destroy(gpa);
+    var wregs = [_]Value{ Value.heap(&t_w.header), Value.int(2) };
+    const wres = try runNative(ct, &wregs);
+    try testing.expect(wres.completed > 0);
+    try testing.expect(!t_w.getInt(2).asBool());
+
+    // Frozen: nothing runs and nothing is stored, natively and in the oracle.
+    const t_f = try buildBoolTable(gpa, K);
+    defer t_f.destroy(gpa);
+    t_f.header.flags.readonly = true;
+    var fregs = [_]Value{ Value.heap(&t_f.header), Value.int(2) };
+    const fres = try runNative(ct, &fregs);
+    try testing.expectEqual(@as(usize, 0), fres.completed);
+    var oregs = [_]Value{ Value.heap(&t_f.header), Value.int(2) };
+    const ovals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(ovals);
+    const ores = irinterp.executeValues(&tr, &oregs, ovals);
+    try testing.expectEqual(@as(usize, 0), ores.completed);
+    try testing.expectEqual(@as(u32, 1), ores.exit_instr);
+    var k: i64 = 2;
+    while (k <= K) : (k += 1) try testing.expect(t_f.getInt(k).asBool());
+}
+
 test "nativegen: astore deopt-replay leaves a deterministic heap (idempotent re-run)" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     // The real C1 oracle: not native-vs-tier1a (they leave the SAME partial heap on

@@ -113,3 +113,36 @@ pub fn referenceRunWith(gpa: std.mem.Allocator, source: [:0]const u8, setup: ?Se
         .total_safepoints = vm.safepoint_seq,
     };
 }
+
+/// The backing allocator for a `checkAllAllocationFailures` run whose code
+/// grows blocks: no block changes size in place (`resize`/`remap` refuse), so
+/// every growth is a fresh allocation. On the plain testing allocator a block
+/// grows in place or not by the address layout earlier work left (a restore
+/// re-parses, and the parser's arena grows), so the allocations a run makes
+/// are not a function of the code alone, and the check reports
+/// `NondeterministicMemoryUsage` for a run that is fine.
+pub const NoResizeInPlace = struct {
+    child: std.mem.Allocator,
+
+    pub fn allocator(self: *NoResizeInPlace) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *NoResizeInPlace = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
+        return new_len == memory.len;
+    }
+
+    fn remap(_: *anyopaque, memory: []u8, _: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
+        return if (new_len == memory.len) memory.ptr else null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *NoResizeInPlace = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ra);
+    }
+};

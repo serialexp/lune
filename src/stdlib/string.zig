@@ -641,6 +641,8 @@ fn codesAuxCore(vm: *Vm, args: []const Value, out: *[2]Value) anyerror!usize {
     else
         decodeAt(s, pos);
     pos += d.len;
+    // The state is a table the caller passed: it may be frozen (doc 76 §5).
+    if (st.isReadonly()) return vm.readonlyError();
     try st.set(vm.gpa, Value.int(2), Value.int(@intCast(pos)));
     try st.set(vm.gpa, Value.int(3), Value.int(emitted + 1));
     out[0] = Value.int(emitted + 1); // 1-based character ordinal
@@ -1487,7 +1489,9 @@ fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         // (S-D); `@max(…, 1)` guarantees termination at end-of-string.
         const newpos = if (span.end == span.start) span.end + @max(ms.seqLen(span.end), 1) else span.end;
         // In-lane cursor write; the generic set covers a non-int cell (a
-        // user overwrote `state[3]`) and the no-fast-path layouts.
+        // user overwrote `state[3]`) and the no-fast-path layouts. The state
+        // is a table the caller passed: it may be frozen (doc 76 §5).
+        if (st.isReadonly()) return vm.readonlyError();
         if (in_lane == null or !st.setInLaneValueInt(3, @intCast(newpos)))
             try st.set(vm.gpa, Value.int(3), Value.int(@intCast(newpos)));
         return try writeCaptures(vm, &ms, sobj, .{ span.start, span.end }, buf);

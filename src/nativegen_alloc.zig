@@ -100,6 +100,10 @@ pub const SlotInfo = struct {
     /// For a `.ptr` (table) invariant slot: the bool-lane ordinal its `guard_lane`
     /// pins, checked once in the prologue. `-1` for non-`.ptr` slots.
     lane: i32,
+    /// For a `.ptr` (table) invariant slot the trace stores into: a covering
+    /// `guard_table` carries `GUARD_TABLE_WRITABLE`, so the prologue also checks
+    /// once that the table is not frozen (doc 76 §5).
+    writable: bool = false,
     /// For a `.func` (cross-frame callee snapshot) invariant slot: the recorded
     /// `Proto.id` its covering `guard_func` pins, checked once in the prologue
     /// (closure type + this id). Unused (0) for non-`.func` slots.
@@ -1031,6 +1035,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         for (t.instrs) |g| {
             if (g.op == .aref and g.a == lr) has_aref = true;
             if (g.op == .guard_lane and g.a == lr) s.lane = g.aux;
+            if (g.op == .guard_table and g.a == lr and g.aux & trace.GUARD_TABLE_WRITABLE != 0) s.writable = true;
         }
         if (has_aref and s.lane < 0) return error.Bail; // array access without a pinned lane
     }

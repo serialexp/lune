@@ -257,6 +257,21 @@ pub const HashPart = extern struct {
         self.* = .empty;
     }
 
+    /// A copy in its own node block: the same nodes in the same slots, dead
+    /// ones included, so the copy probes, iterates (`next` order) and grows
+    /// exactly as this map would. The iteration cache is not copied; the
+    /// copy builds its own on its first traversal. `table.clone` (doc 76
+    /// §5.5): one allocation, no rehash.
+    pub fn clone(self: *const HashPart, gpa: std.mem.Allocator) std.mem.Allocator.Error!HashPart {
+        var out: HashPart = .{ .mask = self.mask, .live = self.live, .used = self.used };
+        if (self.nodes) |n| {
+            const nodes = try gpa.alignedAlloc(Node, node_align, self.mask + 1);
+            @memcpy(nodes, n[0 .. self.mask + 1]);
+            out.nodes = nodes.ptr;
+        }
+        return out;
+    }
+
     pub fn get(self: *const HashPart, key: Value) ?Value {
         const idx = self.liveSlotOf(key) orelse return null;
         return self.nodes.?[idx].value;

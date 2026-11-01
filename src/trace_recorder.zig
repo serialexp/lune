@@ -29,6 +29,7 @@ const trace_ir = @import("trace_ir.zig");
 const Ref = @import("trace_ir.zig").Ref;
 const ObsType = @import("trace_ir.zig").ObsType;
 const PHI_INTERNAL = @import("trace_ir.zig").PHI_INTERNAL;
+const GUARD_TABLE_WRITABLE = @import("trace_ir.zig").GUARD_TABLE_WRITABLE;
 const guardExitPc = @import("trace_ir.zig").guardExitPc;
 const guardSourcePc = @import("trace_ir.zig").guardSourcePc;
 const isSideExitGuardOp = @import("trace_ir.zig").isSideExitGuardOp;
@@ -77,6 +78,8 @@ pub const AbortReason = enum {
     /// which does full metamethod dispatch. Lifting this needs a
     /// `guard_no_metatable` IR op (deferred perf follow-up).
     has_metatable,
+    /// A store's table is frozen (`table.freeze`, doc 76 §5): tier-0 raises.
+    readonly_table,
     /// Allocation failed while building the trace.
     alloc,
     /// Cross-frame inlining exceeded `MAX_INLINE_DEPTH`. (Deep/unbounded
@@ -2865,6 +2868,7 @@ pub const RecordingSession = struct {
         // the append path below stores to exactly such an absent key (`len+1`).
         // Abort the whole trace to tier-0, which does full `__newindex` dispatch.
         if (tbl.metatable != null) return self.abort(.has_metatable);
+        if (tbl.isReadonly()) return self.abort(.readonly_table);
         const lane = tbl.array.lane;
         // `.value`-lane store (doc 32): the type-erased lane holds full 16-byte
         // Values, so *any* value fits and no widen can ever be forced. Admitted for
@@ -2927,7 +2931,7 @@ pub const RecordingSession = struct {
             // P0d: `t[#t+1] = v` (length-dependent append) is non-idempotent under
             // coarse deopt-replay — bar it fail-closed. See `traceHasAlenOf`.
             if (self.traceHasAlenOf(rtab)) return self.abort(.aliased_input);
-            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_WRITABLE }), .container_type, f.tab_od, .neutral);
             try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
             const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
@@ -2969,7 +2973,7 @@ pub const RecordingSession = struct {
 
         const lane_ord: i32 = @intFromEnum(lane);
         const rtab = try self.refOf(f.tab);
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_WRITABLE }), .container_type, f.tab_od, .neutral);
         try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
         const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
@@ -3480,6 +3484,7 @@ pub const RecordingSession = struct {
         if (!(vval.isInt() or vval.isFloat() or vval.isBool())) return self.abort(.nyi_opcode);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
+        if (tbl.isReadonly()) return self.abort(.readonly_table);
         _ = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent = insert
         const rkey = try self.operandRef(f.key);
         if (self.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
@@ -3515,7 +3520,7 @@ pub const RecordingSession = struct {
             try self.guardNum(rval, vval, .value_type, f.val_od);
         }
         const rtab = try self.refOf(f.tab);
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_WRITABLE }), .container_type, f.tab_od, .neutral);
         // Seed the cell pointer for native (H1) — see `recHashGet`. An RMW's read and
         // write `href`s dedup onto the same slot via `seedHashCell`. A dynamic
         // root gets the hrefk `(slot, mask)` aux instead (doc 49).

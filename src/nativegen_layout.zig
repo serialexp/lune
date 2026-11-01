@@ -78,6 +78,9 @@ pub const VALUE_PAYLOAD_OFF: i32 = @offsetOf(value.Value, "payload");
 pub const TABLE_TYPE: u8 = @intFromEnum(object.ObjectType.table);
 /// Offset of `GcHeader.type` (the first header byte) from a `*GcHeader`.
 pub const HEADER_TYPE_OFF: i32 = @offsetOf(object.GcHeader, "type");
+/// `GcFlags.readonly` (doc 76 §5) as a bit of the header's leading qword, for
+/// `bt qword [h], HEADER_READONLY_BIT` (CF = frozen).
+pub const HEADER_READONLY_BIT: u6 = @offsetOf(object.GcHeader, "flags") * 8 + @bitOffsetOf(object.GcFlags, "readonly");
 /// Offset of `Table.metatable` (an optional `*Table`; null = 0) from a
 /// `*GcHeader`. The prologue checks this is null: a table that grew a metatable
 /// after the trace was recorded must side-exit to tier-0 (which dispatches

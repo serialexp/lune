@@ -181,12 +181,13 @@ fn bRawGet(ctx: *anyopaque, args: []const Value) anyerror!Value {
 
 /// `rawset(t, k, v)` — `t[k] = v` without `__newindex`; returns `t`. A nil key is
 /// an error (Lua: "table index is nil"); a NaN key likewise ("table index is
-/// NaN").
+/// NaN"); so is a frozen `t` (doc 76 §5), checked first, as Luau's `lua_rawset`.
 fn bRawSet(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
     const k = try anyArg(vm, args, 1);
     const v = try anyArg(vm, args, 2);
+    if (t.isReadonly()) return vm.readonlyError();
     // Unlocated, as Lua's: the key check fails inside the native.
     if (k.isNil()) return vm.raiseLocatedError("table index is nil", 0);
     if (k.isFloat() and std.math.isNan(k.asFloat())) return vm.raiseLocatedError("table index is NaN", 0);
@@ -215,7 +216,8 @@ fn bRawLen(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// `setmetatable(t, mt)` — install `mt` (a table, or `nil` to clear) as `t`'s
 /// metatable; returns `t`. Raises if `t` is not a table, if `mt` is neither a
 /// table nor nil, or if the **current** metatable carries a `__metatable` field
-/// (a protected metatable — Lua forbids changing it). The metatable is a new GC
+/// (a protected metatable — Lua forbids changing it), or, after that check as in
+/// Luau, if `t` is frozen (doc 76 §5). The metatable is a new GC
 /// edge (`gc.blacken` marks `t.metatable`); the write barrier records it for a
 /// future generational collector.
 fn bSetMetatable(ctx: *anyopaque, args: []const Value) anyerror!Value {
@@ -234,6 +236,7 @@ fn bSetMetatable(ctx: *anyopaque, args: []const Value) anyerror!Value {
         if (!cur.get(vm.mm.metatable).isNil())
             return vm.raiseLocatedError("cannot change a protected metatable", 1);
     }
+    if (t.isReadonly()) return vm.readonlyError();
     t.metatable = new_mt;
     if (new_mt) |m| vm.heap.writeBarrier(&t.header, Value.heap(&m.header)); // no-op until Phase 4
     return args[0];

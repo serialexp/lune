@@ -285,6 +285,22 @@ pub const ArrayPart = extern struct {
         self.* = .empty;
     }
 
+    /// A copy of this (non-grid) array part in its own storage block: the
+    /// same lane, commitment, extent, capacity and bytes, so the copy reads
+    /// and grows exactly as this part would. `table.clone` (doc 76 §5.5):
+    /// one allocation, no repack.
+    pub fn clone(self: *const ArrayPart, gpa: std.mem.Allocator) std.mem.Allocator.Error!ArrayPart {
+        std.debug.assert(self.lane != .grid); // library functions deflate a grid first
+        var out = self.*;
+        const d = self.data orelse return out;
+        const n = storageBytes(self.lane, self.cap);
+        const block = try gpa.alignedAlloc(u8, std.mem.Alignment.of(Value), n);
+        @memcpy(block, d[0..n]);
+        out.data = block.ptr;
+        if (self.present) |p| out.present = block.ptr + (p - d);
+        return out;
+    }
+
     /// `true` when the lane holds no heap pointers — the GC marks the array part
     /// only for `.value`.
     pub fn isLeaf(self: *const ArrayPart) bool {

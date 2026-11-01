@@ -457,7 +457,42 @@ test "§R3: failing-allocator restore during the array-part lane and grid rebuil
             fgpa.destroy(vm_r);
         }
     };
-    try testing.checkAllAllocationFailures(gpa, Inner.run, .{ snap, keyframeser.Program.of(source) });
+    // Restore re-parses the program, so its allocation count is only
+    // deterministic on a backing allocator that never grows in place.
+    var backing: util.NoResizeInPlace = .{ .child = gpa };
+    try testing.checkAllAllocationFailures(backing.allocator(), Inner.run, .{ snap, keyframeser.Program.of(source) });
+}
+
+test "doc 76: a frozen table restores frozen, and an unfrozen one unfrozen" {
+    const gpa = testing.allocator;
+    const source =
+        \\frozen = table.freeze({ 1, 2, x = 3 })
+        \\open = { 1, 2, x = 3 }
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    const snap = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(snap);
+
+    const vm_r = try restore(gpa, snap, keyframeser.Program.of(source), NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+    const frozen = vm_r.globals.get(try vm_r.heap.internValue("frozen"));
+    const open = vm_r.globals.get(try vm_r.heap.internValue("open"));
+    try testing.expect(table.Table.fromHeader(frozen.asHeap()).isReadonly());
+    try testing.expect(!table.Table.fromHeader(open.asHeap()).isReadonly());
+    try testing.expectError(error.ReadonlyTable, vm_r.indexSet(frozen, Value.int(1), Value.int(9)));
+    try vm_r.indexSet(open, Value.int(1), Value.int(9));
 }
 
 test "F2c: independent VMs suspended at the same cut produce byte-identical keyframes" {
