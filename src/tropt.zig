@@ -391,9 +391,9 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
         // `guard_sid` stashes the expected string's konst-pool id — semantic
         // identity (two pins expecting DIFFERENT strings must never be
         // deduplicated: doc 30 round-2 M01), so it joins the dedup-key auxes.
-        // `guard_table`'s `GUARD_TABLE_WRITABLE` adds a check (not frozen,
-        // doc 76 §5): a read's plain guard must not swallow a store's.
-        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_sid, .guard_table => aux,
+        // `guard_table` dedups per table instead (`table_guard`): its
+        // `GUARD_TABLE_WRITABLE` merges into the first guard on the table.
+        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_sid => aux,
         else => 0,
     };
 }
@@ -494,6 +494,18 @@ pub fn optimize(
     defer cse.deinit(gpa);
     var guards: std.AutoHashMapUnmanaged(GuardKey, void) = .empty;
     defer guards.deinit(gpa);
+    // Doc 76 §5: the first `guard_table` on each table, which the later ones
+    // on it fold into. A later store's `GUARD_TABLE_WRITABLE` moves up to
+    // it (`table_guard_aux`), so a table read then stored is checked once.
+    // Checking frozenness earlier is exact: nothing a trace runs can freeze
+    // a table (`table.freeze` is not a recorded builtin, and a host call
+    // that re-enters the VM ends at `guard_host_epoch`), the fact the entry
+    // prologue's hoisted check rests on too.
+    var table_guard: std.AutoHashMapUnmanaged(Ref, Ref) = .empty;
+    defer table_guard.deinit(gpa);
+    const table_guard_aux = try gpa.alloc(i32, n);
+    defer gpa.free(table_guard_aux);
+    @memset(table_guard_aux, 0);
 
     // Doc 51 Fix B (F3): value-keyed konst canonicalization state. `pool_map`
     // interns fold results against the pool (first occurrence of each value
@@ -569,6 +581,14 @@ pub fn optimize(
                     }
                     // always-fails: keep it (defensive; honest recording never
                     // produces this since the guard pins the observed type).
+                }
+                if (ins.op == .guard_table) {
+                    const gop = try table_guard.getOrPut(gpa, a2);
+                    if (gop.found_existing) {
+                        dead[i] = true;
+                        table_guard_aux[gop.value_ptr.*] |= ins.aux;
+                    } else gop.value_ptr.* = @intCast(i);
+                    continue;
                 }
                 const gk = GuardKey{ .op = ins.op, .a = a2, .aux = guardKeyAux(ins.op, ins.aux) };
                 if (guards.contains(gk)) {
@@ -926,7 +946,11 @@ pub fn optimize(
                 out.a = new_index[canon[ins.a]];
                 out.b = new_index[canon[ins.b]];
             },
-            .unary, .guard, .aload => out.a = new_index[canon[ins.a]],
+            .unary, .aload => out.a = new_index[canon[ins.a]],
+            .guard => {
+                out.a = new_index[canon[ins.a]];
+                if (ins.op == .guard_table) out.aux |= table_guard_aux[i];
+            },
             .cvt => {
                 out.a = new_index[canon[ins.a]];
                 if (cvtReadsB(ins.op)) out.b = new_index[canon[ins.b]];
@@ -1710,6 +1734,31 @@ test "doc 30: sgmatch chain is kept; its aux rides verbatim as a konst id throug
         if (ins.op == .scap_int) try testing.expectEqual(@as(Ref, 35), ins.b);
     }
     try testing.expectEqual(@as(usize, 2), opt.consts.len);
+}
+
+test "doc 76: a store's writable table guard folds into the table's first guard" {
+    const gpa = testing.allocator;
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 a table read, then stored
+        .{ .op = .slot_load, .aux = 1 }, // %1 a table only read
+        .{ .op = .guard_table, .a = 0 }, // %2 the read's guard: takes the bit
+        .{ .op = .guard_table, .a = 1 }, // %3 stays plain
+        .{ .op = .guard_table, .a = 0, .aux = trace.GUARD_TABLE_WRITABLE }, // %4 → dropped
+        .{ .op = .guard_table, .a = 0 }, // %5 → dropped
+        .{ .op = .loop }, // %6
+    }, &[_]SlotStore{ .{ .slot = 0, .ref = 0 }, .{ .slot = 1, .ref = 1 } });
+    var opt = try optimize(gpa, &instrs, &.{}, .{});
+    defer freeOpt(gpa, &opt);
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .guard_table));
+    var writable: usize = 0;
+    for (opt.instrs) |ins| {
+        if (ins.op != .guard_table) continue;
+        if (ins.aux & trace.GUARD_TABLE_WRITABLE != 0) {
+            writable += 1;
+            try testing.expectEqual(opt.instrs[ins.a].aux, 0); // r0's table
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), writable);
 }
 
 test "doc 30: guard_sid dedup keys on its konst id — same id dropped, different ids both kept" {
