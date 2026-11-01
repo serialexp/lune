@@ -76,7 +76,8 @@ _(nothing yet)_
   native-valued handler fields (§6.6).
 - [ ] **Defer — metamethods of strings, files and other non-table values.**
 - [x] **Q1 decided** (Bart, 2026-11-01): doc 68 P2 before Phase 4.
-- [ ] **Open questions** (§11): Q2–Q5 decided.
+- [x] **Q2 decided** (Bart, 2026-11-02): `MAX_INDEX_CHAIN = 100`, as LuaJIT.
+- [ ] **Open questions** (§11): Q3–Q5 decided.
 
 ## 1. Why this exists
 
@@ -523,6 +524,8 @@ callouts per iteration for an invariant receiver.
 - **Q2 — `MAX_INDEX_CHAIN`.** Codex: 100, as LuaJIT, bounded additionally by
   the recording length limit, to avoid coverage cliffs. Antigravity: 4,
   since deeper hierarchies are rare and each hop costs guards.
+  **Decided (Bart, 2026-11-02): 100, as LuaJIT.** A chain long enough to
+  reach it would hit some other limit (the recording length) first anyway.
 - **Q3 — when a call uses the computed-callee route.** Both reviewers:
   not for every call. Codex: by access path (the callee is not in a slot),
   not by "loaded from a table". Antigravity: only table-loaded handlers.
