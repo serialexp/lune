@@ -77,7 +77,9 @@ _(nothing yet)_
 - [ ] **Defer — metamethods of strings, files and other non-table values.**
 - [x] **Q1 decided** (Bart, 2026-11-01): doc 68 P2 before Phase 4.
 - [x] **Q2 decided** (Bart, 2026-11-02): `MAX_INDEX_CHAIN = 100`, as LuaJIT.
-- [ ] **Open questions** (§11): Q3–Q5 decided.
+- [x] **Q3 decided** (Bart, 2026-11-02): the computed-callee route by
+  access path.
+- [ ] **Open questions** (§11): Q4–Q5 decided.
 
 ## 1. Why this exists
 
@@ -419,8 +421,8 @@ Phase 4 adds computed-callee upvalue access:
   dead constants do today (`interp.zig` ~4043); no trace-only root is added,
   so collection timing and object ids do not change.
 
-The access-path rule (Q3) decides when this route is used rather than the
-existing slot route.
+The access-path rule (Q3, decided) chooses between them: a callee in a slot
+keeps the slot route; any other callee takes this one.
 
 ### 6.7 `__call`
 
@@ -529,6 +531,10 @@ callouts per iteration for an invariant receiver.
 - **Q3 — when a call uses the computed-callee route.** Both reviewers:
   not for every call. Codex: by access path (the callee is not in a slot),
   not by "loaded from a table". Antigravity: only table-loaded handlers.
+  **Decided (Bart, 2026-11-02): by access path.** A callee the trace can
+  reach through a slot keeps the slot route and its proto guard; any other
+  callee (loaded from a table, an upvalue, a call's result) takes the
+  computed route with a closure-identity guard.
 - **Q4 — ANY_META encoding.** (a) Codex: a bit meaning "metatable
   allowed", merged with AND while the writable bit keeps OR; existing
   aux-0 guards keep their meaning, so metatable-free IR stays
