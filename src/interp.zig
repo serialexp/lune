@@ -987,6 +987,14 @@ pub const Vm = struct {
     /// mid-unwind could not resume). Runtime faults (`TypeError`, …) leave this
     /// null and are turned into a value lazily at the catch via `synthErrorValue`.
     pending_error: ?Value = null,
+    /// What the second step of a fused `get_index2`/`set_index2` faulted
+    /// on (`fusedSecondFault`). Its first step produced that value and no
+    /// register holds it, so `describeFault` cannot probe it later. Keyed
+    /// by the faulting frame's activation (`call_seq`): a fault at an op
+    /// ends its activation, so no later fault matches. It holds only
+    /// static text, no heap reference, so it is no GC root and is never
+    /// cleared or serialized.
+    fused_fault: ?FusedFault = null,
     /// Open upvalues, keyed by absolute stack index and kept in ascending
     /// slot order, one cell per slot. Searched from the end on capture (to
     /// share a cell), and popped from the end on scope/frame exit (to close
@@ -2968,7 +2976,13 @@ pub const Vm = struct {
                         .found => |v| v,
                         .grid_row => |in_range| if (in_range) break :blk try arena.dupe(u8, @errorName(err)) else Value.nil(),
                         .not_indexable, .bad_key => break :blk try self.indexFaultMessage(arena, &info_buf, proto, pc, outer_reg, outer, key1, false),
-                        .unknown => break :blk try arena.dupe(u8, @errorName(err)),
+                        // A functional `__index` produced the middle value;
+                        // its second step kept what it faulted on.
+                        .unknown => if (self.fused_fault) |ff| {
+                            if (ff.call_seq != frame.call_seq) break :blk try arena.dupe(u8, @errorName(err));
+                            if (ff.bad_key) |m| break :blk try arena.dupe(u8, m);
+                            break :blk try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{ff.type_name});
+                        } else break :blk try arena.dupe(u8, @errorName(err)),
                     };
                     break :blk if (store)
                         try self.indexFaultMessage(arena, &info_buf, proto, pc, null, mid, key2, true)
@@ -3002,6 +3016,15 @@ pub const Vm = struct {
         const frames = try self.backtraceFrames(arena, .running);
         return .{ .message = message, .chunk = proto.chunk, .proto_id = proto.id, .line = line, .start = span.start, .end = span.end, .frames = frames };
     }
+
+    /// `Vm.fused_fault`: the activation that faulted, and the message's
+    /// subject: Lua's text for a bad key, else the type of the value that
+    /// could not be indexed.
+    const FusedFault = struct {
+        call_seq: u64,
+        bad_key: ?[]const u8,
+        type_name: []const u8,
+    };
 
     /// What `indexGet` (`store` false) or `indexSet` (true) of
     /// `container[key]` trips over, found without running anything: the raw
@@ -11185,13 +11208,14 @@ pub const Vm = struct {
             .ne => regs.setBool(ins.a, !result.isTruthy()),
             .set_index, .set_field => {},
             .get_index2 => {
-                const v = if (phase == 1) result else (vm.indexGetOp(result, regs.get(@as(u16, @intCast(ins.aux))), 1) catch |e|
-                    return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
+                const key2 = regs.get(@as(u16, @intCast(ins.aux)));
+                const v = if (phase == 1) result else (vm.indexGetOp(result, key2, 1) catch |e|
+                    return parkErr(st, vm.fusedSecondFault(result, key2, false, e))) orelse return enterMetaFrame(mode, st, vm);
                 regs.set(ins.a, v);
             },
             .set_index2 => if (phase == 0) {
                 (vm.indexSetOp(result, regs.get(ins.c), regs.get(@as(u16, @intCast(ins.aux))), 1) catch |e|
-                    return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
+                    return parkErr(st, vm.fusedSecondFault(result, regs.get(ins.c), true, e))) orelse return enterMetaFrame(mode, st, vm);
             },
             .close, .ret_close => return closeStep(mode, st, vm, ins, cursor, span),
             else => if (bytecode.arithFormOf(ins.op) != null) {
@@ -11992,7 +12016,7 @@ pub const Vm = struct {
             if (t.array.isGrid()) return try self.gridCellGet(t, key1, key2);
         }
         const mid = (try self.indexGetOp(container, key1, 0)) orelse return null;
-        return self.indexGetOp(mid, key2, 1);
+        return self.indexGetOp(mid, key2, 1) catch |e| return self.fusedSecondFault(mid, key2, false, e);
     }
 
     /// Read grid cell `t[i][j]` faithfully, reproducing the nested-table semantics
@@ -12036,7 +12060,23 @@ pub const Vm = struct {
     fn fusedStoreOp(self: *Vm, container: Value, key1: Value, key2: Value, val: Value) Error!?void {
         const c = (try self.fusedStoreGrid(container, key1, key2, val)) orelse return {};
         const mid = (try self.indexGetOp(c, key1, 0)) orelse return null;
-        return self.indexSetOp(mid, key2, val, 1);
+        return self.indexSetOp(mid, key2, val, 1) catch |e| return self.fusedSecondFault(mid, key2, true, e);
+    }
+
+    /// A fused op's second step raised `e` on `mid`. For a fault of the
+    /// lookup itself, keep what `describeFault` would have probed had a
+    /// register held `mid` (`Vm.fused_fault`). An error a native handler
+    /// raised probes as `.unknown` and keeps nothing. On the error path
+    /// only.
+    fn fusedSecondFault(self: *Vm, mid: Value, key2: Value, comptime store: bool, e: Error) Error {
+        if (e != Error.TypeError or self.depth == 0) return e;
+        const call_seq = self.frames[self.depth - 1].call_seq;
+        switch (self.probeIndex(mid, key2, store)) {
+            .not_indexable => |n| self.fused_fault = .{ .call_seq = call_seq, .bad_key = null, .type_name = n.v.typeName() },
+            .bad_key => |m| self.fused_fault = .{ .call_seq = call_seq, .bad_key = m, .type_name = "" },
+            .found, .grid_row, .unknown => {},
+        }
+        return e;
     }
 
     /// `fusedStore`'s grid half: the cell store, null once done; else

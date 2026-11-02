@@ -26,15 +26,15 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       compare arms (`interp.zig`, the `.lt…` and constant-operand
       cases) should use `arith.compareFaultText`, which `table.sort`
       already raises. Waits for doc 68 P2, which owns interp.zig.
-- [ ] **A fused read after a function `__index` faults as a bare
-      "TypeError"** (seen 2026-11-02, doc 68 P2; HEAD had it too).
-      `V[1][2]` with `__index = function() return nil end` prints
-      "main:2: TypeError"; 5.4 says "attempt to index a nil value (field
-      'integer index')". With a table `__index` the message lacks the field
-      part. `describeFault`'s `probeIndex` gives `.unknown` for a function
-      `__index` (it cannot call it), so the `get_index2` arm has no
-      operand to name. It should describe the fault from the intermediate
-      value the op saw, not re-probe the container.
+- [ ] **A value read by `get_index` or a fused op's first step gets no
+      name in a fault** (seen 2026-11-02). `t[1].x`, `t[k][2]` and
+      `t["s"][2]` on a nil middle say "attempt to index a nil value"; 5.4
+      adds "(field 'integer index')" for an integer constant key, "(field
+      's')" for a string constant and "(field '?')" otherwise (ldebug.c
+      `getobjname`: `OP_GETI`, `rname`). `bc_names.origin` names only
+      `get_global`/`get_field` loads. A fused op's middle value has no
+      register, so its name would come from `get_index2`'s first key.
+      Next to "Faults name no locals or upvalues".
 - [ ] **An untraceable Lua call costs ~290 instructions more under
       `--trace` than at tier-0** (seen 2026-11-02, doc 68 §12, present
       before P2). `inc(S, acc)` in a loop, with `inc` reading a field

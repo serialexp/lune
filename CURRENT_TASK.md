@@ -1,7 +1,7 @@
 DOC 68 P2 METAMETHODS AS CONTINUATION FRAMES (2026-11-02, coral-raven). Doc 68 checklist, §6.1, §12.
 - Done and gated (test, jit-debug test, hashgate release+debug, embed-test), committed bundled with coral-marten's VM-held natives (Bart: one bundled commit): every operator/index/fused/__close site runs a Lua handler as a .finish_op frame (LuaJIT lj_meta_* shape: helper returns null after pushing; opRetFinish -> finishOp at code[P]). Keyframe format v20. __len gets (t, t). meta_calls -0.2%, meta_close -2.0% instructions, both tiers. Also fixed: ret_close in a coroutine body returned the wrong count (opCoroutineReturn).
 - __call on .call is a frame too (Lua handler only; native handlers and __call-table chains stay nested): tier-0 -10% on a __call loop; --trace +21%, which is the general untraceable-call overhead under --trace (TODO.md, present before P2). P2 is done.
-- Next: the fused get_index2 fault message after a function __index (bare "TypeError"; TODO.md, predates P2).
+- Fused get_index2/set_index2 fault after a function or native __index now names the type (Vm.fused_fault, keyed by call_seq, static text only, set on the error edge of the second step). The (field '...') suffix is a separate naming gap (TODO.md).
 
 DOC 76 GLOBAL DECLARATIONS / ATTRIBUTES / FROZEN TABLES (2026-11-01, coral-raven). Doc 76 checklist.
 - Done: phases 0-3 (d4df993), phase 4 table.freeze/isfrozen/clone (638fc90), D8 constant <const> folding (ddbee74), one guard_table per table in tropt (6b64d10), phase 5 language server (8fb6392).

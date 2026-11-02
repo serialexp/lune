@@ -183,6 +183,20 @@ test "a store with a nil or NaN key says so, through __newindex chains and t[i][
         "false\tmain:4: table index is nil\ntrue\nfalse\tmain:8: attempt to index a nil value\n");
 }
 
+test "a fused a[i][j] after a function __index names what its second step could not index" {
+    try expectProgram(
+        \\local F = setmetatable({}, {__index = function() return nil end})
+        \\local k
+        \\print(pcall(function() return F[1][2] end))
+        \\print(pcall(function() F[1][2] = 3 end))
+        \\print(pcall(function() return setmetatable({}, {__index = rawequal})[1][2] end))
+        \\print(pcall(function() return setmetatable({}, {__index = function() return setmetatable({}, {__index = 7}) end})[1][2] end))
+        \\print(pcall(function() setmetatable({}, {__index = function() return {} end})[1][k] = 3 end))
+    , "false\tmain:3: attempt to index a nil value\nfalse\tmain:4: attempt to index a nil value\n" ++
+        "false\tmain:5: attempt to index a boolean value\nfalse\tmain:6: attempt to index a number value\n" ++
+        "false\tmain:7: table index is nil\n");
+}
+
 test "an __index or __newindex that is not a function is indexed in turn" {
     try expectProgram(
         \\print(setmetatable({}, {__index = "abc"}).len == string.len)
