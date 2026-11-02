@@ -130,7 +130,7 @@ test "gc: a string only a trace's constant pool names is swept as in tier-0 (doc
         \\for k = 1, 5000 do local junk = {} end
         \\local again = tostring(7)
         \\print({})
-    , "2000\ntable: 0x14a1\n", "2000\ntable: 0x1c70\n", .{});
+    , "2000\ntable: 0x149b\n", "2000\ntable: 0x1c6a\n", .{});
 }
 
 // Doc 61 §8 determinism. Each program leaves a heap value in a register
@@ -181,11 +181,11 @@ const LoopDone = struct {
 const cli_hotloop = (trace.TraceConfig{}).hotloop;
 
 test "doc 61 §8: a linked numeric-for whose body leaves a dead string agrees in every tier" {
-    try expectProgramByGc(linkedForSource(""), "2040\ntable: 0x14be\n", "2040\ntable: 0x1950\n", .{ .hotloop = cli_hotloop, .inspect = &LoopDone.linked });
+    try expectProgramByGc(linkedForSource(""), "2040\ntable: 0x14b8\n", "2040\ntable: 0x194a\n", .{ .hotloop = cli_hotloop, .inspect = &LoopDone.linked });
 }
 
 test "doc 61 §8: the same linked numeric-for over a non-maskable proto declines the flush and agrees" {
-    try expectProgramByGc(linkedForSource("unmask(f)\n"), "2040\ntable: 0x14c0\n", "2040\ntable: 0x1952\n", .{ .hotloop = cli_hotloop, .setup = &util.installUnmask, .inspect = &LoopDone.declined });
+    try expectProgramByGc(linkedForSource("unmask(f)\n"), "2040\ntable: 0x14ba\n", "2040\ntable: 0x194c\n", .{ .hotloop = cli_hotloop, .setup = &util.installUnmask, .inspect = &LoopDone.declined });
 }
 
 /// The native leg reached the chain's call A: a linked burst ran the inner
@@ -244,7 +244,7 @@ test "doc 61 §8: a φ the dead-φ filter drops leaves the same heap in every ti
         \\for k = 1, 5000 do local junk = {} end
         \\local x = string.char(1400)
         \\print({})
-    , "table: 0x17c3\n", "table: 0x17c3\n", .{});
+    , "table: 0x17bd\n", "table: 0x17bd\n", .{});
 }
 
 /// Doc 61 §9b witness: an ordinary (non-precise) allocating trace ran, and
@@ -280,7 +280,7 @@ test "doc 61 §9b: an allocating trace's dropped φ leaves the same heap in ever
         \\for k = 1, 5000 do local junk = {} end
         \\local x = tostring(1400)
         \\print({})
-    , "table: 0x162f\n", "table: 0xb0df\n", .{ .inspect = &ranAllocatingTrace });
+    , "table: 0x1629\n", "table: 0xb0d9\n", .{ .inspect = &ranAllocatingTrace });
 }
 
 // Site 3's exit-snapshot programs live with the register probe

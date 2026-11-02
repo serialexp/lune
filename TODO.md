@@ -26,14 +26,26 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       compare arms (`interp.zig`, the `.lt…` and constant-operand
       cases) should use `arith.compareFaultText`, which `table.sort`
       already raises. Waits for doc 68 P2, which owns interp.zig.
-- [ ] **`__len` gets one argument** (seen 2026-11-01, doc 77 review).
-      `Vm.lenValue` calls `handler(t)`; 5.4's `luaV_objlen` calls
-      `handler(t, t)`, as the unary arithmetic metamethods already do here
-      (`unMeta`). Visible to a handler that reads its second parameter.
-- [ ] **A `__close` cannot yield** (doc 76 §6.2). 5.4 suspends a coroutine
-      mid-close; mahina raises "attempt to yield across a C-call boundary",
-      because `Vm.callClose` runs the close as a nested call. Needs the close
-      to be a resumable frame (doc 68's continuation kinds).
+- [ ] **A fused read after a function `__index` faults as a bare
+      "TypeError"** (seen 2026-11-02, doc 68 P2; HEAD had it too).
+      `V[1][2]` with `__index = function() return nil end` prints
+      "main:2: TypeError"; 5.4 says "attempt to index a nil value (field
+      'integer index')". With a table `__index` the message lacks the field
+      part. `describeFault`'s `probeIndex` gives `.unknown` for a function
+      `__index` (it cannot call it), so the `get_index2` arm has no
+      operand to name. It should describe the fault from the intermediate
+      value the op saw, not re-probe the container.
+- [ ] **`.call` on a table with `__call` re-enters through `callValue`**
+      (doc 68 P2, sites 2–3). A yield inside the handler raises "attempt to
+      yield across a C-call boundary". Shift the table into the arguments
+      and enter the handler as an ordinary frame, as LuaJIT and 5.4's
+      `luaD_tryfuncTM` do.
+- [ ] **Metamethod frame entry and return cost** (doc 68 §12). Per Lua
+      metamethod call, callgrind has ~100 instructions in `pushMetaFrame`
+      (`bindAndPushClosure`, the host-epoch bump) and ~122 in
+      `opRetFinish` (the frame pop, the parent reload, `finishOp`'s decode
+      of `code[P]`). `enterCallee`'s trusted push is the model for the
+      first.
 - [ ] **Generic `for` over a native iterator never traces** (seen
       2026-11-01, measuring doc 76). `for _, v in ipairs(t)`,
       `for k, v in pairs(t)` and `for k, v in next, t` all abort recording

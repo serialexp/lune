@@ -303,6 +303,18 @@ comptime {
         if (bn.fast != null and bn.effect != null)
             @compileError("builtin '" ++ bn.name ++ "' sets both `fast` and `effect`; an effect has no tier-0 fast path (doc 70)");
     }
+    // Every `Vm.lib_natives` slot is one ungrouped row's, which every VM
+    // with the base library installs (`installBaseLib`).
+    @setEvalBranchQuota(20_000);
+    for (@typeInfo(function.LibNative).@"enum".field_names) |slot_name| {
+        var rows: usize = 0;
+        for (base_natives) |bn| if (bn.slot) |s| if (std.mem.eql(u8, @tagName(s), slot_name)) {
+            if (bn.groups != system.Groups.none or bn.aio or bn.bound != 0)
+                @compileError("library native '" ++ bn.name ++ "' must be ungrouped and unbound");
+            rows += 1;
+        };
+        if (rows != 1) @compileError("Vm.lib_natives slot '" ++ slot_name ++ "' needs exactly one registry row");
+    }
 }
 
 /// Each `base_natives` row's `Native`, built at compile time with every
@@ -480,8 +492,9 @@ fn orBitsAt(bits: []u64, at: usize, row: []const u64, n: usize) void {
 /// frame). Windows stack contiguously upward: `frames[i+1].base == frames[i].base
 /// + frames[i].closure.proto.num_registers`.
 /// Doc 68 §4.3: what a frame's return means for its parent. `.none` is the
-/// ordinary result wiring through `ret_dest`/`ret_count`; the others arrive
-/// with the continuation frames of doc 68 P1/P2.
+/// ordinary result wiring through `ret_dest`/`ret_count`. `.finish_op` is a
+/// metamethod's frame (doc 68 P2, `Vm.pushMetaFrame`); `.native_resume`
+/// waits for resumable natives (§5).
 pub const Cont = enum(u2) {
     none,
     /// Finish the parent's in-flight instruction with this frame's results
@@ -577,9 +590,13 @@ pub const CallFrame = struct {
     /// Where this frame's results land in its **parent's** window, as a
     /// caller-relative register (the call instruction's `a`). Unused for the
     /// bottom frame (no parent — `run` consumes its `FrameResult` directly).
+    /// A `.finish_op` frame (doc 68 P2) has no return wiring: `finishOp`
+    /// places its result, and this is the continuation's payload instead, a
+    /// `close`'s cursor (`closeStep`).
     ret_dest: u16 = 0,
     /// How many results the parent wants (the call instruction's `c`). Unused for
-    /// the bottom frame.
+    /// the bottom frame. In a `.finish_op` frame, the span of a `return f()`
+    /// its `ret_close` keeps (`closeStep`).
     ret_count: u16 = 0,
     /// Varargs cursor: absolute stack index of this frame's first `...` value.
     /// The extra arguments (beyond `proto.num_params`) are left in the *caller's*
@@ -609,15 +626,18 @@ pub const CallFrame = struct {
     code_cache: []const Instr = &.{},
     code_cache_gen: u64 = CODE_CACHE_GEN_INVALID,
     /// Doc 61 §4.2: this frame is inside instruction `pc`, which is running
-    /// other code: a native it called, or a re-entry (`callValue`) for a
-    /// metamethod or a native's callback. Without it a non-innermost frame
-    /// is suspended at a Lua `.call`, with `pc` one past it. Set on entry,
-    /// restored to the previous value on success, and left set on error,
-    /// where the frame is retained until a catcher discards it (it restores
-    /// the one surviving frame, `frames[entry_depth - 1]`). Every push
+    /// other code: a native it called, a re-entry (`callValue`) for a
+    /// native's callback or a native metamethod, or (doc 68 P2) a Lua
+    /// metamethod in the `.finish_op` frame above it. Without it a
+    /// non-innermost frame is suspended at a Lua `.call`, with `pc` one past
+    /// it. Set on entry, restored to the previous value on success (a
+    /// `.finish_op` frame's return clears it), and left set on error, where
+    /// the frame is retained until a catcher discards it (it restores the
+    /// one surviving frame, `frames[entry_depth - 1]`). Every push
     /// initialises it false: this default, the native inline push and the
-    /// `.S` host-call frame write. Transient: keyframes refuse capture while
-    /// any frame has it set, so it is never serialized.
+    /// `.S` host-call frame write. Never serialized: keyframes refuse
+    /// capture while a frame has it set, except under a `.finish_op` frame,
+    /// from which restore re-derives it.
     in_flight: bool = false,
     /// Doc 61 §5 (B): the dynamic end of a multret consumer's argument span,
     /// window-relative and clamped to `num_registers`. Written by the `.call`
@@ -627,7 +647,7 @@ pub const CallFrame = struct {
     /// not written by the producer and are masked out. Transient, like
     /// `in_flight`.
     multret_top: u16 = 0,
-    /// Doc 68: kind and continuation. Always the default until doc 68 P1.
+    /// Doc 68: kind, continuation and protection.
     ctl: FrameCtl = .{},
 };
 
@@ -1118,6 +1138,16 @@ pub const Vm = struct {
     /// the hidden `@file` methods table, `__name` is `"FILE*"`. Built by
     /// `initIoStreams`; a VM-level root like `string_metatable`.
     file_metatable: ?*table.Table = null,
+    /// The handle methods (`file:read`, …), the file metatable's `__index`:
+    /// the `stdio.methods_module` rows install here, not into a global
+    /// (`getOrCreateModuleTable`). Rooted through `file_metatable` too;
+    /// restore rebinds it from there.
+    file_methods: ?*table.Table = null,
+    /// The natives the library hands back to the program (`function.
+    /// LibNative`), filled by `defineNative` and the keyframe restorer.
+    /// VM-level roots, so they survive the program dropping every other
+    /// reference (`next = nil`).
+    lib_natives: [@typeInfo(function.LibNative).@"enum".field_names.len]?*function.Native = @splat(null),
     /// `io.input()` / `io.output()`: the handles `io.read`/`io.lines` and
     /// `io.write` act on. Output starts as stdout; input as stdin when the
     /// `stdio` group is on, else none. VM-level roots.
@@ -1483,7 +1513,7 @@ pub const Vm = struct {
         const fmt = try self.heap.newTable();
         try fmt.set(self.gpa, self.mm.index, Value.heap(&methods.header));
         try fmt.set(self.gpa, try self.heap.internValue("__name"), try self.heap.internValue("FILE*"));
-        try fmt.set(self.gpa, self.mm.close, self.globals.get(try self.heap.internValue(stdio.file_close_name)));
+        try fmt.set(self.gpa, self.mm.close, self.libNative(.io_file_close));
         self.file_metatable = fmt;
         const out = try self.newStdStream(system.stdout_id, .stdout, .write, "stdout");
         _ = try self.newStdStream(system.stderr_id, .stderr, .write, "stderr");
@@ -2268,8 +2298,15 @@ pub const Vm = struct {
         // `manual` natives have no install slot — they exist in `base_natives` only
         // so the keyframe restorer can rebind them by name (e.g. the default
         // `package.searchers`, which `installPackageRuntime` places into an array).
-        if (bn.manual) return;
+        // One with a `slot` is created here, into its slot only.
+        if (bn.manual and bn.slot == null) return;
         const native = try self.heap.newNativeFrom(template);
+        if (bn.slot) |s| {
+            const cell = &self.lib_natives[@intFromEnum(s)];
+            std.debug.assert(cell.* == null);
+            cell.* = native;
+        }
+        if (bn.manual) return;
         if (bn.module) |mod| {
             const tbl = try self.getOrCreateModuleTable(mod);
             const fkey = try self.heap.internValue(bn.field.?);
@@ -2320,6 +2357,10 @@ pub const Vm = struct {
     /// `pub` so `stdlib/package.zig`'s `installPackageRuntime` can populate the
     /// `package` table after the registry install loop.
     pub fn getOrCreateModuleTable(self: *Vm, name: []const u8) Error!*table.Table {
+        if (std.mem.eql(u8, name, stdio.methods_module)) {
+            if (self.file_methods == null) self.file_methods = try self.heap.newTable();
+            return self.file_methods.?;
+        }
         const key = try self.heap.internValue(name);
         const existing = self.globals.get(key);
         if (existing.isHeap() and existing.heapType() == .table) {
@@ -2490,6 +2531,15 @@ pub const Vm = struct {
     /// (`callValue`) is the unparked one; one an instruction called is the
     /// callee of the top frame's call, which stays in its slot, in flight,
     /// while it runs.
+    /// The library's own native `which` (`function.LibNative`), as a value.
+    /// Every slot is filled with the base library, and the keyframe
+    /// restorer refuses a real run's snapshot that lacks one; nil only in a
+    /// hand-built VM, where calling it raises as any nil call does.
+    pub fn libNative(self: *const Vm, comptime which: function.LibNative) Value {
+        const n = self.lib_natives[@intFromEnum(which)] orelse return Value.nil();
+        return Value.heap(&n.header);
+    }
+
     pub fn calledNative(self: *const Vm) *function.Native {
         if (self.unparkedNative()) |nat| return @constCast(nat);
         const f = &self.frames[self.depth - 1];
@@ -3785,48 +3835,28 @@ pub const Vm = struct {
 
     // ---- doc 76 §6: to-be-closed variables ----
 
-    /// `close` (`from` its operand) or `ret_close` (`from` 0) at instruction
-    /// `pc` of the top frame: close the frame's to-be-closed variables in
-    /// scope there in registers `>= from`, highest first, `__close(v, nil)`
-    /// for each that is not nil or false. An error one raises is passed to
-    /// the rest, then raised.
-    fn closeTop(self: *Vm, pc: usize, from: u16) Error!void {
-        const slot = try self.parkTemp(Value.nil());
-        const raised = try self.closeFrameVars(self.depth - 1, pc, from, false, slot);
-        const err = self.unparkTemp(slot);
-        if (raised) {
-            self.pending_error = err;
-            return Error.LuaError;
-        }
-    }
-
-    /// `ret_close`'s closes, at instruction `pc`. For `return f()` the
-    /// values wait in the multret span `ret_close` consumes, which may reach
-    /// past the frame's window: `stack_top` covers it while the closes make
-    /// calls of their own, and the span is pending again for `ret` after.
-    fn closeForReturn(self: *Vm, pc: usize, multret: bool) Error!void {
-        const saved_top = self.stack_top;
-        const span_top = self.reg_top;
-        if (multret) {
-            std.debug.assert(self.reg_top_pending);
-            self.reg_top_pending = false;
-            self.stack_top = @max(saved_top, span_top);
-        }
-        // An error leaves `stack_top` raised for the catcher, and nothing
-        // pending: a fault never does.
-        try self.closeTop(pc, 0);
-        self.stack_top = saved_top;
-        if (multret) self.setPendingTop(span_top);
+    /// The rest of a `close` (`from` its operand) or `ret_close` (`from` 0)
+    /// at instruction `pc` of the top frame, once the `__close` of the
+    /// variable in register `below` raised `err`: the variables still open
+    /// under it are closed with the error, in Zig (an error's closes are
+    /// never yieldable, as in Lua), and the error is returned to raise.
+    fn closeRaised(self: *Vm, pc: usize, from: u16, below: u16, err: Value) Error {
+        const slot = self.parkTemp(err) catch |e| return e;
+        _ = self.closeFrameVars(self.depth - 1, pc, from, below, false, slot) catch |e| return e;
+        self.pending_error = self.unparkTemp(slot);
+        return Error.LuaError;
     }
 
     /// Close the to-be-closed variables of frame `fi`, at instruction `fpc`,
     /// in registers `>= from`, highest first: `__close(v, err)` for each one
     /// that is not nil or false. `unwinding`: for an error unwinding through
-    /// the frame, so the ones `TbcVar.isLiveAt` `fpc`; else for the `close`
-    /// or `ret_close` at `fpc`, so the ones `openAt` it. `err` is the value
-    /// in stack slot `err_slot`, rooted by the caller; an error a `__close`
-    /// raises replaces it there, for the rest. Returns whether one did.
-    fn closeFrameVars(self: *Vm, fi: u32, fpc: usize, from: u16, unwinding: bool, err_slot: usize) Error!bool {
+    /// the frame, so the ones `TbcVar.isLiveAt` `fpc` with close cursor
+    /// `cursor` (`closeCursor`); else for the rest of the `close` or
+    /// `ret_close` at `fpc`, so the ones `openAt` it below register
+    /// `cursor`. `err` is the value in stack slot `err_slot`, rooted by the
+    /// caller; an error a `__close` raises replaces it there, for the rest.
+    /// Returns whether one did.
+    fn closeFrameVars(self: *Vm, fi: u32, fpc: usize, from: u16, cursor: ?u16, unwinding: bool, err_slot: usize) Error!bool {
         const proto = self.frames[fi].closure.proto;
         const base = self.frames[fi].base;
         var raised = false;
@@ -3835,7 +3865,7 @@ pub const Vm = struct {
             i -= 1;
             const tv = proto.tbc_vars[i];
             if (tv.reg < from) continue;
-            if (!(if (unwinding) tv.isLiveAt(proto.code, fpc) else tv.openAt(fpc))) continue;
+            if (!(if (unwinding) tv.isLiveAt(proto.code, fpc, cursor) else tv.openAt(fpc) and tv.reg < cursor.?)) continue;
             const v = self.regGet(base + tv.reg);
             if (!v.isTruthy()) continue;
             if (try self.callClose(v, self.regGet(err_slot))) |e| {
@@ -3898,11 +3928,25 @@ pub const Vm = struct {
             const f = &self.frames[i];
             if (f.closure.proto.tbc_vars.len == 0) continue;
             const fpc: usize = if ((at_fault and i == top - 1) or f.in_flight) f.pc else f.pc -| 1;
-            if (try self.closeFrameVars(i, fpc, 0, true, slot)) raised = true;
+            if (try self.closeFrameVars(i, fpc, 0, self.closeCursor(i, top), true, slot)) raised = true;
         }
         for (keep, 0..) |*v, k| v.* = self.regGet(slot + 1 + k);
         self.stack_top = slot;
         return if (raised) self.regGet(slot) else null;
+    }
+
+    /// Doc 68 P2: the close cursor of frame `fi` (of `top` frames) when it
+    /// is in flight at a `close`/`ret_close` whose `__close` runs in the
+    /// frame above (`closeStep`): the variables from that register up are
+    /// closed or closing. Null for any other frame.
+    fn closeCursor(self: *const Vm, fi: u32, top: u32) ?u16 {
+        if (!self.frames[fi].in_flight or fi + 1 >= top) return null;
+        const above = &self.frames[fi + 1];
+        if (above.ctl.cont != .finish_op) return null;
+        return switch (self.frames[fi].closure.proto.code[self.frames[fi].pc].op) {
+            .close, .ret_close => above.ret_dest,
+            else => null,
+        };
     }
 
     /// `pcall(f, ...)`/`xpcall(f, h, ...)` (`args` as the natives get them)
@@ -4426,6 +4470,8 @@ pub const Vm = struct {
         if (self.string_metatable) |smt| cb(ctx, &smt.header);
         // 9. the file metatable and the default input/output handles (doc 65).
         if (self.file_metatable) |fmt| cb(ctx, &fmt.header);
+        if (self.file_methods) |t| cb(ctx, &t.header);
+        for (self.lib_natives) |n| if (n) |nat| cb(ctx, &nat.header);
         if (self.io_input) |f| cb(ctx, &f.header);
         if (self.io_output) |f| cb(ctx, &f.header);
         // 10. the task library (doc 73 §7) and the `aio` operations (§7.6).
@@ -5411,6 +5457,8 @@ pub const Vm = struct {
         t[@intFromEnum(bytecode.OpCode.set_index)] = opSetIndexAppend(mode);
         t[@intFromEnum(bytecode.OpCode.new_table)] = opNewTableSized(mode);
         t[@intFromEnum(bytecode.OpCode.ret)] = opCoroutineReturn(mode);
+        // `ret_close` tail-calls `opRet` with its own instruction.
+        t[@intFromEnum(bytecode.OpCode.ret_close)] = opCoroutineReturn(mode);
         t[@intFromEnum(bytecode.OpCode.halt)] = opCoroutineReturn(mode);
         return t;
     }
@@ -8364,11 +8412,13 @@ pub const Vm = struct {
     }
 
     /// `R[a] = lhs op rhs` through `arith` and the operator's metamethod:
-    /// every handler's last resort.
-    inline fn arithGeneric(self: *Vm, comptime base: bytecode.OpCode, regs: RegWindow, a: usize, o: ArithOperands) Error!void {
+    /// every handler's last resort. False when the metamethod got a frame
+    /// (`metaCall`), whose return stores `R[a]` (`finishOp`).
+    inline fn arithGeneric(self: *Vm, comptime base: bytecode.OpCode, regs: RegWindow, a: usize, o: ArithOperands) Error!bool {
         const lhs = o.lhs();
         const rhs = o.rhs();
-        regs.set(a, try self.arithMeta(arithRaw(base, lhs, rhs), @field(self.mm, @tagName(base)), lhs, rhs));
+        regs.set(a, (try self.arithMeta(arithRaw(base, lhs, rhs), @field(self.mm, @tagName(base)), lhs, rhs)) orelse return false);
+        return true;
     }
 
     /// `+`, `-`, `*`: both-int (wrapping) and both-float lanes, then the
@@ -8418,7 +8468,7 @@ pub const Vm = struct {
                 if (o.bothNumber()) {
                     regs.setFloat(instr.a, fmath.powRuntime(o.lhsFloat(), o.rhsFloat()));
                 } else {
-                    vm.arithGeneric(.pow, regs, instr.a, o) catch |e| return parkErr(st, e);
+                    if (!(vm.arithGeneric(.pow, regs, instr.a, o) catch |e| return parkErr(st, e))) return enterMetaFrame(mode, st, vm);
                 }
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -8432,7 +8482,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                vm.arithGeneric(f.base, regs, instr.a, arithOperands(f.shape, st, regs, instr)) catch |e| return parkErr(st, e);
+                if (!(vm.arithGeneric(f.base, regs, instr.a, arithOperands(f.shape, st, regs, instr)) catch |e| return parkErr(st, e))) return enterMetaFrame(mode, st, vm);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -8550,7 +8600,7 @@ pub const Vm = struct {
                     .bnot => vm.unArithMeta(arith.bnot(v), vm.mm.bnot, v),
                     else => comptime unreachable,
                 };
-                regs.set(instr.a, r catch |e| return parkErr(st, e));
+                regs.set(instr.a, (r catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm));
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -8621,7 +8671,7 @@ pub const Vm = struct {
                 if (v.isHeap() and v.heapType() == .table and table.Table.fromHeader(v.asHeap()).metatable == null) {
                     regs.setInt(instr.a, table.Table.fromHeader(v.asHeap()).lengthSearch());
                 } else {
-                    regs.set(instr.a, vm.lenValue(v) catch |e| return parkErr(st, e));
+                    regs.set(instr.a, (vm.lenValue(v) catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm));
                 }
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -8638,7 +8688,7 @@ pub const Vm = struct {
                 const lhs = regs.get(instr.b);
                 const rhs = regs.get(instr.c);
                 regs.set(instr.a, self.concat(lhs, rhs) catch |e| switch (e) {
-                    Error.TypeError => self.binMeta(self.mm.concat, lhs, rhs, Error.TypeError) catch |e2| return parkErr(st, e2),
+                    Error.TypeError => (self.binMeta(self.mm.concat, lhs, rhs, Error.TypeError) catch |e2| return parkErr(st, e2)) orelse return enterMetaFrame(mode, st, vm),
                     else => return parkErr(st, e),
                 });
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
@@ -8668,7 +8718,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const eqv = vm.valuesEqual(regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e);
+                const eqv = (vm.valuesEqual(regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
                 regs.setBool(instr.a, if (op == .eq) eqv else !eqv);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -8767,7 +8817,7 @@ pub const Vm = struct {
                     .ge => self.compareMeta(.le, regs.get(instr.c), regs.get(instr.b)),
                     else => unreachable,
                 };
-                regs.setBool(instr.a, raw catch |e| return parkErr(st, e));
+                regs.setBool(instr.a, (raw catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm));
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -8914,7 +8964,7 @@ pub const Vm = struct {
                     vm.compareMeta(.lt, o.lhs(), o.rhs())
                 else
                     vm.compareMeta(.le, o.lhs(), o.rhs());
-                return cmpBranchTail(mode, st, pc, instr, vm, raw catch |e| return parkErr(st, e));
+                return cmpBranchTail(mode, st, pc, instr, vm, (raw catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm));
             }
         }.h;
     }
@@ -8944,7 +8994,7 @@ pub const Vm = struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const holds = switch (f.rhs) {
-                    .reg => vm.valuesEqual(regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e),
+                    .reg => (vm.valuesEqual(regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm),
                     .num => value.compareNumeric(regs.get(instr.b), st.proto.constants[instr.c]) == .eq,
                     .prim, .str => comptime unreachable,
                 };
@@ -9808,7 +9858,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const v = vm.indexGet(regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e);
+                const v = (vm.indexGetOp(regs.get(instr.b), regs.get(instr.c), 0) catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
                 regs.set(instr.a, v);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -9892,7 +9942,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                vm.indexSet(regs.get(instr.a), regs.get(instr.b), regs.get(instr.c)) catch |e| return parkErr(st, e);
+                (vm.indexSetOp(regs.get(instr.a), regs.get(instr.b), regs.get(instr.c), 0) catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -10013,7 +10063,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                const v = vm.indexGet(regs.get(instr.b), st.proto.constants[instr.c]) catch |e| return parkErr(st, e);
+                const v = (vm.indexGetOp(regs.get(instr.b), st.proto.constants[instr.c], 0) catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
                 regs.set(instr.a, v);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
@@ -10050,7 +10100,7 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
-                vm.indexSet(regs.get(instr.a), st.proto.constants[instr.b], regs.get(instr.c)) catch |e| return parkErr(st, e);
+                (vm.indexSetOp(regs.get(instr.a), st.proto.constants[instr.b], regs.get(instr.c), 0) catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -10068,7 +10118,7 @@ pub const Vm = struct {
                 const container = regs.get(instr.b);
                 const key1 = regs.get(instr.c);
                 const key2 = regs.get(@as(u16, @intCast(instr.aux)));
-                regs.set(instr.a, vm.fusedGet(container, key1, key2) catch |e| return parkErr(st, e));
+                regs.set(instr.a, (vm.fusedGetOp(container, key1, key2) catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm));
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -10085,7 +10135,7 @@ pub const Vm = struct {
                 const key1 = regs.get(instr.b);
                 const key2 = regs.get(instr.c);
                 const val = regs.get(@as(u16, @intCast(instr.aux)));
-                vm.fusedStore(container, key1, key2, val) catch |e| return parkErr(st, e);
+                (vm.fusedStoreOp(container, key1, key2, val) catch |e| return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -10289,8 +10339,10 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 @branchHint(.cold); // keep outlined — see gcTrampoline's note
-                vm.closeTop(pc - 1, instr.a) catch |e| return parkErr(st, e);
-                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+                _ = pc;
+                _ = tags;
+                _ = payloads;
+                return closeStep(mode, st, vm, instr, no_close_cursor, 0);
             }
         }.h;
     }
@@ -10313,10 +10365,65 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 @branchHint(.cold); // keep outlined — see gcTrampoline's note
-                vm.closeForReturn(pc - 1, instr.b == bytecode.all_results) catch |e| return parkErr(st, e);
-                return @call(.always_tail, opRet(mode), .{ st, pc, instr, vm, tags, payloads });
+                _ = pc;
+                _ = tags;
+                _ = payloads;
+                // `return f()`: the values wait in the multret span, which
+                // `closeStep` keeps covered and pending again for `ret`.
+                const span: u16 = if (instr.b == bytecode.all_results) blk: {
+                    vm.reg_top_pending = false;
+                    break :blk @intCast(vm.reg_top - (st.base + instr.a));
+                } else 0;
+                return closeStep(mode, st, vm, instr, no_close_cursor, span);
             }
         }.h;
+    }
+
+    /// `closeStep`'s cursor before any variable is closed: above every
+    /// register.
+    const no_close_cursor = std.math.maxInt(u16);
+
+    /// Doc 76 §6, doc 68 P2: the next close of `close`/`ret_close` `ins` at
+    /// the top frame's pc, of the to-be-closed variables open there in
+    /// registers `>= from` (its operand; 0 for `ret_close`) and below
+    /// `cursor`, highest first. A Lua `__close` runs as a `.finish_op`
+    /// frame carrying the variable's register as the cursor, and its return
+    /// comes back here (`finishOp`); a native or callable one runs in place,
+    /// protected, and its error goes to the rest (`closeRaised`). With none
+    /// left, `close` goes on to the next instruction and `ret_close` is the
+    /// `ret` it fuses. `span` is how many values a `return f()` returns:
+    /// they may reach past the window, so `stack_top` covers them while the
+    /// closes run, and they are pending again for the `ret`. An error
+    /// leaves `stack_top` raised for the catcher, as a fault does.
+    inline fn closeStep(comptime mode: ExecMode, st: *ExecState, vm: *Vm, ins: *const Instr, cursor: u16, span: u16) HandlerResult {
+        const self = vm;
+        const p = st.frame.pc;
+        const proto = st.proto;
+        const base = st.base;
+        const from: u16 = if (ins.op == .close) ins.a else 0;
+        const multret = ins.op == .ret_close and ins.b == bytecode.all_results;
+        const span_end = base + ins.a + span;
+        if (multret) self.stack_top = @max(self.stack_top, span_end);
+        var i = proto.tbc_vars.len;
+        while (i > 0) {
+            i -= 1;
+            const tv = proto.tbc_vars[i];
+            if (tv.reg < from or tv.reg >= cursor or !tv.openAt(p)) continue;
+            const v = self.regGet(base + tv.reg);
+            if (!v.isTruthy()) continue;
+            const handler = self.metamethod(v, self.mm.close);
+            if (handler.isHeap() and handler.heapType() == .function) {
+                self.pushMetaFrame(Closure.fromHeader(handler.asHeap()), &.{ v, Value.nil() }, 0, tv.reg, span) catch |e|
+                    return parkErr(st, e);
+                return enterMetaFrame(mode, st, vm);
+            }
+            if (self.callClose(v, Value.nil()) catch |e| return parkErr(st, e)) |err|
+                return parkErr(st, self.closeRaised(p, from, tv.reg, err));
+        }
+        if (ins.op == .close) return dispatchTail(mode, st, p + 1, vm);
+        self.stack_top = base + st.regs.n;
+        if (multret) self.setPendingTop(span_end);
+        return @call(.always_tail, opRet(mode), .{ st, p + 1, ins, vm, st.regs.tags, st.regs.payloads });
     }
 
     // ---- calls ---- a Lua call pushes a frame and reloads onto it; a native
@@ -10595,7 +10702,7 @@ pub const Vm = struct {
                 // `opRet`'s count again; it consumed a pending `reg_top`,
                 // which still holds the span's end.
                 const lo = st.base + instr.a;
-                const n: usize = if (instr.op == .ret and instr.b == bytecode.all_results) vm.reg_top - lo else if (instr.op == .ret) instr.b else 0;
+                const n: usize = if (instr.op == .halt) 0 else if (instr.b == bytecode.all_results) vm.reg_top - lo else instr.b;
                 vm.returnToResumer(Value.boolean(true), LaneSpan{ .vm = vm, .lo = lo, .n = n }, .dead) catch |e| return parkErr(st, e);
                 return enterContext(mode, st, vm);
             }
@@ -10905,9 +11012,10 @@ pub const Vm = struct {
                 // `print(g())`), take everything the callee produced and stamp
                 // `reg_top` so the parent's adjacent consumer instruction can
                 // expand them.
-                // Doc 68 P0: no frame carries a continuation yet; P1 routes
-                // the others to their finish before the ordinary wiring.
-                std.debug.assert(st.frame.ctl.cont == .none);
+                // Doc 68 P2: a metamethod's frame finishes its parent's
+                // instruction instead (`finishOp`), out of line.
+                if (st.frame.ctl.cont != .none)
+                    return @call(.always_tail, opRetFinish(mode), .{ st, pc, instr, vm, tags, payloads });
                 const depth = self.depth;
                 const parent = &self.frames[depth - 2];
                 const wants_all = st.frame.ret_count == bytecode.all_results;
@@ -10969,6 +11077,108 @@ pub const Vm = struct {
                 return dispatchTailFrom(mode, st, resume_pc, &code[resume_pc], vm, regs.tags, regs.payloads);
             }
         }.h;
+    }
+
+    /// Doc 68 P2: dispatch the metamethod frame `pushMetaFrame` just pushed,
+    /// from its first instruction, in this chain: `enterCallee`'s reload,
+    /// with one full prologue at the boundary. Leaving the chain through
+    /// `.switch_mode` instead rebuilt the dispatch state in `execImpl` on
+    /// every metamethod call (+3% on `bench/stdlib/meta_calls.lua`).
+    inline fn enterMetaFrame(comptime mode: ExecMode, st: *ExecState, vm: *Vm) HandlerResult {
+        const depth = vm.depth;
+        const f = &vm.frames[depth - 1];
+        const cl = f.closure;
+        const code = vm.cachedCodeFor(f, cl.proto);
+        const regs = loadFrame(st, vm, depth, f, cl, f.base, code);
+        return dispatchTailFrom(mode, st, 0, &code[0], vm, regs.tags, regs.payloads);
+    }
+
+    /// Doc 68 P2: `opRet` (after the upvalues are closed) for a `.finish_op`
+    /// frame, a metamethod `pushMetaFrame` pushed. Only its first result
+    /// matters: the frame is popped, its parent leaves flight, and
+    /// `finishOp` completes the instruction the parent is at. Not counted
+    /// toward a continuation anchor (`onRetResume`): the parent is in the
+    /// middle of an instruction, not past a call.
+    fn opRetFinish(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                @branchHint(.cold); // keep outlined — see gcTrampoline's note
+                _ = pc;
+                _ = tags;
+                _ = payloads;
+                const self = vm;
+                const base = st.base;
+                const a: usize = instr.a;
+                const count: usize = if (instr.b == bytecode.all_results) blk: {
+                    self.reg_top_pending = false;
+                    break :blk self.reg_top - (base + a);
+                } else instr.b;
+                // A Zig local from here on: nothing collects before
+                // `finishOp` stores it or passes it to a call, which roots
+                // its arguments.
+                const result = if (count >= 1) self.regGet(base + a) else Value.nil();
+                const phase = st.frame.ctl.phase;
+                const cursor = st.frame.ret_dest;
+                const span = st.frame.ret_count;
+                if (self.trace.regionProfitCount() != 0)
+                    self.trace.dropRegionActivation(st.frame.call_seq);
+                const depth = self.depth;
+                self.depth = depth - 1;
+                const parent = &self.frames[depth - 2];
+                const parent_cl = parent.closure;
+                const code = self.cachedCodeFor(parent, parent_cl.proto);
+                const regs = loadFrame(st, vm, depth - 1, parent, parent_cl, parent.base, code);
+                self.stack_top = parent.base + regs.n;
+                parent.in_flight = false;
+                return finishOp(mode, st, vm, regs, result, phase, cursor, span);
+            }
+        }.h;
+    }
+
+    /// Doc 68 P2, Lua's `luaV_finishOp`: complete the instruction the top
+    /// frame is at, whose metamethod's frame just returned `result`. The
+    /// instruction is read from the canonical code (a JIT image may have
+    /// patched the slot), and its operands from the registers again, as an
+    /// unfused sequence would read them. `phase` is the fused op's step;
+    /// `cursor` and `span` are a `close`'s payload (`closeStep`). A fault
+    /// raised here names the instruction.
+    /// Whether `finishOp` completes `op`: the instructions a metamethod's
+    /// frame can be pushed for. Keyframe restore checks a continuation's
+    /// caller against it.
+    pub fn finishesOp(op: bytecode.OpCode) bool {
+        return switch (op) {
+            .neg, .bnot, .len, .concat, .get_index, .get_field, .eq, .ne, .lt, .le, .gt, .ge => true,
+            .set_index, .set_field, .get_index2, .set_index2, .close, .ret_close => true,
+            else => bytecode.arithFormOf(op) != null or bytecode.cmpBranchOf(op) != null,
+        };
+    }
+
+    inline fn finishOp(comptime mode: ExecMode, st: *ExecState, vm: *Vm, regs: RegWindow, result: Value, phase: u1, cursor: u16, span: u16) HandlerResult {
+        const p = st.frame.pc;
+        const ins = &st.proto.code[p];
+        const next = p + 1;
+        switch (ins.op) {
+            .neg, .bnot, .len, .concat, .get_index, .get_field => regs.set(ins.a, result),
+            .eq, .lt, .le, .gt, .ge => regs.setBool(ins.a, result.isTruthy()),
+            .ne => regs.setBool(ins.a, !result.isTruthy()),
+            .set_index, .set_field => {},
+            .get_index2 => {
+                const v = if (phase == 1) result else (vm.indexGetOp(result, regs.get(@as(u16, @intCast(ins.aux))), 1) catch |e|
+                    return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
+                regs.set(ins.a, v);
+            },
+            .set_index2 => if (phase == 0) {
+                (vm.indexSetOp(result, regs.get(ins.c), regs.get(@as(u16, @intCast(ins.aux))), 1) catch |e|
+                    return parkErr(st, e)) orelse return enterMetaFrame(mode, st, vm);
+            },
+            .close, .ret_close => return closeStep(mode, st, vm, ins, cursor, span),
+            else => if (bytecode.arithFormOf(ins.op) != null) {
+                regs.set(ins.a, result);
+            } else if (bytecode.cmpBranchOf(ins.op) != null) {
+                return cmpBranchTail(mode, st, next, ins, vm, result.isTruthy());
+            } else unreachable,
+        }
+        return dispatchTail(mode, st, next, vm);
     }
 
     // ---- varargs ---- read the current frame's `...` cursor. The
@@ -11429,23 +11639,65 @@ pub const Vm = struct {
         return if (n >= 1) out[0] else Value.nil();
     }
 
+    // ---- doc 68 P2: metamethods as continuation frames ----
+    // The helpers below serve the instruction the top frame is at. Each
+    // returns null when it has pushed a Lua handler's frame (LuaJIT's
+    // `lj_meta_*` returning NULL): the opcode handler then dispatches the
+    // new frame (`enterMetaFrame`), and its return finishes the instruction
+    // (`finishOp`). So the handler's body runs in
+    // the same dispatch as its caller, and a suspend or a coroutine yield
+    // inside it is an ordinary one.
+
+    /// Call metamethod `handler` with `args` for the top frame's
+    /// instruction. A Lua function gets a frame of its own (`pushMetaFrame`)
+    /// and the result is null. Anything else, a native or a callable table,
+    /// is called in place through `callValue` (a suspend due inside it still
+    /// waits, doc 68 §8), and the result is its first return value.
+    /// `phase` says which call of a fused `get_index2`/`set_index2` this is.
+    fn metaCall(self: *Vm, handler: Value, args: []const Value, phase: u1) Error!?Value {
+        if (handler.isHeap() and handler.heapType() == .function) {
+            try self.pushMetaFrame(Closure.fromHeader(handler.asHeap()), args, phase, 0, 0);
+            return null;
+        }
+        return try self.callMeta(handler, args);
+    }
+
+    /// Push Lua handler `cl` with `args` as a `.finish_op` frame above the
+    /// top frame, which stays at its instruction, in flight (doc 68 §4.2).
+    /// `cursor` and `span` are the continuation's payload, kept in the
+    /// frame's return wiring, which a `.finish_op` frame does not use
+    /// (`CallFrame.ret_dest`). Fails on the depth or register limit with
+    /// nothing changed.
+    fn pushMetaFrame(self: *Vm, cl: *const Closure, args: []const Value, phase: u1, cursor: u16, span: u16) Error!void {
+        // Doc 63 §5.6: guest code run on an instruction's behalf can change
+        // anything a trace relies on, as it did through `callValue`.
+        self.heap.bumpHostEpoch();
+        const parent = &self.frames[self.depth - 1];
+        _ = try self.bindAndPushClosure(cl, args);
+        parent.in_flight = true;
+        const f = &self.frames[self.depth - 1];
+        f.ctl = .{ .cont = .finish_op, .phase = phase };
+        f.ret_dest = cursor;
+        f.ret_count = span;
+    }
+
     /// Binary metamethod dispatch for an operator that faulted on its raw
     /// operands. Tries `a`'s metamethod `name`, then `b`'s; the first found is
-    /// called as `handler(a, b)` and its first result returned. If neither has
-    /// it, re-raise `fault` (the located arithmetic/concat/compare `TypeError`).
-    fn binMeta(self: *Vm, name: Value, a: Value, b: Value, fault: Error) Error!Value {
+    /// called as `handler(a, b)` (`metaCall`). If neither has it, re-raise
+    /// `fault` (the located arithmetic/concat/compare `TypeError`).
+    fn binMeta(self: *Vm, name: Value, a: Value, b: Value, fault: Error) Error!?Value {
         var handler = self.metamethod(a, name);
         if (handler.isNil()) handler = self.metamethod(b, name);
         if (handler.isNil()) return fault;
-        return self.callMeta(handler, &.{ a, b });
+        return self.metaCall(handler, &.{ a, b }, 0);
     }
 
     /// Unary metamethod dispatch (`__unm`/`__bnot`): the handler is called with
     /// the operand twice (`handler(v, v)`), matching Lua's convention.
-    fn unMeta(self: *Vm, name: Value, v: Value, fault: Error) Error!Value {
+    fn unMeta(self: *Vm, name: Value, v: Value, fault: Error) Error!?Value {
         const handler = self.metamethod(v, name);
         if (handler.isNil()) return fault;
-        return self.callMeta(handler, &.{ v, v });
+        return self.metaCall(handler, &.{ v, v }, 0);
     }
 
     /// `R[a] = lhs <op> rhs` for add/sub/mul, computing the hot both-int,
@@ -11586,26 +11838,28 @@ pub const Vm = struct {
     /// Wrap a raw binary arithmetic/bitwise result: on `TypeError` (an operand
     /// the operator doesn't accept) fall back to the binary metamethod `name`;
     /// any other arith error (e.g. `DivisionByZero`) propagates unchanged.
-    fn arithMeta(self: *Vm, raw: arith.Error!Value, name: Value, a: Value, b: Value) Error!Value {
+    /// Null when a handler's frame was pushed (`metaCall`).
+    fn arithMeta(self: *Vm, raw: arith.Error!Value, name: Value, a: Value, b: Value) Error!?Value {
         return raw catch |e| switch (e) {
-            error.TypeError => self.binMeta(name, a, b, Error.TypeError),
-            else => |other| other,
+            error.TypeError => return self.binMeta(name, a, b, Error.TypeError),
+            else => |other| return other,
         };
     }
 
     /// Wrap a raw unary arithmetic/bitwise result (`__unm`/`__bnot`).
-    fn unArithMeta(self: *Vm, raw: arith.Error!Value, name: Value, v: Value) Error!Value {
+    fn unArithMeta(self: *Vm, raw: arith.Error!Value, name: Value, v: Value) Error!?Value {
         return raw catch |e| switch (e) {
-            error.TypeError => self.unMeta(name, v, Error.TypeError),
-            else => |other| other,
+            error.TypeError => return self.unMeta(name, v, Error.TypeError),
+            else => |other| return other,
         };
     }
 
     /// `a < b` / `a <= b` with `__lt`/`__le` fallback. Raw comparison faults with
     /// `TypeError` exactly when the operands aren't both numbers (or both
     /// strings) — which is when Lua consults the metamethod. The handler's result
-    /// is taken for its truthiness.
-    fn compareMeta(self: *Vm, comptime op: enum { lt, le }, a: Value, b: Value) Error!bool {
+    /// is taken for its truthiness (`finishOp` takes it there for a handler
+    /// that got a frame, when this returns null).
+    fn compareMeta(self: *Vm, comptime op: enum { lt, le }, a: Value, b: Value) Error!?bool {
         const raw = switch (op) {
             .lt => arith.lt(a, b),
             .le => arith.le(a, b),
@@ -11616,10 +11870,10 @@ pub const Vm = struct {
                     .lt => self.mm.lt,
                     .le => self.mm.le,
                 };
-                const r = try self.binMeta(name, a, b, Error.TypeError);
+                const r = (try self.binMeta(name, a, b, Error.TypeError)) orelse return null;
                 return r.isTruthy();
             },
-            else => |other| other,
+            else => |other| return other,
         };
     }
 
@@ -11628,13 +11882,14 @@ pub const Vm = struct {
     /// both operands are tables and raw-unequal (Lua restricts it to same-type
     /// table/userdata pairs; mahina has only tables). The handler result is taken
     /// for truthiness.
-    fn valuesEqual(self: *Vm, a: Value, b: Value) Error!bool {
+    /// Null when a handler's frame was pushed (`metaCall`).
+    fn valuesEqual(self: *Vm, a: Value, b: Value) Error!?bool {
         if (arith.eq(a, b)) return true;
         if (a.isHeap() and a.heapType() == .table and b.isHeap() and b.heapType() == .table) {
             var handler = self.metamethod(a, self.mm.eq);
             if (handler.isNil()) handler = self.metamethod(b, self.mm.eq);
             if (!handler.isNil()) {
-                const r = try self.callMeta(handler, &.{ a, b });
+                const r = (try self.metaCall(handler, &.{ a, b }, 0)) orelse return null;
                 return r.isTruthy();
             }
         }
@@ -11642,15 +11897,16 @@ pub const Vm = struct {
     }
 
     /// `#v` with `__len` fallback. A table with a `__len` metamethod calls it
-    /// (`handler(t)` → first result); otherwise a table yields its raw border
+    /// (`handler(t, t)` → first result, as 5.4's `luaV_objlen`); otherwise a table yields its raw border
     /// length and a string its byte length (`lenOf`). A non-table/non-string with
     /// no metamethod faults (`TypeError`, located).
-    fn lenValue(self: *Vm, v: Value) Error!Value {
+    /// Null when a handler's frame was pushed (`metaCall`).
+    fn lenValue(self: *Vm, v: Value) Error!?Value {
         if (v.isHeap() and v.heapType() == .table) {
             const handler = self.metamethod(v, self.mm.len);
-            if (!handler.isNil()) return self.callMeta(handler, &.{v});
+            if (!handler.isNil()) return self.metaCall(handler, &.{ v, v }, 0);
         }
-        return lenOf(v);
+        return try lenOf(v);
     }
 
     /// The `__tostring` rendering of `v`, or `null` when `v` has no `__tostring`
@@ -11705,6 +11961,18 @@ pub const Vm = struct {
         return self.indexGet(mid, key2);
     }
 
+    /// `fusedGet` for the top frame's instruction. Null when a functional
+    /// `__index` got a frame (`metaCall`): phase 0 for the first step, whose
+    /// return `finishOp` takes on to the second, phase 1 for the second.
+    fn fusedGetOp(self: *Vm, container: Value, key1: Value, key2: Value) Error!?Value {
+        if (container.isHeap() and container.heapType() == .table) {
+            const t = table.Table.fromHeader(container.asHeap());
+            if (t.array.isGrid()) return try self.gridCellGet(t, key1, key2);
+        }
+        const mid = (try self.indexGetOp(container, key1, 0)) orelse return null;
+        return self.indexGetOp(mid, key2, 1);
+    }
+
     /// Read grid cell `t[i][j]` faithfully, reproducing the nested-table semantics
     /// so no deflation is needed on the read path: an in-range row with an
     /// in-stride present int column yields the cell; an in-range row with any other
@@ -11735,6 +12003,23 @@ pub const Vm = struct {
     /// grid cell (type change, non-int key, out-of-range row) deflates and retries
     /// as a nested store. On a plain table, attempts inflation first, else two steps.
     pub fn fusedStore(self: *Vm, container: Value, key1: Value, key2: Value, val: Value) Error!void {
+        const c = (try self.fusedStoreGrid(container, key1, key2, val)) orelse return;
+        const mid = try self.indexGet(c, key1);
+        try self.indexSet(mid, key2, val);
+    }
+
+    /// `fusedStore` for the top frame's instruction. Null when a functional
+    /// `__index` (phase 0) or `__newindex` (phase 1) got a frame
+    /// (`metaCall`).
+    fn fusedStoreOp(self: *Vm, container: Value, key1: Value, key2: Value, val: Value) Error!?void {
+        const c = (try self.fusedStoreGrid(container, key1, key2, val)) orelse return {};
+        const mid = (try self.indexGetOp(c, key1, 0)) orelse return null;
+        return self.indexSetOp(mid, key2, val, 1);
+    }
+
+    /// `fusedStore`'s grid half: the cell store, null once done; else
+    /// `container`, whose two-step store is the caller's.
+    fn fusedStoreGrid(self: *Vm, container: Value, key1: Value, key2: Value, val: Value) Error!?Value {
         if (container.isHeap() and container.heapType() == .table) {
             const t = table.Table.fromHeader(container.asHeap());
             // Inflation trigger (Phase 4b): a homogeneous-numeric nested table
@@ -11746,13 +12031,12 @@ pub const Vm = struct {
                 if (t == self.globals or !self.heap.inflateToGrid(t)) t.no_grid = true;
             }
             if (t.array.isGrid()) {
-                if (try self.gridCellStore(t, key1, key2, val)) return;
+                if (try self.gridCellStore(t, key1, key2, val)) return null;
                 // Could not stay a grid cell: the grid was deflated; fall through to
                 // the nested store on the now-real row.
             }
         }
-        const mid = try self.indexGet(container, key1);
-        try self.indexSet(mid, key2, val);
+        return container;
     }
 
     /// Store grid cell `t[i][j] = val`, returning `true` once stored in-grid. Grows
@@ -11818,6 +12102,31 @@ pub const Vm = struct {
     }
 
     pub fn indexGet(self: *Vm, container: Value, key: Value) Error!Value {
+        return switch (try self.indexResolve(container, key)) {
+            .value => |v| v,
+            .call => |c| self.callMeta(c.handler, &.{ c.receiver, key }),
+        };
+    }
+
+    /// `indexGet` for the top frame's instruction: null when a functional
+    /// `__index` got a frame (`metaCall`).
+    fn indexGetOp(self: *Vm, container: Value, key: Value, phase: u1) Error!?Value {
+        return switch (try self.indexResolve(container, key)) {
+            .value => |v| v,
+            .call => |c| self.metaCall(c.handler, &.{ c.receiver, key }, phase),
+        };
+    }
+
+    /// A metamethod `indexResolve`/`newindexResolve` found to call: a
+    /// function `handler`, called with `receiver` (the value whose
+    /// metatable holds it) first.
+    const MetaCallee = struct { handler: Value, receiver: Value };
+
+    /// Where `container[key]` leads, Lua's `luaV_finishget` loop: the value,
+    /// or a functional `__index` to call as `handler(receiver, key)`.
+    const IndexStep = union(enum) { value: Value, call: MetaCallee };
+
+    fn indexResolve(self: *Vm, container: Value, key: Value) Error!IndexStep {
         var cur = container;
         var hops: usize = 0;
         while (true) : (hops += 1) {
@@ -11826,7 +12135,7 @@ pub const Vm = struct {
             // hash part: `row[j]` forwards straight into the parent grid's flat
             // cells. (An *outer* grid `t[i]` already minted this handle via
             // `Table.getInt`; this is the *inner* index.)
-            if (cur.isRowView()) return table.Table.rowViewGet(cur, key);
+            if (cur.isRowView()) return .{ .value = table.Table.rowViewGet(cur, key) };
             // Raw read when `cur` is a table; a present field short-circuits.
             if (cur.isHeap() and cur.heapType() == .table) {
                 // Gate (doc 14, Phase 4c): a grid is touched *only* by the fused
@@ -11840,13 +12149,13 @@ pub const Vm = struct {
                     if (t0.array.isGrid()) try self.heap.deflateGrid(t0);
                 }
                 const raw = table.Table.fromHeader(cur.asHeap()).get(key);
-                if (!raw.isNil()) return raw;
+                if (!raw.isNil()) return .{ .value = raw };
             }
             const handler = self.metamethod(cur, self.mm.index);
             if (handler.isNil()) {
                 // No `__index`: an absent table key is `nil`; a non-table here is
                 // the original "attempt to index a <type> value" fault.
-                if (cur.isHeap() and cur.heapType() == .table) return Value.nil();
+                if (cur.isHeap() and cur.heapType() == .table) return .{ .value = Value.nil() };
                 return Error.TypeError;
             }
             // Lua's `luaV_finishget`: a function is called; anything else
@@ -11856,9 +12165,7 @@ pub const Vm = struct {
                 continue;
             }
             // Functional `__index`: `handler(cur, key)` → first result.
-            var out: [1]Value = .{Value.nil()};
-            const n = try self.callValue(handler, &.{ cur, key }, &out);
-            return if (n >= 1) out[0] else Value.nil();
+            return .{ .call = .{ .handler = handler, .receiver = cur } };
         }
     }
 
@@ -11876,6 +12183,22 @@ pub const Vm = struct {
     /// As Luau's `luaV_settable`, only a store that would assign checks it:
     /// an absent key with a `__newindex` dispatches.
     pub fn indexSet(self: *Vm, container: Value, key: Value, val: Value) Error!void {
+        const c = (try self.newindexResolve(container, key, val)) orelse return;
+        _ = try self.callMeta(c.handler, &.{ c.receiver, key, val });
+    }
+
+    /// `indexSet` for the top frame's instruction: null when a functional
+    /// `__newindex` got a frame (`metaCall`).
+    fn indexSetOp(self: *Vm, container: Value, key: Value, val: Value, phase: u1) Error!?void {
+        const c = (try self.newindexResolve(container, key, val)) orelse return {};
+        _ = (try self.metaCall(c.handler, &.{ c.receiver, key, val }, phase)) orelse return null;
+        return {};
+    }
+
+    /// `indexSet` up to the call, Lua's `luaV_finishset` loop: stores and
+    /// returns null, or returns the functional `__newindex` to call as
+    /// `handler(receiver, key, val)`.
+    fn newindexResolve(self: *Vm, container: Value, key: Value, val: Value) Error!?MetaCallee {
         var cur = container;
         var hops: usize = 0;
         while (true) : (hops += 1) {
@@ -11888,7 +12211,7 @@ pub const Vm = struct {
             if (cur.isRowView()) {
                 if (table.Table.rowViewSet(cur, key, val)) {
                     self.heap.writeBarrier(cur.rowViewParent(), val); // no-op until Phase 4
-                    return;
+                    return null;
                 }
                 // A store that can't stay in the row's grid cells: deflate the
                 // parent grid and retry the store on the now-real row table. Under
@@ -11917,7 +12240,7 @@ pub const Vm = struct {
                     if (t.isReadonly()) return Error.ReadonlyTable;
                     try t.set(self.gpa, key, val);
                     self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
-                    return;
+                    return null;
                 }
                 const handler = self.metamethod(cur, self.mm.newindex);
                 if (handler.isNil()) {
@@ -11925,16 +12248,14 @@ pub const Vm = struct {
                     if (t.isReadonly()) return Error.ReadonlyTable;
                     try t.set(self.gpa, key, val);
                     self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
-                    return;
+                    return null;
                 }
                 // As `luaV_finishset`: only a function is called.
                 if (!isFunction(handler)) {
                     cur = handler; // chain the set into the `__newindex` value
                     continue;
                 }
-                var out: [1]Value = .{Value.nil()};
-                _ = try self.callValue(handler, &.{ cur, key, val }, &out);
-                return;
+                return .{ .handler = handler, .receiver = cur };
             }
             // `cur` is not a table: only a `__newindex` can rescue it.
             const handler = self.metamethod(cur, self.mm.newindex);
@@ -11943,9 +12264,7 @@ pub const Vm = struct {
                 cur = handler;
                 continue;
             }
-            var out: [1]Value = .{Value.nil()};
-            _ = try self.callValue(handler, &.{ cur, key, val }, &out);
-            return;
+            return .{ .handler = handler, .receiver = cur };
         }
     }
 

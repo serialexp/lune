@@ -44,9 +44,8 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
     return @ptrCast(@alignCast(ctx));
 }
 
-/// The hidden numeric iterator `gmatch` hands back, mirroring `base.zig`'s
-/// `@ipairs_iter`: a non-identifier name user code can never spell, installed as
-/// a normal global native (so it is a GC root and keyframe-restorable by name).
+/// The hidden iterator `gmatch` hands back, like `base.zig`'s `@ipairs_iter`:
+/// a serialized identity, no global (`Vm.libNative`).
 const gmatch_iter_name = "@gmatch_iter";
 
 /// Fetch argument `i` (0-based) as a table, or raise the located Lua
@@ -60,11 +59,6 @@ fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
     // deflates the grid back to real row tables first.
     if (t.array.isGrid()) try vm.heap.deflateGrid(t);
     return t;
-}
-
-/// Fetch the native installed under `name` as a callable `Value`.
-fn globalNative(vm: *Vm, name: []const u8) anyerror!Value {
-    return vm.globals.get(try vm.heap.internValue(name));
 }
 
 /// Fetch argument `i` (0-based) as string bytes, or raise the located Lua
@@ -591,8 +585,7 @@ fn sCodepointN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usiz
     return count;
 }
 
-/// The hidden iterator `s:codes()` hands back, mirroring `@gmatch_iter`: a
-/// non-spellable global native that is a GC root and keyframe-restorable by name.
+/// The hidden iterator `s:codes()` hands back, like `@gmatch_iter`.
 const codes_iter_name = "@codes_iter";
 
 /// `s:codes()` — returns the generic-for triple `(@codes_iter, state, nil)`,
@@ -604,7 +597,7 @@ const codes_iter_name = "@codes_iter";
 fn sCodesN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     _ = try strObjArg(vm, args, 0); // type-check subject
-    const iter = try globalNative(vm, codes_iter_name);
+    const iter = vm.libNative(.codes_iter);
     const state = try vm.heap.newTable();
     try state.set(vm.gpa, Value.int(1), args[0]); // subject string Value
     try state.set(vm.gpa, Value.int(2), Value.int(0)); // 0-based byte cursor
@@ -617,7 +610,7 @@ fn sCodes1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     // Degenerate single-result projection: just the iterator (state is lost).
     const vm = vmOf(ctx);
     _ = try strObjArg(vm, args, 0);
-    return globalNative(vm, codes_iter_name);
+    return vm.libNative(.codes_iter);
 }
 
 /// `@codes_iter(state)` — decode the character at the stored byte cursor, advance
@@ -1438,7 +1431,7 @@ fn sGmatchN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     _ = try strArg(vm, args, 0); // type-check subject
     _ = try strArg(vm, args, 1); // type-check pattern
-    const iter = try globalNative(vm, gmatch_iter_name);
+    const iter = vm.libNative(.gmatch_iter);
     const state = try vm.heap.newTable();
     try state.set(vm.gpa, Value.int(1), args[0]); // subject string Value
     try state.set(vm.gpa, Value.int(2), args[1]); // pattern string Value
@@ -1452,7 +1445,7 @@ fn sGmatch1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     _ = try strArg(vm, args, 0);
     _ = try strArg(vm, args, 1);
-    return globalNative(vm, gmatch_iter_name);
+    return vm.libNative(.gmatch_iter);
 }
 
 /// `@gmatch_iter(state)` — LuaJIT's `gmatch_aux`: scan forward from the stored
@@ -1941,9 +1934,9 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "string.gmatch", .func = &sGmatch1, .multi = &sGmatchN, .module = "string", .field = "gmatch" },
     .{ .name = "string.gsub", .func = &sGsub1, .multi = &sGsubN, .module = "string", .field = "gsub" },
     // Hidden iterator `gmatch` returns; a bare global like `@ipairs_iter`.
-    .{ .name = gmatch_iter_name, .func = &sGmatchAux1, .multi = &sGmatchAuxN, .recorded = .gmatch_iter },
+    .{ .name = gmatch_iter_name, .func = &sGmatchAux1, .multi = &sGmatchAuxN, .recorded = .gmatch_iter, .manual = true, .slot = .gmatch_iter },
     // Hidden iterator `s:codes()` returns (S-B); same hidden-global pattern.
-    .{ .name = codes_iter_name, .func = &sCodesAux1, .multi = &sCodesAuxN },
+    .{ .name = codes_iter_name, .func = &sCodesAux1, .multi = &sCodesAuxN, .manual = true, .slot = .codes_iter },
 };
 
 // ---------------------------------------------------------------------------

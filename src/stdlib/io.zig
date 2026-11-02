@@ -44,12 +44,12 @@ const OpenMode = system.OpenMode;
 /// spell, like `@gmatch_iter`.
 pub const methods_module = "@file";
 
-/// The hidden iterator `io.lines`/`file:lines` hand back (a global native,
-/// so it is a GC root and keyframe-restorable by name).
+/// The hidden iterator `io.lines`/`file:lines` hand back: a serialized
+/// identity, no global (`Vm.libNative`).
 const lines_iter_name = "@io_lines_iter";
 
 /// The file metatable's `__close` (doc 76 §6), hidden the same way.
-pub const file_close_name = "@io_file_close";
+const file_close_name = "@io_file_close";
 
 /// The longest numeral `read("n")` collects (Lua's `L_MAXLENNUM`); a longer
 /// one fails the read.
@@ -668,7 +668,7 @@ fn linesTriple(vm: *Vm, f: *File, close: bool, fmts: []const Value, argbase: usi
     try state.set(vm.gpa, Value.int(1), Value.heap(&f.header));
     try state.set(vm.gpa, Value.int(2), Value.boolean(close));
     for (fmts, 0..) |v, i| try state.set(vm.gpa, Value.int(@intCast(i + 3)), v);
-    const iter = vm.globals.get(try vm.heap.internValue(lines_iter_name));
+    const iter = vm.libNative(.io_lines_iter);
     // Lua 5.4 adds the file as a fourth (to-be-closed) value when `lines`
     // opened it.
     if (close) return putResults(out, &.{ iter, Value.heap(&state.header), Value.nil(), Value.heap(&f.header) });
@@ -1095,7 +1095,7 @@ pub const natives = [_]function.BaseNative{
     entry("file.setvbuf", &fileSetvbufN, methods_module, "setvbuf", .none),
     entry("file.close", &fileCloseN, methods_module, "close", .none),
     // The hidden `lines` iterator.
-    .{ .name = lines_iter_name, .func = single(&linesIterN), .multi = &linesIterN },
+    .{ .name = lines_iter_name, .func = single(&linesIterN), .multi = &linesIterN, .manual = true, .slot = .io_lines_iter },
     // The hidden `__close` of the file metatable.
-    .{ .name = file_close_name, .func = single(&fileCloseMetaN), .multi = &fileCloseMetaN },
+    .{ .name = file_close_name, .func = single(&fileCloseMetaN), .multi = &fileCloseMetaN, .manual = true, .slot = .io_file_close },
 };

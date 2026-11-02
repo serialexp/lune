@@ -215,6 +215,21 @@ const f2c_corpus = [_][:0]const u8{
     \\local arr = {2, 4, 6, 8, 10}
     \\print(asum(arr))
     ,
+    // The library's own natives (`Vm.lib_natives`) restore into their slots:
+    // with the `next` global gone, `pairs` still hands back the original
+    // after a cut, the same object `saved` holds.
+    \\local saved = next
+    \\next = nil
+    \\local function hsum(t)
+    \\  local s = 0
+    \\  for _, v in pairs(t) do s = s + v end
+    \\  return s
+    \\end
+    \\local h = {}
+    \\h.x = 3
+    \\h.y = 4
+    \\print(hsum(h), hsum(h), pairs(h) == saved)
+    ,
     // A `repeat/until` post-test loop inside a call — a mid-loop cut lands with the
     // back-edge `jmp_if_false` pending, so resume must re-test and continue the
     // loop from the restored register state.
@@ -1174,6 +1189,20 @@ test "doc 68 §5: every cut through pcall/xpcall bodies resumes after restore, c
         \\print(select("#", pcall(body, 1)))
         \\print("done")
     ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}
+
+test "doc 68 P2: every cut through metamethod frames resumes after restore" {
+    // Each metamethod above runs as a frame its caller's instruction waits
+    // on, in flight; the keyframe carries the frame's `.finish_op` tag (and
+    // a `close`'s cursor), and restore re-derives the caller's flight.
+    const gpa = testing.allocator;
+    const source = @import("interp_testutil.zig").metamethod_frames_program;
     const ref = try referenceRun(gpa, source);
     defer ref.deinit(gpa);
     var cut: u64 = 1;

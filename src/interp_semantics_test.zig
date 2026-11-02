@@ -1760,6 +1760,34 @@ test "doc 66: `itern` steps `ipairs` exactly as its native does" {
     );
 }
 
+test "the library hands back its own iterators, whatever the program did to the globals" {
+    // Lua's `pairs` returns the `next` it was built with, so reassigning the
+    // global changes neither what `pairs` returns nor its loops; `ipairs`,
+    // `gmatch`, `s:codes()` and `io.lines`' iterators are no globals at all
+    // (`Vm.lib_natives`).
+    try expectProgram(
+        \\local saved = next
+        \\next = nil
+        \\print(pairs({}) == saved, rawequal(select(1, pairs({})), saved))
+        \\local n = 0
+        \\for i = 1, 300 do
+        \\  for _, v in pairs({ a = 1, b = 2 }) do n = n + v end
+        \\  for _, v in ipairs({ 4, 5 }) do n = n + v end
+        \\  for w in ("ab cd"):gmatch("%a+") do n = n + #w end
+        \\  for _, c in ("hé"):codes() do n = n + c end
+        \\end
+        \\print(n)
+        \\local hidden = 0
+        \\for k in saved, _G do if type(k) == "string" and k:sub(1, 1) == "@" then hidden = hidden + 1 end end
+        \\print(hidden)
+        \\
+    ,
+        "true\ttrue\n" ++
+            "105900\n" ++
+            "0\n",
+    );
+}
+
 test "doc 66 P1: one generic `for` traced with `gmatch` keeps its trace across `pairs`" {
     // One compiled loop driven by `gmatch`, then by `pairs` and `next`,
     // then by `gmatch` with another pattern and the first one again. The

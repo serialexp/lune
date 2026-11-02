@@ -58,51 +58,73 @@ effect log so runs stay replayable (doc 02).
 
 ## 3. Language bugs (not deliberate)
 
-- [ ] `{...}` / `{f()}` keep only the first value (also TODO.md).
+- [x] `{...}` / `{f()}` keep only the first value (also TODO.md).
       `local function v(...) return {...} end print(#v(5,6,7))` → 1.
-      **(verified)**
+      **Fixed** (re-checked 2026-11-02: 3, and `#{0, three()}` is 4).
 - [ ] Call depth capped at 200 (`max_call_depth`, `src/interp.zig:132`) and
       no proper tail calls: `d(250)` and a 1000-deep tail loop overflow.
-      **(verified)** Lua: ~190000 / unbounded.
-- [ ] `pairs`/`next` over the hash part is quadratic: 8000 string keys
+      **(verified)** Lua: ~190000 / unbounded. Re-checked 2026-11-02:
+      `d(250)`, `d(5000)` and a 100000-deep tail loop all overflow. Listed
+      under "Not yet supported" in `docs/differences-from-lua.md`.
+- [x] `pairs`/`next` over the hash part is quadratic: 8000 string keys
       3.7s (lua 0.00s), 16000 18s, 200k > 60s. Sparse int keys too.
-      **(verified)** Global Rule #20.
+      **Fixed** (re-checked 2026-11-02: 200k keys 0.10s, lua 0.23s).
 - [ ] `s = s .. "x"` in a loop: 2.34s vs lua 0.07s at 80k, worse than
-      quadratic.
-- [ ] No string→number coercion: `"10"+5`, `-"2"` error. **(verified)**
+      quadratic. Re-checked 2026-11-02: 1.52s vs lua 0.08s at 80k.
+- [x] No string→number coercion: `"10"+5`, `-"2"` error. **(verified)**
       Nor number/string coercion of string-function args:
       `string.rep(5,2)`, `("abc"):sub("2")`, `format("%d","10")`.
+      **Not a bug:** documented choice ("Strings are not numbers",
+      `docs/differences-from-lua.md` §Numbers).
 - [ ] `load` ignores its env: `load("return x","c","t",{x=5})()` → nil,
       and `load("y=10",…,env)` writes the real global. **(verified)**
       `load(readerFunction)` unsupported. `local _ENV = {}` ignored;
       `setmetatable(_G, {__index/__newindex})` ignored (strict.lua).
+      Re-checked 2026-11-02: still so; listed under "Not yet supported"
+      in `docs/differences-from-lua.md`.
 - [ ] `goto`/labels unsupported (deferred in 00-architecture.md:76).
       **(verified)**
 - [ ] Call sugar `f{...}`, `f"str"` / `require"x"` unsupported (deferred).
-- [ ] `local x <const>` / `<close>`, hex floats (`0x1p4`), the `\z` escape,
-      `'\xff'` don't parse.
+- [x] `local x <const>` / `<close>`, hex floats (`0x1p4`), the `\z` escape,
+      `'\xff'` don't parse. **Fixed** (re-checked 2026-11-02): the first
+      four parse and run; `'\xff'` is refused on purpose (`\x` must be
+      ASCII, strings are UTF-8).
 - [x] Multiple-assignment order: `local i,t=1,{} i, t[i] = i+1, 20` sets
       `t[2]`; the 5.4 manual's order sets `t[1]`.
-- [ ] Integral floats rejected by bitwise ops (`3.0 & 1`, `2^31 | 0`).
-      (`math.floor(1e100)` now returns the float, as in Lua.)
-- [ ] `table.sort` without a comparator rejects elements that only have
-      `__lt`.
+- [x] Integral floats rejected by bitwise ops (`3.0 & 1`, `2^31 | 0`).
+      (`math.floor(1e100)` now returns the float, as in Lua.) **Not a
+      bug:** documented choice ("Bitwise operators take integers only",
+      `docs/differences-from-lua.md` §Numbers, message included).
+- [x] `table.sort` without a comparator rejects elements that only have
+      `__lt`. **Fixed 2026-11-02:** the default comparator takes `__lt`
+      (the left operand's, then the right's, as `<`), and with no handler
+      raises Lua's unlocated "attempt to compare two table values" /
+      "attempt to compare number with string" (`arith.compareFaultText`).
+      Before, it raised a bare `TypeError`, which `pcall(table.sort, t)`
+      even reported as `bad argument to 'pcall'`.
 - [x] `string.format`: `%s` of a table (even with `__tostring`) or function
       errors; `%q` of numbers and `%a` fail; `%d` of 3.5 gives 3 (Lua
       errors). `%q` of `"a\nb"` writes `\n` where Lua writes `\` + newline.
       Fixed 2026-10-26.
-- [ ] Hangs instead of errors: `for i=1,10,0` loops forever (Lua: `'for'
-      step is zero`); `for i=maxint-2,maxint` wraps forever;
-      `string.rep("x",1e10)` allocates until killed.
-- [ ] Small: `next({})` returns nothing (Lua `nil`); ~~`tonumber("inf")` →
+- [ ] Hangs instead of errors: ~~`for i=1,10,0` loops forever (Lua: `'for'
+      step is zero`); `for i=maxint-2,maxint` wraps forever~~ (both fixed,
+      re-checked 2026-11-02); `string.rep("x",1e10)` allocates until killed
+      (still so).
+- [ ] Small: ~~`next({})` returns nothing (Lua `nil`)~~ (fixed);
+      ~~`tonumber("inf")` →
       inf; `tonumber()`/base 99 return nil instead of erroring~~ (fixed);
-      `math.tointeger("8")` → nil; `__name` ignored; internal names leak
-      into `_G` (`@ipairs_iter`, `@gmatch_iter`, `@codes_iter`).
+      ~~`math.tointeger("8")` → nil~~ (documented: strings are not
+      numbers); `__name` ignored; ~~internal names leak
+      into `_G` (`@ipairs_iter`, `@gmatch_iter`, `@codes_iter`)~~ (fixed:
+      `Vm.lib_natives`).
 
 ## 4. Error messages
 
 - [ ] No variable names: `attempt to index a nil value` where Lua says
       `(local 't')` / `(field 'x')` / `(global 'f')` / `(method 'm')`.
+      Re-checked 2026-11-02: global/field/method names are given; locals,
+      upvalues and arithmetic/concat operands are not. Tracked in
+      TODO.md ("Faults name no locals or upvalues").
 - [x] Locations name the function, not the file: `anonymous:11:`,
       `main:10:`, `f:1:`; tracebacks have no file names. **Done
       2026-10-26:** every proto carries its chunk (`Proto.chunk`, from
@@ -130,7 +152,11 @@ effect log so runs stay replayable (doc 02).
 - [ ] Bare native errors: `bad argument to 'concat'` with no
       argument number or type; `t[nil]=1` → `attempt to index a table
       value` (Lua: "table index is nil"). (`insert`, `sort`, `format`, the
-      math library and bad patterns now give Lua's messages.)
+      math library and bad patterns now give Lua's messages.) Any native
+      still returning a bare `TypeError` is named after the native the
+      faulting `.call` targets (`describeFault`), so under
+      `pcall(f, …)` the message blames `pcall` (seen with the old
+      `table.sort`, 2026-11-02).
 - [ ] Excluded functions fail as `attempt to call a nil value`
       (`("x"):byte()`): say "string.byte is not available in mahina; use
       string.codepoint".

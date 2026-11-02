@@ -101,9 +101,19 @@ land; move whole phases to Done once everything inside them is checked.
     become non-recursive except the `pcall` body, which never raises
     `native_reentry_depth`. It lands with the first converted native
     that runs inside a host function's dispatch.
-- [ ] **P2 — metamethods.** The shared callable driver; every metamethod
+- [~] **P2 — metamethods.** The shared callable driver; every metamethod
   site in §3, fused reads and stores included, runs as a continuation frame;
   `__call` chains stay bounded (§6).
+  - [x] **Operator, index and close sites** (2026-11-02). A Lua handler
+    for arith, `unm`, `bnot`, `concat`, `len`, `eq`/`ne`, the orderings
+    (compare-and-branch forms too), `get_index`/`get_field`/`set_index`/
+    `set_field`, both phases of `get_index2`/`set_index2`, and `__close` at
+    `close`/`ret_close` runs as a `.finish_op` frame (§6). Coroutines yield
+    inside them, and keyframes cut and resume there (format v20). `__len`
+    now gets its operand twice, as `luaV_objlen` passes it.
+  - [ ] **`.call` on a table with `__call`** (sites 2–3). Still a
+    `callValue` re-entry: shift the table into the arguments and enter the
+    handler as an ordinary frame (§6's last row).
 - [ ] **P3 — the other natives.** `dofile`, `require`, `tostring`, `print`,
   `table.sort`, `gsub`, one per commit (§7.2–§7.5).
 - [ ] **P4 — gates.** Per site: replay-index and `mahina_replay` stops inside
@@ -365,6 +375,45 @@ A native metamethod (a host function, or `tostring` installed as
 resumable native's and suspends like any other (§7.5). `mh_table_get`/
 `mh_table_set` start at an embedder boundary and stay synchronous (§8).
 
+### 6.1 As built (2026-11-02)
+
+The shape is LuaJIT's `lj_meta_*`: the helper an opcode's slow path calls
+(`binMeta`, `compareMeta`, `indexGetOp`, `indexSetOp`, `lenValue`, …)
+returns a value when it finished and `null` when it pushed the handler's
+frame (`Vm.metaCall` → `pushMetaFrame`). The handler sees `orelse return
+enterMetaFrame(…)`, which dispatches the new frame's first instruction
+without leaving the dispatch loop. The parent stays in flight at `P`.
+`opRet` on a frame whose `ctl.cont` is `.finish_op` goes to
+`opRetFinish`, which pops the frame and runs `finishOp`, §6's table keyed
+on `code[P]`, then dispatches `P + 1`. `Vm.finishesOp` is the same set of
+opcodes; keyframe restore uses it to refuse a `.finish_op` frame whose
+caller is not at one.
+
+Where it differs from the plan above:
+
+- **The phase is a bit of `FrameCtl`** (`ctl.phase`), beside `cont`, not a
+  separate byte.
+- **Native and callable-table handlers stay synchronous** (`callMeta` →
+  `callValue`). They converge with P3's native driver; until then a yield
+  inside one still raises "attempt to yield across a C-call boundary".
+- **`__close` is a site.** `close` and `ret_close` run their open
+  variables top first; each Lua `__close` is a `.finish_op` frame whose
+  `ret_dest` holds the close cursor (the variable being closed) and whose
+  `ret_count` holds a `return f()` span's length. Those fields already
+  serialize, so the cursor needed no format change. A Lua `__close` that
+  raises unwinds normally, and the unwinder closes the rest below the
+  cursor (`Vm.closeCursor`). A native `__close` runs synchronously; its
+  error goes to the rest at once and is then raised at `P`. Closes on the
+  error path stay synchronous, as 5.4 runs them unyieldable.
+- **Synchronous entry points remain** for code outside an opcode:
+  `indexGet`/`indexSet`, `fusedGet`/`fusedStore` (embedders, tests),
+  `metaToString` (`print`, `tostring`) and `set_list`. They resolve with
+  the same `indexResolve`/`newindexResolve` the op paths use and call the
+  handler through `callMeta`.
+- **Keyframes**: capture accepts an in-flight frame only directly under a
+  `.finish_op` frame; restore checks the `ctl` bits and re-derives the
+  parent's `in_flight`.
+
 ## 7. The natives
 
 ### 7.1 `pcall` and `xpcall` (P1)
@@ -624,6 +673,22 @@ inside the pc-layout spread TODO.md records.
 
 The first trial design, a trampoline closure per call, was +57% tier-0
 and 2.45× JIT on the first row. It is why §7.1 is frame tags.
+
+**P2, metamethod and `__close` frames** (2026-11-02, native ReleaseFast,
+user-mode instructions against 50cc2c7; `bench/stdlib/meta_calls.lua` and
+`meta_close.lua`, added with it):
+
+| Program | Tier-0 | `--trace --jit-native` |
+|---|---|---|
+| `meta_calls` (`__index`, `__newindex`, `__add`, `__eq`, `__lt`, `__concat`) | −0.2% | −0.2% |
+| `meta_close` (`__len`, `<close>` with a Lua `__close`) | −2.0% | −2.0% |
+
+Callgrind (an `__index` loop): 71.3 M against 71.4 M. Per call, about 100
+instructions are in `pushMetaFrame`, 122 in `opRetFinish` and 50 in
+`indexGetOp`; those are the levers left (TODO.md). No call allocates. A
+first cut, which left the dispatch loop to enter the handler
+(`.switch_mode`), was +3.4% tier-0 on `meta_calls`; `enterMetaFrame`
+dispatches in place.
 
 ## 13. References
 

@@ -761,3 +761,54 @@ pub fn installCollect(vm: *Vm) anyerror!void {
     const native = try vm.heap.newNative(collectNative, "collect");
     try vm.globals.set(vm.gpa, try vm.heap.internValue("collect"), Value.heap(&native.header));
 }
+
+/// Doc 68 P2: a program that runs Lua code in every kind of metamethod
+/// frame: operators, compare-and-branch, `__index`/`__newindex` (fused
+/// steps on either side), `__close` on block exit and on `return f()`, a
+/// `__close` error caught, coroutines yielding inside `__index` and
+/// `__close`, and a native `__index`, which still runs in place.
+pub const metamethod_frames_program: [:0]const u8 =
+    \\local V = {}
+    \\V.__index = function(t, k) local d = k * 2 return d end
+    \\V.__newindex = function(t, k, v) rawset(t, "last", v) end
+    \\V.__add = function(a, b) return a.x + b.x end
+    \\V.__eq = function(a, b) return a.x == b.x end
+    \\V.__lt = function(a, b) return a.x < b.x end
+    \\V.__concat = function(a, b) return "c" end
+    \\V.__len = function(a) return 7 end
+    \\V.__unm = function(a) return -a.x end
+    \\local p, q = setmetatable({ x = 1 }, V), setmetatable({ x = 2 }, V)
+    \\print(p[5], p + q, p == q, p ~= q, p < q, p > q, p .. q, #p, -p)
+    \\p[3] = 9
+    \\if p < q then print("lt", p.last) end
+    \\local g = setmetatable({}, {__index = function(t, k)
+    \\  return setmetatable({}, {__index = function(t2, k2) return k * 10 + k2 end,
+    \\    __newindex = function(t2, k2, v) print("set", k, k2, v) end})
+    \\end})
+    \\print(g[1][2])
+    \\g[3][4] = 5
+    \\local C = {__close = function(o, e) print("close", o.n, e) end}
+    \\do
+    \\  local a <close> = setmetatable({ n = 1 }, C)
+    \\  local b <close> = setmetatable({ n = 2 }, C)
+    \\end
+    \\local function three() return 4, 5, 6 end
+    \\local function f()
+    \\  local a <close> = setmetatable({ n = 3 }, C)
+    \\  return three()
+    \\end
+    \\print(f())
+    \\print(pcall(function()
+    \\  local a <close> = setmetatable({ n = 4 }, C)
+    \\  local b <close> = setmetatable({}, {__close = function() error("cl") end})
+    \\end))
+    \\local co = coroutine.wrap(function()
+    \\  local a <close> = setmetatable({}, {__close = function() coroutine.yield("yc") end})
+    \\  local m = setmetatable({}, {__index = function(t, k) return coroutine.yield("yi") end})
+    \\  print("got", m.k)
+    \\  return "done"
+    \\end)
+    \\print(co(), co(8), co())
+    \\local s = setmetatable({}, {__index = rawequal})
+    \\print(s.ab)
+;

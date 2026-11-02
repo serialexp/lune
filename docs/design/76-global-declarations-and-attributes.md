@@ -67,9 +67,10 @@ land; move whole phases to Done once everything inside them is checked.
     native
   - [ ] a value with a `__close` recorded as the call, not an abort:
     general metamethod recording, doc 77 (its Phase 5)
-- [ ] **`<close>` gaps against 5.4** (§6.2, TODO.md).
+- [x] **`<close>` gaps against 5.4** (§6.2, TODO.md).
   - [x] pending closes run on an uncaught top-level error
-  - [ ] a `__close` that yields
+  - [x] a `__close` that yields (doc 68 P2: a Lua `__close` runs as a
+    continuation frame)
 - [ ] **Phase 6 — measured.** A table-store benchmark before and after the
   `readonly` check, and the suite (`just bench`) (§5.4).
   - [x] store microbenchmarks, user instructions, local (§5.4)
@@ -385,10 +386,11 @@ the other pending closes still run.
   pending variables as it dies, with the error. 5.4 leaves them pending
   until `coroutine.close`, which a program can forget; closing at death
   keeps "closed by any route" true.
-- **Gap:** a `__close` cannot yield yet. A yield inside one raises "attempt
-  to yield across a C-call boundary", where 5.4 suspends the coroutine
-  mid-close (TODO.md). The close runs as a nested call (`Vm.callClose`), not
-  as a resumable frame.
+- A Lua `__close` can yield, as in 5.4: the normal-exit close (`close`,
+  `ret_close`) runs each Lua handler as a continuation frame (doc 68 P2), so
+  a coroutine suspends mid-close and a keyframe can cut there. A native
+  `__close` still runs as a nested call (`Vm.callClose`), and so do the
+  closes an error runs while unwinding, which 5.4 also runs unyieldable.
 - An error that nothing catches runs the pending closes before the program
   ends, as lua.c's `pcall` around the chunk does. `Vm.exec` does it, so
   `run`, `start`, a resumed run and a REPL line share it: it closes the main

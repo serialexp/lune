@@ -638,6 +638,21 @@ pub const IternLane = enum(u8) {
     inext,
 };
 
+/// A native the library hands back to the program itself (`pairs`
+/// returns `next`): the VM holds each in `Vm.lib_natives`, filled when its
+/// registry row (`BaseNative.slot`) is installed and rebound when a
+/// keyframe restores it, so the library never looks one up by name and a
+/// program that reassigns `next` changes nothing `pairs` returns, as in
+/// Lua. A `manual` row with a slot has no global at all.
+pub const LibNative = enum(u8) {
+    next,
+    ipairs_iter,
+    gmatch_iter,
+    codes_iter,
+    io_lines_iter,
+    io_file_close,
+};
+
 /// One built-in native, as a *registry descriptor* (distinct from the heap
 /// `Native` object above). `name` is the native's **serialized identity** — the
 /// key the keyframe restorer (`keyframeser.zig`) looks up to rebind it — so it
@@ -678,6 +693,8 @@ pub const BaseNative = struct {
     /// itself (by the same `name`) and places it wherever it belongs — e.g. the
     /// default `package.searchers` array. Without this seam such a native would be
     /// unrestorable (`UnknownNative`) since the restorer resolves only by registry name.
+    /// A `manual` row with a `slot` is the exception: the VM creates it at
+    /// install, into its `Vm.lib_natives` slot only.
     manual: bool = false,
     /// How many values a native made from this row carries
     /// (`Native.bound`, `Heap.newBoundNative`), and, for keyframe restore,
@@ -685,6 +702,9 @@ pub const BaseNative = struct {
     /// whose bound values fail it is a malformed snapshot.
     bound: u8 = 0,
     bound_ok: ?*const fn (bound: []const Value) bool = null,
+    /// The `Vm.lib_natives` slot this row's native fills (`LibNative`). At
+    /// most one row per slot.
+    slot: ?LibNative = null,
     /// The host-system groups this native belongs to (doc 65 §5.2); empty for
     /// one every VM has. A grouped native is installed by `Vm.enableSystem`,
     /// not `installBaseLib`, once any one of its groups is on — `io.read`

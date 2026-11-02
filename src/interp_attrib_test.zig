@@ -487,6 +487,92 @@ test "doc 76: coroutine.close runs the pending closes, and a dying coroutine run
     , "true\t1\ntrue\tk:nil\tdead\nfalse\tclosing\nfalse\tdead\nk2:dead\n");
 }
 
+test "doc 68 P2: a Lua __close is a frame, so it can yield, and a close after it still runs" {
+    try expectProgram(closer_prelude ++
+        \\local co = coroutine.wrap(function()
+        \\  local a <close> = closer("a")
+        \\  local b <close> = setmetatable({}, { __close = function() coroutine.yield("in b") end })
+        \\  return "done"
+        \\end)
+        \\print(co(), flush())
+        \\print(co(), flush())
+        \\local m = setmetatable({}, { __index = function(_, k) return coroutine.yield(k) end })
+        \\local co2 = coroutine.wrap(function() return m.x .. m.y end)
+        \\print(co2(), co2(1), co2(2))
+        \\
+    , "in b\t\ndone\ta:nil\nx\ty\t12\n");
+}
+
+test "doc 68 P2: coroutine.close inside a __close or __index frame closes only what is still open" {
+    try expectProgram(closer_prelude ++
+        \\local co = coroutine.create(function()
+        \\  local a <close> = closer("a")
+        \\  local b <close> = setmetatable({}, { __close = function() coroutine.yield("in b") log[#log + 1] = "b resumed" end })
+        \\  local c <close> = closer("c")
+        \\end)
+        \\print(coroutine.resume(co))
+        \\print(flush(), coroutine.close(co), flush(), coroutine.status(co))
+        \\local co2 = coroutine.create(function()
+        \\  local a <close> = closer("a2")
+        \\  local m = setmetatable({}, { __index = function() return coroutine.yield("in idx") end })
+        \\  return m.x
+        \\end)
+        \\print(coroutine.resume(co2))
+        \\print(coroutine.close(co2), flush())
+        \\
+    , "true\tin b\nc:nil\ttrue\ta:nil\tdead\ntrue\tin idx\ntrue\ta2:nil\n");
+}
+
+test "doc 68 P2: an error mid block close reaches the rest, natively raised ones too" {
+    try expectProgram(closer_prelude ++
+        \\print(pcall(function()
+        \\  local a <close> = closer("a")
+        \\  do
+        \\    local b <close> = closer("b")
+        \\    local c <close> = setmetatable({}, { __close = function() error("from c", 0) end })
+        \\    local d <close> = closer("d")
+        \\  end
+        \\  log[#log + 1] = "not reached"
+        \\end))
+        \\print(flush())
+        \\print(pcall(function()
+        \\  local a <close> = closer("a")
+        \\  local b <close> = setmetatable({}, { __close = error })
+        \\end) == false, type(log[1]), #log)
+        \\
+    , "false\tfrom c\nd:nil b:from c a:from c\ntrue\tstring\t1\n");
+}
+
+test "doc 68 P2: __len gets the operand twice, as 5.4's luaV_objlen passes it" {
+    try expectProgram(
+        \\local t = setmetatable({}, { __len = function(a, b) return rawequal(a, b) and 7 or -1 end })
+        \\print(#t)
+        \\
+    , "7\n");
+}
+
+test "doc 68 P2: metamethod frames in hot loops agree in every tier and under GC stress" {
+    try expectProgram(
+        \\local total = 0
+        \\local mt = {}
+        \\mt.__index = function(t, k) return "v" .. k end
+        \\mt.__add = function(a, b) return setmetatable({n = a.n + b.n, s = a.s .. b.s}, mt) end
+        \\mt.__close = function(o) rawset(o, "closed", (rawget(o, "closed") or 0) + 1); total = total + o.closed end
+        \\local acc = setmetatable({n = 0, s = ""}, mt)
+        \\for i = 1, 300 do
+        \\  local one = setmetatable({n = 1, s = tostring(i % 7)}, mt)
+        \\  do
+        \\    local c <close> = one
+        \\    acc = acc + one
+        \\    total = total + #one["k" .. i]
+        \\  end
+        \\  if #acc.s > 40 then acc = setmetatable({n = acc.n, s = string.sub(acc.s, -8)}, mt) end
+        \\end
+        \\print(acc.n, acc.s, total, acc.missing)
+        \\
+    , "300\t601234560123456012345601234560123456\t1692\tvmissing\n");
+}
+
 test "doc 76: a frozen table refuses every store, raw and library ones too, and reads as before" {
     // `refused` prints the line a refusal was raised at, or what else happened.
     try expectProgram(

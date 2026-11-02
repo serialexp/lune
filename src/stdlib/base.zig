@@ -44,9 +44,8 @@ const Value = value.Value;
 const Table = table_mod.Table;
 const Vm = interp.Vm;
 
-/// Name of the hidden numeric iterator `ipairs` hands back. Not a valid mahina
-/// identifier, so user code can never name it, yet it installs as a normal global
-/// native (GC root + keyframe-restorable by name).
+/// Name of the hidden numeric iterator `ipairs` hands back: its serialized
+/// identity only. It is no global; the VM holds it (`Vm.libNative`).
 const ipairs_iter_name = "@ipairs_iter";
 
 // ---------------------------------------------------------------------------
@@ -81,11 +80,6 @@ fn iterableArg(vm: *Vm, args: []const Value, i: usize) anyerror!Value {
     const t = Table.fromHeader(v.asHeap());
     if (t.array.isGrid()) try vm.heap.deflateGrid(t);
     return v;
-}
-
-/// Fetch the native installed under `name` as a callable `Value` (from globals).
-fn globalNative(vm: *Vm, name: []const u8) anyerror!Value {
-    return vm.globals.get(try vm.heap.internValue(name));
 }
 
 // ---------------------------------------------------------------------------
@@ -277,13 +271,13 @@ fn nInextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 fn nPairs1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     _ = try iterableArg(vm, args, 0); // type-check (table or row_view)
-    return globalNative(vm, "next");
+    return vm.libNative(.next);
 }
 
 fn nPairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     const state = try iterableArg(vm, args, 0); // the row_view / table loop state
-    const triple = [3]Value{ try globalNative(vm, "next"), state, Value.nil() };
+    const triple = [3]Value{ vm.libNative(.next), state, Value.nil() };
     const w = @min(@as(usize, 3), out.len);
     var i: usize = 0;
     while (i < w) : (i += 1) out[i] = triple[i];
@@ -294,13 +288,13 @@ fn nPairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 fn nIpairs1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     _ = try iterableArg(vm, args, 0);
-    return globalNative(vm, ipairs_iter_name);
+    return vm.libNative(.ipairs_iter);
 }
 
 fn nIpairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
     const state = try iterableArg(vm, args, 0);
-    const triple = [3]Value{ try globalNative(vm, ipairs_iter_name), state, Value.int(0) };
+    const triple = [3]Value{ vm.libNative(.ipairs_iter), state, Value.int(0) };
     const w = @min(@as(usize, 3), out.len);
     var i: usize = 0;
     while (i < w) : (i += 1) out[i] = triple[i];
@@ -313,10 +307,10 @@ fn nIpairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 
 /// The basic-library iterator natives, concatenated into `interp.base_natives`.
 pub const natives = [_]function.BaseNative{
-    .{ .name = "next", .func = &nNext1, .multi = &nNextN },
+    .{ .name = "next", .func = &nNext1, .multi = &nNextN, .slot = .next },
     .{ .name = "pairs", .func = &nPairs1, .multi = &nPairsN },
     .{ .name = "ipairs", .func = &nIpairs1, .multi = &nIpairsN },
-    .{ .name = ipairs_iter_name, .func = &nInext1, .multi = &nInextN, .itern = .inext },
+    .{ .name = ipairs_iter_name, .func = &nInext1, .multi = &nInextN, .itern = .inext, .manual = true, .slot = .ipairs_iter },
 };
 
 test "next keeps its sorted view across traversals, and a collection mid-walk drops it" {

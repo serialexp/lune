@@ -287,14 +287,61 @@ const nested_reentry_programs = [_][:0]const u8{
     // gsub with a function replacement.
     \\print((string.gsub("a1b22c333", "%d+", function(d) return "<" .. #d .. ">" end)))
     ,
-    // __index function and __add metamethod.
-    \\local mt = {}
-    \\mt.__index = function(t, k) return k .. "!" end
-    \\mt.__add = function(a, b) return 42 end
-    \\local o = setmetatable({}, mt)
-    \\print(o.hello, o + 1)
+    // A native metamethod's own callback: `tostring` as `__index` calls
+    // `__tostring`.
+    \\local o = setmetatable({}, {__tostring = function() return "T" end})
+    \\local w = setmetatable({}, {__index = function(t, k) return tostring(o) .. k end})
+    \\print(w.k)
     ,
 };
+
+test "doc 68 P2: every step inside a Lua metamethod is stoppable, and stops there" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    // No multret consumer: a step where a result span is pending is not
+    // stoppable either, whatever runs it.
+    const source: [:0]const u8 =
+        \\local V = {}
+        \\V.__index = function(t, k) local d = k * 2 return d end
+        \\V.__newindex = function(t, k, v) rawset(t, "last", v) end
+        \\V.__add = function(a, b) return a.x + b.x end
+        \\V.__lt = function(a, b) return a.x < b.x end
+        \\local p, q = setmetatable({ x = 1 }, V), setmetatable({ x = 2 }, V)
+        \\local s = p[5] + (p + q)
+        \\p[3] = 9
+        \\if p < q then s = s + p.last end
+        \\local g = setmetatable({}, {__index = function(t, k)
+        \\  local inner = setmetatable({}, {__index = function(t2, k2) return k * 10 + k2 end})
+        \\  return inner
+        \\end})
+        \\s = s + g[1][2]
+        \\do
+        \\  local a <close> = setmetatable({}, {__close = function(o, e) s = s + 1 end})
+        \\end
+        \\print(s)
+    ;
+    const index = try recordSafepointIndex(gpa, source);
+    defer gpa.free(index);
+    for (index) |sp| try testing.expect(sp.stoppable);
+    var k: u64 = 1;
+    while (k <= index.len) : (k += 1) {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var sink_buf: [1024]u8 = undefined;
+        var sink = io.Writer.fixed(&sink_buf);
+        vm.out = &sink;
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        vm.setSuspendCtl(.{ .after_safepoints = k });
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect((try vm.start(chunk.proto)) == .suspended);
+        try testing.expectEqual(k, vm.safepoint_seq);
+    }
+}
 
 /// The program's safepoint index (owned), recorded by a run to completion.
 fn recordSafepointIndex(gpa: std.mem.Allocator, source: [:0]const u8) ![]Vm.SafepointLine {

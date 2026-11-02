@@ -1157,14 +1157,16 @@ pub const TbcVar = struct {
 
     /// Whether this variable is still to be closed when its frame is at
     /// instruction `pc` of `code`: in scope, and not one the instruction at
-    /// `pc` is closing or has closed (an error raised there comes from those
-    /// closes, which have run every one of them).
-    pub fn isLiveAt(self: TbcVar, code: []const Instr, pc: usize) bool {
+    /// `pc` is closing or has closed. `cursor` is set while the frame waits
+    /// at that `close`/`ret_close` for a `__close` running above it: the
+    /// variables from that register up are closed or closing. Unset, an
+    /// error raised there comes from closes that have run every one of them.
+    pub fn isLiveAt(self: TbcVar, code: []const Instr, pc: usize, cursor: ?u16) bool {
         if (!self.openAt(pc)) return false;
         const ins = code[pc];
         return switch (ins.op) {
-            .close => self.reg < ins.a,
-            .ret_close => false,
+            .close => self.reg < (cursor orelse ins.a),
+            .ret_close => if (cursor) |c| self.reg < c else false,
             else => true,
         };
     }

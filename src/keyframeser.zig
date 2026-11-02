@@ -141,7 +141,14 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v19 (doc 76 §5): `HeapTable.flags` bit 2, `readonly`: a table
 /// `table.freeze` froze, so a restored session refuses the same stores. The
 /// field is unchanged; an older reader would drop the bit.
-pub const snapshot_format_version: u32 = 19;
+///
+/// v20 (doc 68 P2): `FrameRef.ctl` may carry `cont = .finish_op` and its
+/// `phase`: a metamethod's frame, whose return finishes the instruction its
+/// caller is at (in flight there, re-derived on restore). Its `ret_dest`
+/// and `ret_count` are the continuation's payload (a `close`'s cursor and
+/// `return f()` span), not return wiring. The field is unchanged; an older
+/// reader would refuse the bits.
+pub const snapshot_format_version: u32 = 20;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -489,12 +496,15 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     // native activation, whether called from bytecode or re-entered through
     // `callValue`. Its frame is mid-instruction (in flight, §4.2) and Zig code
     // above it holds state no keyframe can carry, so its frames cannot be
-    // resumed. That also keeps `in_flight` out of the format: restore starts
-    // every frame out of flight. A real error, not an assert: release builds
-    // refuse it.
+    // resumed. The one frame in flight a keyframe can carry is the parent of
+    // a metamethod's `.finish_op` frame (doc 68 P2), whose instruction the
+    // frame's return finishes from the canonical code. That keeps `in_flight`
+    // out of the format: restore re-derives it from the frame above. A real
+    // error, not an assert: release builds refuse it.
     if (vm.native_reentry_depth != 0) return error.CaptureInsideNativeActivation;
-    for (vm.frames[0..vm.depth]) |*fr| {
-        if (fr.in_flight) return error.CaptureInsideNativeActivation;
+    for (vm.frames[0..vm.depth], 0..) |*fr, i| {
+        if (fr.in_flight and !(i + 1 < vm.depth and vm.frames[i + 1].ctl.cont == .finish_op))
+            return error.CaptureInsideNativeActivation;
     }
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -610,6 +620,8 @@ pub const RestoreError = error{
     RecompileAllocated, // recompiling the program or a loaded chunk allocated a heap object — a snapshot carries every program and loaded-proto literal (doc 19), so a moved counter means a forked allocation timeline (corrupt snapshot, or not this program's)
     UnknownNative, // a HeapNative.name is not in the native registry
     InvalidNative, // a HeapNative's bound values are not the ones its registry row binds
+    DuplicateLibNative, // two HeapNatives fill one `Vm.lib_natives` slot
+    MissingLibNative, // a real run's snapshot (metatable support built) lacks a `Vm.lib_natives` native
     GlobalsNotATable, // globals_id resolves to a non-table object
     MetatableNotATable, // a HeapTable.metatable_id resolves to a non-table object
     ArrayResidentKeyInHash, // a hash entry's normalized integer key is array-covered (`inArray(k, asize)`, incl. float-spelled) — it would be shadowed by the array slot (corrupt/hand-forged snapshot)
@@ -905,15 +917,36 @@ fn restoreContext(vm: *Vm, ctx: schema.ThreadContext, idmap: *const IdMap, owner
         const fh = idmap.get(fr.closure_id) orelse return error.UnresolvedHeapRef;
         if (fh.type != .function) return error.FrameNotAClosure;
         const cl = function.Closure.fromHeader(fh);
-        // Doc 68 §5: only a protected call's tag may be set, and the bottom
-        // frame has no caller to protect.
-        // Checked on the raw bits: an out-of-range tag is no `Protect` value.
+        // Doc 68 §5: a protected call's tag, or (P2) a metamethod's
+        // `.finish_op` continuation with its phase; never both, and neither
+        // on the bottom frame, which has no caller. The caller of a
+        // continuation must be at an instruction `finishOp` completes.
+        // Checked on the raw bits: an out-of-range tag is no enum value.
         const protect_off = @bitOffsetOf(interp.FrameCtl, "protect");
+        const cont_off = @bitOffsetOf(interp.FrameCtl, "cont");
+        const phase_off = @bitOffsetOf(interp.FrameCtl, "phase");
         const protect_bits = (fr.ctl >> protect_off) & 0b11;
-        if (fr.ctl & ~(@as(u8, 0b11) << protect_off) != 0 or
+        const cont_bits = (fr.ctl >> cont_off) & 0b11;
+        const phase_bit = (fr.ctl >> phase_off) & 0b1;
+        const known = (@as(u8, 0b11) << protect_off) | (@as(u8, 0b11) << cont_off) | (@as(u8, 0b1) << phase_off);
+        const finish = cont_bits == @intFromEnum(interp.Cont.finish_op);
+        if (fr.ctl & ~known != 0 or
             protect_bits > @intFromEnum(interp.Protect.xpcall) or
-            (i == 0 and protect_bits != 0)) return error.InvalidFrameCtl;
-        const ctl: interp.FrameCtl = .{ .protect = @enumFromInt(protect_bits) };
+            (cont_bits != 0 and !finish) or
+            (phase_bit != 0 and !finish) or
+            (finish and protect_bits != 0) or
+            (i == 0 and fr.ctl != 0)) return error.InvalidFrameCtl;
+        if (finish) {
+            const caller = ctx.frames[i - 1];
+            const caller_cl = function.Closure.fromHeader(idmap.get(caller.closure_id).?);
+            if (caller.pc >= caller_cl.proto.code.len or !interp.Vm.finishesOp(caller_cl.proto.code[caller.pc].op))
+                return error.InvalidFrameCtl;
+        }
+        const ctl: interp.FrameCtl = .{
+            .protect = @enumFromInt(protect_bits),
+            .cont = @enumFromInt(cont_bits),
+            .phase = @intCast(phase_bit),
+        };
         // Frame windows are ordered, non-overlapping and in bounds, starting
         // at 0. Usually they are contiguous, but a callee whose dynamic
         // argument span ran past its caller's window sits above that span
@@ -950,6 +983,7 @@ fn restoreContext(vm: *Vm, ctx: schema.ThreadContext, idmap: *const IdMap, owner
         ) catch return error.TooManyFrames;
         vm.frames[i].pc = fr.pc;
         vm.frames[i].ctl = ctl;
+        if (ctl.cont == .finish_op) vm.frames[i - 1].in_flight = true;
         expected_base = @as(usize, fr.base) + cl.proto.num_registers;
     }
     // `pushFrameVararg` raises this to each physical window end. The serialized
@@ -1161,6 +1195,9 @@ pub fn restoreSnapshot(
                 // As many bound values as the row binds (doc 73), filled in
                 // pass 2.
                 if (hn.bound.len != entry.bound) return error.InvalidNative;
+                // The library's own natives (`function.LibNative`): one
+                // object per slot, the one the live VM held.
+                if (entry.slot) |s| if (vm.lib_natives[@intFromEnum(s)] != null) return error.DuplicateLibNative;
                 const template: function.Native = .{
                     .header = GcHeader.init(.native),
                     .func = entry.func,
@@ -1176,6 +1213,7 @@ pub fn restoreSnapshot(
                 // registry is comptime-proven in `interp.zig`; this guards a
                 // caller-supplied `NativeRegistry` on the restore path.
                 std.debug.assert(!(n.recorded != null and n.effect != null));
+                if (entry.slot) |s| vm.lib_natives[@intFromEnum(s)] = n;
                 vm.heap.linkRestored(&n.header, o.id);
                 break :blk &n.header;
             },
@@ -1417,6 +1455,15 @@ pub fn restoreSnapshot(
         const mh = idmap.get(kf.file_metatable_id - 1) orelse return error.UnresolvedHeapRef;
         if (mh.type != .table) return error.MetatableNotATable;
         vm.file_metatable = table.Table.fromHeader(mh);
+        // Its `__index` is the methods table (`Vm.initIoStreams`).
+        const methods = vm.file_metatable.?.get(vm.mm.index);
+        if (!(methods.isHeap() and methods.heapType() == .table)) return error.MetatableNotATable;
+        vm.file_methods = table.Table.fromHeader(methods.asHeap());
+    }
+    // A real run's VM (metatable support built) has every library native;
+    // a snapshot without one could not run its `pairs`.
+    if (kf.string_metatable_id != 0) {
+        for (vm.lib_natives) |n| if (n == null) return error.MissingLibNative;
     }
     vm.io_input = try fileRoot(&idmap, kf.io_input_id);
     vm.io_output = try fileRoot(&idmap, kf.io_output_id);
