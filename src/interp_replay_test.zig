@@ -573,7 +573,7 @@ test "doc 68 defer: the safepoint index stops growing at its limit" {
     const diag = @import("diag.zig");
     const source: [:0]const u8 =
         \\local t = {3, 1, 2}
-        \\table.sort(t, function(a, b) local s = 0 for i = 1, 100 do s = s + i end return a < b end)
+        \\pcall(table.sort, t, function(a, b) local s = 0 for i = 1, 100 do s = s + i end return a < b end)
         \\print("done")
     ;
     var diags = diag.Diagnostics.init(gpa);
@@ -587,13 +587,44 @@ test "doc 68 defer: the safepoint index stops growing at its limit" {
     vm.out = &sink;
     vm.setRecordSafepointLines(true);
     // The replay driver's cap: due inside the sort comparator (main's own
-    // steps up to the `sort` call are fewer than 30), so deferred past it.
+    // steps up to the `sort` call are fewer than 30), which `pcall` of the
+    // native runs from Zig, so deferred past it.
     vm.setSuspendCtl(.{ .after_safepoints = 30, .index_limit = 30 });
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect((try vm.start(chunk.proto)) == .suspended);
     try testing.expect(vm.safepoint_seq > 200);
     try testing.expectEqual(@as(usize, 30), vm.safepoint_lines.items.len);
+}
+
+test "doc 68 §5.1: a table.sort comparator is stoppable, its activation is not" {
+    const gpa = testing.allocator;
+    const native_act = @import("native_act.zig");
+    const source: [:0]const u8 =
+        \\local t = {3, 1, 2}
+        \\table.sort(t, function(a, b)
+        \\  local x = a
+        \\  return x < b
+        \\end)
+        \\print(t[1], t[2], t[3])
+    ;
+    const index = try recordSafepointIndex(gpa, source);
+    defer gpa.free(index);
+    // The activation is the native running: no step stops in it. Every step
+    // in the comparator (lines 3-4) does.
+    var in_act: usize = 0;
+    var in_cmp: usize = 0;
+    for (index) |sp| {
+        if (native_act.kindOfId(sp.proto_id) != null) {
+            try testing.expect(!sp.stoppable);
+            in_act += 1;
+        } else if (sp.line == 3 or sp.line == 4) {
+            try testing.expect(sp.stoppable);
+            in_cmp += 1;
+        }
+    }
+    try testing.expect(in_act > 0);
+    try testing.expect(in_cmp > 0);
 }
 
 test "doc 68 §5: a pcall body is stoppable, in a frame of its own tagged protected" {

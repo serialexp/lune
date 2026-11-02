@@ -395,6 +395,13 @@ pub const OpCode = enum(u8) {
     ///             `async function` and `await` compile to, so no program
     ///             name can rebind them.
     intrinsic,
+
+    // ---- resumable natives (doc 68 §5.1) ----
+    /// `_, b`      step the resumable native `b` (`native_act.Kind`) of the
+    ///             activation running this. Only the activations' hand-built
+    ///             protos hold it (`native_act.zig`); the compiler never
+    ///             emits it. Goes on to the activation's `call` or its `ret`.
+    native_act,
 };
 
 /// The most values one `set_list` stores from fixed registers (a longer
@@ -1334,6 +1341,7 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .vararg_get,
         .intrinsic,
         => try w.print(" r{d}  {d}", .{ instr.a, instr.b }),
+        .native_act => try w.print(" {s}", .{@tagName(@as(@import("native_act.zig").Kind, @enumFromInt(instr.b)))}),
         .eq_p, .ne_p => try w.print(" r{d}  {d}  {s}", .{ instr.a, instr.b, @tagName(@as(Prim, @enumFromInt(instr.c))) }),
         // Doc 66 P1: the control base and the wanted result count.
         .itern => try w.print(" r{d}  {d}", .{ instr.a, instr.c }),

@@ -135,6 +135,10 @@ division or modulo by zero".
 - `table.sort` is a heapsort: equal elements may end up in a different
   order than Lua's, and a comparator that is not a valid order does not
   raise "invalid order function".
+- A `table.sort` comparator, and a `__lt` the sort calls, can yield; Lua
+  raises "attempt to yield across a C-call boundary". The comparator may
+  also be a callable table, which Lua refuses. A sort the program calls
+  through a builtin (`pcall(table.sort, t, f)`) still cannot yield.
 
 ## Calls
 

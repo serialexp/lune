@@ -178,6 +178,83 @@ test "stdlib: table.sort's default comparator takes __lt, the left operand's fir
     );
 }
 
+test "stdlib: table.sort calls its comparator from its activation (doc 68 §5.1)" {
+    // In two halves, for the output buffer. A comparator, `__lt`, a sort
+    // inside a comparator, a callable table, and nothing returned.
+    try expectProgram(
+        \\local t = {5, 2, 8, 1, 9, 3, 7}
+        \\table.sort(t, function(a, b) return a > b end)
+        \\print(table.concat(t, " "))
+        \\local V = {__lt = function(a, b) return a.k < b.k end}
+        \\local u = {}
+        \\for i = 1, 6 do u[i] = setmetatable({ k = (i * 5) % 7 }, V) end
+        \\table.sort(u)
+        \\local ks = {}
+        \\for i = 1, #u do ks[i] = u[i].k end
+        \\print(table.concat(ks, " "))
+        \\local mixed = {3, 1.5, 2, -1}
+        \\table.sort(mixed)
+        \\print(table.concat(mixed, " "))
+        \\local calls = 0
+        \\local w = {4, 3, 2, 1}
+        \\table.sort(w, function(a, b)
+        \\  calls = calls + 1
+        \\  local inner = {b, a}
+        \\  table.sort(inner, function(x, y) return x < y end)
+        \\  return inner[1] == a and a ~= b
+        \\end)
+        \\print(table.concat(w, " "), calls)
+        \\local cmp = setmetatable({}, {__call = function(self, x, y) return x < y end})
+        \\local g = {3, 1, 2}
+        \\table.sort(g, cmp)
+        \\print(table.concat(g, " "))
+        \\print(select("#", table.sort({2, 1}, function(a, b) return a < b end)))
+        \\print(pcall(table.sort, {3, 1, 2}, function(a, b) return a < b end))
+        \\
+    ,
+        "9 8 7 5 3 2 1\n1 2 3 4 5 6\n-1 1.5 2 3\n1 2 3 4\t6\n1 2 3\n0\ntrue\n",
+    );
+}
+
+test "stdlib: table.sort's errors are located as a C function's (doc 68 §5.1)" {
+    // `sort` is a level of its own with no location, as in Lua: `error(m,
+    // 2)` in the comparator is unlocated. A frozen table is located at the
+    // `sort` call; a native comparator's bad argument names it, unlocated;
+    // a comparator that is not callable is `sort`'s bad argument.
+    try expectProgram(
+        \\local e = {3, 1, 2}
+        \\print(pcall(function() table.sort(e, function(a, b) error("cmp", 2) end) end))
+        \\print(pcall(function() table.sort(e, function(a, b) error("cmp", 3) end) end))
+        \\local f = {5, 4, 3, 2, 1}
+        \\print(pcall(function()
+        \\  table.sort(f, function(a, b) if not table.isfrozen(f) then table.freeze(f) end return a < b end)
+        \\end))
+        \\print(table.concat(f, " "))
+        \\print(pcall(function() table.sort({3, 2, 1}, string.rep) end))
+        \\print(pcall(function() table.sort({3, 2, 1}, 7) end))
+        \\
+    ,
+        "false\tcmp\nfalse\tmain:3: cmp\nfalse\tmain:6: attempt to modify a readonly table\n5 4 3 2 1\n" ++
+            "false\tbad argument #1 to 'string.rep' (string expected, got number)\n" ++
+            "false\tmain:10: bad argument #2 to 'sort' (function expected, got number)\n",
+    );
+}
+
+test "stdlib: a traceback through table.sort shows it as a C function" {
+    // The handler's frame, the comparator's, `sort`'s, the protected one's.
+    try expectProgram(
+        \\local tb
+        \\xpcall(function()
+        \\  table.sort({2, 1}, function(a, b) error("z") end)
+        \\end, function(m) tb = debug.traceback(m) end)
+        \\print(tb)
+        \\
+    ,
+        "main:3: z\nstack traceback:\n\tmain:4: in function 'anonymous'\n\tmain:3: in function 'anonymous'\n" ++
+            "\t[C]: in function 'table.sort'\n\tmain:3: in function 'anonymous'\n\tmain:4: in main chunk\n",
+    );
+}
+
 test "stdlib: table.sort without a comparator or __lt raises Lua's compare error" {
     // Unlocated, as Lua's: the comparison fails inside `sort`, a C function there.
     try expectProgram(

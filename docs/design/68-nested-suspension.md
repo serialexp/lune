@@ -116,6 +116,12 @@ land; move whole phases to Done once everything inside them is checked.
     up one slot and the handler takes `R[A]` (§6.1).
 - [ ] **P3 — the other natives.** `dofile`, `require`, `tostring`, `print`,
   `table.sort`, `gsub`, one per commit (§7.2–§7.5).
+  - [x] **`table.sort`** (2026-11-02). A comparison that needs a Lua call
+    (a comparator, or `__lt`) moves the sort into an activation frame of a
+    synthetic system proto, which calls the comparator as an ordinary
+    frame. Comparators yield, keyframes cut inside them, and the activation
+    is never a stop (§7.2.1). Comparisons that need no call stay in Zig.
+    `pcall(table.sort, …)` still sorts through `callValue`.
 - [ ] **P4 — gates.** Per site: replay-index and `mahina_replay` stops inside
   it (wasm), capture → restore → recapture identity with the replay
   envelope (§9), GC stress, 8-mode equivalence, the benchmark in §10. The
@@ -516,6 +522,41 @@ comparator. Each comparison asks the driver to call the comparator with
 `t[a], t[b]`, wanting one result. No allocation per comparison. The
 no-comparator path stays a single native call with no step machinery.
 
+#### 7.2.1 As built (2026-11-02)
+
+The descriptor of §5.1 became a proto. `native_act.zig` builds one static
+system proto per resumable native, `native_act k; call; native_act k; ret`,
+with a reserved id below the coroutine body's (keyframes resolve it like a
+compiled proto). Code images stay per VM, and protos are shared. The new
+`native_act` opcode runs the native's Zig step against the frame's registers.
+The step either lays out a call in the call area and makes it, or returns.
+
+- **Escalating.** `tSort` runs the heapsort in Zig, comparing raw values
+  inline. At the first comparison that needs a Lua call it stores its state
+  in `Vm.act_seed` and returns `error.ActivateNative`. Under a `.call`,
+  `opEntry` enters the activation in the native's call slot, with a fresh
+  closure each time (object ids stay a function of the program). Under
+  `callValue` (`pcall(table.sort, …)`, a host call), `activationSync`
+  finishes the same state machine with nested `callValue`s.
+- **State.** `SortState`'s eight integers (`n`, the heap bounds, `root`,
+  `child`, the phase and the step to resume) sit in R2..R9 between the
+  arguments and the call area. The step reloads them and stores them back
+  around each call. The read-only check runs at entry and after every call,
+  since a comparator can freeze the table mid-sort.
+- **The call.** `opNativeAct` makes the call itself, through
+  `callTail(.native_act)`, instead of dispatching `code[1]`. Each `of`
+  keeps its own helper instances, which keeps `opCall`'s inlining as it
+  was (§12). A Lua comparator enters as `.native_call`. It is not counted
+  toward its head anchor, and returns into a system proto are not counted
+  toward a continuation anchor (`noteResume`). Neither has anything a
+  recording could take. A call made in `.full` hands off to `.fast`, as a
+  back-edge does: the activation's cycle has no back-edge to do it.
+- **Errors.** A running activation (on top, out of flight) is not a level
+  for `error(m, n)`, as a native is not. A fault in the activation is
+  located at the native's call. The traceback shows
+  `[C]: in function 'table.sort'`. A non-callable comparator raises
+  `bad argument #2 to 'sort'`. A callable table is accepted, as in Lua 5.4.
+
 ### 7.3 `require` and `dofile`
 
 `require`: the module name, the searcher index, the loader and its data, and
@@ -610,9 +651,9 @@ only from pure callbacks or replay-from-start.
   and `__eq` functions, `pcall` of a trivial function, `table.sort` with a
   comparator, `gsub` with a function. Metamethods and `pcall` should get
   faster (no nested `execWithEntry` setup); `table.sort` with a comparator
-  may cost up to 10% more. Zero allocations per comparison or per metamethod
-  call; native state copying, gsub output and `require` diagnostics linear
-  in their size. Numbers go in §12; no timing assertions in tests.
+  may cost up to 10% more (it came in at +15%, §12). Zero allocations per
+  comparison or per metamethod call; native state copying, gsub output and
+  `require` diagnostics linear in their size. Numbers go in §12; no timing assertions in tests.
 
 ## 11. Round-1 review (2026-10-22)
 
@@ -708,6 +749,39 @@ untraceable Lua call pays under `--trace`. A plain call with the same
 body shows it on the old binary too: 1971 M tier-0 against 2837 M
 (TODO.md, "An untraceable Lua call costs ~290 instructions more under
 `--trace`").
+
+**P3, `table.sort` activations** (2026-11-02, native ReleaseFast,
+user-mode instructions against df85c32 plus the tree's other uncommitted
+work; `bench/stdlib/sort_cmp.lua`, added with it, at N = 20000):
+
+| Program | Tier-0 | `--trace --jit-native` |
+|---|---|---|
+| `sort_cmp` (a comparator function, then `__lt`) | +14.9% | +16.2% |
+| `str_sort` (no comparator) | −1.8% | −1.8% |
+| `recursive-fib` | −1.0% | 0.0% |
+| `binary-trees` | −0.5% | +0.1% |
+| `meta_calls` | 0.0% | 0.0% |
+| `pcall_faults` | +0.2% | +0.4% |
+
+The comparator path is over §10's 10%. Each comparison now goes through a
+real call and return plus a step: about 210 instructions in `opNativeAct`
+(the call inlined), 180 in `sortStep` (state reload and store, the
+read-only check) and 120 in `opRet`. The old `callValue` was about 250
+(callgrind, N = 5000). The levers are in TODO.md. Raw sorts got faster
+because `SortState.run` is specialised on whether there is a comparator,
+and the read-only check left the swap.
+
+Three first cuts were worse and are why the design looks as it does:
+
+- Dispatching the activation's `.call` counted every comparison toward the
+  comparator's head anchor. That made it a head trace, entered from tier-0
+  1.5 M times at about 184 cycles each (JIT +93%).
+- Returns into the activation formed a continuation anchor that could only
+  abort, and the `.full` stint that armed it lasted the rest of the sort
+  (JIT +55%).
+- Sharing `callTail(.call)` with `opCall` made LLVM stop inlining
+  `opCallFast` into it, which cost 8 instructions per Lua call
+  (recursive-fib tier-0 +0.6%).
 
 ## 13. References
 

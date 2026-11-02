@@ -47,7 +47,29 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       `noteResume` 3%, `onCallEntryTraced` 1.4%. Since doc 68 P2 a Lua
       `__call` handler pays it as well (it used to run nested and skip
       the bookkeeping). Find why an anchor whose recordings abort keeps
-      its frames in `.full`.
+      its frames in `.full`. **Found (2026-11-02, doc 68 P3):** `.full`
+      hands back to `.fast` only at a back-edge (`backEdgeEpilogue`) or a
+      trace exit. Code with no loop of its own keeps whatever mode it was
+      entered in, so after a `.full` stint (an armed anchor, an aborted
+      recording) it stays `.full` until the next back-edge. `table.sort`'s
+      activation now hands off at its calls (`enterCallee`'s
+      `.native_call` arm). The general fix needs a handoff point on the
+      call or return path that costs `.fast` nothing.
+- [ ] **A `table.sort` comparison costs ~100 instructions more as a
+      frame** (doc 68 §12: `sort_cmp` +14.9% tier-0, +16.2% JIT, over
+      §10's 10%). Per comparison: ~210 in `opNativeAct` with the call
+      inlined, ~180 in `sortStep`, ~120 in `opRet`. The old `callValue`
+      was ~250. Levers: have `opRet` into an activation run its step
+      without dispatching `native_act` through a prologue (this helps
+      every resumable native, gsub and require too); store only the
+      state words a step changed, or pack them (eight `setInt`s and eight
+      loads per comparison now); hoist `sortTable`'s re-check.
+- [ ] **`pcall(table.sort, t, f)`: `error(m, 2)` in `f` is located at
+      the main chunk** (seen 2026-11-02). Lua 5.4 gives no location: level
+      2 is the sort, a C function. Under `pcall` the sort runs through
+      `callValue` (`activationSync`), whose nested calls don't count the
+      native as a level. A direct `table.sort` call is right. This is the
+      general `callValue` level count, not sort's.
 - [ ] **Metamethod frame entry and return cost** (doc 68 §12). Per Lua
       metamethod call, callgrind has ~100 instructions in `pushMetaFrame`
       (`bindAndPushClosure`, the host-epoch bump) and ~122 in
@@ -202,6 +224,11 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       line but costs scalar +6.4% and still leaves fib +1.5%. Needs a
       structural answer for the call handler: e.g. a quickened opcode for
       fast callees, or splitting the closure path from the native arm.
+      Seen again (2026-11-02, doc 68 P3): instantiating
+      `callTail(.call)` from a second handler (`opNativeAct`) made LLVM
+      outline `opCallFast`: fib +0.6%, about eight more instructions
+      (`mov`s and a `jmp`) per call on the closure path. `callTail(.native_act)` keeps the
+      instances apart.
 
 ## Lua 5.4 divergence audit: bugs (noted 2026-10-25)
 
@@ -809,6 +836,20 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
 - [x] **The `NativeResult` literal in `runWithLinkedLoopDone` lowered to a
       ~1 KB `memcpy` on every trace entry** (its arrays were `undefined`).
       Assigned field by field (2026-10-23, `nativegen_artifact.zig`).
+
+## A short loop in a function called from a loop runs 5x slower with the JIT (noted 2026-11-02)
+
+- [ ] **Heapsort written in mahina: 14.4 G instructions tier-0, 52.0 G
+      with `--trace --jit-native`** (5×10⁵ elements, `lsort`/`sift` as
+      the native `table.sort` does it; `/tmp/p3/sortcmp.lua lua 100000`).
+      `--jit-stats`: 22.6 M trace entries, native code 32% of cycles,
+      tier-0 10%, the rest the entry/exit seam. `sift`'s `while` loop is
+      its own trace, entered once per call and left after a few
+      iterations. The outer `for` in `lsort` can't take it in:
+      `too_long` (2035 IR) when recording through `sift`, `cross_frame`
+      at `sift`'s `ret`. LuaJIT inlines the call and its loop into the
+      outer trace, with side traces on the inner exits. Found while
+      choosing doc 68 P3's shape (the sort stays in Zig).
 
 ## A nested `while` goes silent late on a short run (noted 2026-10-23)
 

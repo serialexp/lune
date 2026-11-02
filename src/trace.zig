@@ -3797,6 +3797,10 @@ pub const TraceState = struct {
         // §5.9): as `onCallEntry`, one `fast_block` test for both.
         if ((self.fast_block & (FastBit.recording | FastBit.jit_suspended)) != 0) return;
         if (proto.is_vararg) return;
+        // A system proto (a resumable native's activation, doc 68 §5.1) has
+        // no instruction a recording could take: its continuation would
+        // abort on `native_act` and only cost every comparison a probe.
+        if (proto.system) return;
         if (resume_pc >= img.len) return; // resume at end-of-code (no instruction to anchor)
         // Patched steady state: one bounds-checked opcode compare (D9 S1).
         const resumed_op = img[resume_pc].op;

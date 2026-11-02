@@ -31,6 +31,8 @@ pub const mem = @import("mem.zig");
 pub const bytes = @import("bytes.zig");
 /// Coroutine stacks and execution contexts (doc 73).
 pub const coroutine = @import("coroutine.zig");
+/// Resumable natives' activations (doc 68 §5.1).
+pub const native_act = @import("native_act.zig");
 
 /// Diagnostic / CLI I/O — the single wrapper around the churny `std.Io` writer
 /// API and `Value` text rendering.
@@ -183,6 +185,7 @@ test {
     _ = aio_virtual;
     _ = @import("file.zig");
     _ = @import("coroutine.zig");
+    _ = native_act;
     _ = @import("stack_mem.zig");
     _ = datetime;
     _ = tzif;

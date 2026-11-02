@@ -39,6 +39,7 @@ const system = @import("system.zig");
 const filemod = @import("file.zig");
 const File = filemod.File;
 const coroutine = @import("coroutine.zig");
+const native_act = @import("native_act.zig");
 const stdaio = @import("stdlib/aio.zig");
 const Thread = coroutine.Thread;
 
@@ -741,6 +742,8 @@ fn resolveProto(root: *const Proto, vm: *Vm, id: u32) std.mem.Allocator.Error!?*
         error.OutOfMemory => error.OutOfMemory,
         else => unreachable, // compiling it raises nothing else
     };
+    // Doc 68 §5.1: a resumable native's activation.
+    if (native_act.kindOfId(id)) |kind| return native_act.protoOf(kind);
     if (findProto(root, id)) |p| return p;
     for (vm.loaded_chunks.items) |lc| if (findProto(lc.chunk.proto, id)) |p| return p;
     return null;

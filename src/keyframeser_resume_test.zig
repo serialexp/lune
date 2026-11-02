@@ -1211,6 +1211,22 @@ test "doc 68 P2: every cut through metamethod frames resumes after restore" {
     }
 }
 
+test "doc 68 §5.1: every cut through table.sort's activation resumes after restore" {
+    // The activation's state is its registers, integers; a cut in a
+    // comparator (or a coroutine yielding from one) carries the activation
+    // frame, which restore rebinds to its reserved proto id.
+    const gpa = testing.allocator;
+    const programs = @import("interp_testutil.zig");
+    const source = programs.resumable_natives_program;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    try testing.expectEqualStrings(programs.resumable_natives_output, ref.full_out);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}
+
 test "keyframe cut before a sweep: a re-interned unreachable string keeps its id across restore" {
     // TODO.md "Keyframe cut before a sweep loses an intern hit on restore".
     // `mk`'s string is unreachable once its frame returns and the print

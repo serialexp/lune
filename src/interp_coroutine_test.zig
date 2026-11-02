@@ -159,6 +159,8 @@ test "coroutine: close, status and the main thread" {
 }
 
 test "coroutine: yield only where it can" {
+    // A `table.sort` comparator runs in an ordinary frame (doc 68 §5.1), so
+    // it can yield, where Lua 5.4 refuses; a native `pcall` calls from Zig.
     try expectProgram(
         \\print(pcall(coroutine.yield, 1))
         \\local co = coroutine.create(function()
@@ -167,7 +169,9 @@ test "coroutine: yield only where it can" {
         \\print(coroutine.resume(co))
         \\local co2 = coroutine.create(function() return pcall(coroutine.yield, 1) end)
         \\print(coroutine.resume(co2))
-    , "false\tattempt to yield from outside a coroutine\nfalse\tattempt to yield across a C-call boundary\ntrue\tfalse\tattempt to yield across a C-call boundary\n");
+        \\local co3 = coroutine.create(function() return pcall(table.sort, {3, 2, 1}, function(a, b) coroutine.yield() return a < b end) end)
+        \\print(coroutine.resume(co3))
+    , "false\tattempt to yield from outside a coroutine\ntrue\ntrue\tfalse\tattempt to yield across a C-call boundary\ntrue\tfalse\tattempt to yield across a C-call boundary\n");
 }
 
 test "coroutine: a coroutine resumed inside a Zig callback yields to it" {

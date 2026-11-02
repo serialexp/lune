@@ -1,0 +1,169 @@
+//! Doc 68 §5.1: resumable natives. A native that has to call Lua code in
+//! the middle of its work (`table.sort`'s comparator, a `__lt` handler)
+//! makes those calls from an **activation**: a frame of a tiny hand-built
+//! system proto,
+//!
+//!     [0] native_act  k        step the native
+//!     [1] call        C, 2, 1  the call it asked for
+//!     [2] native_act  k        step again, with that call's result
+//!     [3] ret         0, 0     its work is done
+//!
+//! so the call is an ordinary Lua call of an ordinary frame: a coroutine
+//! can yield inside it, a keyframe captures it, a step debugger stops in
+//! it, and an error unwinds through it, none of which a Zig re-entry
+//! (`Vm.callValue`) can do. The native's state lives in the activation's
+//! registers, as integers, never in a Zig frame or the heap.
+//!
+//! A step (`Vm.opNativeAct`) runs the native's own Zig code against the
+//! frame's registers until it either needs a call (it writes the callee
+//! and two arguments at `callReg` and the step dispatches `[1]`) or is done
+//! (`[3]`). There is no back-edge, so nothing counts toward a trace.
+//!
+//! The native itself starts as any other: called inline, it does every
+//! step that needs no Lua call in Zig, and only at the first one that does
+//! it leaves its state in `Vm.act_seed` and signals `error.ActivateNative`,
+//! which the `.call` that called it turns into the activation
+//! (`Vm.opEntry`); the activation's first step takes the seed. Called from
+//! Zig (`callValue`), it finishes there instead, with Zig re-entries for its
+//! calls (`Vm.nativeUnparkedFailed`).
+
+const std = @import("std");
+const bytecode = @import("bytecode.zig");
+
+const Instr = bytecode.Instr;
+const Proto = bytecode.Proto;
+
+/// The resumable natives.
+pub const Kind = enum(u8) {
+    /// `table.sort` with a comparator, or over values compared by `__lt`.
+    sort,
+};
+
+/// An activation's register layout: the native's parameters (bound as a
+/// Lua function's are), then its state words, then the call area: the
+/// callee and its two arguments, with the call's one result landing on the
+/// callee's slot.
+const Layout = struct {
+    params: u8,
+    words: u8,
+    /// How a traceback names it: `module.name`, a `[C]` row.
+    module: []const u8,
+    name: []const u8,
+};
+
+fn layoutOf(kind: Kind) Layout {
+    return switch (kind) {
+        .sort => .{ .params = 2, .words = 8, .module = "table", .name = "sort" },
+    };
+}
+
+/// The most state words any resumable native keeps.
+pub const max_words = 8;
+
+/// The first state word's register.
+pub fn wordReg(kind: Kind) u16 {
+    return layoutOf(kind).params;
+}
+
+/// The call area's first register: the callee, then its arguments; the
+/// call's result lands here.
+pub fn callReg(kind: Kind) u16 {
+    const l = layoutOf(kind);
+    return @as(u16, l.params) + l.words;
+}
+
+/// The module and name a traceback shows the activation as (`table.sort`).
+pub fn moduleOf(kind: Kind) []const u8 {
+    return layoutOf(kind).module;
+}
+
+/// What a step asks the activation to do next.
+pub const Next = enum {
+    /// Make the call it laid out at `callReg`, then step again.
+    call,
+    /// Return, with no results.
+    done,
+};
+
+/// The pc of the activation's call and of its return.
+pub const call_pc: usize = 1;
+pub const ret_pc: usize = 3;
+
+/// A native's state when it signals `error.ActivateNative`, for the
+/// activation's first step (or the Zig fallback) to carry on from. Only
+/// integers: what the state refers to sits in the native's arguments,
+/// which become the activation's parameters.
+pub const Seed = struct {
+    kind: Kind,
+    words: [max_words]i64,
+};
+
+/// The reserved proto ids, which keyframes name the activations by:
+/// below the native-body chunk's two (`coroutine.native_body_proto_id`,
+/// the top id but one, and its chunk's root, one below it; `coroutine.zig`
+/// asserts they stay apart), one per kind, downwards. Spelled out rather
+/// than derived, so the trace-side modules that read opcodes don't reach
+/// the VM through this file.
+pub const first_id: u32 = std.math.maxInt(u32) - 3;
+const kind_count = @typeInfo(Kind).@"enum".field_names.len;
+
+pub fn idOf(kind: Kind) u32 {
+    return first_id - @intFromEnum(kind);
+}
+
+/// The kind whose activation `p` is, or null for any other proto.
+pub fn kindOf(p: *const Proto) ?Kind {
+    return kindOfId(p.id);
+}
+
+pub fn kindOfId(id: u32) ?Kind {
+    if (id > first_id or id <= first_id - kind_count) return null;
+    return @enumFromInt(first_id - id);
+}
+
+/// The activation proto of `kind`. One per process, shared by every VM:
+/// nothing in it is mutable (no globals, so no slot hints), and a VM keeps
+/// its own per-proto state (code images, anchors) keyed by it.
+pub fn protoOf(kind: Kind) *const Proto {
+    return &protos[@intFromEnum(kind)];
+}
+
+const protos: [kind_count]Proto = blk: {
+    var ps: [kind_count]Proto = undefined;
+    for (&ps, 0..) |*p, i| p.* = build(@enumFromInt(i));
+    break :blk ps;
+};
+
+fn build(comptime kind: Kind) Proto {
+    const l = layoutOf(kind);
+    const k: u16 = @intFromEnum(kind);
+    const c = callReg(kind);
+    const code = [_]Instr{
+        Instr.opAB(.native_act, 0, k),
+        Instr.opABC(.call, c, 2, 1),
+        Instr.opAB(.native_act, 0, k),
+        Instr.opAB(.ret, 0, 0),
+    };
+    std.debug.assert(code[call_pc].op == .call and code[ret_pc].op == .ret);
+    const frozen = code;
+    return .{
+        .code = &frozen,
+        .num_registers = c + 3,
+        .num_params = l.params,
+        .name = l.name,
+        .chunk = "[C]",
+        // To Lua the frame is the native running: no step stops in it, and
+        // a traceback shows it as the native (`Vm.contextFrames`).
+        .system = true,
+        .id = idOf(kind),
+    };
+}
+
+test "activation ids are reserved and round-trip" {
+    try std.testing.expectEqual(@as(?Kind, .sort), kindOfId(idOf(.sort)));
+    try std.testing.expectEqual(@as(?Kind, null), kindOfId(first_id + 1));
+    try std.testing.expectEqual(@as(?Kind, null), kindOfId(first_id - kind_count));
+    try std.testing.expectEqual(@as(?Kind, null), kindOfId(0));
+    try std.testing.expectEqual(idOf(.sort), protoOf(.sort).id);
+    try std.testing.expect(protoOf(.sort).code[0].op == .native_act);
+}

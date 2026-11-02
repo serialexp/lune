@@ -45,6 +45,7 @@ const bc_names = @import("bc_names.zig");
 const ast = @import("ast.zig");
 const stdmath = @import("stdlib/math.zig");
 const stdtable = @import("stdlib/table.zig");
+const native_act = @import("native_act.zig");
 const stdbase = @import("stdlib/base.zig");
 const stdbasic = @import("stdlib/basic.zig");
 const stdstring = @import("stdlib/string.zig");
@@ -547,15 +548,17 @@ pub fn protectSignal(e: anyerror) ?Protect {
 }
 
 /// What a native that checked its arguments asks the `.call` it was called
-/// by to do in its place (`Vm.opEntry`): a protected call (doc 68 §5), or a
+/// by to do in its place (`Vm.opEntry`): a protected call (doc 68 §5), a
 /// coroutine switch (doc 73): `resume`, `yield`, or the call of a
-/// `coroutine.wrap` function, a resume of its bound coroutine.
+/// `coroutine.wrap` function, a resume of its bound coroutine; or the
+/// activation of a resumable native that needs a Lua call (doc 68 §5.1).
 const EntryKind = enum(u8) {
     pcall,
     xpcall,
     co_resume,
     co_yield,
     co_wrap,
+    native_act,
 };
 
 fn entrySignal(e: anyerror) ?EntryKind {
@@ -564,6 +567,7 @@ fn entrySignal(e: anyerror) ?EntryKind {
     if (e == error.ActivateResume) return .co_resume;
     if (e == error.ActivateYield) return .co_yield;
     if (e == error.ActivateWrap) return .co_wrap;
+    if (e == error.ActivateNative) return .native_act;
     return null;
 }
 
@@ -995,6 +999,13 @@ pub const Vm = struct {
     /// static text, no heap reference, so it is no GC root and is never
     /// cleared or serialized.
     fused_fault: ?FusedFault = null,
+    /// Doc 68 §5.1: the state a resumable native left when it signalled
+    /// `error.ActivateNative`, for its activation's first step (or the Zig
+    /// fallback, `nativeUnparkedFailed`) to take. Set and taken within one
+    /// call, never across a stop (an activation's first pc is a system
+    /// proto's, which no suspend stops at), so it is never serialized.
+    /// Integers only, so no GC root.
+    act_seed: ?native_act.Seed = null,
     /// Open upvalues, keyed by absolute stack index and kept in ascending
     /// slot order, one cell per slot. Searched from the end on capture (to
     /// share a cell), and popped from the end on scope/frame exit (to close
@@ -2507,10 +2518,11 @@ pub const Vm = struct {
     /// the location prefix in that case), or an empty stack.
     pub fn callSiteAt(self: *Vm, level: usize) ?CallSite {
         if (self.depth == 0 or level == 0) return null;
-        // Lua counts C functions as levels, with no location. Three live here:
+        // Lua counts C functions as levels, with no location. Four live here:
         // the native that called the running native (`callValue`), the
-        // `pcall`/`xpcall` beneath each protected frame (doc 68 §5), and a
-        // native-body coroutine's frame (doc 73).
+        // `pcall`/`xpcall` beneath each protected frame (doc 68 §5), a
+        // native-body coroutine's frame (doc 73), and a resumable native's
+        // activation (doc 68 §5.1).
         var lvl = level;
         if (self.unparkedNative() != null) {
             if (lvl == 1) return null;
@@ -2522,6 +2534,16 @@ pub const Vm = struct {
             // Doc 73: a native-body coroutine's frame is that native, the
             // coroutine's bottom: it and every level below it are unlocated.
             if (self.isNativeBodyFrame(idx)) return null;
+            if (native_act.kindOf(self.frames[idx].closure.proto) != null) {
+                // On top and out of flight, a step of it is running: it
+                // is the running native, which is no level, as a native
+                // an instruction calls is none. Otherwise it called the
+                // running code, from C.
+                if (idx == self.depth - 1 and !self.frames[idx].in_flight) continue;
+                if (lvl == 1) return null;
+                lvl -= 1;
+                continue;
+            }
             if (lvl == 1) return self.siteOf(idx);
             lvl -= 1;
             if (self.frames[idx].ctl.protect != .none) {
@@ -2688,11 +2710,13 @@ pub const Vm = struct {
         }
     };
     fn nativeSite(self: *Vm) ?NativeSite {
-        // A native called by a native, or the body of a native-body
-        // coroutine: named by its qualified name, with no location (Lua's
-        // `bad argument #1 to 'string.rep'` under `pcall(string.rep)`).
+        // A native called by a native: by `callValue`, by a native-body
+        // coroutine's frame, or by a resumable native's activation (a
+        // comparator `table.sort` calls). Named by its qualified name, with
+        // no location (Lua's `bad argument #1 to 'string.rep'` under
+        // `pcall(string.rep)`).
         if (self.unparkedNative()) |nat| return .{ .fname = self.loadedNativeName(nat), .chunk = "", .line = 0, .located = false };
-        if (self.depth > 0 and self.isNativeBodyFrame(self.depth - 1)) {
+        if (self.depth > 0 and (self.isNativeBodyFrame(self.depth - 1) or native_act.kindOf(self.frames[self.depth - 1].closure.proto) != null)) {
             const f = &self.frames[self.depth - 1];
             const call = bytecode.callOperandsOf(f.closure.proto.code[f.pc]) orelse return null;
             const callee = self.regGet(f.base + call.a);
@@ -3012,6 +3036,13 @@ pub const Vm = struct {
         };
 
         const frames = try self.backtraceFrames(arena, .running);
+        // Doc 68 §5.1: a fault in a resumable native's activation (a call it
+        // made that could not be made) is the native's, so it is located
+        // where the native was called, as any native's fault is.
+        if (native_act.kindOf(proto) != null and self.depth >= 2) {
+            const site = self.siteOf(self.depth - 2);
+            return .{ .message = message, .chunk = site.proto.chunk, .proto_id = site.proto.id, .line = site.line, .start = site.span.start, .end = site.span.end, .frames = frames };
+        }
         return .{ .message = message, .chunk = proto.chunk, .proto_id = proto.id, .line = line, .start = span.start, .end = span.end, .frames = frames };
     }
 
@@ -3228,6 +3259,11 @@ pub const Vm = struct {
                 // Only a coroutine's bottom frame runs it, for its body.
                 const nm = self.loadedNativeName(function.Native.fromHeader(thread.?.body.asHeap()));
                 row.* = .{ .name = nm.field, .module = nm.module, .chunk = "[C]", .proto_id = fp.id, .native = true, .thread = tid };
+                continue;
+            }
+            if (native_act.kindOf(fp)) |kind| {
+                // Doc 68 §5.1: the native the activation runs.
+                row.* = .{ .name = fp.name, .module = native_act.moduleOf(kind), .chunk = "[C]", .proto_id = fp.id, .native = true, .thread = tid };
                 continue;
             }
             if (fp.system) {
@@ -3851,7 +3887,26 @@ pub const Vm = struct {
             // `yield` signals only where it can yield, and nothing called
             // from Zig can (`native_reentry_depth` is raised).
             .co_yield => unreachable,
+            .native_act => self.activationSync(args),
         };
+    }
+
+    /// Doc 68 §5.1: a resumable native called from Zig that needs a Lua
+    /// call finishes here, from the state it left (`act_seed`), making its
+    /// calls through `callValue`. It returns no results.
+    fn activationSync(self: *Vm, args: []const Value) Error!usize {
+        const seed = self.takeActSeed();
+        switch (seed.kind) {
+            .sort => try stdtable.sortSync(self, seed, args),
+        }
+        return 0;
+    }
+
+    /// The state the resumable native that just signalled left.
+    pub fn takeActSeed(self: *Vm) native_act.Seed {
+        const seed = self.act_seed.?;
+        self.act_seed = null;
+        return seed;
     }
 
     // ---- doc 76 §6: to-be-closed variables ----
@@ -8286,6 +8341,7 @@ pub const Vm = struct {
             .set_index2 => opSetIndex2(mode),
             .set_list => opSetList(mode),
             .intrinsic => opIntrinsic(mode),
+            .native_act => opNativeAct(mode),
             .get_global => opGetGlobal(mode),
             .set_global => opSetGlobal(mode),
             .def_global => opDefGlobal(mode),
@@ -10058,6 +10114,35 @@ pub const Vm = struct {
         }.h;
     }
 
+    /// Doc 68 §5.1: step the resumable native `b` of the activation running
+    /// this (`native_act.zig`), against the frame's registers: then make the
+    /// call it laid out, or return. Its state is the registers', so a step
+    /// starts where the last one stopped, wherever the call between went.
+    ///
+    /// The call is the activation's `.call` instruction, made here rather
+    /// than dispatched, so its Lua callee enters as a `.native_call`. The
+    /// frame stands at that instruction while it runs, as if dispatched: a
+    /// native callee finds its call there.
+    fn opNativeAct(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                _ = pc;
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const next = switch (@as(native_act.Kind, @enumFromInt(instr.b))) {
+                    .sort => stdtable.sortStep(vm, regs),
+                } catch |e| return parkErr(st, e);
+                switch (next) {
+                    .call => {
+                        const at = native_act.call_pc;
+                        st.frame.pc = at;
+                        return callTail(mode, .native_act, st, at + 1, &st.code[at], vm, tags, payloads);
+                    },
+                    .done => return dispatchTailFrom(mode, st, native_act.ret_pc, &st.code[native_act.ret_pc], vm, tags, payloads),
+                }
+            }
+        }.h;
+    }
+
     /// Doc 66 P2: `get_field a, b, c` is `R[a] = R[b][K[c]]` with `K[c]` an
     /// interned string, `get_index` without the key's `load_const`. The fast
     /// lane is `get_index`'s heap-key lane: the lookup and any `__index`
@@ -10470,13 +10555,41 @@ pub const Vm = struct {
         return if (of == .itern) 2 else instr.b;
     }
 
+    /// How `enterCallee` enters its closure.
+    const CalleeEntry = enum {
+        /// The call's own callee (or its `__call` handler): counted toward
+        /// the callee's head anchor.
+        call,
+        /// The function after `pcall`/`xpcall` (doc 68 §5).
+        pcall,
+        xpcall,
+        /// A resumable native's activation (doc 68 §5.1), in the call of the
+        /// native, which stays in the callee slot.
+        activation,
+        /// The call an activation makes for its native (a `table.sort`
+        /// comparator): not counted toward the callee's head anchor, as a
+        /// `callValue` call never was. A head trace entered from tier-0 on
+        /// every comparison costs more than the comparator saves (TODO.md).
+        native_call,
+
+        /// How far past the call's base the callee's arguments start, less
+        /// one: past `f` for `pcall`, past `f, handler` for `xpcall`.
+        fn shift(self: CalleeEntry) usize {
+            return switch (self) {
+                .call, .activation, .native_call => 0,
+                .pcall => Protect.pcall.shift(),
+                .xpcall => Protect.xpcall.shift(),
+            };
+        }
+    };
+
     /// Enter closure `cl` for the call `instr` (a `callTail` opcode) makes,
-    /// with the callee `shift` registers past the call's base and `nargs`
-    /// arguments after it: lay out its window, freeze the caller's resume
-    /// cursor, push the frame, reload `st` onto it and dispatch its first
-    /// instruction. `shift` 0 is a closure callee, whose results land at
-    /// the call's base. 1 and 2 are a protected call (doc 68 §5): the
-    /// function sits after `pcall` (`xpcall`, and its handler), and the
+    /// as `entry` says, with `nargs` arguments `entry.shift()` registers
+    /// past the call's argument start: lay out its window, freeze the
+    /// caller's resume cursor, push the frame, reload `st` onto it and
+    /// dispatch its first instruction. A `call` or `activation` frame's
+    /// results land at the call's base. A protected call's (doc 68 §5)
+    /// function sits after `pcall` (`xpcall`, and its handler), and its
     /// results land one past the base, one fewer of them. A failed push
     /// parks its error, leaving the caller faulting at the call.
     ///
@@ -10484,8 +10597,8 @@ pub const Vm = struct {
     /// again here, behind the caller's stores, they cost every Lua call ~3
     /// instructions (callgrind, recursive-fib). The return wiring is read
     /// from `instr` at the push, as the closure arm always did.
-    inline fn enterCallee(comptime mode: ExecMode, comptime of: bytecode.OpCode, comptime shift: usize, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, base: usize, call_a: usize, cl: *const Closure, nargs: usize) HandlerResult {
-        comptime std.debug.assert(shift <= 2);
+    inline fn enterCallee(comptime mode: ExecMode, comptime of: bytecode.OpCode, comptime entry: CalleeEntry, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, base: usize, call_a: usize, cl: *const Closure, nargs: usize) HandlerResult {
+        const shift = comptime entry.shift();
         const self = vm;
         const cp = cl.proto;
         const a: usize = call_a + shift;
@@ -10547,7 +10660,7 @@ pub const Vm = struct {
         const code = self.closureCode(cl, cp);
         self.pushFrameImage(cl, cp.num_registers, callee_base, ret_dest, ret_count, va_base, va_count, code, self.trace.registry.entry_registry.image_gen);
         const regs = loadFrame(st, vm, depth + 1, &self.frames[depth], cl, callee_base, code);
-        if (shift == 0) {
+        if (entry == .call) {
             // Doc 44: count this SUCCESSFUL Lua-callee entry
             // toward the callee's function-head anchor (after the
             // push — failed calls never count). A hot verdict
@@ -10567,7 +10680,18 @@ pub const Vm = struct {
             // mismatch).
             if (mode == .fast and self.trace.pending_call_anchor != null)
                 return .switch_mode;
-        } else {
+        } else if (entry == .native_call) {
+            // The activation's cycle has no back-edge, the T3 handoff point
+            // (`backEdgeEpilogue`): a recording that aborted on its
+            // `native_act`, or any stint that sent it `.full`, would hold
+            // `.full` for the rest of the native. Its calls hand off
+            // instead, parked at the callee's pc 0, which the re-entry
+            // dispatches with the one prologue it gets in either mode.
+            if (mode == .full and self.runFastPath()) {
+                st.frame.pc = 0;
+                return .switch_mode;
+            }
+        } else if (shift != 0) {
             // Below the new window: the caller's slots, rewired now
             // that the push can no longer fail.
             const pa = base + call_a;
@@ -10615,6 +10739,12 @@ pub const Vm = struct {
     ///
     /// `coroutine.resume`/`yield` (doc 73): a switch to another stack
     /// (`enterResume`, `enterYield`).
+    ///
+    /// A resumable native (doc 68 §5.1): the call becomes a call of the
+    /// native's activation (`native_act.zig`) with the same arguments, which
+    /// carries on from the state it left (`act_seed`). The native stays in
+    /// the callee slot; the activation's results land there, as its own
+    /// would have.
     fn opEntry(comptime mode: ExecMode, comptime of: bytecode.OpCode) *const HandlerFn {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
@@ -10626,14 +10756,26 @@ pub const Vm = struct {
                     .co_resume => enterResume(mode, of, st, pc, instr, vm),
                     .co_yield => enterYield(mode, of, st, pc, instr, vm),
                     .co_wrap => enterWrap(mode, of, st, pc, instr, vm),
+                    .native_act => enterActivation(st, pc, instr, vm),
                 };
             }
 
-            inline fn enter(comptime kind: Protect, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
+            inline fn enter(comptime entry: CalleeEntry, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
                 const a: usize = callA(of, instr);
-                const shift = comptime kind.shift();
+                const shift = comptime entry.shift();
                 const cl = Closure.fromHeader(vm.regGet(st.base + a + 1).asHeap());
-                return enterCallee(mode, of, shift, st, pc, instr, vm, st.base, a, cl, entryArgCount(of, st, instr, vm) - shift);
+                return enterCallee(mode, of, entry, st, pc, instr, vm, st.base, a, cl, entryArgCount(of, st, instr, vm) - shift);
+            }
+
+            /// A fresh closure per activation, as any call of a closure
+            /// constructor makes one: the object ids it takes are the same
+            /// in every run of the program, where a VM-wide cached one's
+            /// would depend on where the run started. The frame roots it
+            /// from the push, and no safepoint comes between.
+            inline fn enterActivation(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
+                const kind = vm.act_seed.?.kind;
+                const cl = vm.heap.newClosure(native_act.protoOf(kind), 0) catch |e| return parkErr(st, e);
+                return enterCallee(mode, of, .activation, st, pc, instr, vm, st.base, callA(of, instr), cl, entryArgCount(of, st, instr, vm));
             }
         }.h;
     }
@@ -10886,11 +11028,18 @@ pub const Vm = struct {
         }.h;
     }
 
-    /// `.call`'s body, shared with `itern`'s fallback (doc 66 P1): `of` names
-    /// the opcode `instr` is, and the operands are the call it makes
-    /// (`callA`/`callB`; `c` is the same field for both).
+    /// `.call`'s body, shared with `itern`'s fallback (doc 66 P1) and with
+    /// a resumable native's step (doc 68 §5.1): `of` names the opcode whose
+    /// handler makes the call, and the operands are the call `instr` makes
+    /// (`callA`/`callB`; `c` is the same field for both). For `.native_act`
+    /// `instr` is its activation's `.call`, whose Lua callee enters as a
+    /// `.native_call`. Each `of` instantiates its own helpers (`opCallFast`,
+    /// `opEntry`): sharing `.call`'s with `opNativeAct` cost every Lua call
+    /// 8 instructions on `recursive-fib` (doc 68 §12), as LLVM stopped
+    /// inlining them into `opCall`.
     inline fn callTail(comptime mode: ExecMode, comptime of: bytecode.OpCode, st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
-        comptime std.debug.assert(of == .call or of == .itern);
+        comptime std.debug.assert(of == .call or of == .itern or of == .native_act);
+        const entry: CalleeEntry = comptime if (of == .native_act) .native_call else .call;
         const self = vm;
         const a: usize = callA(of, instr);
         const base = st.base;
@@ -10916,7 +11065,7 @@ pub const Vm = struct {
                 const cl = Closure.fromHeader(callee.asHeap());
                 // The proto is read before the push, so `cl` need not
                 // live across it (`onCallEntry` below).
-                return enterCallee(mode, of, 0, st, pc, instr, vm, base, a, cl, nargs);
+                return enterCallee(mode, of, entry, st, pc, instr, vm, base, a, cl, nargs);
             },
             .native => {
                 const nat = function.Native.fromHeader(callee.asHeap());
@@ -10954,7 +11103,7 @@ pub const Vm = struct {
                         lane_payloads[k] = lane_payloads[k - 1];
                     }
                     self.regSet(lo, handler);
-                    return enterCallee(mode, of, 0, st, pc, instr, vm, base, a, Closure.fromHeader(handler.asHeap()), nargs + 1);
+                    return enterCallee(mode, of, entry, st, pc, instr, vm, base, a, Closure.fromHeader(handler.asHeap()), nargs + 1);
                 }
                 // A native handler, or a `__call` table chaining to
                 // another, still runs nested through `callValue`
@@ -11107,12 +11256,15 @@ pub const Vm = struct {
                 // `.full` — park and flip in `.fast`, the opCall discipline.
                 // Only with tracing on, so a tier-0 return makes no call. A
                 // protected frame's return is `pcall`'s (doc 68 §5), which
-                // never counted (`enterCallee`'s head-anchor note). The
+                // never counted (`enterCallee`'s head-anchor note). Nor is a
+                // return into a resumable native's activation, a system
+                // proto (`noteResume`'s refusal, tested here so a comparison
+                // makes no call). The
                 // popped frame is still intact at `frames[depth]`; reading
                 // its tag here, not before the pop, keeps nothing live
                 // across the calls above (a spill cost every return ~4
                 // instructions).
-                if (self.trace.config.enabled and self.frames[depth - 1].ctl.protect == .none)
+                if (self.trace.config.enabled and self.frames[depth - 1].ctl.protect == .none and !st.proto.system)
                     self.trace.onRetResume(st.proto, @intCast(st.frame.pc), st.base, st.frame.call_seq, st.code);
                 if (mode == .fast and self.trace.pending_ret_anchor != null)
                     return .switch_mode;

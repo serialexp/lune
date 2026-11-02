@@ -762,6 +762,69 @@ pub fn installCollect(vm: *Vm) anyerror!void {
     try vm.globals.set(vm.gpa, try vm.heap.internValue("collect"), Value.heap(&native.header));
 }
 
+/// Doc 68 §5.1: a program that runs Lua code from `table.sort`'s
+/// activation in every way it can: a comparator, `__lt` handlers, a sort
+/// inside a comparator, comparator errors caught, the table frozen
+/// mid-sort, a native comparator, a callable table, `pcall` of the native
+/// (the Zig fallback), and a comparator yielding inside a coroutine.
+pub const resumable_natives_program: [:0]const u8 =
+    \\local t = {5, 2, 8, 1, 9, 3, 7}
+    \\table.sort(t, function(a, b) return a > b end)
+    \\print(table.concat(t, " "))
+    \\local V = {__lt = function(a, b) return a.k < b.k end}
+    \\local u = {}
+    \\for i = 1, 6 do u[i] = setmetatable({ k = (i * 5) % 7 }, V) end
+    \\table.sort(u)
+    \\local ks = {}
+    \\for i = 1, #u do ks[i] = u[i].k end
+    \\print(table.concat(ks, " "))
+    \\local calls = 0
+    \\local w = {4, 3, 2, 1}
+    \\table.sort(w, function(a, b)
+    \\  calls = calls + 1
+    \\  local inner = {b, a}
+    \\  table.sort(inner, function(x, y) return x < y end)
+    \\  return inner[1] == a and a ~= b
+    \\end)
+    \\print(table.concat(w, " "), calls)
+    \\print(pcall(table.sort, {3, 1, 2}, function(a, b) return a < b end))
+    \\local e = {3, 1, 2}
+    \\print(pcall(function() table.sort(e, function(a, b) error("cmp", 2) end) end))
+    \\print(pcall(function() table.sort(e, function(a, b) error("cmp") end) end))
+    \\local f = {5, 4, 3, 2, 1}
+    \\print(pcall(function()
+    \\  table.sort(f, function(a, b) if not table.isfrozen(f) then table.freeze(f) end return a < b end)
+    \\end))
+    \\print(table.concat(f, " "))
+    \\print(pcall(function() table.sort({3, 2, 1}, string.rep) end))
+    \\local cmp = setmetatable({}, {__call = function(self, x, y) return x < y end})
+    \\local g = {3, 1, 2}
+    \\table.sort(g, cmp)
+    \\print(table.concat(g, " "))
+    \\local co = coroutine.wrap(function()
+    \\  local y = {5, 3, 9, 1}
+    \\  table.sort(y, function(a, b) coroutine.yield(a) return a < b end)
+    \\  return table.concat(y, " ")
+    \\end)
+    \\local r, n = co(), 0
+    \\while type(r) == "number" do n = n + 1 r = co() end
+    \\print(r, n)
+;
+
+/// `resumable_natives_program`'s output.
+pub const resumable_natives_output =
+    "9 8 7 5 3 2 1\n" ++
+    "1 2 3 4 5 6\n" ++
+    "1 2 3 4\t6\n" ++
+    "true\n" ++
+    "false\tcmp\n" ++
+    "false\tmain:23: cmp\n" ++
+    "false\tmain:26: attempt to modify a readonly table\n" ++
+    "5 4 3 2 1\n" ++
+    "false\tbad argument #1 to 'string.rep' (string expected, got number)\n" ++
+    "1 2 3\n" ++
+    "1 3 5 9\t6\n";
+
 /// Doc 68 P2: a program that runs Lua code in every kind of metamethod
 /// frame: operators, compare-and-branch, `__index`/`__newindex` (fused
 /// steps on either side), `__close` on block exit and on `return f()`, a

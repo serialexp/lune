@@ -38,6 +38,8 @@ const function = @import("../function.zig");
 const table_mod = @import("../table.zig");
 const interp = @import("../interp.zig");
 const arith = @import("../arith.zig");
+const native_act = @import("../native_act.zig");
+const RegWindow = @import("../regwindow.zig").RegWindow;
 
 const Value = value.Value;
 const Table = table_mod.Table;
@@ -259,30 +261,209 @@ fn tUnpackN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 
 /// The `table.*` natives, concatenated into `interp.base_natives`.
 // ---------------------------------------------------------------------------
-// table.sort — in-place heapsort with an optional VM-reentrant comparator
+// table.sort — in-place heapsort, a resumable native (doc 68 §5.1)
 // ---------------------------------------------------------------------------
 
-/// `a < b` under the active comparator: the user closure (truthiness of its first
-/// result) when `comp` is non-null, else `<` as `lua_lessthan` takes it: numbers
-/// and strings raw (`arith.lt`), anything else through `a`'s `__lt`, then `b`'s,
-/// as the `lt` instruction's `binMeta` does. With no handler it raises Lua's
-/// "attempt to compare …", unlocated, as Lua's sort (a C function) does.
-/// Inline, so the raw compare stays in `sortSiftDown`'s loop.
-inline fn sortLess(vm: *Vm, comp: ?Value, a: Value, b: Value) anyerror!bool {
-    if (comp) |c| return sortCall(vm, c, a, b);
-    return arith.lt(a, b) catch |e| switch (e) {
-        error.TypeError => sortLessMeta(vm, a, b),
-        else => |other| other,
-    };
+/// Where `table.sort`'s heapsort is (`SortState.step`).
+const SortStep = enum(u3) {
+    /// Building the heap: sift `start` down over `[start, n]`, then the one
+    /// before it.
+    heapify,
+    /// Taking the largest to the back: swap `1` and `end`, then sift `1`
+    /// down over `[1, end - 1]`.
+    extract,
+    /// Sifting `root` down over `[root, lim]`.
+    sift,
+    /// Waiting for `t[child] < t[child + 1]`: which child is the larger.
+    pick,
+    /// Waiting for `t[root] < t[child]`: whether `root` goes down.
+    root,
+};
+
+/// `table.sort`'s heapsort as a state machine (doc 68 §7.2): it stops at
+/// any comparison that needs a Lua call and carries on from that call's
+/// result, wherever its state is kept, a Zig local (the native's own steps,
+/// the Zig fallback) or the activation's registers (`native_act.zig`). The
+/// comparisons, and the swaps between them, are the classic heapsort's, in
+/// its order. Each reads the elements fresh, so a comparator that mutates
+/// the table only reshuffles it, and the sort always terminates: `root`
+/// strictly increases within a sift.
+const SortState = struct {
+    n: i64,
+    start: i64,
+    end: i64,
+    root: i64,
+    lim: i64,
+    child: i64,
+    extracting: bool,
+    step: SortStep,
+
+    /// How many integers hold it (`toWords`).
+    const word_count = 8;
+    comptime {
+        std.debug.assert(word_count <= native_act.max_words);
+        std.debug.assert(native_act.callReg(.sort) == native_act.wordReg(.sort) + word_count);
+    }
+
+    fn init(n: i64) SortState {
+        return .{ .n = n, .start = @divFloor(n, 2), .end = n, .root = 0, .lim = 0, .child = 0, .extracting = false, .step = .heapify };
+    }
+
+    /// Where `run` carries on from: a step, or the pending comparison
+    /// with its result in hand.
+    const At = enum { heapify, extract, sift, pick, root, got_pick, got_root, sift_done };
+
+    /// Run the sort until a comparison needs a Lua call, which it returns
+    /// with the state saved at that comparison, or to the end (null).
+    /// `result` is that comparison's, once its call is made; without one, a
+    /// state saved at a comparison asks for it again.
+    ///
+    /// With a comparator `comp` (nil for none) every comparison is a call.
+    /// Without one, `<` is taken as `lua_lessthan` takes it: numbers and
+    /// strings compare raw, here, and anything else through `a`'s `__lt`,
+    /// then `b`'s, as the `lt` instruction's `binMeta` does; with no handler
+    /// it raises Lua's "attempt to compare …", unlocated, as Lua's sort (a C
+    /// function) does.
+    ///
+    /// One labeled switch over a local copy, so the steps are direct jumps
+    /// and the raw path runs as the plain loops would; compiled once with a
+    /// comparator and once without.
+    ///
+    /// The swaps write `t` without checking that it is not frozen: only
+    /// Lua code can freeze it, so the caller checks when the sort starts and
+    /// after every call (`sortTable`).
+    inline fn run(s: *SortState, vm: *Vm, t: *Table, comp: Value, result: ?bool) interp.Error!?SortCall {
+        if (comp.isNil()) return s.runIn(vm, t, false, comp, result);
+        return s.runIn(vm, t, true, comp, result);
+    }
+
+    inline fn runIn(s: *SortState, vm: *Vm, t: *Table, comptime has_comp: bool, comp: Value, result: ?bool) interp.Error!?SortCall {
+        var x = s.*;
+        defer s.* = x;
+        var less = result orelse false;
+        const from: At = if (result != null) switch (x.step) {
+            .pick => .got_pick,
+            .root => .got_root,
+            .heapify, .extract, .sift => unreachable,
+        } else switch (x.step) {
+            .heapify => .heapify,
+            .extract => .extract,
+            .sift => .sift,
+            .pick => .pick,
+            .root => .root,
+        };
+        at: switch (from) {
+            .heapify => {
+                if (x.start < 1) {
+                    x.extracting = true;
+                    continue :at .extract;
+                }
+                x.root = x.start;
+                x.lim = x.n;
+                continue :at .sift;
+            },
+            .extract => {
+                if (x.end <= 1) {
+                    x.step = .extract;
+                    return null;
+                }
+                try sortSwap(vm, t, 1, x.end);
+                x.root = 1;
+                x.lim = x.end - 1;
+                continue :at .sift;
+            },
+            .sift => {
+                if (x.root * 2 > x.lim) continue :at .sift_done;
+                x.child = x.root * 2;
+                if (x.child + 1 <= x.lim) continue :at .pick;
+                continue :at .root;
+            },
+            .pick => {
+                const l = t.get(Value.int(x.child));
+                const r = t.get(Value.int(x.child + 1));
+                less = rawLess(has_comp, l, r) orelse {
+                    x.step = .pick;
+                    return try sortCallOf(vm, has_comp, comp, l, r);
+                };
+                continue :at .got_pick;
+            },
+            .got_pick => {
+                if (less) x.child += 1;
+                continue :at .root;
+            },
+            .root => {
+                const l = t.get(Value.int(x.root));
+                const r = t.get(Value.int(x.child));
+                less = rawLess(has_comp, l, r) orelse {
+                    x.step = .root;
+                    return try sortCallOf(vm, has_comp, comp, l, r);
+                };
+                continue :at .got_root;
+            },
+            .got_root => {
+                if (!less) continue :at .sift_done;
+                try sortSwap(vm, t, x.root, x.child);
+                x.root = x.child;
+                continue :at .sift;
+            },
+            .sift_done => {
+                if (x.extracting) {
+                    x.end -= 1;
+                    continue :at .extract;
+                }
+                x.start -= 1;
+                continue :at .heapify;
+            },
+        }
+    }
+
+    fn toWords(s: SortState) [native_act.max_words]i64 {
+        var w: [native_act.max_words]i64 = @splat(0);
+        w[0..word_count].* = .{ s.n, s.start, s.end, s.root, s.lim, s.child, @intFromBool(s.extracting), @intFromEnum(s.step) };
+        return w;
+    }
+
+    fn fromWords(w: []const i64) SortState {
+        return .{ .n = w[0], .start = w[1], .end = w[2], .root = w[3], .lim = w[4], .child = w[5], .extracting = w[6] != 0, .step = @enumFromInt(w[7]) };
+    }
+
+    /// Keep it in the registers from `at` on, as integers.
+    fn store(s: SortState, regs: RegWindow, at: usize) void {
+        const w = s.toWords();
+        for (w[0..word_count], at..) |x, r| regs.setInt(r, x);
+    }
+
+    fn load(regs: RegWindow, at: usize) SortState {
+        var w: [word_count]i64 = undefined;
+        for (&w, at..) |*x, r| x.* = regs.get(r).asInt();
+        return fromWords(&w);
+    }
+};
+
+/// A comparison that needs a Lua call: `f(a, b)`, whose first result's
+/// truthiness is `a < b`.
+const SortCall = struct { f: Value, a: Value, b: Value };
+
+/// `l < r` taken raw, or null when it needs a Lua call: always with a
+/// comparator, and for anything but two numbers or two strings without.
+inline fn rawLess(comptime has_comp: bool, l: Value, r: Value) ?bool {
+    if (has_comp) return null;
+    return arith.lt(l, r) catch null;
 }
 
-/// The default comparator's `__lt` fallback, out of `sortLess`'s raw path.
-noinline fn sortLessMeta(vm: *Vm, a: Value, b: Value) anyerror!bool {
+/// The call that decides `l < r` when `rawLess` can't.
+inline fn sortCallOf(vm: *Vm, comptime has_comp: bool, comp: Value, l: Value, r: Value) interp.Error!SortCall {
+    if (has_comp) return .{ .f = comp, .a = l, .b = r };
+    return sortLtCall(vm, l, r);
+}
+
+/// The default comparator's `__lt` call, out of `run`'s raw path.
+noinline fn sortLtCall(vm: *Vm, a: Value, b: Value) interp.Error!SortCall {
     const handler = ltHandler(vm, a) orelse ltHandler(vm, b) orelse {
         var buf: [arith.compare_fault_max]u8 = undefined;
         return vm.raiseLocatedError(arith.compareFaultText(&buf, a, b), 0);
     };
-    return sortCall(vm, handler, a, b);
+    return .{ .f = handler, .a = a, .b = b };
 }
 
 /// `v`'s `__lt` handler, or null when it has none.
@@ -292,57 +473,94 @@ fn ltHandler(vm: *Vm, v: Value) ?Value {
     return if (h.isNil()) null else h;
 }
 
-/// Call a comparator (`comp` or a `__lt` handler) on `a, b`: the truthiness of
-/// its first result. Inline, as `sortLess`, for the per-comparison call.
-inline fn sortCall(vm: *Vm, c: Value, a: Value, b: Value) anyerror!bool {
-    var r: [1]Value = .{Value.nil()};
-    const n = try vm.callValue(c, &.{ a, b }, r[0..1]);
-    return n >= 1 and r[0].isTruthy();
-}
-
-/// Swap the 1-based array elements `i` and `j`, reading both fresh (the comparator
-/// may have mutated the table since they were last seen).
-fn sortSwap(t: *Table, gpa: std.mem.Allocator, i: i64, j: i64) interp.Error!void {
+/// Swap the 1-based array elements `i` and `j`, reading both fresh.
+fn sortSwap(vm: *Vm, t: *Table, i: i64, j: i64) interp.Error!void {
     const vi = t.get(Value.int(i));
     const vj = t.get(Value.int(j));
-    try t.set(gpa, Value.int(i), vj);
-    try t.set(gpa, Value.int(j), vi);
+    try t.set(vm.gpa, Value.int(i), vj);
+    try t.set(vm.gpa, Value.int(j), vi);
 }
 
-/// Max-heap sift-down over the 1-based subrange `[start, end]`. Each step reads
-/// elements by index, so an inconsistent/mutating comparator only reshuffles the
-/// (still in-bounds) result and always terminates — `root` strictly increases.
-fn sortSiftDown(vm: *Vm, t: *Table, comp: ?Value, start: i64, end: i64) anyerror!void {
-    var root = start;
-    while (root * 2 <= end) {
-        var child = root * 2;
-        if (child + 1 <= end and try sortLess(vm, comp, t.get(Value.int(child)), t.get(Value.int(child + 1))))
-            child += 1;
-        if (try sortLess(vm, comp, t.get(Value.int(root)), t.get(Value.int(child)))) {
-            try sortSwap(t, vm.gpa, root, child);
-            root = child;
-        } else return;
-    }
+/// Whether `v` can be called: a function, or a value with a `__call`.
+fn isCallable(vm: *Vm, v: Value) bool {
+    if (v.isHeap() and (v.heapType() == .function or v.heapType() == .native)) return true;
+    const mt = vm.metatableOf(v) orelse return false;
+    return !mt.getHeap(vm.mm.call).isNil();
+}
+
+/// The sort's table, as the sort finds it after a call. The comparator may
+/// have frozen it, and from then on the sort may not write it, as nothing
+/// may. It may have flattened it into a grid (doc 14), which a stdlib op
+/// deflates first.
+inline fn sortTable(vm: *Vm, v: Value) interp.Error!*Table {
+    const t = Table.fromHeader(v.asHeap());
+    if (t.isReadonly()) return vm.readonlyError();
+    if (t.array.isGrid()) try vm.heap.deflateGrid(t);
+    return t;
 }
 
 /// `table.sort(list[, comp])` — sort `list[1..#list]` in place; returns nothing.
 /// A frozen `list` raises before anything else, even a short one, as Luau's.
+/// The sort runs here until a comparison needs a Lua call; then it leaves
+/// its state for its activation (doc 68 §5.1), which makes that call and
+/// every later one as an ordinary call (`sortStep`). With no comparator and
+/// no `__lt` it is all one native call.
 fn tSort(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const t = try tableArg(vm, args, 0);
     if (t.isReadonly()) return vm.readonlyError();
-    const comp: ?Value = if (args.len >= 2 and !args[1].isNil()) args[1] else null;
+    const comp: Value = if (given(args, 1)) args[1] else Value.nil();
+    // Lua takes only a function; a callable table works too, as anywhere a
+    // call is made.
+    if (!comp.isNil() and !isCallable(vm, comp)) return vm.badArg(2, "function", comp);
     const n = t.length();
     if (n < 2) return Value.nil();
-    // Build the heap, then repeatedly extract the max to the back.
-    var start = @divFloor(n, 2);
-    while (start >= 1) : (start -= 1) try sortSiftDown(vm, t, comp, start, n);
-    var end = n;
-    while (end > 1) : (end -= 1) {
-        try sortSwap(t, vm.gpa, 1, end);
-        try sortSiftDown(vm, t, comp, 1, end - 1);
+    var s = SortState.init(n);
+    if (try s.run(vm, t, comp, null) == null) return Value.nil();
+    vm.act_seed = .{ .kind = .sort, .words = s.toWords() };
+    return error.ActivateNative;
+}
+
+/// One step of `table.sort`'s activation (`Vm.opNativeAct`): take the
+/// result of the call it asked for (or, on its first step, the state the
+/// native left), then run on to the next call, laid out in the call area,
+/// or to the end. `R[0]` is the table and `R[1]` the comparator, as the
+/// native was called.
+pub fn sortStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
+    const at = native_act.wordReg(.sort);
+    const c = native_act.callReg(.sort);
+    const t = try sortTable(vm, regs.get(0));
+    var s: SortState = undefined;
+    var result: ?bool = null;
+    if (regs.get(at).isNil()) {
+        const seed = vm.takeActSeed();
+        std.debug.assert(seed.kind == .sort);
+        s = SortState.fromWords(&seed.words);
+    } else {
+        s = SortState.load(regs, at);
+        result = regs.get(c).isTruthy();
     }
-    return Value.nil();
+    const call = try s.run(vm, t, regs.get(1), result) orelse return .done;
+    s.store(regs, at);
+    regs.set(c, call.f);
+    regs.set(c + 1, call.a);
+    regs.set(c + 2, call.b);
+    return .call;
+}
+
+/// `table.sort` called from Zig (`Vm.callValue`), where no activation can
+/// be pushed: it finishes from the state the native left, making its calls
+/// through `callValue` (`Vm.activationSync`).
+pub fn sortSync(vm: *Vm, seed: native_act.Seed, args: []const Value) interp.Error!void {
+    std.debug.assert(seed.kind == .sort);
+    const comp: Value = if (given(args, 1)) args[1] else Value.nil();
+    var s = SortState.fromWords(&seed.words);
+    var result: ?bool = null;
+    while (try s.run(vm, try sortTable(vm, args[0]), comp, result)) |call| {
+        var r: [1]Value = .{Value.nil()};
+        const n = try vm.callValue(call.f, &.{ call.a, call.b }, r[0..1]);
+        result = n >= 1 and r[0].isTruthy();
+    }
 }
 
 // ---------------------------------------------------------------------------

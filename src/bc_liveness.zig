@@ -340,6 +340,13 @@ fn effectOf(ins: Instr, pc: u32, code_len: usize) Effect {
             e.all_live = true;
             e.succ[0] = next;
         },
+        // Doc 68 §5.1: only an activation's hand-built proto holds it, which
+        // is never analysed (not `maskable`, scanned whole). Everything is
+        // live across it.
+        .native_act => {
+            e.all_live = true;
+            e.succ[0] = next;
+        },
     }
     return e;
 }

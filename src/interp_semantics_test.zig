@@ -3141,9 +3141,11 @@ test "doc 61 Phase 0: a native stays in flight between and after its re-entries"
 }
 
 test "doc 61 Phase 0: table.sort and a require loader keep their caller in flight across every re-entry; pcall suspends it" {
-    // The comparator runs once per comparison: each sees the same shapes.
-    // A Lua function under `pcall` runs in a protected frame (doc 68 §5),
-    // with its caller suspended at the `.call`.
+    // The comparator runs once per comparison: each sees the same shapes,
+    // called from the sort's activation (doc 68 §5.1), which is suspended at
+    // its `.call` as main is at its own. A Lua function under `pcall` runs
+    // in a protected frame (doc 68 §5), with its caller suspended at the
+    // `.call`.
     try expectShapes(
         \\local seen = {}
         \\local t = {5, 3, 8, 1, 9, 2}
@@ -3155,7 +3157,7 @@ test "doc 61 Phase 0: table.sort and a require loader keep their caller in fligh
         \\print(require('m'))
         \\print(shapes())
         \\
-    , "F:call F:call\nS F:call\nF:call F:call\t:preload:\nF:call\n");
+    , "S S F:call\nS F:call\nF:call F:call\t:preload:\nF:call\n");
 }
 
 test "doc 61 Phase 0: an xpcall handler sees the faulting frame in flight at its fault" {

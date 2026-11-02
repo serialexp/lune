@@ -33,6 +33,12 @@ pub const native_body_source: [:0]const u8 = "return function(f, ...) return f(.
 /// above any program's or loaded chunk's.
 pub const native_body_proto_id: u32 = std.math.maxInt(u32) - 1;
 
+comptime {
+    // The resumable natives' activations (doc 68 §5.1) take the ids below
+    // this one's chunk (its root is `native_body_proto_id - 1`).
+    std.debug.assert(@import("native_act.zig").first_id < native_body_proto_id - 1);
+}
+
 /// One stack's memory: a single block (`stack_mem`) holding the two register
 /// lanes, the scratch lane and the frame array, each region starting on a
 /// block-aligned offset.
