@@ -1,7 +1,8 @@
 # 80 — Growing strings: allocator, pacing, concat, long strings — Design
 
-Status: partial — U1 (large-block cache), U2 (single-copy concat) and U3
-(byte-charged GC pacing) built; U4 (long strings) outstanding
+Status: partial — U1 (large-block cache), U2 (single-copy concat), U3
+(byte-charged GC pacing) and U4 (long strings: the sparse intern hash) built;
+the follow-ups below outstanding
 Owner: Bart
 Last updated: 2026-11-02
 
@@ -26,6 +27,12 @@ land; move whole units to Done once everything inside them is checked.
   `internKnown` below it. Both carry the operands' character facts, so no
   construction scan runs.
 - [x] **Bench `bench/stdlib/str_concat_grow.lua`** with its hashgate rows.
+- [x] **Q1 — long strings: which model** (§5). Bart picked (A) first, then
+  (B) once §5.2 showed doc 28 §5 had already designed it.
+- [x] **U4 — long strings, as (B)** (§5.4). Doc 28 §5's L3: the sparse
+  hash, widened to the first and last eight bytes, LuaJIT's chain guard
+  with its weighting, and an identical-hash trigger that the rebuild keeps.
+  str_concat_grow −61%, io_read_all −53%; os_date +7.7% (below).
 
 ### Outstanding
 
@@ -35,11 +42,12 @@ land; move whole units to Done once everything inside them is checked.
 - [ ] **n-ary concat** (§4.2): `a .. b .. c .. d` is three binary concats
   with two intermediate strings; Lua's `OP_CONCAT` joins a register range
   once. A bytecode change; not started.
-- [ ] **Q1 — long strings: which model** (§5). (A) Lua 5.4 uninterned long
-  strings, which Bart picked first, or (B) LuaJIT's sparse hash, which keeps
-  every string interned. Bart decides before U4 starts; §5.1–§5.2 list
-  what each one touches.
-- [ ] **U4 — long strings**, per Q1's answer.
+- [ ] **The identical-hash trigger counts compares, not their cost**
+  (§5.4). os_date's date strings form groups of more than four that are
+  cheap to compare. Promoting them costs every later string with that
+  sparse hash a dense hash too: +7.7% instructions. A budget of compared
+  bytes would promote only groups whose compares are expensive. Not
+  measured.
 - [ ] **Embedders** (§2.3): document `LargeBlockCache` in the embedding
   guide; the C API does not install it today.
 
@@ -205,7 +213,8 @@ fewer instructions, and one that is new 18 % fewer.
 - Concat is binary. `"x=" .. x .. ", y=" .. y` makes three strings to keep
   one, where Lua's `OP_CONCAT` joins a register range in one pass. That is
   a compiler and bytecode change.
-- The hash still reads the whole result on every step (§5).
+- The hash still reads the whole result on every step (§5). U4 (§5.4)
+  fixed this.
 
 ## 5. Q1 — long strings
 
@@ -226,7 +235,7 @@ string to n bytes still does O(n²) hashing work. After U2, a 160k
   intern table and every pointer-equality fast path stay as they are, and
   the cost moves to the comparisons on a hash-chain hit.
 
-Bart decides between them before U4 starts.
+Bart decides between them before U4 starts. **He picked (B)** (§5.4).
 
 ### 5.1 What (A) touches
 
@@ -322,11 +331,25 @@ every step, so hits are rare.
 
 ### 5.3 Outstanding for U4
 
-- [ ] Bart picks (A) or (B) with §5.1/§5.2 in hand.
-- [ ] Under (A): the five silent sites first, then the dead-node and
-  keyframe designs, each its own increment.
-- [ ] Under (B): the sparse hash and the chain guard, with an adversarial
-  collision test and the str_concat_grow and str_long_keys A/Bs.
+- [x] Bart picks (A) or (B) with §5.1/§5.2 in hand: (B).
+- [ ] Under (A): not taken. §5.1 stays as the inventory should the
+  question come back.
+- [x] Under (B): the sparse hash and the chain guard, with adversarial
+  collision tests (`gc.zig`, "doc 28 §5: …") and the A/Bs (§5.4).
+
+### 5.4 What U4 built
+
+Doc 28 §5.1 records the design as landed, the variants measured and the
+review. In short:
+- `string.sparseHash` is `hash_sparse` reading two more words from 8 bytes
+  up, so the first and last eight bytes all count;
+- `Heap.strtabFind` counts LuaJIT's way;
+- `strtabGuard` also fires on the fourth same-hash, same-length compare;
+- `strtabDecideMarks` keeps both rules across a rebuild.
+
+The 80k `s = s .. "x"` loop takes 0.07 s (U1–U3: 0.15 s; lua5.4 0.09 s).
+Every intern still pays a sparse hash, and a promoted bucket pays the
+dense one as well: that is os_date's +7.7% (checklist).
 
 ## References
 

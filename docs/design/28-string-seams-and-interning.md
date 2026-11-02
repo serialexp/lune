@@ -1,7 +1,9 @@
 # 28 — String seams & interning: general string-op speed
 
 Status: reviewed (codex gpt-5.6-sol: approve-with-must-fixes — all folded in
-below and marked **[MF]**)
+below and marked **[MF]**); L1/L2/L4 landed 2026-08-28; L3 landed 2026-11-02,
+widened and with a second chain trigger (§5.1)
+Last updated: 2026-11-02
 Arc: Bart 2026-08-28 — "Lets do the strings first. Everyone will run into
 those at some point."
 
@@ -223,6 +225,68 @@ program proportionally; the tax drops most where strings are longest.
 This document does NOT assume L3; L1/L2/L4 land regardless. L3 is a
 standalone yes/no with this section as the decision text.
 
+### 5.1 As landed (2026-11-02, doc 80 U4)
+
+Bart said yes to L3 as doc 80's U4: growing strings made the O(len) hash
+the cost of `s = s .. x`. The port of `hash_sparse`, the chain guard and
+`lj_str_resize` was checked bit for bit against `lj_str.c` compiled from C.
+Measured against full Wyhash (instruction counts, both tiers), the pure
+port won big (str_concat_grow −61%, io_read_all −53%, str_manip −4%) and
+lost on two shapes the four samples cannot see. In str_long_keys, keys
+differing only at bytes 64–65 of 72 put up to 22 keys on one hash: +22%,
+every hit comparing bytes along the group. In io_lines, `"%07d "` lines
+are told apart only by digits 4–6: +11%.
+
+Codex (gpt-5.6-sol) and Antigravity reviewed the options. Four variants
+were measured, and Bart picked the last:
+
+1. **The LuaJIT weighting**, which the first port missed: `lj_str_new`
+   counts twice a string whose hash and length matched, so a chain of 17
+   such strings trips the guard, not 33.
+2. **Two more sampled words**: from 8 bytes the hash also reads the words
+   at 4 and n−8, so the first and last eight bytes all count (Antigravity's
+   suggestion; the values below 8 bytes are LuaJIT's). The pin test has C
+   oracle values for the widened hash.
+3. **An identical-hash trigger**: a miss that byte-compares
+   `strtab_max_ident` (4) strings sharing its hash and length rehashes their
+   chain, as the long-chain guard does. A rebuild marks a bucket dense when
+   more than 32 strings name it or a group of more than 4 shares a sparse
+   hash and length (`strtabDecideMarks`). Only marked buckets can hold such
+   a group, so only their strings are grouped, by a sort in scratch.
+   Restore passes the same guard.
+
+Codex's review points that held:
+- the trigger promotes the whole sparse bucket (one mark bit decides the
+  hash);
+- it runs on intern misses only: `internedLookup` and the recorder's
+  `rec_heap` probe stay read-only;
+- the rebuild must re-decide by group multiplicity, not chain length;
+- restore bypassed the guard.
+
+Final A/B against the tree before L3 (instruction counts, JIT tier; tier 0
+the same within a point):
+
+| bench | Δ |
+|---|---|
+| str_concat_grow | −60.6% |
+| io_read_all | −52.9% |
+| str_long_keys | −4.2% |
+| str_manip | −2.1% |
+| gsub_fn, str_find_match, str_gsub, str_gmatch | −1.0 to −1.6% |
+| io_lines | −0.8% |
+| scalar | +1.6% (tier 0 +0.3%) |
+| **os_date** | **+7.7%** |
+
+The 80k `s = s .. "x"` loop takes 0.07 s, against 0.15 s before and
+lua5.4's 0.09 s.
+
+The os_date cost is the trigger's, and was known when it was picked. Date
+strings that differ only in the hour or the seconds form groups of more
+than four. Promoting them makes every later string with that sparse hash
+pay both hashes, which costs more than the short compares it saves. The
+trigger counts compares, not their cost; a byte budget instead of a count
+is the open refinement (doc 80 checklist).
+
 ## 6. L4 — intern with a known cp_len
 
 `Heap.intern` recounts code points on every miss (`createWithHash` →
@@ -373,3 +437,6 @@ L3 (sparse intern hash, §5) remains a separate decision for Bart — it is
 the biggest single remaining lever on every string-producing bench
 (wyhash is 11.3% of str_manip; LuaJIT's `hash_sparse` is 4 sampled u32
 loads, O(1) in the length).
+
+**Follow-up (2026-11-02):** L3 landed as doc 80's U4; §5.1 has what was
+built and its A/B.

@@ -15,18 +15,78 @@ const std = @import("std");
 const object = @import("object.zig");
 const GcHeader = object.GcHeader;
 
+/// The intern table's primary hash (doc 28 §5, L3): LuaJIT's `hash_sparse`
+/// (`lj_str.c`), the length mixed with sampled 32-bit words, so it costs the
+/// same at any length. LuaJIT samples four (first, last, middle, quarter);
+/// from eight bytes we also read the second and the second-to-last, so the
+/// first and last eight bytes all count. That is where structured strings
+/// keep what tells them apart: a line number, a counter, a key's suffix
+/// (`io_lines`, `str_long_keys`). Loads are little-endian, so the value is
+/// the same on every target, and the seed is fixed, so it is a pure function
+/// of the bytes. It only chooses a bucket: the intern table still compares
+/// the bytes, so strings that agree on the samples share a chain but never
+/// an object. A chain that collects too many of them moves to `denseHash`
+/// (`gc.Heap.strtabRehashChain`).
+pub fn sparseHash(content: []const u8) u64 {
+    const n = content.len;
+    var h: u32 = @as(u32, @truncate(n)) ^ sparse_seed;
+    var a: u32 = undefined;
+    var b: u32 = undefined;
+    if (n >= 4) {
+        a = word(content, 0);
+        h ^= word(content, n - 4);
+        if (n >= 8) {
+            a ^= std.math.rotl(u32, word(content, 4), 13);
+            h ^= std.math.rotl(u32, word(content, n - 8), 19);
+        }
+        b = word(content, (n >> 1) - 2);
+        h ^= b;
+        h -%= std.math.rotl(u32, b, 14);
+        b +%= word(content, (n >> 2) - 1);
+    } else if (n != 0) {
+        a = content[0];
+        h ^= content[n - 1];
+        b = content[n >> 1];
+        h ^= b;
+        h -%= std.math.rotl(u32, b, 14);
+    } else {
+        a = 0;
+        b = 0;
+    }
+    a ^= h;
+    a -%= std.math.rotl(u32, h, 11);
+    b ^= a;
+    b -%= std.math.rotl(u32, a, 25);
+    h ^= b;
+    h -%= std.math.rotl(u32, b, 16);
+    return h;
+}
+
+/// The hash of a chain `sparseHash` overloaded (doc 28 §5): every byte,
+/// keyed differently from the sparse one.
+pub fn denseHash(content: []const u8) u64 {
+    return std.hash.Wyhash.hash(dense_seed, content);
+}
+
+const sparse_seed: u32 = 0x9e37_79b9;
+const dense_seed: u64 = 0x2545_f491_4f6c_dd1d;
+
+inline fn word(content: []const u8, at: usize) u32 {
+    return std.mem.readInt(u32, content[at..][0..4], .little);
+}
+
 /// An interned, immutable string. `extern` so `header` is guaranteed at offset 0
 /// (the embedding convention), and the raw bytes live immediately after the
 /// struct in the same allocation.
 pub const String = extern struct {
     header: GcHeader,
-    /// Content hash (Wyhash, seed 0 — matches the interning map's `StringContext`
-    /// so a lookup-by-bytes and the stored hash agree). Consumed ONLY by the
-    /// intern table (`Heap.strtab*`) — table keys hash heap values by stable
-    /// `GcHeader.id` (`table.ValueContext`), NOT by this field, and observable
-    /// iteration order is canonically sorted (doc 02), so this hash function is
-    /// free to change without touching any observable behaviour. Not serialized:
-    /// restore recomputes it through `create`.
+    /// The intern table's hash of the content: `sparseHash`, or `denseHash`
+    /// when the string's sparse bucket was rehashed (doc 28 §5); the heap
+    /// sets it when it interns the string (`Heap.strtabHash`). Consumed ONLY
+    /// by the intern table (`Heap.strtab*`) — table keys hash heap values by
+    /// stable `GcHeader.id`, NOT by this field, and observable iteration
+    /// order is canonically sorted (doc 02), so this hash function is free to
+    /// change without touching any observable behaviour. Not serialized.
     hash: u64,
     /// Byte length of the inline payload.
     len: usize,
@@ -146,15 +206,17 @@ pub const String = extern struct {
 
     /// Allocate a `String` owning a copy of `content`. This is the raw allocation
     /// only — it does **not** intern or GC-link the object; the heap does that
-    /// (`gc.zig`). Callers should go through `Heap.intern`, not here.
+    /// (`gc.zig`). Callers should go through `Heap.intern`, not here. The hash
+    /// is the sparse one; the heap resets it if the string's bucket is dense
+    /// (`Heap.internRestoredUnique`).
     pub fn create(gpa: std.mem.Allocator, content: []const u8) std.mem.Allocator.Error!*String {
-        return createWithHash(gpa, content, std.hash.Wyhash.hash(0, content));
+        return createWithHash(gpa, content, sparseHash(content));
     }
 
     /// `create` with the content hash already computed. For `Heap.intern`, which
     /// has just hashed `content` to probe the intern table — the miss path must
-    /// not pay the hash twice. `hash` MUST be `Wyhash.hash(0, content)`; every
-    /// other caller goes through `create`, which guarantees it.
+    /// not pay the hash twice. `hash` MUST be what `Heap.strtabHash` gives
+    /// `content`; every other caller goes through `create`.
     pub fn createWithHash(gpa: std.mem.Allocator, content: []const u8, hash: u64) std.mem.Allocator.Error!*String {
         return createWithHashKnown(gpa, content, hash, .{});
     }
@@ -247,7 +309,7 @@ pub const String = extern struct {
             const s: *String = @ptrCast(raw.ptr);
             s.* = .{
                 .header = header,
-                .hash = std.hash.Wyhash.hash(0, content),
+                .hash = 0, // `Heap.internBuilt` sets it
                 .len = self.len,
                 .cp_len = self.cp_len,
                 .next_intern = null,
@@ -289,8 +351,39 @@ test "String header is at offset 0 and bytes round-trip inline" {
     try testing.expectEqual(object.ObjectType.string, s.header.type);
     try testing.expectEqual(@as(usize, 5), s.len);
     try testing.expectEqualStrings("hello", s.bytes());
-    // hash matches the interning map's StringContext (Wyhash seed 0)
-    try testing.expectEqual(std.hash.Wyhash.hash(0, "hello"), s.hash);
+    try testing.expectEqual(sparseHash("hello"), s.hash);
+}
+
+test "sparseHash is LuaJIT's hash_sparse, widened, with our fixed seed" {
+    // Values from lj_str.c's hash_sparse with the two extra words, compiled
+    // from C with seed 0x9e3779b9 (doc 28 §5): the port, word order and
+    // wrapping included. Below eight bytes they are LuaJIT's own values.
+    const cases = .{
+        .{ "", 4112797746 },              .{ "a", 2105022239 },
+        .{ "ab", 3570053872 },            .{ "abc", 3570053872 },
+        .{ "abcd", 152015797 },           .{ "hello", 4040743631 },
+        .{ "abcdefg", 3451932861 },       .{ "abcdefgh", 2610000187 },
+        .{ "hello world", 347140700 },    .{ "key_000123", 3203954009 },
+        .{ "\xc3\xa9t\xc3\xa9", 2420152850 },
+        .{ "0123456789abcdefghijklmnopqrstuvwxyz0123456789", 1106307625 },
+    };
+    inline for (cases) |c| try testing.expectEqual(@as(u64, c[1]), sparseHash(c[0]));
+    // It samples: "ab" and "abc" collide, which the intern table resolves by
+    // comparing bytes.
+}
+
+test "sparseHash reads every one of the first and last eight bytes" {
+    var buf: [72]u8 = undefined;
+    @memset(&buf, 'x');
+    const base = sparseHash(&buf);
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 64, 65, 66, 67, 68, 69, 70, 71 }) |at| {
+        buf[at] = 'y';
+        try testing.expect(sparseHash(&buf) != base);
+        buf[at] = 'x';
+    }
+    // A byte between the samples is not read: those strings share a hash.
+    buf[50] = 'y';
+    try testing.expectEqual(base, sparseHash(&buf));
 }
 
 test "Builder: parts written in place make the same string as create" {
@@ -303,7 +396,6 @@ test "Builder: parts written in place make the same string as create" {
     const ref = try String.create(testing.allocator, "a\xc3\xa9xyzw");
     defer ref.destroy(testing.allocator);
     try testing.expectEqualStrings(ref.bytes(), s.bytes());
-    try testing.expectEqual(ref.hash, s.hash);
     try testing.expectEqual(ref.cp_len, s.cp_len);
     try testing.expectEqual(ref.isAscii(), s.isAscii());
     try testing.expectEqual(@as(usize, 6), s.cpLen());
