@@ -46,9 +46,12 @@ land; move whole sections to Done once everything inside them is checked.
   already running (a thread waits for `trace.entries > 0`), for arithmetic,
   call, table-write and `for` loops, in tier-1a and native, then the VM
   running another line (`interp_interrupt_test.zig`); pty runs of the REPL
-  keep session locals. Not yet: peeled and instability-unrolled loops; a loop
-  entered through a chain (ledger length > 1); an interrupt during recording;
-  injecting the lost-zero race (Q4); registers coherent (parallel-φ swaps,
+  keep session locals. Also done: an int-to-float loop, a nested loop entered through a chain,
+  an interrupt while the recorder is active (best effort: the thread catches
+  that window only sometimes; the asserted outcome holds either way). Not yet:
+  a peeled trace (needs a re-entered loop, so a runaway loop cannot be one;
+  needs a different harness) and instability-unrolled loops; injecting the
+  lost-zero race (Q4); registers coherent (parallel-φ swaps,
   write-only values). Allocating loops (`{}`, string concat) do not trace
   today (`new_table` / `set_list` abort), so they are interruptible only
   through tier-0. Behaviour asserted by counts, a generous watchdog for
