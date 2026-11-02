@@ -238,7 +238,7 @@ pub const Value = extern struct {
                 .table, .typed_array => .table,
                 .function, .native => .function,
                 .upvalue => .upvalue,
-                .host, .file => .userdata,
+                .host, .file, .bytebuf => .userdata,
                 .thread => .thread,
                 _ => .value,
             },

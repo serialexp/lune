@@ -2149,7 +2149,7 @@ export class GridPartDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel. The array part's representation rides along (doc 61 Phase K), because it decides later grid inflation and so later allocations: `lane` is its array.Lane ordinal, `flags` bit 0 is `frozen` and bit 1 the table's `no_grid`. A grid (lane = grid) has an empty `array` and exactly one `grid` entry; any other lane has none. `rehash_threshold` is the hash population at which the next new integer key re-splits array and hash (Table.rehash). It depends on the table's history and decides where later keys land, which `#t` and `next` can observe, so it is carried rather than recomputed; it is always at least 4.
+ * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel. The array part's representation rides along (doc 61 Phase K), because it decides later grid inflation and so later allocations: `lane` is its array.Lane ordinal, `flags` bit 0 is `frozen` and bit 1 the table's `no_grid`; bit 2 is the table's `readonly` (frozen by table.freeze, doc 76 §5), which a restored table keeps. A grid (lane = grid) has an empty `array` and exactly one `grid` entry; any other lane has none. `rehash_threshold` is the hash population at which the next new integer key re-splits array and hash (Table.rehash). It depends on the table's history and decides where later keys land, which `#t` and `next` can observe, so it is carried rather than recomputed; it is always at least 4.
  */
 export interface HeapTableInput {
   /**
@@ -2205,7 +2205,7 @@ export interface HeapTableInput {
 }
 
 /**
- * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel. The array part's representation rides along (doc 61 Phase K), because it decides later grid inflation and so later allocations: `lane` is its array.Lane ordinal, `flags` bit 0 is `frozen` and bit 1 the table's `no_grid`. A grid (lane = grid) has an empty `array` and exactly one `grid` entry; any other lane has none. `rehash_threshold` is the hash population at which the next new integer key re-splits array and hash (Table.rehash). It depends on the table's history and decides where later keys land, which `#t` and `next` can observe, so it is carried rather than recomputed; it is always at least 4.
+ * A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel. The array part's representation rides along (doc 61 Phase K), because it decides later grid inflation and so later allocations: `lane` is its array.Lane ordinal, `flags` bit 0 is `frozen` and bit 1 the table's `no_grid`; bit 2 is the table's `readonly` (frozen by table.freeze, doc 76 §5), which a restored table keeps. A grid (lane = grid) has an empty `array` and exactly one `grid` entry; any other lane has none. `rehash_threshold` is the hash population at which the next new integer key re-splits array and hash (Table.rehash). It depends on the table's history and decides where later keys land, which `#t` and `next` can observe, so it is carried rather than recomputed; it is always at least 4.
  */
 export interface HeapTableOutput {
   /**
@@ -3146,6 +3146,82 @@ export class HeapFileDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
+ * A byte buffer (doc 68 §7.4): what a native's activation has built so far, such as `string.gsub`'s output between two replacement calls. Only its used bytes; the capacity is not state.
+ */
+export interface HeapBytesInput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  bytes: number[];
+}
+
+/**
+ * A byte buffer (doc 68 §7.4): what a native's activation has built so far, such as `string.gsub`'s output between two replacement calls. Only its used bytes; the capacity is not state.
+ */
+export interface HeapBytesOutput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  bytes: number[];
+}
+
+export type HeapBytes = HeapBytesOutput;
+
+export class HeapBytesEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapBytesInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.bytes.length, "little_endian");
+    for (let value_bytes__iter_index = 0; value_bytes__iter_index < value.bytes.length; value_bytes__iter_index++) {
+      const value_bytes__iter = value.bytes[value_bytes__iter_index];
+      this.writeUint8(value_bytes__iter);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapBytes value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapBytes): number {
+    let size = 0;
+    // bytes: bytes (kind: length_prefixed)
+    size += value.bytes.length;
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class HeapBytesDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapBytesOutput {
+    const value: any = {};
+
+    value.bytes = [];
+    const bytes_length = this.readUint32("little_endian");
+    for (let i = 0; i < bytes_length; i++) {
+      let bytes__iter: any;
+      bytes__iter = this.readUint8();
+      value.bytes.push(bytes__iter);
+    }
+    return value;
+  }
+}
+
+/**
  * A stack that isn't running (doc 73): its live register window (a slot dead at capture is a DeadSlot tombstone, by the same keep set the collector walks it with), its call frames, bottom first, and its open upvalues. Laid out exactly as Keyframe's stack/frames/open_upvalues, which describe the running stack.
  */
 export interface ThreadContextInput {
@@ -3790,7 +3866,7 @@ export interface HeapObjectInput {
    * @remarks
    *
    * Discriminator: field 'obj_type'
-   * Variants: 7
+   * Variants: 8
    * - HeapString (when value === 0)
    * - HeapTable (when value === 1)
    * - HeapClosure (when value === 2)
@@ -3798,8 +3874,9 @@ export interface HeapObjectInput {
    * - HeapUpvalue (when value === 4)
    * - HeapFile (when value === 7)
    * - HeapThread (when value === 8)
+   * - HeapBytes (when value === 9)
    */
-  body: { type: 'HeapString'; value: HeapStringInput } | { type: 'HeapTable'; value: HeapTableInput } | { type: 'HeapClosure'; value: HeapClosureInput } | { type: 'HeapNative'; value: HeapNativeInput } | { type: 'HeapUpvalue'; value: HeapUpvalueInput } | { type: 'HeapFile'; value: HeapFileInput } | { type: 'HeapThread'; value: HeapThreadInput };
+  body: { type: 'HeapString'; value: HeapStringInput } | { type: 'HeapTable'; value: HeapTableInput } | { type: 'HeapClosure'; value: HeapClosureInput } | { type: 'HeapNative'; value: HeapNativeInput } | { type: 'HeapUpvalue'; value: HeapUpvalueInput } | { type: 'HeapFile'; value: HeapFileInput } | { type: 'HeapThread'; value: HeapThreadInput } | { type: 'HeapBytes'; value: HeapBytesInput };
 }
 
 /**
@@ -3823,7 +3900,7 @@ export interface HeapObjectOutput {
    * @remarks
    *
    * Discriminator: field 'obj_type'
-   * Variants: 7
+   * Variants: 8
    * - HeapString (when value === 0)
    * - HeapTable (when value === 1)
    * - HeapClosure (when value === 2)
@@ -3831,8 +3908,9 @@ export interface HeapObjectOutput {
    * - HeapUpvalue (when value === 4)
    * - HeapFile (when value === 7)
    * - HeapThread (when value === 8)
+   * - HeapBytes (when value === 9)
    */
-  body: { type: 'HeapString'; value: HeapStringOutput } | { type: 'HeapTable'; value: HeapTableOutput } | { type: 'HeapClosure'; value: HeapClosureOutput } | { type: 'HeapNative'; value: HeapNativeOutput } | { type: 'HeapUpvalue'; value: HeapUpvalueOutput } | { type: 'HeapFile'; value: HeapFileOutput } | { type: 'HeapThread'; value: HeapThreadOutput };
+  body: { type: 'HeapString'; value: HeapStringOutput } | { type: 'HeapTable'; value: HeapTableOutput } | { type: 'HeapClosure'; value: HeapClosureOutput } | { type: 'HeapNative'; value: HeapNativeOutput } | { type: 'HeapUpvalue'; value: HeapUpvalueOutput } | { type: 'HeapFile'; value: HeapFileOutput } | { type: 'HeapThread'; value: HeapThreadOutput } | { type: 'HeapBytes'; value: HeapBytesOutput };
 }
 
 export type HeapObject = HeapObjectOutput;
@@ -3848,6 +3926,7 @@ export const enum HeapObjectBodyVariant {
   HeapUpvalue = 'HeapUpvalue',
   HeapFile = 'HeapFile',
   HeapThread = 'HeapThread',
+  HeapBytes = 'HeapBytes',
 }
 
 export class HeapObjectEncoder extends BitStreamEncoder {
@@ -3911,6 +3990,13 @@ export class HeapObjectEncoder extends BitStreamEncoder {
       for (const byte of encoded_value) {
         this.writeUint8(byte);
       }
+    }
+    else if (value.body.type === 'HeapBytes') {
+      const encoder_value = new HeapBytesEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.body as any).type}`);
     }
@@ -3950,6 +4036,10 @@ export class HeapObjectEncoder extends BitStreamEncoder {
     }
     else if (value.body.type === 'HeapThread') {
       const _enc = new HeapThreadEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HeapBytes') {
+      const _enc = new HeapBytesEncoder();
       size += _enc.calculateSize(value.body.value);
     }
     else {
@@ -4011,6 +4101,12 @@ export class HeapObjectDecoder extends SeekableBitStreamDecoder {
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.body = { type: 'HeapThread', value: payload };
+    }
+    else if (value.obj_type === 9) {
+      const decoder = new HeapBytesDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapBytes', value: payload };
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.obj_type}`);
     }
@@ -4785,6 +4881,12 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         objects__iter.body = { type: 'HeapThread', value: payload };
+      }
+      else if (objects__iter.obj_type === 9) {
+        const decoder = new HeapBytesDecoder(this.bytes.slice(this.byteOffset), objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        objects__iter.body = { type: 'HeapBytes', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${objects__iter.obj_type}`);
       }
@@ -5099,6 +5201,12 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         keyframe_objects__iter.body = { type: 'HeapThread', value: payload };
+      }
+      else if (keyframe_objects__iter.obj_type === 9) {
+        const decoder = new HeapBytesDecoder(this.bytes.slice(this.byteOffset), keyframe_objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_objects__iter.body = { type: 'HeapBytes', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${keyframe_objects__iter.obj_type}`);
       }

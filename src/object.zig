@@ -29,6 +29,9 @@ pub const ObjectType = enum(u8) {
     file,
     /// A coroutine (`coroutine.zig`, doc 73).
     thread,
+    /// A growable byte buffer an activation builds a result in
+    /// (`bytebuf.zig`, doc 68 §7.4); never a program-visible value.
+    bytebuf,
     _,
 };
 

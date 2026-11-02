@@ -207,6 +207,13 @@
       ]
     },
 
+    "HeapBytes": {
+      "description": "A byte buffer (doc 68 §7.4): what a native's activation has built so far, such as `string.gsub`'s output between two replacement calls. Only its used bytes; the capacity is not state.",
+      "sequence": [
+        { "name": "bytes", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" }
+      ]
+    },
+
     "ThreadContext": {
       "description": "A stack that isn't running (doc 73): its live register window (a slot dead at capture is a DeadSlot tombstone, by the same keep set the collector walks it with), its call frames, bottom first, and its open upvalues. Laid out exactly as Keyframe's stack/frames/open_upvalues, which describe the running stack.",
       "sequence": [
@@ -250,7 +257,8 @@
             { "type": "HeapNative",  "when": "value === 3" },
             { "type": "HeapUpvalue", "when": "value === 4" },
             { "type": "HeapFile",    "when": "value === 7" },
-            { "type": "HeapThread",  "when": "value === 8" }
+            { "type": "HeapThread",  "when": "value === 8" },
+            { "type": "HeapBytes",   "when": "value === 9" }
           ]
         }
       ]

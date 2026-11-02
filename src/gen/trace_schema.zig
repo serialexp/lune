@@ -5,7 +5,7 @@ const binschema = @import("binschema");
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_ConstString = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, ConstString: ConstString };
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_HeapRef = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, HeapRef: HeapRef };
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_HeapRef_DeadSlot = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, HeapRef: HeapRef, DeadSlot: DeadSlot };
-pub const BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile_HeapThread = union(enum) { HeapString: HeapString, HeapTable: HeapTable, HeapClosure: HeapClosure, HeapNative: HeapNative, HeapUpvalue: HeapUpvalue, HeapFile: HeapFile, HeapThread: HeapThread };
+pub const BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile_HeapThread_HeapBytes = union(enum) { HeapString: HeapString, HeapTable: HeapTable, HeapClosure: HeapClosure, HeapNative: HeapNative, HeapUpvalue: HeapUpvalue, HeapFile: HeapFile, HeapThread: HeapThread, HeapBytes: HeapBytes };
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_ConstString_EffectBytes_HostFail = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, ConstString: ConstString, EffectBytes: EffectBytes, HostFail: HostFail };
 
 pub const ConstInt = struct {
@@ -999,6 +999,39 @@ pub const HeapFile = struct {
     }
 };
 
+pub const HeapBytes = struct {
+    bytes: []const u8,
+
+    pub fn encode(self: HeapBytes, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HeapBytes, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint32(@intCast(self.bytes.len), .little_endian);
+        try enc.writeBytes(self.bytes);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapBytes {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapBytes {
+        _ = allocator;
+        _ = root;
+        var result: HeapBytes = undefined;
+        const _len_0 = try dec.readUint32(.little_endian);
+        result.bytes = try dec.readBytesSlice(_len_0);
+        return result;
+    }
+};
+
 pub const ThreadContext = struct {
     stack: []const StackValue,
     frames: []const FrameRef,
@@ -1142,7 +1175,7 @@ pub const HeapThread = struct {
 pub const HeapObject = struct {
     id: u32,
     obj_type: u8,
-    body: BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile_HeapThread,
+    body: BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile_HeapThread_HeapBytes,
 
     pub fn encode(self: HeapObject, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -1164,6 +1197,7 @@ pub const HeapObject = struct {
             .HeapUpvalue => |_uv_4| try _uv_4.encodeInto(enc, ctx),
             .HeapFile => |_uv_5| try _uv_5.encodeInto(enc, ctx),
             .HeapThread => |_uv_6| try _uv_6.encodeInto(enc, ctx),
+            .HeapBytes => |_uv_7| try _uv_7.encodeInto(enc, ctx),
         }
     }
 
@@ -1196,6 +1230,9 @@ pub const HeapObject = struct {
         }
         else if (result.obj_type == 8) {
             result.body = .{ .HeapThread = try HeapThread.decodeWith(allocator, dec, root) };
+        }
+        else if (result.obj_type == 9) {
+            result.body = .{ .HeapBytes = try HeapBytes.decodeWith(allocator, dec, root) };
         }
         else {
             return error.InvalidVariant;

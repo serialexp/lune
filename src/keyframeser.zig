@@ -38,6 +38,7 @@ const trace = @import("trace.zig");
 const system = @import("system.zig");
 const filemod = @import("file.zig");
 const File = filemod.File;
+const ByteBuf = @import("bytebuf.zig").ByteBuf;
 const coroutine = @import("coroutine.zig");
 const native_act = @import("native_act.zig");
 const stdaio = @import("stdlib/aio.zig");
@@ -149,7 +150,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// and `ret_count` are the continuation's payload (a `close`'s cursor and
 /// `return f()` span), not return wiring. The field is unchanged; an older
 /// reader would refuse the bits.
-pub const snapshot_format_version: u32 = 20;
+///
+/// v21 (doc 68 §7.4): byte buffers. `HeapObject` gained `HeapBytes` (obj_type
+/// 9: the used bytes), what `string.gsub`'s activation builds its result in
+/// between two replacement calls.
+pub const snapshot_format_version: u32 = 21;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -264,7 +269,7 @@ fn sortedHashEntries(a: std.mem.Allocator, t: *const table.Table) ![]HashKV {
 /// Otherwise a file carries the fingerprint it was restored with, if any.
 /// A coroutine's stack is read through `vm` (`toSchemaThread`).
 pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader, live: ?system.HostSystem) !schema.HeapObject {
-    const Body = schema.BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile_HeapThread;
+    const Body = schema.BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue_HeapFile_HeapThread_HeapBytes;
     const body: Body = switch (h.type) {
         .string => .{ .HeapString = .{ .bytes = string.String.fromHeader(h).bytes() } },
         .table => blk: {
@@ -351,6 +356,7 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader, live: ?sy
             } };
         },
         .thread => .{ .HeapThread = try toSchemaThread(a, vm, Thread.fromHeader(h)) },
+        .bytebuf => .{ .HeapBytes = .{ .bytes = ByteBuf.fromHeader(h).bytes() } },
         else => return error.UnsupportedObject, // typed_array / host: no F2a variant
     };
     return .{ .id = h.id, .obj_type = @intFromEnum(h.type), .body = body };
@@ -1185,6 +1191,17 @@ pub fn restoreSnapshot(
                 vm.heap.linkRestored(&f.header, o.id);
                 break :blk &f.header;
             },
+            .HeapBytes => |hb| blk: {
+                var list = try std.ArrayList(u8).initCapacity(gpa, hb.bytes.len);
+                errdefer list.deinit(gpa);
+                list.appendSliceAssumeCapacity(hb.bytes);
+                const b = try ByteBuf.create(gpa, list);
+                vm.heap.linkRestored(&b.header, o.id);
+                // The pacing it was charged when captured, as a restored
+                // string's is (`internRestoredUnique`).
+                vm.heap.chargeByteBuf(b);
+                break :blk &b.header;
+            },
             .HeapThread => |ht| blk: {
                 try checkThreadShape(ht, kf.current_id != 0 and kf.current_id - 1 == o.id);
                 if (ht.kind == thread_kind_main and vm.main_thread != null) return error.InvalidThread;
@@ -1262,7 +1279,7 @@ pub fn restoreSnapshot(
     for (kf.objects) |o| {
         const h = idmap.get(o.id).?;
         switch (o.body) {
-            .HeapString, .HeapFile => {},
+            .HeapString, .HeapFile, .HeapBytes => {},
             .HeapNative => |hn| {
                 const n = function.Native.fromHeader(h);
                 for (hn.bound, n.bound) |sv, *v| v.* = try fromSchemaValue(sv, &idmap);

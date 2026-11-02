@@ -218,7 +218,7 @@ test "VM-driven snapshot captures a complete, non-dangling heap graph" {
             // to a present object — no dangling reference.
             var refs: std.ArrayList(u32) = .empty;
             for (kf.objects) |o| switch (o.body) {
-                .HeapString, .HeapNative, .HeapFile => {},
+                .HeapString, .HeapNative, .HeapFile, .HeapBytes => {},
                 .HeapTable => |t| {
                     for (t.array) |v| if (refId(v)) |id| try refs.append(a, id);
                     for (t.entries) |e| {
@@ -259,7 +259,7 @@ test "VM-driven snapshot captures a complete, non-dangling heap graph" {
                 .HeapNative => n_native += 1,
                 .HeapString => n_string += 1,
                 .HeapFile => {}, // io.stdout / io.stderr
-                .HeapThread => {},
+                .HeapThread, .HeapBytes => {},
             };
             try testing.expect(n_table >= 2); // globals + g
             try testing.expect(n_closure >= 1); // g.add

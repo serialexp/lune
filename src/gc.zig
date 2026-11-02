@@ -41,6 +41,7 @@ const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
 const system = @import("system.zig");
 const File = @import("file.zig").File;
+const ByteBuf = @import("bytebuf.zig").ByteBuf;
 const stack_mem = @import("stack_mem.zig");
 const GcHeader = object.GcHeader;
 const GcColor = object.GcColor;
@@ -746,6 +747,25 @@ pub const Heap = struct {
         return f;
     }
 
+    /// Allocate a byte buffer (doc 68 §7.4) owning `list`, and register it
+    /// with the heap. Charges the pacing for the bytes it already holds.
+    pub fn newByteBuf(self: *Heap, list: std.ArrayList(u8)) std.mem.Allocator.Error!*ByteBuf {
+        const b = try ByteBuf.create(self.gpa, list);
+        self.link(&b.header);
+        self.chargeByteBuf(b);
+        return b;
+    }
+
+    /// Charge the pacing for the bytes `b` has grown by since the last
+    /// charge, as a string's bytes are (`stringUnits`).
+    pub fn chargeByteBuf(self: *Heap, b: *ByteBuf) void {
+        const want = stringUnits(b.list.items.len);
+        if (want > b.charged) {
+            self.chargeString(want - b.charged);
+            b.charged = want;
+        }
+    }
+
     /// Register a new coroutine object (doc 73; `coroutine.newThread`).
     pub fn linkThread(self: *Heap, h: *GcHeader) void {
         self.link(h);
@@ -929,7 +949,7 @@ pub const Heap = struct {
     fn blacken(self: *Heap, h: *GcHeader) void {
         switch (h.type) {
             // Leaves: no heap children. A `File`'s path is owned bytes.
-            .string, .file => {},
+            .string, .file, .bytebuf => {},
             // A `Native`'s name is a borrowed/static slice, not a heap
             // String; its bound values (`coroutine.wrap`'s coroutine) are
             // its only children.
@@ -1085,6 +1105,11 @@ fn destroyObject(heap: *Heap, h: *GcHeader) void {
         .native => Native.fromHeader(h).destroy(gpa),
         .upvalue => Upvalue.fromHeader(h).destroy(gpa),
         .file => File.fromHeader(h).destroy(gpa),
+        .bytebuf => {
+            const b = ByteBuf.fromHeader(h);
+            heap.string_debt -= b.charged;
+            b.destroy(gpa);
+        },
         .thread => heap.thread_ops.?.destroy(heap, h),
         // typed_array (Phase 9b) and host (embedding) are not heap-allocated
         // here yet.
@@ -1471,6 +1496,36 @@ test "doc 80: a string past nominal_object_bytes charges its bytes to pacing, an
     try testing.expectEqual(@as(usize, 0), heap.string_debt);
     try testing.expectEqual(@as(usize, initial_gc_threshold), heap.next_gc);
     try testing.expectEqual(@as(u64, 1), heap.collections);
+}
+
+test "doc 68 §7.4: a byte buffer charges its used bytes as it grows, a rooted one survives, the sweep refunds" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    var list: std.ArrayList(u8) = .empty;
+    try list.appendNTimes(heap.gpa, 'a', nominal_object_bytes - 1);
+    const base_objects = heap.object_count;
+    const b = try heap.newByteBuf(list);
+    try testing.expectEqual(@as(usize, 0), heap.string_debt);
+    try testing.expectEqual(base_objects + 1, heap.object_count);
+
+    // Growth charges the difference only, however the capacity moved.
+    try b.list.appendNTimes(heap.gpa, 'b', 2 * nominal_object_bytes + 1);
+    heap.chargeByteBuf(b);
+    try testing.expectEqual(@as(usize, 3), heap.string_debt);
+    heap.chargeByteBuf(b);
+    try testing.expectEqual(@as(usize, 3), heap.string_debt);
+    try testing.expectEqual(@as(usize, 3), b.charged);
+    try testing.expectEqualStrings("a", b.bytes()[0..1]);
+
+    // Rooted, it survives a collection with its charge; unrooted, the sweep
+    // frees it and refunds exactly what it paid.
+    try collectWithRoots(&heap, &.{&b.header});
+    try testing.expectEqual(@as(usize, 3), heap.string_debt);
+    try testing.expectEqual(base_objects + 1, heap.object_count);
+    try collectWithRoots(&heap, &.{});
+    try testing.expectEqual(@as(usize, 0), heap.string_debt);
+    try testing.expectEqual(base_objects, heap.object_count);
 }
 
 test "doc 80 §3: an armed intern links a charged string only when no collection can come due" {
