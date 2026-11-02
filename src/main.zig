@@ -228,16 +228,31 @@ const TraceOpts = struct {
     system: mahina.system.Groups = .all,
 };
 
+/// `std.start` hands `main` the `smp_allocator` in a fast or small build
+/// that links no libc and has threads (`callMain`); the block cache then
+/// calls it directly instead of through its vtable. Any other process
+/// allocator (the safe one, or a libc build's malloc) is called through it.
+const process_gpa_is_smp = !builtin.cpu.arch.isWasm() and !builtin.link_libc and
+    !builtin.single_threaded and (builtin.mode == .fast or builtin.mode == .small);
+const BlockCache = mahina.mem.LargeBlockCacheOver(if (process_gpa_is_smp) &std.heap.SmpAllocator.vtable else null);
+
 pub fn main(init: std.process.Init) u8 {
     // A program's stdout is buffered (fully, unless it is a terminal; doc 65
     // §6), so whatever is still in the buffer goes out here, on every return
     // path. Declared first, so it runs after every other deferred report.
     defer mahina.io.flush();
-    // `--mem-stats` swaps `gpa` for a TrackingAllocator wrapper over the process
-    // allocator (Rule Z-4: account at the boundary). The tracker must be declared
+    // The VM's allocations go through a large-block cache over the process
+    // allocator, which on its own maps and unmaps every block past 32 KiB
+    // (`mem.LargeBlockCache`). Declared before every user of `gpa`, so its
+    // deinit runs after they have freed theirs. The I/O threads and the
+    // language server keep `init.gpa`: the cache is single-threaded.
+    var block_cache = BlockCache.init(init.gpa, BlockCache.default_retain_floor);
+    defer block_cache.deinit();
+    // `--mem-stats` swaps `gpa` for a TrackingAllocator wrapper over that
+    // (Rule Z-4: account at the boundary). The tracker must be declared
     // here — stable address for the vtable handle, and alive past `runSource` so
     // the deferred report sees final counts.
-    var mem_tracker = mahina.mem.TrackingAllocator.init(init.gpa);
+    var mem_tracker = mahina.mem.TrackingAllocator.init(block_cache.allocator());
     var mem_stats = false;
     defer if (mem_stats) {
         const s = mem_tracker.stats;
@@ -399,7 +414,7 @@ pub fn main(init: std.process.Init) u8 {
 
     // Everything below allocates, so the gpa choice happens exactly here: after
     // flag parsing (which only compares argv strings), before first use.
-    const gpa = if (mem_stats) mem_tracker.allocator() else init.gpa;
+    const gpa = if (mem_stats) mem_tracker.allocator() else block_cache.allocator();
 
     // No script and no `-e`: the REPL (doc 75 §6). Its program arguments are
     // none; `arg[0]` is the interpreter's name.
