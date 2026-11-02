@@ -197,9 +197,15 @@ result, drift found.
   spawning*, features REQ-8 `proc.run` (REQ-12..18), REQ-9 `proc.pipe`
   (REQ-19..21), REQ-10 `proc.spawn` (REQ-22..25), REQ-11 environment and
   working directory (REQ-26..27). 20 requirements, 46 criteria, all `draft`,
-  no notes yet (the doc's decisions and open questions still to be moved).
+  15 notes on REQ-7 (1 rationale, 3 goals, 4 non-goals, 4 decisions, 2 open questions, 1 context).
   Trace pass: all 46 criteria verified by `gt requirement verify` against a
   local report. Three tests added to prove what criteria claim (poll returns
   the result once ended; signalled and timed-out jobs raise on wait; kill
-  defaults to `TERM`). Not yet converted: the REPL/line editor (§6), Ctrl-C
-  forwarding, portability (§7), and the notes.
+  defaults to `TERM`). Same day, the REPL half: epic REQ-28 *The REPL and
+  shell*, features REQ-29 session (REQ-32..36), REQ-30 shortcuts
+  (REQ-37..41), REQ-31 line editor (REQ-42..46); 15 requirements, 33
+  criteria, 8 notes on REQ-28, all verified locally (79 units across docs 75
+  and 77). Not covered: Ctrl-C forwarding to children and VM-close
+  termination (no test; context note on REQ-7), the REPL printing
+  `interrupted`, portability (§7). `cd` translation test now also asserts
+  the OLDPWD/PWD updates its criterion claims.

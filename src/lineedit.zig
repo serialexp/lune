@@ -433,7 +433,7 @@ fn typeInto(ed: *Editor, hist: *const History, bytes: []const u8) !Status {
     return st;
 }
 
-test "decoder: plain bytes, control keys, UTF-8 and escape sequences" {
+test "[REQ-42.1] decoder: plain bytes, control keys, UTF-8 and escape sequences" {
     const keys = try decodeAll(testing.allocator, "a\xc3\xa9\x01\x1b[A\x1b[3~\x1bOH\x1b[1;5C\x1bb\x7f\r");
     defer testing.allocator.free(keys);
     try testing.expectEqual(@as(usize, 10), keys.len);
@@ -449,7 +449,7 @@ test "decoder: plain bytes, control keys, UTF-8 and escape sequences" {
     try testing.expect(keys[9] == .enter);
 }
 
-test "decoder: a broken UTF-8 sequence and unknown escapes are dropped" {
+test "[REQ-42.2] decoder: a broken UTF-8 sequence and unknown escapes are dropped" {
     const keys = try decodeAll(testing.allocator, "\xe2\x82x\x1b[99zy");
     defer testing.allocator.free(keys);
     try testing.expectEqual(@as(usize, 2), keys.len);
@@ -457,7 +457,7 @@ test "decoder: a broken UTF-8 sequence and unknown escapes are dropped" {
     try testing.expectEqual(@as(u21, 'y'), keys[1].char);
 }
 
-test "editor: insert, move, delete and kill" {
+test "[REQ-43.1] editor: insert, move, delete and kill" {
     var hist = History.init(testing.allocator);
     defer hist.deinit();
     var ed = Editor.init(testing.allocator);
@@ -479,7 +479,7 @@ test "editor: insert, move, delete and kill" {
     try testing.expectEqualStrings("", ed.line());
 }
 
-test "editor: multi-byte characters are one step" {
+test "[REQ-43.2] editor: multi-byte characters are one step" {
     var hist = History.init(testing.allocator);
     defer hist.deinit();
     var ed = Editor.init(testing.allocator);
@@ -491,7 +491,7 @@ test "editor: multi-byte characters are one step" {
     try testing.expectEqualStrings("a\xe2\x82\xacz", ed.line());
 }
 
-test "editor: Enter, Ctrl-C, and Ctrl-D (end of input only when empty)" {
+test "[REQ-44.1] editor: Enter, Ctrl-C, and Ctrl-D (end of input only when empty)" {
     var hist = History.init(testing.allocator);
     defer hist.deinit();
     var ed = Editor.init(testing.allocator);
@@ -504,7 +504,7 @@ test "editor: Enter, Ctrl-C, and Ctrl-D (end of input only when empty)" {
     try testing.expectEqual(Status.interrupted, try typeInto(&ed, &hist, "\x03"));
 }
 
-test "editor: history walks back and forward and gives the typed line back" {
+test "[REQ-45.1] editor: history walks back and forward and gives the typed line back" {
     var hist = History.init(testing.allocator);
     defer hist.deinit();
     try hist.add("one");
@@ -524,7 +524,7 @@ test "editor: history walks back and forward and gives the typed line back" {
     try testing.expectEqualStrings("draft", ed.line());
 }
 
-test "history: blanks and repeats are not kept, the oldest go past the limit, a file round-trips" {
+test "[REQ-45.2] history: blanks and repeats are not kept, the oldest go past the limit, a file round-trips" {
     var hist = History.init(testing.allocator);
     defer hist.deinit();
     hist.max = 3;
@@ -548,7 +548,7 @@ test "history: blanks and repeats are not kept, the oldest go past the limit, a 
     try testing.expectEqualStrings("x", back.items.items[0]);
 }
 
-test "render: prompt, text, clear and cursor column; a long line scrolls" {
+test "[REQ-46.1] render: prompt, text, clear and cursor column; a long line scrolls" {
     var hist = History.init(testing.allocator);
     defer hist.deinit();
     var ed = Editor.init(testing.allocator);
@@ -568,7 +568,7 @@ test "render: prompt, text, clear and cursor column; a long line scrolls" {
     try testing.expectEqualStrings("\r> 456789\x1b[K\r\x1b[8C", aw.written());
 }
 
-test "promptWidth skips colour codes" {
+test "[REQ-46.2] promptWidth skips colour codes" {
     try testing.expectEqual(@as(usize, 5), promptWidth("\x1b[32m~/x\x1b[0m> "));
     try testing.expectEqual(@as(usize, 2), promptWidth("> "));
 }

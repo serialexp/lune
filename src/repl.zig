@@ -780,7 +780,7 @@ pub fn interactive(cfg: Config, session: *Session) !u8 {
 
 const testing = std.testing;
 
-test "recognize: shortcut words, and the Lua lines that start like them" {
+test "[REQ-37.1] [REQ-37.2] recognize: shortcut words, and the Lua lines that start like them" {
     try testing.expectEqualStrings("/tmp", recognize("cd /tmp").?.rest);
     try testing.expectEqualStrings("..", recognize("  cd ..").?.rest);
     try testing.expectEqualStrings("", recognize("cd").?.rest);
@@ -805,7 +805,7 @@ fn luaOf(gpa: Allocator, word: []const u8, rest: []const u8) ![]u8 {
     };
 }
 
-test "translate: cd reads its path as a shell word" {
+test "[REQ-38.1] [REQ-38.2] translate: cd reads its path as a shell word" {
     const gpa = testing.allocator;
     const b = try luaOf(gpa, "cd", "'/tmp/my dir'");
     defer gpa.free(b);
@@ -819,10 +819,11 @@ test "translate: cd reads its path as a shell word" {
     const e = try luaOf(gpa, "cd", "");
     defer gpa.free(e);
     try testing.expect(std.mem.indexOf(u8, e, "os.chdir((os.getenv(\"HOME\") or \"\"))") != null);
+    try testing.expect(std.mem.indexOf(u8, d, "os.setenv(\"OLDPWD\", __o) os.setenv(\"PWD\", os.getcwd())") != null);
     try testing.expectEqualStrings("cd: too many arguments", (try translate(gpa, "cd", "a b")).bad);
 }
 
-test "translate: export and unset" {
+test "[REQ-39.1] [REQ-39.2] [REQ-39.3] translate: export and unset" {
     const gpa = testing.allocator;
     const a = try luaOf(gpa, "export", "PATH=$PATH:/x A=\"q r\" B='$no' C=");
     defer gpa.free(a);
@@ -840,7 +841,7 @@ test "translate: export and unset" {
     defer gpa.free(c);
 }
 
-test "translate: exit takes a status" {
+test "[REQ-40.1] translate: exit takes a status" {
     const gpa = testing.allocator;
     try testing.expectEqual(@as(u8, 0), (try translate(gpa, "exit", "")).exit);
     try testing.expectEqual(@as(u8, 3), (try translate(gpa, "exit", "3")).exit);
@@ -888,7 +889,7 @@ const Rig = struct {
     }
 };
 
-test "historyPath: XDG_STATE_HOME first, then ~/.local/state, else none" {
+test "[REQ-45.3] historyPath: XDG_STATE_HOME first, then ~/.local/state, else none" {
     const gpa = testing.allocator;
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
@@ -903,7 +904,7 @@ test "historyPath: XDG_STATE_HOME first, then ~/.local/state, else none" {
     try testing.expectEqualStrings("/state/mahina/history", b);
 }
 
-test "session: expressions print their values, statements print nothing" {
+test "[REQ-32.1] session: expressions print their values, statements print nothing" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     try testing.expect(try r.feed("1 + 1") == .done);
@@ -915,7 +916,7 @@ test "session: expressions print their values, statements print nothing" {
     try testing.expectEqualStrings("", r.err.written());
 }
 
-test "session: a chunk that ends early waits for more lines" {
+test "[REQ-33.1] [REQ-33.2] session: a chunk that ends early waits for more lines" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     try testing.expect(try r.feed("for i = 1, 3 do") == .more);
@@ -932,7 +933,7 @@ test "session: a chunk that ends early waits for more lines" {
     try testing.expect(!r.session.continuing());
 }
 
-test "session: a syntax error is reported once and the line is dropped" {
+test "[REQ-34.1] session: a syntax error is reported once and the line is dropped" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     try testing.expect(try r.feed("x y") == .done);
@@ -942,7 +943,7 @@ test "session: a syntax error is reported once and the line is dropped" {
     try testing.expectEqualStrings("still alive\n", r.out.written());
 }
 
-test "session: a runtime error is reported and the next line still runs" {
+test "[REQ-34.2] session: a runtime error is reported and the next line still runs" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     try testing.expect(try r.feed("error('boom')") == .done);
@@ -952,7 +953,7 @@ test "session: a runtime error is reported and the next line still runs" {
     try testing.expectEqualStrings("2\n", r.out.written());
 }
 
-test "session: globals persist from one line to the next" {
+test "[REQ-35.1] session: globals persist from one line to the next" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     _ = try r.feed("function inc() n = (n or 0) + 1 return n end");
@@ -961,7 +962,7 @@ test "session: globals persist from one line to the next" {
     try testing.expectEqualStrings("1\n2\n", r.out.written());
 }
 
-test "session: top-level locals persist from line to line, and closures share them" {
+test "[REQ-35.2] [REQ-35.3] session: top-level locals persist from line to line, and closures share them" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     _ = try r.feed("local n = 1");
@@ -980,7 +981,7 @@ test "session: top-level locals persist from line to line, and closures share th
     try testing.expectEqualStrings("", r.err.written());
 }
 
-test "session: locals of blocks and loops do not persist, and a recursive local function works" {
+test "[REQ-36.1] session: locals of blocks and loops do not persist, and a recursive local function works" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     _ = try r.feed("do local hidden = 1 end");
@@ -992,7 +993,7 @@ test "session: locals of blocks and loops do not persist, and a recursive local 
     try testing.expectEqualStrings("nil\nnil\n120\n", r.out.written());
 }
 
-test "session: a persisted <const> cannot be assigned, and a <close> local stays in its chunk" {
+test "[REQ-36.2] [REQ-36.3] session: a persisted <const> cannot be assigned, and a <close> local stays in its chunk" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     _ = try r.feed("local c <const> = 7");
@@ -1006,7 +1007,7 @@ test "session: a persisted <const> cannot be assigned, and a <close> local stays
     try testing.expectEqualStrings("7\n7\nclosed\nnil\n", r.out.written());
 }
 
-test "session: a constant <const> folds in its own line and persists for the next ones" {
+test "[REQ-36.2] session: a constant <const> folds in its own line and persists for the next ones" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     // Doc 76 D8: the line's own uses fold; the cell still carries the value.
@@ -1017,7 +1018,7 @@ test "session: a constant <const> folds in its own line and persists for the nex
     try testing.expectEqualStrings("", r.err.written());
 }
 
-test "session: persisted locals survive a garbage collection" {
+test "[REQ-35.4] session: persisted locals survive a garbage collection" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     _ = try r.feed("local keep = {1, 2, 3}");
@@ -1031,7 +1032,7 @@ test "session: persisted locals survive a garbage collection" {
     try testing.expectEqualStrings("", r.err.written());
 }
 
-test "session: cd, export, unset and exit run as shortcuts, but not over a global of that name" {
+test "[REQ-37.3] [REQ-41.1] session: cd, export, unset and exit run as shortcuts, but not over a global of that name" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     try testing.expect(try r.feed("export GREETING=hi") == .done);
@@ -1053,7 +1054,7 @@ test "session: cd, export, unset and exit run as shortcuts, but not over a globa
     try testing.expectEqual(calls, r.host.mutate_calls);
 }
 
-test "session: a failing cd says why and does not end the session" {
+test "[REQ-41.2] session: a failing cd says why and does not end the session" {
     const r = try Rig.init(testing.allocator);
     defer r.deinit(testing.allocator);
     r.host.chdir_result = .not_found;
