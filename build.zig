@@ -195,13 +195,20 @@ pub fn build(b: *std.Build) void {
     const jit_unwind_tests = b.addTest(.{ .root_module = jit_unwind_mod, .filters = test_filters });
     const run_jit_unwind_tests = b.addRunArtifact(jit_unwind_tests);
 
+    // `-Dtest-junit=<dir>`: every test process appends one JUnit `<testcase>`
+    // per test to `<dir>/<pid>.frag` (doc 79); `tools/junit-merge.py <dir>`
+    // joins them. The runs then always execute: a cached run would record
+    // nothing.
+    const test_junit = b.option([]const u8, "test-junit", "Directory for per-process JUnit fragments (doc 79)");
     const test_step = b.step("test", "Run all unit tests");
     var shard: u8 = 0;
     while (shard < @max(test_shards, 1)) : (shard += 1) {
         const run_shard = b.addRunArtifact(mod_tests);
         if (test_shards > 1) run_shard.setEnvironmentVariable("MAHINA_TEST_SHARD", b.fmt("{d}/{d}", .{ shard, test_shards }));
+        junitReport(run_shard, test_junit);
         test_step.dependOn(&run_shard.step);
     }
+    junitReport(run_exe_tests, test_junit);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_jit_unwind_tests.step);
 
@@ -277,6 +284,7 @@ pub fn build(b: *std.Build) void {
     const capi_tests = b.addTest(.{ .root_module = capi_mod, .filters = test_filters, .test_runner = runner.config() });
     capi_tests.use_llvm = true;
     const run_capi_tests = b.addRunArtifact(capi_tests);
+    junitReport(run_capi_tests, test_junit);
     test_step.dependOn(&run_capi_tests.step);
 
     // The C header-consumer smoke test (doc 59 §3.8): a real C program compiled
@@ -495,6 +503,14 @@ pub fn build(b: *std.Build) void {
     //      `addTest` because Zig's test runner needs host I/O to report results,
     //      which `wasm32-freestanding` lacks — there is no in-`zig build` way to
     //      execute freestanding-wasm tests without a WASI shim + runtime.
+}
+
+/// Point a test run's fragments at `dir` (tests/test_runner.zig, doc 79) and
+/// make it always run: a cached run would record nothing.
+fn junitReport(run: *std.Build.Step.Run, dir: ?[]const u8) void {
+    const d = dir orelse return;
+    run.setEnvironmentVariable("MAHINA_TEST_JUNIT_DIR", d);
+    run.has_side_effects = true;
 }
 
 /// tests/test_runner.zig and the two modules it imports from the module under

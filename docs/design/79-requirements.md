@@ -1,6 +1,6 @@
 # 79 — Requirements on gothab.io for mahina — Design
 
-Status: draft; the model is adopted from Gothab, the Zig test-citation scheme (Q1) and report path (Q2) await Bart's decision. No doc is converted yet.
+Status: draft; the model is adopted from Gothab. A prototype of the Zig citation scheme and JUnit report works locally (Q1, Q2); CI upload and a reusable package are not done. No doc is converted yet.
 Owner: Bart
 Last updated: 2026-11-02
 
@@ -18,8 +18,27 @@ land; move whole sections to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Q1 — how a Zig test cites a key.** Options below.
-- [ ] **Q2 — how citations reach gothab.io.** Options below.
+- [x] **Q1 — how a Zig test cites a key.** Prototype: `[REQ-n.m]` tags in the
+  test name (option A).
+- [x] **Q2 (local half) — a JUnit report with the citations.** `tests/test_runner.zig`
+  swaps each test's `func` for a per-index shim (option C) and writes one
+  `<testcase>` per test to `<dir>/<pid>.frag` when `MAHINA_TEST_JUNIT_DIR` is
+  set; `zig build test -Dtest-junit=<dir>` sets it on every test run and makes
+  the runs uncached; `tools/junit-merge.py <dir>` joins the fragments.
+  Checked: 2512 cases from the full suite, tags land in the `requirements`
+  property. Not checked: that gothab.io ingests it (CI upload only).
+- [ ] **Q2 (CI half).** Add the `-Dtest-junit` run, the merge and an
+  `actions/test-results@v1` upload (`files:` the merged report) to
+  `.gothab/workflows/ci.yml`'s unit-test job.
+- [ ] **A shared package.** The runner code is mahina-specific (Linux
+  syscalls, `junit_capacity` shims, our sharding). A reusable `verifies` for
+  Zig would extract the shim, the tag parser and the JUnit writer into a
+  module a project adds as its `test_runner`. Not started.
+- [ ] **Prototype limits.** Linux only; at most 8192 tests per binary (a
+  larger binary writes nothing and says so); a leak is detected by std after
+  the shim returns, so it fails the build but not the case in the report; the
+  8192 comptime shims are compiled into every test binary (compile cost not
+  measured).
 - [ ] **Conversion order.** Which docs, in which areas (§Converting).
 - [ ] **Extraction + trace pass** per doc; progress is logged under
   §Conversion progress.
