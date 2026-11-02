@@ -1,0 +1,191 @@
+# 80 — Growing strings: allocator, pacing, concat, long strings — Design
+
+Status: partial — U1 (large-block cache) and U3 (byte-charged GC pacing)
+built; U2 (single-copy concat) and U4 (long strings) outstanding
+Owner: Bart
+Last updated: 2026-11-02
+
+## Implementation status
+
+Tracking the gap between this design and what's on master. Tick items as they
+land; move whole units to Done once everything inside them is checked.
+
+### Done
+
+- [x] **U1 — large-block cache** (§2). `mem.LargeBlockCacheOver` in
+  `src/mem.zig`; the CLI (`src/main.zig`) installs it over the process
+  allocator on every platform.
+- [x] **U3 — GC pacing charges string bytes** (§3). `gc.stringUnits`,
+  `Heap.string_debt`, the refund in `destroyObject`, and the trace charge
+  rule (§3.2): `guard_gc`/`guard_host_epoch` publish their bound in
+  `Heap.trace_alloc_bound`, the stralloc shims arm `trace_callout`, and a
+  charged intern that would break the guard's promise is refused and the op
+  declines to tier 0.
+
+### Outstanding
+
+- [ ] **Bench `bench/stdlib/str_concat_grow.lua`** with its hashgate rows
+  (written; lands once `bench/refs/output-hashes.tsv` is free).
+- [ ] **U2 — concat builds its result in one copy** (§4): `Vm.concat`
+  sizes the result from its parts and interns it once, with Known facts
+  (length, hash seed) taken from the parts.
+- [ ] **Q1 — long strings: which model** (§5). (A) Lua 5.4 uninterned long
+  strings, which Bart picked first, or (B) LuaJIT's sparse hash, which keeps
+  every string interned. Bart decides before U4 starts.
+- [ ] **U4 — long strings**, per Q1's answer.
+- [ ] **Embedders** (§2.3): document `LargeBlockCache` in the embedding
+  guide; the C API does not install it today.
+
+## 1. Why this exists
+
+`s = s .. "x"` in a loop is the idiom every Lua programmer reaches for, and in
+mahina it was worse than quadratic: 80 000 iterations took 1.23 s
+(`lua` 0.08 s), 160 000 took 5.34 s, and RSS climbed past 230 MB. Three costs
+stacked:
+
+1. **Every allocation past 32 KiB was an `mmap`/`munmap` pair.** The release
+   CLI's process allocator is `std.heap.smp_allocator`, which sends anything
+   larger than its 64 KiB slab classes straight to `PageAllocator`. A growing
+   string past 32 KiB therefore paid a syscall pair plus first-touch page
+   faults on every step, and the kernel zeroed every page again.
+2. **The collector did not see string bytes.** Pacing counted objects, so a
+   heap of a few hundred 100 KiB strings looked as small as a few hundred
+   empty tables. The dead intermediates of the loop stayed alive until the
+   object count caught up, which is where the RSS went.
+3. **Each concat copies twice and hashes the whole result** (§4, §5).
+
+U1 and U3 fix the first two. U2 and U4 attack the third.
+
+| | 80k `s..x` | 160k `s..x` | `str_concat_grow` 80000 | peak RSS (80k) |
+|---|---|---|---|---|
+| before | 1.23 s | 5.34 s | 1.57 s | 181 MB |
+| U1 | 0.50 s | 1.93 s | 0.58 s | 243 MB |
+| U1 + U3 | 0.19 s | 0.75 s | 0.22 s | 8 MB |
+
+## 2. U1 — the large-block cache
+
+### 2.1 Shape
+
+`LargeBlockCacheOver(static_vtable)` wraps a child allocator and keeps
+freed blocks of 32 KiB and up for reuse:
+
+- **Size classes**, 8 per doubling from 32 KiB to 64 MiB (81 classes, at
+  most 12.5 % waste). A request is rounded up to its class, so a block freed
+  by one string serves the next string of a similar size.
+- **One LRU across classes**, not a cap per class. A per-class cap filled up
+  with blocks of sizes the program had already grown past, and those blocks
+  were never reused.
+- **A bounded total:** kept bytes never exceed
+  `max(retain_floor, peak_in_use)`. The floor is 64 MiB by default. Above it
+  the cache keeps at most as much as the program has ever had live at once,
+  so it never more than doubles the footprint. The oldest blocks are evicted
+  first.
+- **Blocks above 64 MiB** are still the cache's (taken at its 64-byte
+  alignment, at their exact length), but are never kept. Treating them as
+  the cache's own means resize and remap stay with the cache as a buffer
+  grows past the limit, so it is never copied between two allocators.
+- **resize/remap between classes are delegated to the child at class
+  sizes.** On Linux that is `mremap`, so a growing buffer moves without a
+  copy. Refusing them and copying instead cost `io_read_all_bin` 19 %.
+
+### 2.2 Cost on the fast path
+
+The wrapper is one extra compare for small allocations. When the child's
+vtable is known at comptime (`static_vtable`, which the CLI passes for
+`SmpAllocator`), child calls are inlined direct calls, and the large-block
+paths are `noinline`. With a dynamic vtable the A/B cost was +2–7 %
+instructions across the board. With the static vtable every benchmark is
+within ±0.7 %.
+
+### 2.3 Who installs it
+
+The CLI installs it over the process allocator on every platform; with
+`--mem-stats` the tracker wraps the cache, so it counts what the VM asks for. The thread, LSP and viz
+allocators keep the plain process allocator. An embedder brings its own
+allocator (Rule Z-4), so the cache is opt-in there: wrap the backing
+allocator once and feed the VM from it.
+
+## 3. U3 — GC pacing charges string bytes
+
+### 3.1 The charge
+
+A string costs `stringUnits(len) = len / nominal_object_bytes` (256) object
+units on top of its own object. That is charged as `Heap.string_debt` when
+the string is linked into the intern table (`internImpl`, and
+`internRestoredUnique` on restore), and refunded when `destroyObject`
+frees it. The pacer's debt is `stack_debt + string_debt`: `next_gc` is
+`gc_target - debt`, and a sweep sets the next target to
+`max(1024, (live + debt) * 2)`. Short strings charge nothing, so programs
+that never build long strings collect on exactly the schedule they had
+before.
+
+The charge is a pure function of string lengths, so all eight modes see the
+same schedule and the same collections (doc 02).
+
+### 3.2 The trace charge rule
+
+Doc 24 D3 lets a trace iteration run only if
+`!gc_stress ∧ object_count + A < next_gc`, where A is the trace's static
+allocation bound. That is what guarantees no collection can start in the
+middle of an iteration. A charged string breaks the promise: one 1 MiB
+string adds 4096 units, far more than the one object A counted for it.
+
+Rejected alternatives were (a) charging nothing on trace, which makes the
+schedule depend on the tier and breaks 8-mode equivalence, and (b) folding a
+byte bound into A, which no static bound can give for `rep` or `sub` of a
+runtime length.
+
+The rule that ships:
+
+1. `guard_gc` and `guard_host_epoch` store A in `Heap.trace_alloc_bound`
+   when they pass (native and tier-1a both).
+2. The trace-side string shims (`ssub`, `srev`, `srep2`, `supper`, `slower`,
+   `scapStr` in `stralloc.zig`) set `Heap.trace_callout` around their
+   allocation.
+3. A charged intern miss under `trace_callout` is admitted only if
+   `object_count + A + units < next_gc`. Otherwise it is refused: the shim
+   sets `trace_charge_refused` and returns `.decline`, so tier 0 replays the
+   op and the collection happens where tier 0 would have done it.
+
+The refusal must be `.decline`, not `.oom`: on a precise trace an OOM is
+raised in place (doc 45 D5), which would turn a pacing event into a
+program-visible error. `tostr` and `schar1` produce short strings and are
+never charged.
+
+## 4. U2 — concat in one copy
+
+Today `Vm.concat` builds the result in a scratch buffer, then interns it,
+which copies it again and hashes every byte. U2 sizes the result from its
+parts, writes it once into the string's own storage, and interns it with the
+facts already known (the length, and the hash of the left part where the
+hash allows it). It touches `Vm.concat` in `interp.zig` and adds one intern
+entry to `gc.zig`.
+
+## 5. Q1 — long strings
+
+Even with U1–U3, every concat hashes its full result, so a loop that grows a
+string to n bytes still does O(n²) hashing work. Two ways out:
+
+- **(A) Lua 5.4: long strings are not interned.** Strings past a limit
+  (40 bytes in Lua) are created without a hash-table lookup; equality
+  compares lengths and then bytes, and a long string used as a table key
+  hashes lazily, once. This is what Bart picked first. It is structural:
+  string identity, table keys, equality, the JIT's pointer-equality string
+  compares, keyframe string tables and restore all change.
+- **(B) LuaJIT: everything stays interned, with a sparse hash.** A long
+  string hashes a fixed sample of its bytes, so hashing is O(1) in its
+  length. Strings that collide fall back to a full hash on long chains. The
+  intern table and every pointer-equality fast path stay as they are, and
+  the cost moves to the comparisons on a hash-chain hit.
+
+Bart decides between them before U4 starts.
+
+## References
+
+- `src/mem.zig` — `LargeBlockCacheOver`.
+- `src/main.zig` — the CLI's allocator chain.
+- `src/gc.zig` — `stringUnits`, `string_debt`, `traceChargeFits`.
+- `src/stralloc.zig` — the charged shims.
+- Doc 02 (determinism), doc 24 D3 (`guard_gc`), doc 45 D5 (precise OOM).
+- LuaJIT `lj_str.c` (`lj_str_new`, sparse hashing); Lua 5.4 `lstring.c`
+  (`luaS_newlstr`, `LUAI_MAXSHORTLEN`).

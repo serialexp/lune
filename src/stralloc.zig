@@ -128,17 +128,43 @@ pub noinline fn tostrNumRuntime(heap: *gc.Heap, x: f64) callconv(.c) StrResult {
 const string_std = @import("stdlib/string.zig");
 const string_mod = @import("string.zig");
 
+// Doc 80 §3: a core that can build a string past `gc.nominal_object_bytes`
+// runs with the heap's trace charge check armed. A string the intern would
+// charge is linked only when the charge cannot make a collection due before
+// the iteration ends; otherwise the intern fails before linking, and the
+// shim declines, so tier-0 replays the op, charges, and collects at the
+// safepoint after it, as it always would. `tostr_*` and `schar1` build at
+// most a few dozen bytes and are never charged.
+
+inline fn armCharge(heap: *gc.Heap) void {
+    heap.trace_callout = true;
+    heap.trace_charge_refused = false;
+}
+
+inline fn disarmCharge(heap: *gc.Heap) void {
+    heap.trace_callout = false;
+}
+
+/// An intern OOM from an armed core, unless it was the charge check: a decline.
+inline fn chargeFailure(heap: *const gc.Heap) StrResult {
+    return if (heap.trace_charge_refused) .decline else .oom;
+}
+
 /// `ssub` body: `string.sub(s, i, j)` by character position, Lua clamping.
 pub noinline fn ssubRuntime(heap: *gc.Heap, s: *object.GcHeader, i: i64, j: i64) callconv(.c) StrResult {
     const str = string_mod.String.fromHeader(s);
-    const r = string_std.subCore(heap, str, i, j) catch return .oom;
+    armCharge(heap);
+    defer disarmCharge(heap);
+    const r = string_std.subCore(heap, str, i, j) catch return chargeFailure(heap);
     return .ok(&r.header);
 }
 
 /// `srev` body: `string.reverse(s)`, characters mirrored as UTF-8 units.
 pub noinline fn srevRuntime(heap: *gc.Heap, s: *object.GcHeader) callconv(.c) StrResult {
     const str = string_mod.String.fromHeader(s);
-    const r = string_std.reverseCore(heap, str) catch return .oom;
+    armCharge(heap);
+    defer disarmCharge(heap);
+    const r = string_std.reverseCore(heap, str) catch return chargeFailure(heap);
     return .ok(&r.header);
 }
 
@@ -156,9 +182,11 @@ pub noinline fn schar1Runtime(heap: *gc.Heap, code: i64) callconv(.c) StrResult 
 /// string → decline (tier-0 replays and raises "resulting string too large").
 pub noinline fn srep2Runtime(heap: *gc.Heap, s: *object.GcHeader, n: i64) callconv(.c) StrResult {
     const str = string_mod.String.fromHeader(s);
+    armCharge(heap);
+    defer disarmCharge(heap);
     const r = string_std.rep2Core(heap, str, n) catch |e| return switch (e) {
         error.TooLarge => .decline,
-        error.OutOfMemory => .oom,
+        error.OutOfMemory => chargeFailure(heap),
     };
     return .ok(&r.header);
 }
@@ -168,14 +196,18 @@ pub noinline fn srep2Runtime(heap: *gc.Heap, s: *object.GcHeader, n: i64) callco
 /// invariant (doc 26 D1), never re-derived on trace.
 pub noinline fn supperRuntime(heap: *gc.Heap, s: *object.GcHeader) callconv(.c) StrResult {
     const str = string_mod.String.fromHeader(s);
-    const r = string_std.caseCore(heap, str, .upper) catch return .oom;
+    armCharge(heap);
+    defer disarmCharge(heap);
+    const r = string_std.caseCore(heap, str, .upper) catch return chargeFailure(heap);
     return .ok(&r.header);
 }
 
 /// `slower` body: `string.lower(s)`, ditto.
 pub noinline fn slowerRuntime(heap: *gc.Heap, s: *object.GcHeader) callconv(.c) StrResult {
     const str = string_mod.String.fromHeader(s);
-    const r = string_std.caseCore(heap, str, .lower) catch return .oom;
+    armCharge(heap);
+    defer disarmCharge(heap);
+    const r = string_std.caseCore(heap, str, .lower) catch return chargeFailure(heap);
     return .ok(&r.header);
 }
 
@@ -238,9 +270,11 @@ pub noinline fn sgmatchRuntime(heap: *gc.Heap, state: *object.GcHeader, expected
 /// `scap_str` body: intern the span in scratch slot `slot`. A stale scratch
 /// (the core's defense in depth) declines; an intern OOM is `.oom`.
 pub noinline fn scapStrRuntime(heap: *gc.Heap, slot: i64) callconv(.c) StrResult {
+    armCharge(heap);
+    defer disarmCharge(heap);
     const r = string_std.scapStrCore(heap, @intCast(slot)) catch |e| return switch (e) {
         error.StaleScratch => .decline,
-        error.OutOfMemory => .oom,
+        error.OutOfMemory => chargeFailure(heap),
     };
     return .ok(&r.header);
 }

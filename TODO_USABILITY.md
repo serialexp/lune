@@ -71,6 +71,8 @@ effect log so runs stay replayable (doc 02).
       **Fixed** (re-checked 2026-11-02: 200k keys 0.10s, lua 0.23s).
 - [ ] `s = s .. "x"` in a loop: 2.34s vs lua 0.07s at 80k, worse than
       quadratic. Re-checked 2026-11-02: 1.52s vs lua 0.08s at 80k.
+      Doc 80 U1 + U3 (2026-11-02): 0.19s, RSS 8 MB. Still hashes and
+      copies the whole result per step (U2, U4).
 - [x] No string→number coercion: `"10"+5`, `-"2"` error. **(verified)**
       Nor number/string coercion of string-function args:
       `string.rep(5,2)`, `("abc"):sub("2")`, `format("%d","10")`.

@@ -912,6 +912,8 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     else
                         false;
                     if (pass) {
+                        // The string callouts' charge check reads A (doc 80 §3).
+                        ctx.heap.?.trace_alloc_bound = a_bound;
                         if (record) rec.guardPass(i, Value.boolean(true));
                     } else {
                         if (record) rec.exit(i, .guard, Value.boolean(false));
@@ -1451,6 +1453,7 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                         if (record) rec.exit(i, .guard, Value.nil());
                         break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
+                    heap.trace_alloc_bound = a_bound;
                 },
                 // Doc 63 §5.1: result `aux` of the site, read from the window the
                 // shim wrote, checked against its observed type before it is used.

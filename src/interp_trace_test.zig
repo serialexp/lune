@@ -571,6 +571,69 @@ test "doc 24 c4: observation blackout — an armed safepoint recorder keeps allo
     try testing.expectEqual(@as(u64, 0), vm.trace.entries);
 }
 
+test "doc 80 §3: big strings built on trace charge their bytes on the tier-0 collection schedule" {
+    // `rep`/`reverse` of a 2.4-8.4 KB string on trace: each distinct result
+    // charges 9-32 pacing units, so collections come every few dozen
+    // iterations, and an
+    // iteration whose charge could make one due mid-burst must decline that
+    // op to tier-0. The collection count, the heap counters and the output
+    // must match a pure tier-0 run exactly.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local rep, rev = string.rep, string.reverse
+        \\local u = 0
+        \\for i = 1, 3000 do
+        \\  local s = rep("ab", 1200 + i)
+        \\  local dead = rev(s)
+        \\  u = u + #dead
+        \\end
+        \\print(u)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    const Run = struct { out: [64]u8 = undefined, len: usize = 0, objs: usize = 0, next_gc: usize = 0, next_id: u64 = 0, collections: u64 = 0, entries: u64 = 0 };
+    var runs: [2]Run = .{ .{}, .{} };
+    for (&runs, 0..) |*r, mode| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        if (mode == 1) {
+            vm.trace.config.enabled = true;
+            vm.trace.config.execute = true;
+            vm.trace.config.optimize = true;
+            vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+            vm.trace.config.hotloop = 4;
+        }
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        r.len = sink.buffered().len;
+        @memcpy(r.out[0..r.len], sink.buffered());
+        r.objs = vm.heap.object_count;
+        r.next_gc = vm.heap.next_gc;
+        r.next_id = vm.heap.next_obj_id;
+        r.collections = vm.heap.collections;
+        r.entries = vm.trace.entries;
+    }
+    try testing.expectEqualStrings(runs[0].out[0..runs[0].len], runs[1].out[0..runs[1].len]);
+    // The bytes paced it: 6000 strings of ~20 units over a ~1000-object
+    // floor collect far more often than the object count alone would.
+    try testing.expect(runs[0].collections > 20);
+    try testing.expectEqual(runs[0].collections, runs[1].collections);
+    try testing.expectEqual(runs[0].objs, runs[1].objs);
+    try testing.expectEqual(runs[0].next_gc, runs[1].next_gc);
+    try testing.expectEqual(runs[0].next_id, runs[1].next_id);
+    try testing.expect(runs[1].entries > 0);
+}
+
 test "doc 24 c4: threshold bouncing across real GC cycles — heap schedule and output identical across modes" {
     // The "guard_gc failing after many committed bursts" leg at VM scale: an
     // unbounded fresh-string loop (`tostring(i)` for 4000 distinct i) crosses

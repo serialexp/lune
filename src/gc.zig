@@ -54,8 +54,8 @@ const Proto = bytecode.Proto;
 
 /// The initial collection threshold (and the floor it never drops below): the
 /// collector first runs once the live-object count reaches this, and afterwards
-/// targets `max(this, (live + stack_debt) * heap_growth)` pacing units (an
-/// object is one, `nominal_object_bytes` of coroutine stack another). Small
+/// targets `max(this, (live + debt) * heap_growth)` pacing units (an object is
+/// one, `nominal_object_bytes` of coroutine stack or string bytes another). Small
 /// enough that even short
 /// programs exercise a cycle; the growth factor keeps long programs from
 /// collecting on every allocation.
@@ -69,6 +69,16 @@ const heap_growth: usize = 2;
 /// garbage stacks get the headroom garbage objects do, about the live
 /// heap's size, before they bring a collection forward.
 pub const nominal_object_bytes: usize = 256;
+
+/// The pacing units a string of `len` bytes is charged beyond its one as an
+/// object (`Heap.string_debt`): its bytes over `nominal_object_bytes`, so a
+/// string under that charges nothing and an 80 KB one 312. Without it a
+/// program building big strings keeps a cycle's worth of them, a thousand
+/// objects at the floor, alive between collections: `s = s .. "x"` to 80k
+/// held 230 MB where Lua holds 3.
+pub inline fn stringUnits(len: usize) usize {
+    return len / nominal_object_bytes;
+}
 
 /// Doc 30: the JIT pattern-match scratch — plain per-VM memory the match
 /// callouts (`smatch`/`sgmatch` in stralloc.zig) write and the projection ops
@@ -176,6 +186,27 @@ pub const Heap = struct {
     /// collection forward by the memory their stacks pin, not by one object
     /// each.
     stack_debt: usize = 0,
+    /// Pacing units charged for the strings currently linked
+    /// (`stringUnits`), so garbage strings bring the next collection forward
+    /// by their bytes. Charged at link (`internImpl`, and keyframe restore
+    /// through `internRestoredUnique`), refunded when the sweep frees one.
+    string_debt: usize = 0,
+    /// Doc 24 D3 with string pacing (doc 80 §3): the `A` of the last
+    /// `guard_gc`/`guard_host_epoch` a trace passed, which native code and
+    /// tier-1a store as they pass it. Read only while `trace_callout` is set.
+    trace_alloc_bound: usize = 0,
+    /// Set by the trace-side string callouts (`stralloc.zig`) around their
+    /// core call: a string the intern would charge is then linked only when
+    /// the charge cannot make a collection due before the iteration ends
+    /// (`traceChargeFits`). Tier-0 never sets it.
+    trace_callout: bool = false,
+    /// Set when `internImpl` refused a charge for `trace_callout`, so the
+    /// callout declines (tier-0 replays the op and collects) instead of
+    /// reporting the OOM the refusal surfaces as.
+    trace_charge_refused: bool = false,
+    /// Sweeps run so far. Not program-visible state: tests compare it across
+    /// tiers to pin the collection schedule.
+    collections: u64 = 0,
     /// The dispatch prologue's GC gate, a countdown: a collection is due
     /// exactly when it is `<= 0`, which holds iff `gc_stress or object_count
     /// >= next_gc`. It is `next_gc - object_count` (`0` under stress),
@@ -581,13 +612,35 @@ pub const Heap = struct {
             if (known.ascii) |a| std.debug.assert(a == existing.isAscii());
             return existing;
         }
+        const units = stringUnits(content.len);
+        if (units != 0 and self.trace_callout and !self.traceChargeFits(units)) {
+            self.trace_charge_refused = true;
+            return error.OutOfMemory;
+        }
         const s = try String.createWithHashKnown(self.gpa, content, h, known);
         errdefer s.destroy(self.gpa);
         try self.strtabEnsureCapacity();
         // Infallible from here.
         self.strtabInsert(s);
         self.link(&s.header);
+        if (units != 0) self.chargeString(units);
         return s;
+    }
+
+    /// Whether a trace callout may link a string charged `units`: then no
+    /// collection can come due before the iteration ends, as `guard_gc`
+    /// promised for its links (doc 24 D3) — the iteration links at most
+    /// `trace_alloc_bound` objects, and the charge lowers `next_gc` by
+    /// `units`. When it may not, the callout declines before linking and
+    /// tier-0 replays the op, which charges and collects where it always
+    /// would (doc 80 §3).
+    fn traceChargeFits(self: *const Heap, units: usize) bool {
+        return !self.gc_stress and (self.object_count +| self.trace_alloc_bound +| units) < self.next_gc;
+    }
+
+    fn chargeString(self: *Heap, units: usize) void {
+        self.string_debt += units;
+        self.retarget();
     }
 
     /// The interned `String` for `content`, or null if these bytes are not
@@ -607,6 +660,10 @@ pub const Heap = struct {
         if (self.strtabLookup(s.bytes(), s.hash) != null) return error.DuplicateInternedString;
         try self.strtabEnsureCapacity();
         self.strtabInsert(s);
+        // The restorer links it next; the snapshot's `gc_target` less this
+        // debt is the `next_gc` the captured heap had.
+        const units = stringUnits(s.len);
+        if (units != 0) self.chargeString(units);
     }
 
     /// Convenience: intern `content` and wrap it as a `Value`.
@@ -763,8 +820,13 @@ pub const Heap = struct {
     }
 
     fn retarget(self: *Heap) void {
-        self.next_gc = self.gc_target -| self.stack_debt;
+        self.next_gc = self.gc_target -| self.debt();
         self.refreshHeadroom();
+    }
+
+    /// The pacing units charged beyond one per object.
+    pub fn debt(self: *const Heap) usize {
+        return self.stack_debt +| self.string_debt;
     }
 
     fn refreshHeadroom(self: *Heap) void {
@@ -939,9 +1001,11 @@ pub const Heap = struct {
         self.strtab_count = live_str;
         self.object_count = live;
         self.thread_count = live_threads;
-        // The destroyed coroutines refunded their stacks above, so
-        // `stack_debt` is what the survivors hold.
-        self.setGcTarget(@max(initial_gc_threshold, (live +| self.stack_debt) *| heap_growth));
+        self.collections += 1;
+        // The destroyed coroutines refunded their stacks above, and the
+        // destroyed strings their bytes, so the debt is what the survivors
+        // hold.
+        self.setGcTarget(@max(initial_gc_threshold, (live +| self.debt()) *| heap_growth));
         self.strtabMaybeShrink();
         // Doc 73: stacks pooled since the last collection hand their pages
         // back, so an idle pool holds no committed stack memory.
@@ -977,7 +1041,11 @@ pub const ThreadOps = struct {
 fn destroyObject(heap: *Heap, h: *GcHeader) void {
     const gpa = heap.gpa;
     switch (h.type) {
-        .string => String.fromHeader(h).destroy(gpa),
+        .string => {
+            const s = String.fromHeader(h);
+            heap.string_debt -= stringUnits(s.len);
+            s.destroy(gpa);
+        },
         .table => Table.fromHeader(h).destroy(gpa),
         .function => Closure.fromHeader(h).destroy(gpa),
         .native => Native.fromHeader(h).destroy(gpa),
@@ -1343,6 +1411,62 @@ test "a second cycle is stable (survivors reset to white)" {
     try collectWithRoots(&heap, &.{&t.header});
     try testing.expectEqual(after_first, heap.object_count);
     try testing.expectEqualStrings("one", string.String.fromHeader(t.get(Value.int(1)).asHeap()).bytes());
+}
+
+test "doc 80: a string past nominal_object_bytes charges its bytes to pacing, and the sweep refunds them" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const before = heap.next_gc;
+
+    var buf: [3 * nominal_object_bytes + 5]u8 = undefined;
+    @memset(&buf, 'x');
+    _ = try heap.intern(buf[0 .. nominal_object_bytes - 1]); // too short to charge
+    try testing.expectEqual(@as(usize, 0), heap.string_debt);
+    _ = try heap.intern(&buf); // 3 units
+    try testing.expectEqual(@as(usize, 3), heap.string_debt);
+    try testing.expectEqual(before - 3, heap.next_gc);
+    // An intern hit links nothing and charges nothing.
+    _ = try heap.intern(&buf);
+    try testing.expectEqual(@as(usize, 3), heap.string_debt);
+    try testing.expect(heap.gc_headroom == @as(i64, @intCast(heap.next_gc)) - @as(i64, @intCast(heap.object_count)));
+
+    // Nothing is rooted: the sweep frees both and the debt with them.
+    try heap.beginCollect();
+    heap.traceAll();
+    heap.sweep();
+    try testing.expectEqual(@as(usize, 0), heap.string_debt);
+    try testing.expectEqual(@as(usize, initial_gc_threshold), heap.next_gc);
+    try testing.expectEqual(@as(u64, 1), heap.collections);
+}
+
+test "doc 80 §3: an armed intern links a charged string only when no collection can come due" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var buf: [10 * nominal_object_bytes]u8 = undefined;
+    @memset(&buf, 'y');
+
+    heap.setGcTarget(heap.object_count + 20);
+    heap.trace_alloc_bound = 5;
+    heap.trace_callout = true;
+    // object_count + A + 10 units = 15 < 20: linked and charged.
+    _ = try heap.intern(&buf);
+    try testing.expect(!heap.trace_charge_refused);
+    try testing.expectEqual(@as(usize, 10), heap.string_debt);
+    // Now 1 + 5 + 10 >= next_gc (10): refused before anything is linked.
+    const count = heap.object_count;
+    const id = heap.next_obj_id;
+    try testing.expectError(error.OutOfMemory, heap.intern(buf[1..]));
+    try testing.expect(heap.trace_charge_refused);
+    try testing.expectEqual(count, heap.object_count);
+    try testing.expectEqual(id, heap.next_obj_id);
+    try testing.expectEqual(@as(usize, 10), heap.string_debt);
+    // A string too short to charge is never refused.
+    _ = try heap.intern(buf[0..10]);
+    // Unarmed (tier-0), the same intern links and charges.
+    heap.trace_callout = false;
+    _ = try heap.intern(buf[1..]);
+    try testing.expectEqual(@as(usize, 19), heap.string_debt);
+    try testing.expect(heap.shouldCollect());
 }
 
 test "shouldCollect honours the stress knob and the threshold" {

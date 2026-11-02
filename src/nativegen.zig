@@ -1535,6 +1535,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.next_gc))));
                 try a.cmpRegMem(.rcx, .rax, 0);
                 try jccNativeExit(a, exit_labels, i, .ae);
+                // Passed: the string callouts' charge check reads A (doc 80 §3).
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.trace_alloc_bound))));
+                try a.movMemImm32(.rax, 0, @intCast(ins.aux));
             },
             // Doc 45 D6: precise-only table allocation. Calls the SAME
             // noinline `table_runtime.tnew` shim tier-1a executes (one
@@ -1654,6 +1657,8 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.next_gc))));
                 try a.cmpRegMem(.rcx, .rax, 0);
                 try jccNativeExit(a, exit_labels, i, .ae);
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.trace_alloc_bound))));
+                try a.movMemImm32(.rax, 0, @intCast(ins.aux));
             },
             // host_result: the result the shim wrote to `R[a + aux]`, tag
             // checked against its recorded type (exit through C_B1 on a
