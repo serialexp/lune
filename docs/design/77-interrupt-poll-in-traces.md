@@ -97,8 +97,26 @@ one-cycle loop is at the mercy of front-end alignment, so it measures
 alignment, not the poll. The remaining cost on `sieve_int` is the single
 fused `test`+`jne` per lap on a loop of only a few instructions. Loops that
 call, allocate or index tables return to the dispatcher anyway and show no
-cost. Code alignment of loop heads (LuaJIT aligns them) is a possible
-follow-up.
+cost.
+
+Loop-head alignment was tried (2026-11-02) and not kept. Minimum cycles of 9
+runs, three configurations (entry alignment 64 with the head aligned to 16, 32
+or 64; and entry alignment 16 with the head aligned to 16):
+
+| program | HEAD before poll | head 16 / entry 64 | head 32 / entry 64 | head 64 / entry 64 | head 16 / entry 16 |
+|---|---|---|---|---|---|
+| tight `while` | 403M | 492M | 491M | 430M | 802M |
+| `sieve_int` | 84.2M | 88.3M | 88.6M | 95.5M | 95.8M |
+| `field_hash` | 59.9M | 57.4M | 61.7M | 81.5M | 81.5M |
+
+No setting wins on all three, and the only difference between the best and
+worst rows is where the loop falls against 64-byte lines. Fixing a constant
+that suits these programs would be tuning for the board (Rule Z-6). A
+principled version would choose the pad from the loop's emitted span so that it
+crosses the fewest 64-byte lines, which needs the span before binding the label
+(emit twice, or reserve and patch). Not done; the poll's `test` shifts every
+loop by a few bytes, so numbers on this board will keep moving by a few percent
+with any codegen change.
 
 ## Why this exists
 
