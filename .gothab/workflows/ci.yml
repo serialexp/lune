@@ -43,7 +43,7 @@ jobs:
             run: |
               python3 -m unittest discover -s tools -p test_jit_boundaries.py
               python3 tools/check-jit-boundaries.py
-              time zig build test -Dtest-shards="$(nproc)" --summary all
+              time zig build test -Dtest-shards="$(nproc)" -Dtest-junit="$PWD/test-results" --summary all
           - name: unit tests (jit-debug)
             run: time zig build test -Djit-debug=true -Dtest-shards="$(nproc)" --summary all
           - name: frozen-output gate
@@ -135,3 +135,17 @@ jobs:
         run: |
           set -eu
           ${{ matrix.run }}
+
+      # Doc 79: the unit-test leg's cases, with the requirement keys their
+      # names cite, as one JUnit report.
+      - name: Merge the unit-test report
+        if: always() && matrix.name == 'unit tests'
+        run: |
+          mkdir -p test-results
+          python3 tools/junit-merge.py test-results > test-results/junit.xml
+
+      - name: Upload test results
+        uses: actions/test-results@v1
+        if: always() && matrix.name == 'unit tests'
+        with:
+          files: test-results/junit.xml

@@ -84,6 +84,8 @@ fn installJunit(dir: []const u8) void {
         return;
     }
     var path_buf: [512]u8 = undefined;
+    // The directory may not exist yet (one level is created; EEXIST is fine).
+    if (std.mem.printSentinel(&path_buf, "{s}", .{dir}, 0)) |dir_z| _ = linux.mkdir(dir_z.ptr, 0o755) else |_| return;
     const path = std.mem.printSentinel(&path_buf, "{s}/{d}.frag", .{ dir, linux.getpid() }, 0) catch return;
     const rc = linux.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
     if (@as(isize, @bitCast(rc)) < 0) return;
