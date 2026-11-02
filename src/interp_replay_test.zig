@@ -319,6 +319,8 @@ test "doc 68 P2: every step inside a Lua metamethod is stoppable, and stops ther
         \\do
         \\  local a <close> = setmetatable({}, {__close = function(o, e) s = s + 1 end})
         \\end
+        \\local K = setmetatable({ n = 1 }, {__call = function(self, a) local r = self.n + a return r end})
+        \\s = s + K(5)
         \\print(s)
     ;
     const index = try recordSafepointIndex(gpa, source);

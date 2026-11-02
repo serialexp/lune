@@ -811,4 +811,9 @@ pub const metamethod_frames_program: [:0]const u8 =
     \\print(co(), co(8), co())
     \\local s = setmetatable({}, {__index = rawequal})
     \\print(s.ab)
+    \\local K = setmetatable({ n = 1 }, {__call = function(self, a, ...) return self.n + a + select("#", ...) end})
+    \\print(K(5, 6, 7))
+    \\local Y = setmetatable({}, {__call = function(self, v) return coroutine.yield(v) end})
+    \\local cy = coroutine.wrap(function() return Y("yk") + 1 end)
+    \\print(cy(), cy(4))
 ;

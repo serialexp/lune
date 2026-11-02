@@ -101,7 +101,7 @@ land; move whole phases to Done once everything inside them is checked.
     become non-recursive except the `pcall` body, which never raises
     `native_reentry_depth`. It lands with the first converted native
     that runs inside a host function's dispatch.
-- [~] **P2 — metamethods.** The shared callable driver; every metamethod
+- [x] **P2 — metamethods.** The shared callable driver; every metamethod
   site in §3, fused reads and stores included, runs as a continuation frame;
   `__call` chains stay bounded (§6).
   - [x] **Operator, index and close sites** (2026-11-02). A Lua handler
@@ -111,9 +111,9 @@ land; move whole phases to Done once everything inside them is checked.
     `close`/`ret_close` runs as a `.finish_op` frame (§6). Coroutines yield
     inside them, and keyframes cut and resume there (format v20). `__len`
     now gets its operand twice, as `luaV_objlen` passes it.
-  - [ ] **`.call` on a table with `__call`** (sites 2–3). Still a
-    `callValue` re-entry: shift the table into the arguments and enter the
-    handler as an ordinary frame (§6's last row).
+  - [x] **`.call` on a table with `__call`** (sites 2–3, 2026-11-02). A
+    Lua handler is entered as an ordinary frame: `[table, args…]` shifts
+    up one slot and the handler takes `R[A]` (§6.1).
 - [ ] **P3 — the other natives.** `dofile`, `require`, `tostring`, `print`,
   `table.sort`, `gsub`, one per commit (§7.2–§7.5).
 - [ ] **P4 — gates.** Per site: replay-index and `mahina_replay` stops inside
@@ -396,6 +396,16 @@ Where it differs from the plan above:
 - **Native and callable-table handlers stay synchronous** (`callMeta` →
   `callValue`). They converge with P3's native driver; until then a yield
   inside one still raises "attempt to yield across a C-call boundary".
+- **`__call` needs no `finish_op`.** `callTail` shifts `[table, args…]`
+  up one slot, stores the Lua handler in `R[A]` and enters it through
+  `enterCallee` with one more argument, as `luaD_tryfuncTM` does. The
+  compiler lays every call out at the register top, so the slot past the
+  span is free, and the push follows the shift with no safepoint between,
+  so the collector never sees the longer span masked by the call's
+  liveness row. A native handler, or a `__call` table whose handler is
+  another `__call` table, keeps the nested `callValue` path: a native
+  would run in flight at the call with its last argument in a masked
+  slot.
 - **`__close` is a site.** `close` and `ret_close` run their open
   variables top first; each Lua `__close` is a `.finish_op` frame whose
   `ret_dest` holds the close cursor (the variable being closed) and whose
@@ -689,6 +699,15 @@ instructions are in `pushMetaFrame`, 122 in `opRetFinish` and 50 in
 first cut, which left the dispatch loop to enter the handler
 (`.switch_mode`), was +3.4% tier-0 on `meta_calls`; `enterMetaFrame`
 dispatches in place.
+
+`__call` as a frame (3·10⁶ calls of a one-line handler, against 50cc2c7):
+tier-0 2400 M → 2160 M (−10%). `--trace --jit-native` 2492 M → 3026 M
+(+21%): nothing traces there (the loop aborts `cross_frame` at the call,
+the handler `has_metatable`), and the handler now pays what every
+untraceable Lua call pays under `--trace`. A plain call with the same
+body shows it on the old binary too: 1971 M tier-0 against 2837 M
+(TODO.md, "An untraceable Lua call costs ~290 instructions more under
+`--trace`").
 
 ## 13. References
 

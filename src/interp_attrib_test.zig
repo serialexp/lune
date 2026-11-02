@@ -543,6 +543,29 @@ test "doc 68 P2: an error mid block close reaches the rest, natively raised ones
     , "false\tfrom c\nd:nil b:from c a:from c\ntrue\tstring\t1\n");
 }
 
+test "doc 68 P2: a Lua __call handler is an ordinary frame: it yields, and takes every argument shape" {
+    try expectProgram(
+        \\local C = setmetatable({ tag = "c" }, { __call = function(self, a, ...) return self.tag, a, select("#", ...) end })
+        \\local function three() return 7, 8, 9 end
+        \\print(C(1, 2, 3))
+        \\print(C(three()))
+        \\print((C()))
+        \\for k, v in setmetatable({}, { __call = function(_, _, i) if i < 3 then return i + 1, i * 2 end end }), nil, 0 do io.write(k, v, " ") end
+        \\print()
+        \\local Y = setmetatable({}, { __call = function(_, v) return coroutine.yield(v) end })
+        \\local co = coroutine.wrap(function() return Y("y") + 1 end)
+        \\print(co(), co(4))
+        \\local R = setmetatable({}, {})
+        \\getmetatable(R).__call = function(_, n) if n == 0 then return 0 end return 1 + R(n - 1) end
+        \\local acc = 0
+        \\for i = 1, 300 do acc = acc + R(2) end
+        \\print(acc)
+        \\local T = setmetatable({}, { __call = setmetatable({}, { __call = function(h, t, x) return x end }) })
+        \\print(T(5), pcall(setmetatable({}, { __call = function() error("e", 0) end })))
+        \\
+    , "c\t1\t2\nc\t7\t2\nc\n10 22 34 \ny\t5\n600\n5\tfalse\te\n");
+}
+
 test "doc 68 P2: __len gets the operand twice, as 5.4's luaV_objlen passes it" {
     try expectProgram(
         \\local t = setmetatable({}, { __len = function(a, b) return rawequal(a, b) and 7 or -1 end })

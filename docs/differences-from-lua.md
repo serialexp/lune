@@ -58,10 +58,11 @@ integers included, with one exception: `..` ends a numeral, so `1..2` is
 **Not yet supported:**
 
 - `goto` and labels.
-- Yielding from a `__call` handler, or from a builtin installed directly
-  as a metamethod (`__index = coroutine.yield`), raises "attempt to yield
-  across a C-call boundary". A Lua function metamethod can yield,
-  `__close` included.
+- Yielding from a builtin installed directly as a metamethod
+  (`__index = coroutine.yield`), or from a `__call` reached through
+  another `__call` table, raises "attempt to yield across a C-call
+  boundary". A Lua function metamethod can yield, `__close` and `__call`
+  included.
 - Calls without parentheses: `f"str"`, `f[[str]]`, `f{...}`, so
   `require"mod"` must be `require("mod")`.
 - A `#!` first line.

@@ -10908,20 +10908,42 @@ pub const Vm = struct {
             },
             // `__call`: a non-callable heap value (typically a table)
             // with a `__call` metamethod is invoked as
-            // `handler(value, args...)`. The arguments already sit
-            // contiguously as `[callee, args...]` at `stack[base+a..]`
-            // — exactly the handler's argument list, so no copy is
-            // needed; `callValue` reads it before writing results.
-            // Results honour `nwanted`/`all_results` like the native
-            // arm. A nil/non-heap callee, or a callee whose `__call`
-            // chain bottoms out in a non-callable, stays the located
-            // "attempt to call a <type> value" fault. A `__call` whose
-            // handler is itself a `__call` table chains through
-            // `callValue` (bounded by `native_reentry_depth`; a cycle
-            // surfaces as a catchable StackOverflow, never a hang).
+            // `handler(value, args...)`. A nil/non-heap callee, or a
+            // callee whose `__call` chain bottoms out in a non-callable,
+            // stays the located "attempt to call a <type> value" fault.
             else => {
                 const handler = self.metamethod(callee, self.mm.call);
                 if (handler.isNil()) return parkErr(st, Error.TypeError);
+                // Doc 68 P2: a Lua handler is entered as an ordinary
+                // frame, as LuaJIT and 5.4's `luaD_tryfuncTM` do: shift
+                // `[callee, args...]` up one slot, put the handler in
+                // `R[a]`, and call it with one more argument. The
+                // compiler lays every call out at the register top, so
+                // the slot past the span is free; `enterCallee` pushes
+                // at once, so no safepoint sees the shifted span masked.
+                if (handler.isHeap() and handler.heapType() == .function) {
+                    const lo = base + a;
+                    const hi = lo + 1 + nargs;
+                    if (hi >= self.regCapacity()) return parkErr(st, Error.StackOverflow);
+                    const lane_tags = self.tags.ptr;
+                    const lane_payloads = self.payloads.ptr;
+                    var k = hi;
+                    while (k > lo) : (k -= 1) {
+                        lane_tags[k] = lane_tags[k - 1];
+                        lane_payloads[k] = lane_payloads[k - 1];
+                    }
+                    self.regSet(lo, handler);
+                    return enterCallee(mode, of, 0, st, pc, instr, vm, base, a, Closure.fromHeader(handler.asHeap()), nargs + 1);
+                }
+                // A native handler, or a `__call` table chaining to
+                // another, still runs nested through `callValue`
+                // (bounded by `native_reentry_depth`; a cycle surfaces
+                // as a catchable StackOverflow, never a hang). The
+                // arguments already sit contiguously as
+                // `[callee, args...]` at `stack[base+a..]` — exactly the
+                // handler's argument list; `callValue` reads it before
+                // writing results. Results honour `nwanted`/
+                // `all_results` like the native arm.
                 const nwanted: usize = instr.c;
                 // Doc 61 P2, as in the native arm: cover a dynamic
                 // argument span past the window while the handler runs.

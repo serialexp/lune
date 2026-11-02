@@ -35,11 +35,17 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       `__index` (it cannot call it), so the `get_index2` arm has no
       operand to name. It should describe the fault from the intermediate
       value the op saw, not re-probe the container.
-- [ ] **`.call` on a table with `__call` re-enters through `callValue`**
-      (doc 68 P2, sites 2–3). A yield inside the handler raises "attempt to
-      yield across a C-call boundary". Shift the table into the arguments
-      and enter the handler as an ordinary frame, as LuaJIT and 5.4's
-      `luaD_tryfuncTM` do.
+- [ ] **An untraceable Lua call costs ~290 instructions more under
+      `--trace` than at tier-0** (seen 2026-11-02, doc 68 §12, present
+      before P2). `inc(S, acc)` in a loop, with `inc` reading a field
+      through `__index` (so neither the loop nor `inc` traces): 1971 M
+      instructions tier-0 against 2837 M with `--trace --jit-native` for
+      3·10⁶ calls. The profile has the callee's ops on the `.full`
+      prologue (`opGetField` 21% against 11%), `recordingBarred` 5%,
+      `noteResume` 3%, `onCallEntryTraced` 1.4%. Since doc 68 P2 a Lua
+      `__call` handler pays it as well (it used to run nested and skip
+      the bookkeeping). Find why an anchor whose recordings abort keeps
+      its frames in `.full`.
 - [ ] **Metamethod frame entry and return cost** (doc 68 §12). Per Lua
       metamethod call, callgrind has ~100 instructions in `pushMetaFrame`
       (`bindAndPushClosure`, the host-epoch bump) and ~122 in
