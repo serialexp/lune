@@ -535,14 +535,19 @@ pub const Heap = struct {
     /// stays ~1). Growing rebuilds the chains by stored hash. The ONLY fallible
     /// step of an intern miss besides the string allocation itself; on error
     /// nothing has been mutated.
-    fn strtabEnsureCapacity(self: *Heap) std.mem.Allocator.Error!void {
+    /// Inline, as every intern miss passes it, nearly always with room.
+    inline fn strtabEnsureCapacity(self: *Heap) std.mem.Allocator.Error!void {
+        if (self.strtab_count < self.strtab.len) return;
+        return self.strtabGrow();
+    }
+
+    noinline fn strtabGrow(self: *Heap) std.mem.Allocator.Error!void {
         if (self.strtab.len == 0) {
             const nt = try self.gpa.alloc(?*String, strtab_min_size);
             @memset(nt, null);
             self.strtab = nt;
             return;
         }
-        if (self.strtab_count + 1 <= self.strtab.len) return;
         // Cap: past 2^31 buckets just tolerate higher load (as LuaJIT does at
         // LJ_MAX_STRTAB) rather than overflowing the shift.
         if (self.strtab.len >= (@as(usize, 1) << 31)) return;
@@ -612,19 +617,48 @@ pub const Heap = struct {
             if (known.ascii) |a| std.debug.assert(a == existing.isAscii());
             return existing;
         }
-        const units = stringUnits(content.len);
-        if (units != 0 and self.trace_callout and !self.traceChargeFits(units)) {
-            self.trace_charge_refused = true;
-            return error.OutOfMemory;
-        }
         const s = try String.createWithHashKnown(self.gpa, content, h, known);
         errdefer s.destroy(self.gpa);
+        try self.linkNew(s);
+        return s;
+    }
+
+    /// Intern a string built in place (`String.Builder`, doc 80 §4): the
+    /// existing object for its bytes, freeing the built one, or else the
+    /// built one, registered and linked. Takes the builder's allocation
+    /// either way; on error the heap is unchanged.
+    pub fn internBuilt(self: *Heap, b: *String.Builder) std.mem.Allocator.Error!*String {
+        const s = b.finish();
+        if (self.strtabLookup(s.bytes(), s.hash)) |existing| {
+            s.destroy(self.gpa);
+            return existing;
+        }
+        errdefer s.destroy(self.gpa);
+        try self.linkNew(s);
+        return s;
+    }
+
+    /// The miss path every intern entry ends in (doc 28 §6 [MF], doc 24 D5):
+    /// register and link `s`, which is not in the intern table. Its fallible
+    /// steps come first, so on error the heap is unchanged and the caller
+    /// still owns `s`. Inline: out of line, the call cost every miss ~25
+    /// instructions.
+    inline fn linkNew(self: *Heap, s: *String) std.mem.Allocator.Error!void {
+        const units = stringUnits(s.len);
+        if (self.chargeRefused(units)) return error.OutOfMemory;
         try self.strtabEnsureCapacity();
         // Infallible from here.
         self.strtabInsert(s);
         self.link(&s.header);
         if (units != 0) self.chargeString(units);
-        return s;
+    }
+
+    /// Whether a trace callout's charge of `units` must be refused (doc 80
+    /// §3); a refusal is recorded for the callout and surfaces as an OOM.
+    fn chargeRefused(self: *Heap, units: usize) bool {
+        if (units == 0 or !self.trace_callout or self.traceChargeFits(units)) return false;
+        self.trace_charge_refused = true;
+        return true;
     }
 
     /// Whether a trace callout may link a string charged `units`: then no
@@ -1467,6 +1501,56 @@ test "doc 80 §3: an armed intern links a charged string only when no collection
     _ = try heap.intern(buf[1..]);
     try testing.expectEqual(@as(usize, 19), heap.string_debt);
     try testing.expect(heap.shouldCollect());
+}
+
+test "doc 80 §4: internBuilt links a new string, and frees the built copy of one already interned" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var big: [2 * nominal_object_bytes]u8 = undefined;
+    @memset(&big, 'z');
+
+    var b = try String.Builder.init(testing.allocator, big.len + 3);
+    defer b.deinit(testing.allocator);
+    b.append(&big, big.len, true);
+    b.append("abc", 3, true);
+    const count = heap.object_count;
+    const s = try heap.internBuilt(&b);
+    try testing.expectEqual(count + 1, heap.object_count);
+    try testing.expectEqual(@as(usize, 2), heap.string_debt);
+    try testing.expectEqual(big.len + 3, s.len);
+    // The same bytes through the plain intern find the built string.
+    var flat: [big.len + 3]u8 = undefined;
+    @memcpy(flat[0..big.len], &big);
+    @memcpy(flat[big.len..], "abc");
+    try testing.expectEqual(s, try heap.intern(&flat));
+
+    // Built again: the existing object comes back, nothing is linked or
+    // charged, and the built copy is freed (testing.allocator would report
+    // it leaked).
+    var again = try String.Builder.init(testing.allocator, flat.len);
+    defer again.deinit(testing.allocator);
+    again.append(&flat, flat.len, true);
+    try testing.expectEqual(s, try heap.internBuilt(&again));
+    try testing.expectEqual(count + 1, heap.object_count);
+    try testing.expectEqual(@as(usize, 2), heap.string_debt);
+}
+
+test "doc 80 §4: internBuilt under an armed callout refuses a charge as intern does" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var buf: [10 * nominal_object_bytes]u8 = undefined;
+    @memset(&buf, 'q');
+    heap.setGcTarget(heap.object_count + 12);
+    heap.trace_alloc_bound = 5;
+    heap.trace_callout = true;
+    var b = try String.Builder.init(testing.allocator, buf.len);
+    defer b.deinit(testing.allocator);
+    b.append(&buf, buf.len, true);
+    const count = heap.object_count;
+    try testing.expectError(error.OutOfMemory, heap.internBuilt(&b));
+    try testing.expect(heap.trace_charge_refused);
+    try testing.expectEqual(count, heap.object_count);
+    try testing.expectEqual(@as(usize, 0), heap.string_debt);
 }
 
 test "shouldCollect honours the stress knob and the threshold" {

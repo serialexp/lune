@@ -1,7 +1,7 @@
 # 80 — Growing strings: allocator, pacing, concat, long strings — Design
 
-Status: partial — U1 (large-block cache) and U3 (byte-charged GC pacing)
-built; U2 (single-copy concat) and U4 (long strings) outstanding
+Status: partial — U1 (large-block cache), U2 (single-copy concat) and U3
+(byte-charged GC pacing) built; U4 (long strings) outstanding
 Owner: Bart
 Last updated: 2026-11-02
 
@@ -21,14 +21,20 @@ land; move whole units to Done once everything inside them is checked.
   `Heap.trace_alloc_bound`, the stralloc shims arm `trace_callout`, and a
   charged intern that would break the guard's promise is refused and the op
   declines to tier 0.
+- [x] **U2 — concat copies each operand once** (§4). `String.Builder`
+  and `Heap.internBuilt` for a result past 256 bytes, a stack join plus
+  `internKnown` below it. Both carry the operands' character facts, so no
+  construction scan runs.
+- [x] **Bench `bench/stdlib/str_concat_grow.lua`** with its hashgate rows.
 
 ### Outstanding
 
-- [ ] **Bench `bench/stdlib/str_concat_grow.lua`** with its hashgate rows
-  (written; lands once `bench/refs/output-hashes.tsv` is free).
-- [ ] **U2 — concat builds its result in one copy** (§4): `Vm.concat`
-  sizes the result from its parts and interns it once, with Known facts
-  (length, hash seed) taken from the parts.
+- [ ] **More producers through `String.Builder`** (§4.2): `table.concat`,
+  `string.rep`, `string.format` and `gsub` build in a growable buffer and
+  then intern a copy. Defer until the builder grows a capacity API.
+- [ ] **n-ary concat** (§4.2): `a .. b .. c .. d` is three binary concats
+  with two intermediate strings; Lua's `OP_CONCAT` joins a register range
+  once. A bytecode change; not started.
 - [ ] **Q1 — long strings: which model** (§5). (A) Lua 5.4 uninterned long
   strings, which Bart picked first, or (B) LuaJIT's sparse hash, which keeps
   every string interned. Bart decides before U4 starts.
@@ -54,13 +60,16 @@ stacked:
    object count caught up, which is where the RSS went.
 3. **Each concat copies twice and hashes the whole result** (§4, §5).
 
-U1 and U3 fix the first two. U2 and U4 attack the third.
+U1 and U3 fix the first two. U2 removes the extra copy and the construction
+scan; U4 is about the hash.
 
 | | 80k `s..x` | 160k `s..x` | `str_concat_grow` 80000 | peak RSS (80k) |
 |---|---|---|---|---|
 | before | 1.23 s | 5.34 s | 1.57 s | 181 MB |
 | U1 | 0.50 s | 1.93 s | 0.58 s | 243 MB |
 | U1 + U3 | 0.19 s | 0.75 s | 0.22 s | 8 MB |
+| U1 + U3 + U2 | 0.15 s | 0.57 s | 0.18 s | 8 MB |
+| `lua5.4` | 0.10 s | 0.44 s | 0.09 s | 3 MB |
 
 ## 2. U1 — the large-block cache
 
@@ -154,12 +163,48 @@ never charged.
 
 ## 4. U2 — concat in one copy
 
-Today `Vm.concat` builds the result in a scratch buffer, then interns it,
-which copies it again and hashes every byte. U2 sizes the result from its
-parts, writes it once into the string's own storage, and interns it with the
-facts already known (the length, and the hash of the left part where the
-hash allows it). It touches `Vm.concat` in `interp.zig` and adds one intern
-entry to `gc.zig`.
+Before U2, `Vm.concat` joined its operands in a heap scratch buffer, then
+interned that. On a miss the intern copied the bytes again and ran the
+construction scan (code-point count and ASCII bit) over the whole result;
+on a hit the scratch buffer was allocated and freed for nothing.
+
+### 4.1 What shipped
+
+The operands' character facts are known: a string carries its cached
+`cp_len` and ASCII bit, and a number's text is ASCII with one code point per
+byte. So the result's facts are a sum and an AND, and every concat skips the
+scan (safe builds still assert the claim against it). The bytes take one of
+two paths, split at `nominal_object_bytes` (256):
+
+- **A short result is joined in a stack buffer** and interned with
+  `internKnown`. A hit allocates nothing; a miss allocates the string and
+  copies the short result once more.
+- **A long result is built in place.** `String.Builder` allocates the
+  string's own block (header plus payload), the operands are copied into it,
+  and `Heap.internBuilt` seals it (hash and caches) and interns it. A miss
+  links that block as it is. A hit, which is rare for a long result, frees
+  it.
+
+Every intern entry ends in one miss-path tail, `Heap.linkNew` (the charge
+refusal of §3.2, table growth, insert, link, charge), so the doc 24 D5
+transactional shape and the charge rule cannot fork between entries. It and
+the intern table's capacity check are `inline`: as out-of-line calls they
+cost every miss about 25 instructions (scalar +3.6 %).
+
+Instruction counts against U3, both tiers: str_concat_grow −16.6 %,
+str_long_keys −12 %, str_sort −4 %, pairs_hash −1.7 %, everything else
+within ±0.5 %. A short concat whose result is already interned costs 20 %
+fewer instructions, and one that is new 18 % fewer.
+
+### 4.2 Not yet
+
+- `table.concat`, `string.rep`, `string.format` and `gsub` still build in
+  a growable buffer and intern a copy. They want a builder that can grow
+  and trim its block; the exact-size `Builder` is the first slice of that.
+- Concat is binary. `"x=" .. x .. ", y=" .. y` makes three strings to keep
+  one, where Lua's `OP_CONCAT` joins a register range in one pass. That is
+  a compiler and bytecode change.
+- The hash still reads the whole result on every step (§5).
 
 ## 5. Q1 — long strings
 

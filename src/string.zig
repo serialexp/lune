@@ -199,6 +199,63 @@ pub const String = extern struct {
         return self;
     }
 
+    /// A string built in place (doc 80 §4): the producer writes its bytes
+    /// straight into the allocation the string will own, so a result whose
+    /// length is known up front (concat) copies each part once, and the
+    /// parts' character facts stand in for the construction scan.
+    /// `Heap.internBuilt` seals and interns it; `deinit` frees one that was
+    /// never handed over.
+    pub const Builder = struct {
+        raw: ?[]align(@alignOf(String)) u8,
+        len: usize = 0,
+        cp_len: usize = 0,
+        ascii: bool = true,
+
+        /// A builder for exactly `len` bytes.
+        pub fn init(gpa: std.mem.Allocator, len: usize) std.mem.Allocator.Error!Builder {
+            const total = std.math.add(usize, @sizeOf(String), len) catch return error.OutOfMemory;
+            return .{ .raw = try gpa.alignedAlloc(u8, std.mem.Alignment.of(String), total) };
+        }
+
+        pub fn deinit(self: *Builder, gpa: std.mem.Allocator) void {
+            if (self.raw) |raw| gpa.free(raw);
+            self.raw = null;
+        }
+
+        /// Append `part`, whose code-point count and ASCII bit the caller
+        /// knows (a string operand's cached ones, or a number's text). A
+        /// wrong claim traps in `finish` in safe builds.
+        pub fn append(self: *Builder, part: []const u8, cp_len: usize, ascii: bool) void {
+            const raw = self.raw.?;
+            std.debug.assert(@sizeOf(String) + self.len + part.len <= raw.len);
+            @memcpy(raw[@sizeOf(String) + self.len ..][0..part.len], part);
+            self.len += part.len;
+            self.cp_len += cp_len;
+            self.ascii = self.ascii and ascii;
+        }
+
+        /// Seal the filled builder into an unlinked `String`, its hash and
+        /// character caches set, and hand its allocation over to it.
+        pub fn finish(self: *Builder) *String {
+            const raw = self.raw.?;
+            std.debug.assert(@sizeOf(String) + self.len == raw.len);
+            self.raw = null;
+            const content = raw[@sizeOf(String)..];
+            std.debug.assert(std.meta.eql(Counted{ .cp_len = self.cp_len, .ascii = self.ascii }, countCodepoints(content)));
+            var header = GcHeader.init(.string);
+            header.flags.str_ascii = self.ascii;
+            const s: *String = @ptrCast(raw.ptr);
+            s.* = .{
+                .header = header,
+                .hash = std.hash.Wyhash.hash(0, content),
+                .len = self.len,
+                .cp_len = self.cp_len,
+                .next_intern = null,
+            };
+            return s;
+        }
+    };
+
     /// Recover the concrete string from its embedded header (the header is at
     /// offset 0, but `@fieldParentPtr` is layout-independent regardless).
     pub fn fromHeader(h: *GcHeader) *String {
@@ -234,6 +291,28 @@ test "String header is at offset 0 and bytes round-trip inline" {
     try testing.expectEqualStrings("hello", s.bytes());
     // hash matches the interning map's StringContext (Wyhash seed 0)
     try testing.expectEqual(std.hash.Wyhash.hash(0, "hello"), s.hash);
+}
+
+test "Builder: parts written in place make the same string as create" {
+    var b = try String.Builder.init(testing.allocator, 3 + 4);
+    defer b.deinit(testing.allocator);
+    b.append("a\xc3\xa9", 2, false); // "aé"
+    b.append("xyzw", 4, true);
+    const s = b.finish();
+    defer s.destroy(testing.allocator);
+    const ref = try String.create(testing.allocator, "a\xc3\xa9xyzw");
+    defer ref.destroy(testing.allocator);
+    try testing.expectEqualStrings(ref.bytes(), s.bytes());
+    try testing.expectEqual(ref.hash, s.hash);
+    try testing.expectEqual(ref.cp_len, s.cp_len);
+    try testing.expectEqual(ref.isAscii(), s.isAscii());
+    try testing.expectEqual(@as(usize, 6), s.cpLen());
+}
+
+test "Builder: deinit frees a builder that was never finished" {
+    var b = try String.Builder.init(testing.allocator, 4);
+    b.append("ab", 2, true);
+    b.deinit(testing.allocator); // testing.allocator reports a leak otherwise
 }
 
 test "empty string is representable" {

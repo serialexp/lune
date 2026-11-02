@@ -11777,18 +11777,30 @@ pub const Vm = struct {
 
     /// `R[b] .. R[c]` — string concatenation. Strings concatenate directly;
     /// numbers coerce to their text form (Lua-shaped). Anything else errors.
-    /// The result is interned.
+    /// The result is interned, and the operands' character facts stand in
+    /// for the construction scan (doc 80 §4). A short result is joined on
+    /// the stack, so an intern hit allocates nothing; a long one is built in
+    /// the string's own allocation, so each operand is copied once.
     fn concat(self: *Vm, a: Value, b: Value) Error!Value {
         var buf_a: [64]u8 = undefined;
         var buf_b: [64]u8 = undefined;
-        const sa = try coerceConcat(a, &buf_a);
-        const sb = try coerceConcat(b, &buf_b);
+        const pa = try concatPart(a, &buf_a);
+        const pb = try concatPart(b, &buf_b);
+        const len = pa.bytes.len + pb.bytes.len;
 
-        const tmp = try self.gpa.alloc(u8, sa.len + sb.len);
-        defer self.gpa.free(tmp);
-        @memcpy(tmp[0..sa.len], sa);
-        @memcpy(tmp[sa.len..], sb);
-        return self.heap.internValue(tmp);
+        if (len <= concat_stack_max) {
+            var buf: [concat_stack_max]u8 = undefined;
+            @memcpy(buf[0..pa.bytes.len], pa.bytes);
+            @memcpy(buf[pa.bytes.len..len], pb.bytes);
+            const s = try self.heap.internKnown(buf[0..len], .{ .cp_len = pa.cp_len + pb.cp_len, .ascii = pa.ascii and pb.ascii });
+            return Value.heap(&s.header);
+        }
+        var sb = try string.String.Builder.init(self.gpa, len);
+        defer sb.deinit(self.gpa);
+        sb.append(pa.bytes, pa.cp_len, pa.ascii);
+        sb.append(pb.bytes, pb.cp_len, pb.ascii);
+        const s = try self.heap.internBuilt(&sb);
+        return Value.heap(&s.header);
     }
 
     /// The metatable governing `v`, or null. A table carries its own
@@ -13310,6 +13322,23 @@ pub fn coerceConcat(v: Value, buf: []u8) Error![]const u8 {
         .float => io.formatFloat(buf, v.asFloat()),
         else => Error.TypeError,
     };
+}
+
+/// The longest `..` result joined on the stack (`Vm.concat`): past it, a
+/// result is long enough that building it in place beats the extra copy.
+const concat_stack_max = gc.nominal_object_bytes;
+
+/// A concat operand's bytes (`coerceConcat`) with their character facts.
+const ConcatPart = struct { bytes: []const u8, cp_len: usize, ascii: bool };
+
+fn concatPart(v: Value, buf: []u8) Error!ConcatPart {
+    if (v.isHeap() and v.heapType() == .string) {
+        const s = string.String.fromHeader(v.asHeap());
+        return .{ .bytes = s.bytes(), .cp_len = s.cpLen(), .ascii = s.isAscii() };
+    }
+    // A number's text is ASCII.
+    const text = try coerceConcat(v, buf);
+    return .{ .bytes = text, .cp_len = text.len, .ascii = true };
 }
 
 /// `#v` — length of a string (code points, S-B) or table (border). Other types
