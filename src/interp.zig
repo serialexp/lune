@@ -3903,6 +3903,7 @@ pub const Vm = struct {
                 return 0;
             },
             .gsub => return stdstring.gsubSync(self, seed, args, results_out),
+            .dofile => return stdload.dofileSync(self, seed, results_out),
         }
     }
 
@@ -10144,6 +10145,7 @@ pub const Vm = struct {
                 const next = switch (@as(native_act.Kind, @enumFromInt(instr.b))) {
                     .sort => stdtable.sortStep(vm, regs),
                     .gsub => stdstring.gsubStep(vm, regs),
+                    .dofile => stdload.dofileStep(vm, regs),
                 } catch |e| return parkErr(st, e);
                 switch (next) {
                     .call => {

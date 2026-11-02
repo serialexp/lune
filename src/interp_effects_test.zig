@@ -1111,6 +1111,36 @@ test "L-3: dofile runs the file and returns its results (record)" {
     try testing.expectEqualStrings("42\tok\n", sink.buffered());
 }
 
+test "doc 68 §7.3: a dofile'd chunk runs as an activation: it yields, and all its results pass" {
+    const gpa = testing.allocator;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "y.lua", .content = "local v = coroutine.yield(1)\nreturn v, 'done', nil" },
+        .{ .path = "none.lua", .content = "" },
+        .{ .path = "boom.lua", .content = "error('boom', 0)" },
+    } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .record;
+    vm.system = ffs.system();
+
+    try compileRun(gpa, &vm,
+        \\local co = coroutine.wrap(function() return dofile("y.lua") end)
+        \\print(co())
+        \\print(co(7))
+        \\print(select('#', dofile("none.lua")))
+        \\print(pcall(dofile, "none.lua"))
+        \\print(pcall(dofile, "boom.lua"))
+        \\print(pcall(function() return dofile("boom.lua") end))
+        \\print(select('#', pcall(dofile, "y.lua")))
+    );
+    // `pcall(dofile, …)` runs the chunk through `callValue`, where `yield`
+    // is an error: the last line counts `false` and its message.
+    try testing.expectEqualStrings("1\n7\tdone\tnil\n0\ntrue\nfalse\tboom\nfalse\tboom\n2\n", sink.buffered());
+}
+
 test "L-3: record→serialize→replay reproduces output with the FS detached" {
     const gpa = testing.allocator;
     // `add.lua` is a vararg chunk loaded by `loadfile` and then called with args;

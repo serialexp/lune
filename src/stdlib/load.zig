@@ -37,6 +37,8 @@ const std = @import("std");
 const value = @import("../value.zig");
 const function = @import("../function.zig");
 const interp = @import("../interp.zig");
+const native_act = @import("../native_act.zig");
+const RegWindow = @import("../regwindow.zig").RegWindow;
 const parser = @import("../parser.zig");
 const compiler = @import("../compiler.zig");
 const diag = @import("../diag.zig");
@@ -263,8 +265,27 @@ fn dofileCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
         return raiseLoadError(vm, if (n >= 2) loaded[1] else Value.nil());
     }
 
-    // Run the loaded chunk with no arguments; its results fill `out` directly.
-    return vm.callValue(loaded[0], &.{}, out);
+    // The chunk's call is a Lua call, so it is made from an activation
+    // (doc 68 §7.3): a coroutine can yield in the chunk, and a keyframe
+    // can cut there. The activation's results are the chunk's.
+    vm.act_seed = .{ .kind = .dofile, .words = @splat(0), .value = loaded[0] };
+    return error.ActivateNative;
+}
+
+/// The one step of `dofile`'s activation: lay out the call of the loaded
+/// chunk, which the seed carried. What it returns is the activation's.
+pub fn dofileStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
+    const seed = vm.takeActSeed();
+    std.debug.assert(seed.kind == .dofile);
+    regs.set(native_act.callReg(.dofile), seed.value);
+    return .call;
+}
+
+/// `dofile` called from Zig (`Vm.callValue`), where no activation can be
+/// pushed: the chunk runs through `callValue` (`Vm.activationSync`).
+pub fn dofileSync(vm: *Vm, seed: native_act.Seed, results_out: []Value) interp.Error!usize {
+    std.debug.assert(seed.kind == .dofile);
+    return vm.callValue(seed.value, &.{}, results_out);
 }
 
 /// Raise `msg` (a heap string or nil) as the in-flight Lua error for `dofile`. The

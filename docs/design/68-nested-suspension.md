@@ -116,6 +116,12 @@ land; move whole phases to Done once everything inside them is checked.
     up one slot and the handler takes `R[A]` (§6.1).
 - [ ] **P3 — the other natives.** `dofile`, `require`, `tostring`, `print`,
   `table.sort`, `gsub`, one per commit (§7.2–§7.5).
+  - [x] **`dofile`** (2026-11-02). The file is read and compiled in Zig, as
+    before; the chunk's call is then an activation's (`Kind.dofile`:
+    `native_act / call C,0,all / ret C,all / ret C,all`), so the chunk can
+    yield and keyframes cut inside it. Nothing follows the call, so its
+    results are the activation's with no step between (`Layout.tail`).
+    `pcall(dofile, …)` runs the chunk through `callValue`.
   - [x] **`table.sort`** (2026-11-02). A comparison that needs a Lua call
     (a comparator, or `__lt`) moves the sort into an activation frame of a
     synthetic system proto, which calls the comparator as an ordinary

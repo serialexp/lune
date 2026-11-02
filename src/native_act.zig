@@ -7,6 +7,8 @@
 //!     [1] call        C, n, 1  the call it asked for
 //!     [2] native_act  k        step again, with that call's result
 //!     [3] ret         C, r     its work is done
+//! (A native with nothing to do after its call, `dofile`, returns the call's
+//! results as they are: `call C, 0, all` and `ret C, all` at [2] and [3].)
 //!
 //! so the call is an ordinary Lua call of an ordinary frame: a coroutine
 //! can yield inside it, a keyframe captures it, a step debugger stops in
@@ -45,6 +47,8 @@ pub const Kind = enum(u8) {
     sort,
     /// `string.gsub` with a function replacement.
     gsub,
+    /// `dofile`: the loaded chunk's call, whose results are its own.
+    dofile,
 };
 
 /// An activation's register layout: the native's parameters (bound as a
@@ -63,6 +67,10 @@ const Layout = struct {
     dynamic_args: bool = false,
     /// The values the activation returns, from `callReg`.
     results: u8,
+    /// The call's results are the activation's own, however many: the call
+    /// wants them all and what follows it is a `ret` of them all, with no
+    /// step between. Such a native has nothing to do after its call.
+    tail: bool = false,
     /// How a traceback names it: `module.name`, a `[C]` row.
     module: []const u8,
     name: []const u8,
@@ -74,6 +82,8 @@ fn layoutOf(kind: Kind) Layout {
         // s, pattern, replacement, n; the buffer, then src, count, max_n
         // and the pending match's end. A call passes up to 32 captures.
         .gsub => .{ .params = 4, .words = 5, .call_args = 32, .dynamic_args = true, .results = 2, .module = "string", .name = "gsub" },
+        // path; the chunk is called with no arguments
+        .dofile => .{ .params = 1, .words = 0, .call_args = 0, .results = 0, .tail = true, .module = "", .name = "dofile" },
     };
 }
 
@@ -174,11 +184,12 @@ fn build(comptime kind: Kind) Proto {
     const k: u16 = @intFromEnum(kind);
     const c = callReg(kind);
     const nargs: u16 = if (l.dynamic_args) bytecode.all_results else l.call_args;
+    const ret_all = Instr.opAB(.ret, c, bytecode.all_results);
     const code = [_]Instr{
         Instr.opAB(.native_act, 0, k),
-        Instr.opABC(.call, c, nargs, 1),
-        Instr.opAB(.native_act, 0, k),
-        Instr.opAB(.ret, c, l.results),
+        Instr.opABC(.call, c, nargs, if (l.tail) bytecode.all_results else 1),
+        if (l.tail) ret_all else Instr.opAB(.native_act, 0, k),
+        if (l.tail) ret_all else Instr.opAB(.ret, c, l.results),
     };
     std.debug.assert(code[call_pc].op == .call and code[ret_pc].op == .ret);
     const frozen = code;
@@ -198,6 +209,7 @@ fn build(comptime kind: Kind) Proto {
 test "activation ids are reserved and round-trip" {
     try std.testing.expectEqual(@as(?Kind, .sort), kindOfId(idOf(.sort)));
     try std.testing.expectEqual(@as(?Kind, .gsub), kindOfId(idOf(.gsub)));
+    try std.testing.expectEqual(@as(?Kind, .dofile), kindOfId(idOf(.dofile)));
     try std.testing.expectEqual(@as(?Kind, null), kindOfId(first_id + 1));
     try std.testing.expectEqual(@as(?Kind, null), kindOfId(first_id - kind_count));
     try std.testing.expectEqual(@as(?Kind, null), kindOfId(0));
