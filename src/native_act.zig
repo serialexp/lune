@@ -49,6 +49,8 @@ pub const Kind = enum(u8) {
     gsub,
     /// `dofile`: the loaded chunk's call, whose results are its own.
     dofile,
+    /// `require`, from the first searcher or loader that is a Lua function.
+    require,
 };
 
 /// An activation's register layout: the native's parameters (bound as a
@@ -71,6 +73,11 @@ const Layout = struct {
     /// wants them all and what follows it is a `ret` of them all, with no
     /// step between. Such a native has nothing to do after its call.
     tail: bool = false,
+    /// The activation returns however many values the step leaves (it ends
+    /// them with `Vm.setActArgsEnd`), not `results`.
+    dynamic_results: bool = false,
+    /// How many results the call writes back, from `callReg`.
+    call_results: u8 = 1,
     /// How a traceback names it: `module.name`, a `[C]` row.
     module: []const u8,
     name: []const u8,
@@ -82,6 +89,10 @@ fn layoutOf(kind: Kind) Layout {
         // s, pattern, replacement, n; the buffer, then src, count, max_n
         // and the pending match's end. A call passes up to 32 captures.
         .gsub => .{ .params = 4, .words = 5, .call_args = 32, .dynamic_args = true, .results = 2, .module = "string", .name = "gsub" },
+        // name; the phase, the searcher index, then the notfound buffer (or
+        // the loader) and the loader's data. A call is a searcher's or the
+        // loader's: its one or two arguments, and (up to) two results.
+        .require => .{ .params = 1, .words = 4, .call_args = 2, .dynamic_args = true, .dynamic_results = true, .results = 0, .call_results = 2, .module = "", .name = "require" },
         // path; the chunk is called with no arguments
         .dofile => .{ .params = 1, .words = 0, .call_args = 0, .results = 0, .tail = true, .module = "", .name = "dofile" },
     };
@@ -101,6 +112,7 @@ pub fn callReg(kind: Kind) u16 {
     const l = layoutOf(kind);
     return @as(u16, l.params) + l.words;
 }
+
 
 /// The module and name a traceback shows the activation as (`table.sort`).
 pub fn moduleOf(kind: Kind) []const u8 {
@@ -133,14 +145,14 @@ pub const ret_pc: usize = 3;
 
 /// A native's state when it signals `error.ActivateNative`, for the
 /// activation's first step (or the Zig fallback) to carry on from.
-/// Integers, and at most one heap `value` (the byte buffer `gsub` has
-/// built so far, which `Vm.forEachRootHeader` roots until a step takes it):
-/// what the state refers to otherwise sits in the native's arguments, which
-/// become the activation's parameters.
+/// Integers, and up to two heap `values` (the byte buffer `gsub` has built
+/// so far; `require`'s loader and its data), which `Vm.forEachRootHeader`
+/// roots until a step takes them: what the state refers to otherwise sits
+/// in the native's arguments, which become the activation's parameters.
 pub const Seed = struct {
     kind: Kind,
     words: [max_words]i64,
-    value: Value = Value.nil(),
+    values: [2]Value = .{ Value.nil(), Value.nil() },
 };
 
 /// The reserved proto ids, which keyframes name the activations by:
@@ -187,15 +199,15 @@ fn build(comptime kind: Kind) Proto {
     const ret_all = Instr.opAB(.ret, c, bytecode.all_results);
     const code = [_]Instr{
         Instr.opAB(.native_act, 0, k),
-        Instr.opABC(.call, c, nargs, if (l.tail) bytecode.all_results else 1),
+        Instr.opABC(.call, c, nargs, if (l.tail) bytecode.all_results else l.call_results),
         if (l.tail) ret_all else Instr.opAB(.native_act, 0, k),
-        if (l.tail) ret_all else Instr.opAB(.ret, c, l.results),
+        if (l.tail or l.dynamic_results) ret_all else Instr.opAB(.ret, c, l.results),
     };
     std.debug.assert(code[call_pc].op == .call and code[ret_pc].op == .ret);
     const frozen = code;
     return .{
         .code = &frozen,
-        .num_registers = c + 1 + @max(l.call_args, l.results),
+        .num_registers = c + 1 + @max(l.call_args, l.results, l.call_results),
         .num_params = l.params,
         .name = l.name,
         .chunk = "[C]",

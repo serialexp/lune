@@ -3145,7 +3145,8 @@ test "doc 61 Phase 0: table.sort and a require loader keep their caller in fligh
     // called from the sort's activation (doc 68 §5.1), which is suspended at
     // its `.call` as main is at its own. A Lua function under `pcall` runs
     // in a protected frame (doc 68 §5), with its caller suspended at the
-    // `.call`.
+    // `.call`. A `require` loader, a Lua function, runs the same way from
+    // the `require` activation (doc 68 §7.3).
     try expectShapes(
         \\local seen = {}
         \\local t = {5, 3, 8, 1, 9, 2}
@@ -3157,7 +3158,7 @@ test "doc 61 Phase 0: table.sort and a require loader keep their caller in fligh
         \\print(require('m'))
         \\print(shapes())
         \\
-    , "S S F:call\nS F:call\nF:call F:call\t:preload:\nF:call\n");
+    , "S S F:call\nS F:call\nS S F:call\t:preload:\nF:call\n");
 }
 
 test "doc 61 Phase 0: an xpcall handler sees the faulting frame in flight at its fault" {

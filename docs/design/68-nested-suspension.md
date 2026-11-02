@@ -122,6 +122,15 @@ land; move whole phases to Done once everything inside them is checked.
     yield and keyframes cut inside it. Nothing follows the call, so its
     results are the activation's with no step between (`Layout.tail`).
     `pcall(dofile, …)` runs the chunk through `callValue`.
+  - [x] **`require`** (2026-11-02). The cache check and the built-in
+    (native) searchers run inline in Zig; the first searcher or loader that
+    is a Lua function moves the rest into an activation (`Kind.require`),
+    whose state is the phase (searching / loading), the searcher index, and
+    either the not-found buffer (a `bytebuf`) or the loader and its data.
+    The seed now carries two heap values (`Seed.values`). One core
+    (`requireLoop`) serves the inline run, the steps and the `callValue`
+    fallback. The activation returns one or two results
+    (`Layout.dynamic_results`: the step ends them with `setActArgsEnd`).
   - [x] **`table.sort`** (2026-11-02). A comparison that needs a Lua call
     (a comparator, or `__lt`) moves the sort into an activation frame of a
     synthetic system proto, which calls the comparator as an ordinary

@@ -270,6 +270,36 @@ test "require returns the loader data and treats a false cache entry as unloaded
     , "m\t:preload:\t:preload:\t1\n7\t:preload:\ntrue\ttrue\n");
 }
 
+test "doc 68 §7.3: require runs a Lua searcher and loader as an activation: they yield, and every result passes" {
+    try expectProgram(
+        \\package.preload.y = function(n) local v = coroutine.yield("in loader " .. n); return {v = v} end
+        \\local co = coroutine.wrap(function()
+        \\  local m, d = require("y")
+        \\  return m.v, d, package.loaded.y == m
+        \\end)
+        \\print(co())
+        \\print(co(5))
+        \\package.preload.m2 = function() return 1 end
+        \\print(select("#", require("m2")), select("#", require("m2")))
+        \\package.preload.e = function() error("bad", 0) end
+        \\print(pcall(require, "e"))
+        \\print(pcall(function() return require("e") end))
+        \\package.preload.s = function(n, d) return n .. d end
+        \\print(pcall(require, "s"))
+        \\package.searchers = {function(n) return "\n\tA" end, function(n) local x = coroutine.yield("s?"); return function() return x end, "d" end}
+        \\local c2 = coroutine.wrap(function() return require("q") end)
+        \\print(c2())
+        \\print(c2(9))
+        \\package.searchers = {function(n) return "\n\tA" end, function(n) return "\n\tB" end}
+        \\print(pcall(require, "zz"))
+        \\print(pcall(function() return require("zz") end))
+    , "in loader y\n5\t:preload:\ttrue\n2\t1\nfalse\tbad\nfalse\tbad\n" ++
+        "true\ts:preload:\t:preload:\n" ++
+        "s?\n9\td\n" ++
+        "false\tmodule 'zz' not found:\n\tA\n\tB\n" ++
+        "false\tmodule 'zz' not found:\n\tA\n\tB\n");
+}
+
 test "__tostring may return a number but not a table" {
     try expectProgram(
         \\print(tostring(setmetatable({}, {__tostring = function() return 42 end})))

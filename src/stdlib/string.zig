@@ -1934,7 +1934,7 @@ fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
             st.pending_end = -1;
             const bb = try vm.heap.newByteBuf(out);
             out = .empty; // the buffer owns it now
-            vm.act_seed = .{ .kind = .gsub, .words = st.toWords(), .value = Value.heap(&bb.header) };
+            vm.act_seed = .{ .kind = .gsub, .words = st.toWords(), .values = .{ Value.heap(&bb.header), Value.nil() } };
             return error.ActivateNative;
         }
     } else if (repl_table != null) {
@@ -1975,7 +1975,7 @@ pub fn gsubStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
         const seed = vm.takeActSeed();
         std.debug.assert(seed.kind == .gsub);
         st = GsubState.fromWords(&seed.words);
-        regs.set(at, seed.value);
+        regs.set(at, seed.values[0]);
     } else {
         st = GsubState.load(regs, at + 1);
         answer = regs.get(c);
@@ -2010,7 +2010,7 @@ pub fn gsubSync(vm: *Vm, seed: native_act.Seed, args: []const Value, results_out
     // list, which nothing can sweep while the calls run.
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(vm.gpa);
-    try out.appendSlice(vm.gpa, ByteBuf.fromHeader(seed.value.asHeap()).bytes());
+    try out.appendSlice(vm.gpa, ByteBuf.fromHeader(seed.values[0].asHeap()).bytes());
     const job = gsubJobOf(args[0], args[1], args[2]);
     var caps: [pattern.max_captures]Value = undefined;
     var answer: ?Value = null;
@@ -2521,7 +2521,7 @@ test "string.gsub: string repl with %1, count, table repl, anchor" {
     try testing.expectEqual(@as(i64, 0), seed.words[0]); // src: before the first match
     try testing.expectEqual(@as(i64, 0), seed.words[1]); // count
     try testing.expectEqual(@as(i64, -1), seed.words[3]); // nothing pending
-    try testing.expectEqualStrings("", ByteBuf.fromHeader(seed.value.asHeap()).bytes());
+    try testing.expectEqualStrings("", ByteBuf.fromHeader(seed.values[0].asHeap()).bytes());
 }
 
 test "@gmatch_iter walks the state table and stops when exhausted" {

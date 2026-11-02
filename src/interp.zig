@@ -3904,6 +3904,7 @@ pub const Vm = struct {
             },
             .gsub => return stdstring.gsubSync(self, seed, args, results_out),
             .dofile => return stdload.dofileSync(self, seed, results_out),
+            .require => return stdpackage.requireSync(self, seed, args, results_out),
         }
     }
 
@@ -4546,7 +4547,7 @@ pub const Vm = struct {
         //    its catch. Load-bearing for the `xpcall` handler path, which allocates
         //    (and so may collect) while the error value waits to be handed over.
         if (self.pending_error) |ev| if (ev.isHeap()) cb(ctx, ev.asHeap());
-        if (self.act_seed) |seed| if (seed.value.isHeap()) cb(ctx, seed.value.asHeap());
+        if (self.act_seed) |seed| for (seed.values) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         // 8. metamethod-dispatch roots: every interned metamethod-name string and
         //    the shared string metatable. Referenced from the VM (not `globals`),
         //    so they must be marked explicitly or a collection mid-dispatch would
@@ -10146,6 +10147,7 @@ pub const Vm = struct {
                     .sort => stdtable.sortStep(vm, regs),
                     .gsub => stdstring.gsubStep(vm, regs),
                     .dofile => stdload.dofileStep(vm, regs),
+                    .require => stdpackage.requireStep(vm, regs),
                 } catch |e| return parkErr(st, e);
                 switch (next) {
                     .call => {

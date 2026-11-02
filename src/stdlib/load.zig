@@ -268,7 +268,7 @@ fn dofileCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
     // The chunk's call is a Lua call, so it is made from an activation
     // (doc 68 §7.3): a coroutine can yield in the chunk, and a keyframe
     // can cut there. The activation's results are the chunk's.
-    vm.act_seed = .{ .kind = .dofile, .words = @splat(0), .value = loaded[0] };
+    vm.act_seed = .{ .kind = .dofile, .words = @splat(0), .values = .{ loaded[0], Value.nil() } };
     return error.ActivateNative;
 }
 
@@ -277,7 +277,7 @@ fn dofileCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
 pub fn dofileStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
     const seed = vm.takeActSeed();
     std.debug.assert(seed.kind == .dofile);
-    regs.set(native_act.callReg(.dofile), seed.value);
+    regs.set(native_act.callReg(.dofile), seed.values[0]);
     return .call;
 }
 
@@ -285,7 +285,7 @@ pub fn dofileStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
 /// pushed: the chunk runs through `callValue` (`Vm.activationSync`).
 pub fn dofileSync(vm: *Vm, seed: native_act.Seed, results_out: []Value) interp.Error!usize {
     std.debug.assert(seed.kind == .dofile);
-    return vm.callValue(seed.value, &.{}, results_out);
+    return vm.callValue(seed.values[0], &.{}, results_out);
 }
 
 /// Raise `msg` (a heap string or nil) as the in-flight Lua error for `dofile`. The

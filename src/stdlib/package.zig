@@ -36,6 +36,9 @@ const function = @import("../function.zig");
 const interp = @import("../interp.zig");
 const table_mod = @import("../table.zig");
 const load = @import("load.zig");
+const native_act = @import("../native_act.zig");
+const ByteBuf = @import("../bytebuf.zig").ByteBuf;
+const RegWindow = @import("../regwindow.zig").RegWindow;
 
 const Value = value.Value;
 const Vm = interp.Vm;
@@ -299,9 +302,13 @@ fn searchPathN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usiz
 /// `package.loaded[name]` counts as not loaded, as `lua_toboolean` does. Searchers returning a string contribute to the not-found message;
 /// no loader → a raised `module '<name>' not found:…` error.
 ///
-/// Reentrant: a loader may `require` further modules (rides `native_reentry_depth`
-/// through `callValue`). A `require` cycle currently bottoms out in `StackOverflow`
-/// rather than a dedicated "loop" message (see TODO).
+/// The searchers and the loader are called from `requireLoop`. The built-in
+/// searchers are natives, so a `require` that needs nothing else runs inline
+/// here; at the first searcher or loader that is a Lua function (a module's
+/// chunk always is) it becomes an activation (doc 68 §7.3): it hands its
+/// state to `error.ActivateNative`'s handler, and the calls are ordinary
+/// frames a coroutine can yield in. A `require` cycle bottoms out in the
+/// frame limit (see TODO).
 fn requireCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
     std.debug.assert(out.len >= 1);
     // `name_val` is an argument → it lives in the caller's register window, which
@@ -326,52 +333,136 @@ fn requireCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
     // Accumulate the not-found message from string-returning searchers.
     var notfound: std.ArrayList(u8) = .empty;
     defer notfound.deinit(vm.gpa);
-
-    var loader: Value = Value.nil();
-    var loader_data: Value = Value.nil();
-    var i: i64 = 1;
-    while (true) : (i += 1) {
-        // Re-derive `searchers` each iteration: the previous iteration ran a searcher
-        // via `callValue`, which could have reassigned `package.searchers` (orphaning
-        // a cached pointer for GC).
-        const searchers = try requirePackageSubTable(vm, "searchers", "package.searchers");
-        const s = searchers.getInt(i);
-        if (s.isNil()) break; // end of the searcher array
-        var res: [2]Value = .{ Value.nil(), Value.nil() };
-        const got = try vm.callValue(s, &.{name_val}, res[0..2]);
-        const r0 = res[0];
-        const r1 = if (got >= 2) res[1] else Value.nil();
-        if (isCallable(r0)) {
-            loader = r0;
-            loader_data = r1;
-            break;
-        } else if (interp.strBytes(r0)) |msg| {
-            try notfound.appendSlice(vm.gpa, msg);
-        }
-        // nil / false / any non-string, non-callable → skip this searcher.
+    var st: ReqState = .{};
+    const outcome = try requireLoop(vm, name_val, name, &st, &notfound, null, true);
+    switch (outcome) {
+        .done => |d| {
+            out[0] = d[0];
+            if (out.len < 2) return 1;
+            out[1] = d[1];
+            return 2;
+        },
+        .call => {
+            // A Lua function to call: from here on the calls are an activation's.
+            vm.act_seed = switch (st.phase) {
+                .search => blk: {
+                    const bb = try vm.heap.newByteBuf(notfound);
+                    notfound = .empty; // the buffer owns it now
+                    break :blk .{ .kind = .require, .words = st.toWords(), .values = .{ Value.heap(&bb.header), Value.nil() } };
+                },
+                .load => .{ .kind = .require, .words = st.toWords(), .values = .{ st.loader, st.data } },
+            };
+            return error.ActivateNative;
+        },
     }
+}
 
-    if (!isCallable(loader)) {
-        const emsg = try std.fmt.allocPrint(vm.gpa, "module '{s}' not found:{s}", .{ name, notfound.items });
-        defer vm.gpa.free(emsg);
-        return vm.raiseLocatedError(emsg, 0);
+/// Where a `require` is: looking for a loader (`i` the searcher to call, or
+/// whose answer comes next), or running the one it found.
+const ReqPhase = enum(i64) { search, load };
+
+/// A `require`'s state between its calls. Integers in an activation's
+/// registers, and the two values (`loader`, `data`) once the phase is `load`.
+const ReqState = struct {
+    phase: ReqPhase = .search,
+    i: i64 = 1,
+    loader: Value = Value.nil(),
+    data: Value = Value.nil(),
+
+    fn toWords(self: ReqState) [native_act.max_words]i64 {
+        var w: [native_act.max_words]i64 = @splat(0);
+        w[0] = @intFromEnum(self.phase);
+        w[1] = self.i;
+        return w;
     }
+};
 
-    // Run the loader: `loader(name, data)` → one result. `loader_data` is
-    // returned after it, but the loader's window need not keep it (a loader
-    // that takes no parameters leaves it dead), so park it for the call.
-    var lr: [1]Value = .{Value.nil()};
-    const data_slot = try vm.parkTemp(loader_data);
-    _ = try vm.callValue(loader, &.{ name_val, loader_data }, lr[0..1]);
-    loader_data = vm.unparkTemp(data_slot);
-    const result = lr[0];
+/// A call `requireLoop` needs made: a searcher's, or the loader's.
+const ReqCall = struct {
+    f: Value,
+    nargs: u8,
+    args: [2]Value,
+};
 
-    // Cache per Lua's rule: a non-nil loader result is the module; otherwise, if the
-    // loader left `loaded[name]` unset, default the entry to `true`. Re-derive
-    // `loaded` after the loader call (it may have replaced `package.loaded`); a
-    // loader that assigned `package.loaded[name]` itself is then honoured by the
-    // re-fetch below.
-    // A frozen `package.loaded` (doc 76 §5) refuses the store as any table.
+const ReqOutcome = union(enum) {
+    /// A call to make; its answer comes back to `requireLoop` as `answer`.
+    call: ReqCall,
+    /// `require`'s two results: the module and the loader's data.
+    done: [2]Value,
+};
+
+fn isNative(v: Value) bool {
+    return v.isHeap() and v.heapType() == .native;
+}
+
+/// `require`'s search and load, from the state `st` (a fresh one, or where a
+/// call was made), until it needs a call it can't make itself. `answer` is
+/// what the last call returned (the searcher's first two results, or the
+/// loader's first), null before the first call. With `inline_natives` a
+/// native callee is called right here (`Vm.callValue`); without, every call
+/// is returned for the caller to make. `notfound` collects the searchers'
+/// diagnostics.
+fn requireLoop(vm: *Vm, name_val: Value, name: []const u8, st: *ReqState, notfound: *std.ArrayList(u8), answer_in: ?[2]Value, comptime inline_natives: bool) anyerror!ReqOutcome {
+    var answer = answer_in;
+    while (true) switch (st.phase) {
+        .search => {
+            if (answer) |a| {
+                answer = null;
+                if (isCallable(a[0])) {
+                    st.loader = a[0];
+                    st.data = a[1];
+                    st.phase = .load;
+                    continue;
+                } else if (interp.strBytes(a[0])) |msg| {
+                    try notfound.appendSlice(vm.gpa, msg);
+                }
+                // nil / false / any non-string, non-callable → skip this searcher.
+                st.i += 1;
+            }
+            // Re-derive `searchers` each time: the previous searcher ran code
+            // that could have reassigned `package.searchers` (orphaning a
+            // cached pointer for GC).
+            const searchers = try requirePackageSubTable(vm, "searchers", "package.searchers");
+            const s = searchers.getInt(st.i);
+            if (s.isNil()) { // end of the searcher array
+                const emsg = try std.fmt.allocPrint(vm.gpa, "module '{s}' not found:{s}", .{ name, notfound.items });
+                defer vm.gpa.free(emsg);
+                return vm.raiseLocatedError(emsg, 0);
+            }
+            if (inline_natives and isNative(s)) {
+                var res: [2]Value = .{ Value.nil(), Value.nil() };
+                const got = try vm.callValue(s, &.{name_val}, res[0..2]);
+                answer = .{ res[0], if (got >= 2) res[1] else Value.nil() };
+                continue;
+            }
+            return .{ .call = .{ .f = s, .nargs = 1, .args = .{ name_val, Value.nil() } } };
+        },
+        .load => {
+            if (answer) |a| return .{ .done = try requireFinish(vm, name_val, a[0], st.data) };
+            if (inline_natives and isNative(st.loader)) {
+                // `loader_data` is returned after the loader, but the
+                // loader's window need not keep it (a loader that takes no
+                // parameters leaves it dead), so park it for the call.
+                var lr: [1]Value = .{Value.nil()};
+                const data_slot = try vm.parkTemp(st.data);
+                _ = try vm.callValue(st.loader, &.{ name_val, st.data }, lr[0..1]);
+                st.data = vm.unparkTemp(data_slot);
+                answer = .{ lr[0], Value.nil() };
+                continue;
+            }
+            return .{ .call = .{ .f = st.loader, .nargs = 2, .args = .{ name_val, st.data } } };
+        },
+    };
+}
+
+/// The end of a `require`: cache `result` per Lua's rule, and answer with the
+/// module and the loader's `data`. A non-nil loader result is the module;
+/// otherwise, if the loader left `loaded[name]` unset, the entry defaults to
+/// `true`. `loaded` is re-derived after the loader call (it may have
+/// replaced `package.loaded`); a loader that assigned `package.loaded[name]`
+/// itself is honoured by the re-fetch below. A frozen `package.loaded`
+/// (doc 76 §5) refuses the store as any table.
+fn requireFinish(vm: *Vm, name_val: Value, result: Value, data: Value) anyerror![2]Value {
     const loaded = try requirePackageSubTable(vm, "loaded", "package.loaded");
     if (!result.isNil()) {
         if (loaded.isReadonly()) return vm.readonlyError();
@@ -383,10 +474,108 @@ fn requireCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
         try loaded.set(vm.gpa, name_val, Value.boolean(true));
         cur = Value.boolean(true);
     }
-    out[0] = cur;
-    if (out.len < 2) return 1;
-    out[1] = loader_data;
-    return 2;
+    return .{ cur, data };
+}
+
+/// One step of `require`'s activation (doc 68 §7.3): `R0` is the module
+/// name, `R1` the phase (nil before the first step, which takes the native's
+/// seed), `R2` the searcher index, `R3` the not-found buffer while
+/// searching, or the loader once found, and `R4` the loader's data. Runs to
+/// the next searcher or the loader, laid out in the call area as the callee
+/// and its arguments, or to the end, leaving the two results there.
+pub fn requireStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
+    const at = native_act.wordReg(.require);
+    const c = native_act.callReg(.require);
+    const name_val = regs.get(0);
+    const name = interp.strBytes(name_val).?;
+    var st: ReqState = .{};
+    var answer: ?[2]Value = null;
+    if (regs.get(at).isNil()) {
+        const seed = vm.takeActSeed();
+        std.debug.assert(seed.kind == .require);
+        st.phase = @enumFromInt(seed.words[0]);
+        st.i = seed.words[1];
+        regs.set(at + 2, seed.values[0]);
+        regs.set(at + 3, seed.values[1]);
+    } else {
+        st.phase = @enumFromInt(regs.get(at).asInt());
+        st.i = regs.get(at + 1).asInt();
+        answer = .{ regs.get(c), regs.get(c + 1) };
+        // The loader's answer is its first result alone.
+        if (st.phase == .load) answer.?[1] = Value.nil();
+    }
+    var no_list: std.ArrayList(u8) = .empty;
+    var bb: ?*ByteBuf = null;
+    if (st.phase == .search) bb = ByteBuf.fromHeader(regs.get(at + 2).asHeap());
+    if (st.phase == .load) {
+        st.loader = regs.get(at + 2);
+        st.data = regs.get(at + 3);
+    }
+    const nf: *std.ArrayList(u8) = if (bb) |b| &b.list else &no_list;
+    const outcome = requireLoop(vm, name_val, name, &st, nf, answer, false) catch |e| return interp.narrowError(e);
+    if (bb) |b| vm.heap.chargeByteBuf(b);
+    switch (outcome) {
+        .call => |call| {
+            regs.setInt(at, @intFromEnum(st.phase));
+            regs.setInt(at + 1, st.i);
+            if (st.phase == .load) {
+                regs.set(at + 2, st.loader);
+                regs.set(at + 3, st.data);
+            }
+            regs.set(c, call.f);
+            for (call.args[0..call.nargs], c + 1..) |v, r| regs.set(r, v);
+            vm.setActArgsEnd(c + 1 + call.nargs);
+            return .call;
+        },
+        .done => |d| {
+            regs.set(c, d[0]);
+            regs.set(c + 1, d[1]);
+            vm.setActArgsEnd(c + 2);
+            return .done;
+        },
+    }
+}
+
+/// `require` called from Zig (`Vm.callValue`), where no activation can be
+/// pushed: it finishes from the state the native left, making its calls
+/// through `callValue` (`Vm.activationSync`).
+pub fn requireSync(vm: *Vm, seed: native_act.Seed, args: []const Value, results_out: []Value) interp.Error!usize {
+    std.debug.assert(seed.kind == .require);
+    const name_val = args[0];
+    const name = interp.strBytes(name_val).?;
+    var st: ReqState = .{ .phase = @enumFromInt(seed.words[0]), .i = seed.words[1] };
+    // The buffer was only the seed's carrier: take its bytes into a Zig
+    // list, which nothing can sweep while the calls run.
+    var notfound: std.ArrayList(u8) = .empty;
+    defer notfound.deinit(vm.gpa);
+    switch (st.phase) {
+        .search => try notfound.appendSlice(vm.gpa, ByteBuf.fromHeader(seed.values[0].asHeap()).bytes()),
+        .load => {
+            st.loader = seed.values[0];
+            st.data = seed.values[1];
+        },
+    }
+    var answer: ?[2]Value = null;
+    while (true) {
+        const outcome = requireLoop(vm, name_val, name, &st, &notfound, answer, false) catch |e| return interp.narrowError(e);
+        switch (outcome) {
+            .done => |d| {
+                const result = d;
+                const w = @min(result.len, results_out.len);
+                @memcpy(results_out[0..w], result[0..w]);
+                return w;
+            },
+            .call => |call| {
+                var r: [2]Value = .{ Value.nil(), Value.nil() };
+                // The loader's data waits in the Zig frame while the loader
+                // runs: keep it rooted.
+                const slot = try vm.parkTemp(st.data);
+                const n = try vm.callValue(call.f, call.args[0..call.nargs], r[0..2]);
+                st.data = vm.unparkTemp(slot);
+                answer = .{ r[0], if (n >= 2) r[1] else Value.nil() };
+            },
+        }
+    }
 }
 
 fn require1(ctx: *anyopaque, args: []const Value) anyerror!Value {
