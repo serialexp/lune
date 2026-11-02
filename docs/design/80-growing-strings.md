@@ -37,7 +37,8 @@ land; move whole units to Done once everything inside them is checked.
   once. A bytecode change; not started.
 - [ ] **Q1 — long strings: which model** (§5). (A) Lua 5.4 uninterned long
   strings, which Bart picked first, or (B) LuaJIT's sparse hash, which keeps
-  every string interned. Bart decides before U4 starts.
+  every string interned. Bart decides before U4 starts; §5.1–§5.2 list
+  what each one touches.
 - [ ] **U4 — long strings**, per Q1's answer.
 - [ ] **Embedders** (§2.3): document `LargeBlockCache` in the embedding
   guide; the C API does not install it today.
@@ -209,7 +210,9 @@ fewer instructions, and one that is new 18 % fewer.
 ## 5. Q1 — long strings
 
 Even with U1–U3, every concat hashes its full result, so a loop that grows a
-string to n bytes still does O(n²) hashing work. Two ways out:
+string to n bytes still does O(n²) hashing work. After U2, a 160k
+`s = s .. "x"` loop spends 56 % of its cycles in `Wyhash.hash`, 16 % in
+`memcpy` and 12 % in the collector. Two ways out:
 
 - **(A) Lua 5.4: long strings are not interned.** Strings past a limit
   (40 bytes in Lua) are created without a hash-table lookup; equality
@@ -224,6 +227,100 @@ string to n bytes still does O(n²) hashing work. Two ways out:
   the cost moves to the comparisons on a hash-chain hit.
 
 Bart decides between them before U4 starts.
+
+### 5.1 What (A) touches
+
+Interning is load-bearing in two forms: object-id equality (`Value.eql`,
+every hash-part probe, `next`, the native hrefk guard, keyframes) and
+address equality (`eq_s`/`jeq_s`, `guard_sid`, the compiler's constant
+dedup, the trace konst pool). An inventory of the tree (2026-11-02)
+found these sites, grouped by what fails:
+
+**Silently wrong results** (each must be fixed before any long string
+skips the intern table):
+
+1. `==`/`~=` on two strings: `eqLanes` (interp.zig ~8923) answers "not
+   equal" for two heap refs that are not both tables, with no slow path;
+   `eqStrLane` (~8962, the `eq_s`/`jeq_s` lanes) compares addresses, and
+   `opJEqSlow` has no string arm. `Value.eql` (value.zig ~252) compares ids,
+   and the recorder's konst fold (`eqRef`) inherits it.
+2. Table keys: `hash_part` hashes and matches heap keys by id (`keyHash`,
+   `Ident`, `liveNodeInline`), so an equal but distinct long string misses.
+   This is every `get`/`set`/`getPtr`/`remove`, and the `get_field`/
+   `set_field` fast lanes.
+3. `next(t, k)` (`nextLive`) finds the control key by raw bits, then by id,
+   then by binary search over ids: an equal but distinct control key lands
+   at the wrong position.
+4. `forwardPendingHashLoad` (trace_recorder.zig ~2706) treats two konsts
+   as different cells when their refs differ, which interning made equal to
+   "different content".
+5. **Deopt replay (doc 24 D2).** Re-running a partial iteration after a
+   coarse exit costs no new object ids because its string producers' first
+   misses are the re-run's hits; `tostr_*` CSE rests on the same fact. An
+   uninterned long result allocates a new id on every re-run, so `ssub`,
+   `srev`, `srep2`, `supper`/`slower` and `scap_str` would diverge from
+   tier 0 (8-mode equivalence). They would have to become effects, stay
+   restricted to short results on trace, or move to precise deopt.
+
+**Structural:**
+
+6. A deleted hash node keeps only `key_id` (its payload is zeroed by
+   `remove`), and `probeForPut`/`liveSlotOf` rely on "a key occupies at most
+   one node, live or dead": a dead id match proves absence and is
+   resurrected. A dead long-string node cannot be matched by content, so a
+   re-inserted equal string would take a second node, which breaks the
+   stable slots `next` depends on. Nodes would need the content hash and a
+   comparable handle, or long keys must leave the dead-match rule.
+7. Keyframe restore interns every `HeapString` and rejects duplicates
+   (`internRestoredUnique`); two equal long strings are legal under (A).
+   The recompile of loaded chunks must allocate nothing
+   (`RecompileAllocated`), which holds only because literals re-intern to
+   restored strings: the compiler would have to keep interning long
+   literals.
+8. The sweep re-inserts every surviving string into the intern table; it
+   would skip long ones.
+
+**Slower but correct:** the hrefk guard compares the node's `key_id` with
+the konst's id, so a table whose key object is not the literal side-exits
+every iteration (record the node's own id instead); `guard_sid` pattern
+pins and `sgmatchCore` exit when an equal pattern is a different object;
+konst dedup, `callee_global_dedup` and `hash_cell_dedup` lose sharing.
+`fieldByName` returns "absent" for any name past the limit
+(`internedLookup` would always miss). Tests that assert result identity
+(stdlib/string.zig, effectser) or use `strtab_count` as an
+"allocated nothing" probe go blind or fail.
+
+**Unaffected:** `<`/`<=` already compare bytes; metamethod, type and
+method names are short; table key *order* stays deterministic (by id,
+with one key object per content per table); GC byte pacing applies as is.
+
+About 250 intern call sites outside test files exist; nearly all produce
+short strings. The long producers are concat, the stdlib string cores,
+`table.concat`, `string.format`/`gsub`, file/getenv results and the C
+API's `push_string`.
+
+### 5.2 What (B) touches
+
+`String.hash` is read only by the intern table (`strtabLookup`,
+`strtabInsert`, rebuild); table keys hash by id. So (B) is local to
+`gc.zig` and `string.zig`: the hash function for strings past a length
+limit, plus LuaJIT's collision guard (`lj_str.c` `lj_str_new`: more than
+32 collisions on a chain rehashes that chain with the dense hash, marked
+by a tag bit on the bucket head). Equality, table keys, the JIT, deopt
+replay and keyframes are untouched. The seed must stay a constant (LuaJIT
+draws it from its PRNG; ours feeds no observable order, doc 02, but a
+fixed seed keeps runs identical). What it does not remove: a chain hit
+still compares bytes (`memcmp`) when hash and length match, and a hit on a
+long string is a full compare. For `s = s .. x` the length differs on
+every step, so hits are rare.
+
+### 5.3 Outstanding for U4
+
+- [ ] Bart picks (A) or (B) with §5.1/§5.2 in hand.
+- [ ] Under (A): the five silent sites first, then the dead-node and
+  keyframe designs, each its own increment.
+- [ ] Under (B): the sparse hash and the chain guard, with an adversarial
+  collision test and the str_concat_grow and str_long_keys A/Bs.
 
 ## References
 
