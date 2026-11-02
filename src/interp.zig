@@ -2906,6 +2906,7 @@ pub const Vm = struct {
         const line = span.line;
         // `faultVarInfo`'s suffix, when it fits.
         var info_buf: [256]u8 = undefined;
+        var cmp_buf: [arith.compare_fault_max]u8 = undefined;
 
         const message: []const u8 = switch (err) {
             Error.StackOverflow => try arena.dupe(u8, "stack overflow"),
@@ -2937,15 +2938,12 @@ pub const Vm = struct {
                 .bnot => try bitwiseFaultMessage(arena, regs.get(instr.b)),
                 .len => try std.fmt.allocPrint(arena, "attempt to get length of a {s} value", .{regs.get(instr.b).typeName()}),
                 .concat => try std.fmt.allocPrint(arena, "attempt to concatenate a {s} value", .{firstNonConcatable(regs.get(instr.b), regs.get(instr.c)).typeName()}),
-                .lt, .le, .gt, .ge, .jlt, .jle, .jgt, .jge => try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ regs.get(instr.b).typeName(), regs.get(instr.c).typeName() }),
-                // Doc 66 P4: in source order, which put the constant on the
-                // left when `cmp_k_left` is set.
-                .jlt_k, .jle_k, .jgt_k, .jge_k => blk: {
-                    const x = regs.get(instr.b).typeName();
-                    const k = proto.constants[instr.c].typeName();
-                    const k_left = instr.a & bytecode.cmp_k_left != 0;
-                    break :blk try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ if (k_left) k else x, if (k_left) x else k });
-                },
+                // Lua compiles `x > y` as `y < x`, so 5.4 names a `>`/`>=`'s
+                // right operand first, whichever side of the source held it.
+                .lt, .le, .jlt, .jle => try arena.dupe(u8, arith.compareFaultText(&cmp_buf, regs.get(instr.b), regs.get(instr.c))),
+                .gt, .ge, .jgt, .jge => try arena.dupe(u8, arith.compareFaultText(&cmp_buf, regs.get(instr.c), regs.get(instr.b))),
+                .jlt_k, .jle_k => try arena.dupe(u8, arith.compareFaultText(&cmp_buf, regs.get(instr.b), proto.constants[instr.c])),
+                .jgt_k, .jge_k => try arena.dupe(u8, arith.compareFaultText(&cmp_buf, proto.constants[instr.c], regs.get(instr.b))),
                 // Lua 5.4's `forprep` wording, first non-number in operand order.
                 .for_prep => try arena.dupe(u8, if (!regs.get(instr.a).isNumber())
                     "'for' initial value must be a number"

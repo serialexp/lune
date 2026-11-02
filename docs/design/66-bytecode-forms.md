@@ -986,7 +986,14 @@ a temporary plus `jmp_if_false`/`jmp_if_true`.
   As built (2026-10-22). `a`'s bit 0 is the polarity (`cmp_on_true`) and
   bit 1 `cmp_k_left`: a constant on the left (`0 < x`) compiles to the
   mirrored relation with the constant on the right (`x > 0`), and the flag
-  exists only so a fault names the operands in source order. Ordered
+  exists only so a fault names the operands in source order. (**Revised
+  2026-11-02:** `cmp_k_left` is gone. Lua 5.4 does not name operands in
+  source order: it compiles `x > y` as `y < x`, so a `>`/`>=` fault names
+  the right operand first, and `1 < t` and `t > 1` read alike. In the op's
+  own operands that is lhs-first for `<`/`<=` and rhs-first for `>`/`>=`
+  whatever the source wrote, so the flag carried nothing; `describeFault`
+  renders through `arith.compareFaultText`, which also gives 5.4's "two
+  table values".) Ordered
   relations get constant forms for numbers only; a string or primitive
   on one side of `<` uses the register form, which faults or calls
   `__lt` as before. In `repeat … until cmp` the operands evaluate in the

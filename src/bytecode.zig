@@ -337,9 +337,8 @@ pub const OpCode = enum(u8) {
     // bit 0 of `a` (`cmp_on_true`). Polarity rides in `a` rather than in a
     // negated relation: `not (x < y)` is not `x >= y` when either is NaN.
     // They write no register. The ordered relations against a constant take
-    // a number; `cmp_k_left` in `a` records that the source had the
-    // constant on the left (`0 < x` compiles to `x > 0`), for the fault
-    // text only. `cmpBranchOf` decodes them, and `condBranchOf` names them
+    // a number; one on the source's left is mirrored (`0 < x` compiles to
+    // `x > 0`). `cmpBranchOf` decodes them, and `condBranchOf` names them
     // a branch.
     /// `a, b, c, aux`  R[b] < R[c]
     jlt,
@@ -513,9 +512,6 @@ pub const CmpForm = struct {
 /// Bit 0 of a compare-and-branch's `a`: jump when the comparison holds
 /// (set) or when it fails (clear).
 pub const cmp_on_true: u16 = 1;
-/// Bit 1 of an ordered constant compare-and-branch's `a`: the source wrote
-/// the constant on the left, so a fault names the operands in that order.
-pub const cmp_k_left: u16 = 2;
 
 /// The compare-and-branch `op` performs, or null when it is not one.
 /// Usable at comptime.
@@ -1483,11 +1479,11 @@ test "doc 66 §5.4: condBranchOf decodes exactly the conditional branches" {
                 const got = cb.?;
                 try testing.expectEqual(CondTest.compare, got.cond);
                 try testing.expectEqual(@as(i64, 7), got.target);
-                try testing.expect(got.on_true); // a = 3: on_true | k_left
+                try testing.expect(got.on_true); // a = 3: bit 0 is on_true
                 try testing.expectEqual(@as(?i64, 7), loop_target);
-                const off = condBranchOf(.{ .op = op, .a = cmp_k_left, .aux = -4 }, 10).?;
+                const off = condBranchOf(.{ .op = op, .a = 2, .aux = -4 }, 10).?;
                 try testing.expect(!off.on_true);
-                try testing.expectEqual(@as(?i64, 7), loopTestTargetOf(.{ .op = op, .a = cmp_k_left, .aux = -4 }, 10));
+                try testing.expectEqual(@as(?i64, 7), loopTestTargetOf(.{ .op = op, .a = 2, .aux = -4 }, 10));
             },
             else => {
                 try testing.expectEqual(@as(?CondBranch, null), cb);

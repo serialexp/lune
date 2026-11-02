@@ -20,12 +20,14 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       and concat faults don't name their operand, even a global (5.4:
       "attempt to perform arithmetic on a nil value (global 'x')"; compare
       faults carry no name in 5.4 either).
-- [ ] **`<` on two values of one type says "table with table"** (seen
+- [x] **`<` on two values of one type says "table with table"** (seen
       2026-11-02). 5.4's `luaG_ordererror` says "attempt to compare two
       table values" when both type names match. `describeFault`'s
       compare arms (`interp.zig`, the `.lt…` and constant-operand
       cases) should use `arith.compareFaultText`, which `table.sort`
-      already raises. Waits for doc 68 P2, which owns interp.zig.
+      already raises. **Done 2026-11-02**, together with the operand
+      order: `>`/`>=` name the right operand first, as 5.4's swapped `<`
+      does (`1 > "a"` is "string with number"); `cmp_k_left` removed.
 - [ ] **A value read by `get_index` or a fused op's first step gets no
       name in a fault** (seen 2026-11-02). `t[1].x`, `t[k][2]` and
       `t["s"][2]` on a nil middle say "attempt to index a nil value"; 5.4

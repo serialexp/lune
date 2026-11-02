@@ -1853,7 +1853,8 @@ const Compiler = struct {
         }
         if (self.numberLiteral(cmp.lhs)) |v| {
             // `K < x` is `x > K`: the same comparison of the same operands
-            // (`>` is `<` swapped), so only the fault text needs the order.
+            // (`>` is `<` swapped). The fault text needs no record of it:
+            // 5.4 names a `>`'s right operand first either way.
             const mirrored: bytecode.CmpRel = switch (rel) {
                 .lt => .gt,
                 .le => .ge,
@@ -1864,7 +1865,7 @@ const Compiler = struct {
             const k = try self.addConstant(v);
             const t = try self.operandReg(cmp.rhs);
             self.cur_span = op_span;
-            return Instr{ .op = bytecode.cmpBranchOp(mirrored, .num).?, .a = on | bytecode.cmp_k_left, .b = t, .c = k };
+            return Instr{ .op = bytecode.cmpBranchOp(mirrored, .num).?, .a = on, .b = t, .c = k };
         }
         const t1 = try self.operandRegBefore(cmp.lhs, cmp.rhs);
         const t2 = try self.operandReg(cmp.rhs);
@@ -3227,19 +3228,13 @@ test "doc 66 P4: a comparison test compiles to one compare-and-branch" {
     try testing.expectEqual(@as(usize, 1), count.get(.jmp_if_false));
     try testing.expectEqual(@as(usize, 1), count.get(.jmp_if_true));
     try testing.expectEqual(@as(usize, 0), count.get(.not));
-    var mirrored: usize = 0;
     for (proto.code) |ins| {
-        const f = bytecode.cmpBranchOf(ins.op) orelse continue;
+        if (bytecode.cmpBranchOf(ins.op) == null) continue;
         // Every test here jumps past its block when the condition is false:
         // a `not`, and `~=` against `==`, flip the polarity.
         const negated = ins.op == .jle or ins.op == .jeq_s or ins.op == .jeq;
         try testing.expectEqual(negated, ins.a & bytecode.cmp_on_true != 0);
-        if (ins.a & bytecode.cmp_k_left != 0) {
-            mirrored += 1;
-            try testing.expectEqual(bytecode.CmpRel.gt, f.rel);
-        }
     }
-    try testing.expectEqual(@as(usize, 1), mirrored);
 }
 
 test "doc 66: an `and`/`or`/`not` test compiles to a chain of branches" {

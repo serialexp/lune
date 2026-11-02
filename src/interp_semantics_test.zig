@@ -1359,9 +1359,12 @@ test "doc 66 P4: a compare-and-branch is its compare followed by the branch" {
     , "2660\t738004662\n0 1 2 3 4 5\n4\n206669\t3000\t1000.5\t4002\n", .{ .record_aborts = true, .inspect = Inspect.run });
 }
 
-test "doc 66 P4: a compare-and-branch fault names its operands in source order" {
-    // `1 < t` compiles to `t > 1` against a constant; the message still reads
-    // "number with table", and each points at its own line.
+test "doc 66 P4: a compare-and-branch fault names its operands as Lua 5.4 does" {
+    // 5.4 compiles `x > y` as `y < x`, so `<`/`<=` name the left operand
+    // first and `>`/`>=` the right; `1 < t` compiles to `t > 1` against a
+    // constant and still reads "number with table". Two operands of one type
+    // are "two table values" (`luaG_ordererror`). Each points at its own
+    // line. The expected text is lua5.4's output for this program.
     try expectProgram(
         \\local function err(f) local ok, e = pcall(f); print(ok, e:match(":(%d+): attempt to compare (.*)")) end
         \\local t, s = {}, "s"
@@ -1376,9 +1379,26 @@ test "doc 66 P4: a compare-and-branch fault names its operands in source order" 
         \\err(function() repeat until 1 <= t end)
         \\
     ,
-        "false\t3\ttable with number\nfalse\t4\tnumber with table\nfalse\t5\ttable with number\n" ++
-            "false\t6\tnumber with table\nfalse\t7\ttable with string\nfalse\t8\tstring with table\n" ++
+        "false\t3\ttable with number\nfalse\t4\tnumber with table\nfalse\t5\tnumber with table\n" ++
+            "false\t6\ttable with number\nfalse\t7\ttable with string\nfalse\t8\ttable with string\n" ++
             "false\t9\tnumber with string\nfalse\t10\ttable with number\nfalse\t11\tnumber with table\n",
+    );
+}
+
+test "a compare fault on two values of one type says \"two X values\", as Lua 5.4" {
+    // The branch form, the value form, and `>` on mixed operands (right named
+    // first) for contrast. The expected text is lua5.4's output.
+    try expectProgram(
+        \\local function err(f) local ok, e = pcall(f); print(ok, e:match(":(%d+): attempt to compare (.*)")) end
+        \\local t, s = {}, "s"
+        \\err(function() if t > t then end end)
+        \\err(function() return t < t end)
+        \\err(function() return true <= false end)
+        \\err(function() return s > 1 end)
+        \\
+    ,
+        "false\t3\ttwo table values\nfalse\t4\ttwo table values\n" ++
+            "false\t5\ttwo boolean values\nfalse\t6\tnumber with string\n",
     );
 }
 
