@@ -7,12 +7,25 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 - [ ] **Lua 5.5 global declarations, attributes and frozen tables.**
       Designed in doc 76 (decisions D1–D8 there); its status list tracks
       the phases.
-- [ ] **A caught bare fault drops Lua's variable suffix** (seen
-      2026-11-01). `pcall(function() local t = nil; return t.x end)` gives
-      "main:1: attempt to index a nil value"; 5.4 says "... (local 't')".
-      `synthErrorValue` builds the caught value from `describeFault`'s
-      message, which leaves `faultVarInfo`'s suffix to the reporter, so
-      `pcall`, a `__close`'s error argument and the top-level report all lack it.
+- [ ] **Faults name no locals or upvalues** (seen 2026-11-01; diagnosis
+      corrected 2026-11-02). `pcall(function() local t = nil; return t.x end)`
+      gives "main:1: attempt to index a nil value"; 5.4 says "... (local 't')".
+      The first diagnosis ("a caught fault drops the suffix") was wrong:
+      global, field and method names do reach caught values. What's missing
+      is the names themselves. `bc_names.zig`'s `Origin.Kind` has only
+      `global`/`field`/`method`, because the compiler keeps no register→name
+      map at runtime. Needs Lua's `Proto.locvars` (name + live pc range per
+      register, from `declareLocal`/`endScope` in `compiler.zig`) and upvalue
+      names, then `local 'x'` / `upvalue 'x'` origins. Same gap: arithmetic
+      and concat faults don't name their operand, even a global (5.4:
+      "attempt to perform arithmetic on a nil value (global 'x')"; compare
+      faults carry no name in 5.4 either).
+- [ ] **`<` on two values of one type says "table with table"** (seen
+      2026-11-02). 5.4's `luaG_ordererror` says "attempt to compare two
+      table values" when both type names match. `describeFault`'s
+      compare arms (`interp.zig`, the `.lt…` and constant-operand
+      cases) should use `arith.compareFaultText`, which `table.sort`
+      already raises. Waits for doc 68 P2, which owns interp.zig.
 - [ ] **`__len` gets one argument** (seen 2026-11-01, doc 77 review).
       `Vm.lenValue` calls `handler(t)`; 5.4's `luaV_objlen` calls
       `handler(t, t)`, as the unary arithmetic metamethods already do here
@@ -98,10 +111,13 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 - [ ] `file:seek("bogus")` and `file:setvbuf("bogus")` say `invalid option`;
       Lua says `invalid option 'bogus'` (`luaL_checkoption`), from
       `src/stdlib/io.zig`.
-- [ ] `os.getenv(1)` raises `string expected, got number`; Lua coerces a
+- [x] `os.getenv(1)` raises `string expected, got number`; Lua coerces a
       number argument to its string and returns `nil`. Check whether
       number-to-string argument coercion is a documented mahina choice
-      (`docs/differences-from-lua.md`) before changing it.
+      (`docs/differences-from-lua.md`) before changing it. **Checked
+      2026-11-02: documented** ("Strings are not numbers",
+      `docs/differences-from-lua.md` §Numbers covers argument coercion
+      too). Not a bug; no change.
 
 ## Restore rejects a keyframe whose program literals were swept (noted 2026-10-26)
 

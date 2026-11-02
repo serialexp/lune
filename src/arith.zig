@@ -301,6 +301,28 @@ pub fn le(a: Value, b: Value) Error!bool {
     return Error.TypeError;
 }
 
+/// Lua's text for an ordering neither `lt`/`le` nor a `__lt`/`__le` handler
+/// takes (`luaG_ordererror`): "attempt to compare two table values" for two
+/// operands of one type, "attempt to compare number with string" otherwise.
+/// `buf` needs `compare_fault_max` bytes.
+pub fn compareFaultText(buf: *[compare_fault_max]u8, a: Value, b: Value) []const u8 {
+    const ta = a.typeName();
+    const tb = b.typeName();
+    return (if (std.mem.eql(u8, ta, tb))
+        std.fmt.bufPrint(buf, "attempt to compare two {s} values", .{ta})
+    else
+        std.fmt.bufPrint(buf, "attempt to compare {s} with {s}", .{ ta, tb })) catch unreachable;
+}
+
+/// Room for the longest `compareFaultText`: two of the longest type names.
+pub const compare_fault_max = 64;
+
+test "compareFaultText: two values of one type, else the pair" {
+    var buf: [compare_fault_max]u8 = undefined;
+    try std.testing.expectEqualStrings("attempt to compare two number values", compareFaultText(&buf, Value.int(1), Value.float(2.5)));
+    try std.testing.expectEqualStrings("attempt to compare nil with boolean", compareFaultText(&buf, Value.nil(), Value.boolean(true)));
+}
+
 /// `a == b`. Never errors: different types are simply unequal. Numbers compare
 /// across the int/float boundary by exact value.
 pub fn eq(a: Value, b: Value) bool {

@@ -24,9 +24,9 @@
 //! determinism: O(n log n) worst case, no pivot choice, and it terminates even
 //! under an inconsistent comparator (we do not emulate Lua's "invalid order
 //! function" detection; `docs/design/02-determinism.md` requires reproducibility,
-//! not Lua's exact ordering of equal elements). The default comparator is
-//! `arith.lt` — matching mahina's `<` operator exactly (numeric-only today; sorting
-//! non-numbers without a `comp` raises `TypeError`, the same gap `<` has). A
+//! not Lua's exact ordering of equal elements). The default comparator is `<` as
+//! the `lt` instruction takes it: numbers and strings raw, anything else through
+//! `__lt` (`sortLess`), and "attempt to compare …" when there is no handler. A
 //! custom comparator re-enters the VM via `Vm.callValue`; a comparator that errors
 //! propagates out (catchable by an enclosing `pcall`). GC discipline: elements are
 //! read by index on every comparison, never cached across a `callValue` (which may
@@ -263,14 +263,41 @@ fn tUnpackN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 // ---------------------------------------------------------------------------
 
 /// `a < b` under the active comparator: the user closure (truthiness of its first
-/// result) when `comp` is non-null, else mahina's numeric `<` (`arith.lt`).
-fn sortLess(vm: *Vm, comp: ?Value, a: Value, b: Value) anyerror!bool {
-    if (comp) |c| {
-        var r: [1]Value = .{Value.nil()};
-        const n = try vm.callValue(c, &.{ a, b }, r[0..1]);
-        return n >= 1 and r[0].isTruthy();
-    }
-    return arith.lt(a, b);
+/// result) when `comp` is non-null, else `<` as `lua_lessthan` takes it: numbers
+/// and strings raw (`arith.lt`), anything else through `a`'s `__lt`, then `b`'s,
+/// as the `lt` instruction's `binMeta` does. With no handler it raises Lua's
+/// "attempt to compare …", unlocated, as Lua's sort (a C function) does.
+/// Inline, so the raw compare stays in `sortSiftDown`'s loop.
+inline fn sortLess(vm: *Vm, comp: ?Value, a: Value, b: Value) anyerror!bool {
+    if (comp) |c| return sortCall(vm, c, a, b);
+    return arith.lt(a, b) catch |e| switch (e) {
+        error.TypeError => sortLessMeta(vm, a, b),
+        else => |other| other,
+    };
+}
+
+/// The default comparator's `__lt` fallback, out of `sortLess`'s raw path.
+noinline fn sortLessMeta(vm: *Vm, a: Value, b: Value) anyerror!bool {
+    const handler = ltHandler(vm, a) orelse ltHandler(vm, b) orelse {
+        var buf: [arith.compare_fault_max]u8 = undefined;
+        return vm.raiseLocatedError(arith.compareFaultText(&buf, a, b), 0);
+    };
+    return sortCall(vm, handler, a, b);
+}
+
+/// `v`'s `__lt` handler, or null when it has none.
+fn ltHandler(vm: *Vm, v: Value) ?Value {
+    const mt = vm.metatableOf(v) orelse return null;
+    const h = mt.getHeap(vm.mm.lt);
+    return if (h.isNil()) null else h;
+}
+
+/// Call a comparator (`comp` or a `__lt` handler) on `a, b`: the truthiness of
+/// its first result. Inline, as `sortLess`, for the per-comparison call.
+inline fn sortCall(vm: *Vm, c: Value, a: Value, b: Value) anyerror!bool {
+    var r: [1]Value = .{Value.nil()};
+    const n = try vm.callValue(c, &.{ a, b }, r[0..1]);
+    return n >= 1 and r[0].isTruthy();
 }
 
 /// Swap the 1-based array elements `i` and `j`, reading both fresh (the comparator

@@ -39,6 +39,7 @@ const testing = std.testing;
 
 const util = @import("interp_testutil.zig");
 const runOut = util.runOut;
+const expectProgram = util.expectProgram;
 
 // ---------------------------------------------------------------------------
 // Minimal host stdlib — tonumber / string.format / io.write / arg.
@@ -154,5 +155,39 @@ test "stdlib: nsieve runs end-to-end and matches LuaJIT (correctness milestone)"
             "Primes up to    20000     2262\n" ++
             "Primes up to    10000     1229\n",
         sink.buffered(),
+    );
+}
+test "stdlib: table.sort's default comparator takes __lt, the left operand's first" {
+    // Each handler names its owner, so the log shows whose `__lt` ran: in
+    // `{{}, b}` the left operand has none, so `b`'s is taken, as `<` takes it.
+    try expectProgram(
+        \\local log = {}
+        \\local mt = {__lt = function(x, y) return x.v < y.v end}
+        \\local function obj(v) return setmetatable({v = v}, mt) end
+        \\local t = {obj(3), obj(1), obj(2)}
+        \\table.sort(t)
+        \\print(t[1].v, t[2].v, t[3].v)
+        \\local b = {}
+        \\setmetatable(b, {__lt = function(x, y) log[#log + 1] = (y == b) and "b" or "?"; return false end})
+        \\local u = {{}, b}
+        \\table.sort(u)
+        \\print(log[1], #log)
+        \\
+    ,
+        "1\t2\t3\nb\t1\n",
+    );
+}
+
+test "stdlib: table.sort without a comparator or __lt raises Lua's compare error" {
+    // Unlocated, as Lua's: the comparison fails inside `sort`, a C function there.
+    try expectProgram(
+        \\print(pcall(table.sort, {{}, {}}))
+        \\print(pcall(table.sort, {1, "a"}))
+        \\print(pcall(function() table.sort({{}, {}}) end))
+        \\
+    ,
+        "false\tattempt to compare two table values\n" ++
+            "false\tattempt to compare number with string\n" ++
+            "false\tattempt to compare two table values\n",
     );
 }

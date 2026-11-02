@@ -11,7 +11,7 @@ The differences most likely to stop an existing Lua program:
 
 - Strings never turn into numbers in arithmetic: `"10" + 1` is an error
   (§Numbers).
-- No `goto`, `<const>`/`<close>`, or `f"str"`/`f{...}` call syntax (§Syntax).
+- No `goto` or `f"str"`/`f{...}` call syntax (§Syntax).
 - Calls nest at most 200 deep, and tail calls are not eliminated
   (§Calls).
 
@@ -58,7 +58,9 @@ integers included, with one exception: `..` ends a numeral, so `1..2` is
 **Not yet supported:**
 
 - `goto` and labels.
-- The `<const>` and `<close>` attributes.
+- A `__close` metamethod that yields: closing a variable inside a
+  coroutine raises "attempt to yield across a C-call boundary" if the
+  close yields. (`<const>` and `<close>` themselves are supported.)
 - Calls without parentheses: `f"str"`, `f[[str]]`, `f{...}`, so
   `require"mod"` must be `require("mod")`.
 - A `#!` first line.
@@ -127,7 +129,7 @@ division or modulo by zero".
   address, so it is the same on every run. Built-in functions print as
   `native: 0x…` (`type` still says `"function"`).
 - **Not yet supported:** `__pairs`; `ipairs` and the `table` library
-  ignore `__index`, `__newindex` and `__len`; `table.sort` ignores `__lt`.
+  ignore `__index`, `__newindex` and `__len`.
 - `table.sort` is a heapsort: equal elements may end up in a different
   order than Lua's, and a comparator that is not a valid order does not
   raise "invalid order function".
