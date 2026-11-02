@@ -28,12 +28,16 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       `inext`, `itern_next` for `next`), in an outer loop too, so the whole
       nest runs on tier 0. Only closure iterators trace. Before doc 76 as
       after it.
-- [ ] **`pairs`/`ipairs` look their iterator up by name per call**
+- [x] **`pairs`/`ipairs` look their iterator up by name per call**
       (`stdlib/base.zig` `globalNative`): an intern lookup plus a globals
       read on every call, and the result is whatever the global `next` is
       now, so `next = nil; pairs(t)` breaks `pairs`, which Lua's doesn't.
       Same in `string.gmatch`/`utf8.codes` (`stdlib/string.zig`). Resolve
-      each once, at install and keyframe restore.
+      each once, at install and keyframe restore. **Done (2026-11-02):**
+      `Vm.lib_natives` slots (`function.LibNative`, Bart's pick), filled at
+      install and rebound at restore; the hidden iterators, `io.lines`' and
+      the file `__close` are no longer globals, and the file methods table
+      (`@file`) is `Vm.file_methods`.
 
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
@@ -68,6 +72,14 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       per-closure memo (`Closure.code_memo`, Bart's pick) fills `.call`'s
       and the host's frame caches; `two` 1262 → 1219, tier-0 flat (doc 63
       §5.10.6).
+- [ ] **The intern table runs at up to 100% load** (`gc.zig`
+      `strtabEnsureCapacity`, LuaJIT's policy), and a program whose live
+      strings sit near a grow point pays for it: `os_date` moved +0.89%
+      in every mode when six permanent strings left the table (2026-11-02,
+      `Vm.lib_natives`), all in `internImpl`, and six dummy strings put it
+      back. A lower grow threshold or another table shape would make the
+      cost less sensitive to the population. Measure across the suite
+      first.
 - [ ] **Home coalescing stops at the loop's own guard.** "Win 2" in
       `nativegen_alloc.zig` computes a carried slot's update into its home
       only when no side exit follows it, and a loop's own condition guard
@@ -3698,3 +3710,9 @@ test in `src/interp_phaseq_test.zig` and were dodged there, not fixed.
   below an inlined depth; pcall'd borrowed pops; `all_results` windows past the
   register file; cheaper tier-0→trace entry and a fused native C→R link (cycles
   flat despite −27% instructions); doc 63 Phase 2b/2c supersede this seam.
+- [ ] **Span-based loop-head placement for native traces.** Where a loop head
+      falls against 64-byte lines moved `field_hash` by 40% and a tight loop
+      between 1.0 and 2.7 cycles/lap (doc 77, "Measured cost"). Fixed
+      alignment constants only fit the board (Rule Z-6). Choose the head's pad
+      from the emitted loop span so it crosses the fewest 64-byte lines: needs
+      the span before binding `loop_top` (emit twice, or reserve and patch).
