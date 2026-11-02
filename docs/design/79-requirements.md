@@ -174,5 +174,21 @@ is the conversion order, Q4.
 
 ## Conversion progress
 
-(none yet; one bullet per converted doc: its keys, criterion and note
-counts, trace-pass result, drift found.)
+One bullet per converted doc: its keys, criterion and note counts, trace-pass
+result, drift found.
+
+- **Doc 77, interrupting traced loops** (2026-11-02, serialexp/lune): area
+  REQ-1 *Runtime*, epic REQ-2 *Interrupting running code*, feature REQ-3
+  *Interrupting traced loops*, requirements REQ-4 (a runaway loop stops in
+  every execution tier; 4 criteria) and REQ-5 (the VM is usable after an
+  interrupt; 2 criteria). 16 notes on REQ-3 (1 rationale, 2 goals, 3
+  non-goals, 4 decisions, 4 open questions, 4 context). All `draft`.
+  Trace pass: all 6 criteria verified by `gt requirement verify` against a
+  local report (17 of 33 interrupt-filtered cases cite a key). Two tests were
+  strengthened so they prove what their criterion says (globals survive the
+  interrupt; code after `pcall` does not run). The first verify run also
+  caught a wrong test of mine (the interrupt was requested before the global
+  was set). Drift: the doc names an `ExitReason.interrupted` and a dispatcher
+  early arm that the code does not have (recorded as a `context` note). The
+  tier-0 criterion (REQ-4.1) comes from the interrupt landed under doc 75 §4,
+  which this doc builds on.

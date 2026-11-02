@@ -10,7 +10,11 @@ const testing = std.testing;
 
 const Vm = interp.Vm;
 
-test "interrupt: a requested interrupt stops a runaway loop" {
+/// Set before a loop that never ends; the next chunk checks it survived.
+const keep = "keep = 42 ";
+const reuse = "assert(keep == 42); local n = 0; for i = 1, 1000 do n = n + i end; assert(n == 500500)";
+
+test "[REQ-4.1] interrupt: a requested interrupt stops a runaway loop" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
     vm.heap.requestInterrupt();
@@ -18,7 +22,7 @@ test "interrupt: a requested interrupt stops a runaway loop" {
     try testing.expectError(error.Interrupted, util.compileRun(testing.allocator, &vm, "while true do end"));
 }
 
-test "interrupt: pcall does not catch it" {
+test "[REQ-5.2] interrupt: pcall does not catch it" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
     vm.heap.requestInterrupt();
@@ -27,17 +31,23 @@ test "interrupt: pcall does not catch it" {
         util.compileRun(testing.allocator, &vm, "pcall(function() while true do end end); caught = true"),
     );
     try testing.expect(!interp.catchable(error.Interrupted));
+    // The code after the protected call did not run.
+    vm.heap.clearInterrupt();
+    vm.pending_error = null;
+    vm.unwindTo(0, 0);
+    try util.compileRun(testing.allocator, &vm, "assert(caught == nil)");
 }
 
-test "interrupt: clearing the request lets the VM run again" {
+test "[REQ-5.1] interrupt: clearing the request lets the VM run again" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
+    try util.compileRun(testing.allocator, &vm, keep);
     vm.heap.requestInterrupt();
     try testing.expectError(error.Interrupted, util.compileRun(testing.allocator, &vm, "while true do end"));
     vm.heap.clearInterrupt();
     vm.pending_error = null;
     vm.unwindTo(0, 0);
-    try util.compileRun(testing.allocator, &vm, "local n = 0; for i = 1, 1000 do n = n + i end; assert(n == 500500)");
+    try util.compileRun(testing.allocator, &vm, reuse);
 }
 
 test "interrupt: a request keeps the headroom at zero until it is cleared" {
@@ -98,7 +108,7 @@ const tracing = struct {
         vm.heap.clearInterrupt();
         vm.pending_error = null;
         vm.unwindTo(0, 0);
-        try util.compileRun(testing.allocator, &vm, "local n = 0; for i = 1, 1000 do n = n + i end; assert(n == 500500)");
+        try util.compileRun(testing.allocator, &vm, reuse);
     }
 
     fn run(source: [:0]const u8, native: bool) !void {
@@ -118,84 +128,84 @@ const tracing = struct {
         vm.heap.clearInterrupt();
         vm.pending_error = null;
         vm.unwindTo(0, 0);
-        try util.compileRun(testing.allocator, &vm, "local n = 0; for i = 1, 1000 do n = n + i end; assert(n == 500500)");
+        try util.compileRun(testing.allocator, &vm, reuse);
     }
 };
 
-const arith_loop = "local x = 0 while true do x = x + 1 end";
-const call_loop = "local function f(a) return a + 1 end local x = 0 while true do x = f(x) end";
-const table_loop = "local t = {} local n = 0 while true do n = n + 1 t[n % 8 + 1] = n end";
+const arith_loop = keep ++ "local x = 0 while true do x = x + 1 end";
+const call_loop = keep ++ "local function f(a) return a + 1 end local x = 0 while true do x = f(x) end";
+const table_loop = keep ++ "local t = {} local n = 0 while true do n = n + 1 t[n % 8 + 1] = n end";
 // A float step on an integer accumulator (int entry, float body). NOT a
 // peeled trace: a doc-39 peel needs the loop to be re-entered per instance, so
 // a runaway loop cannot be one. The peeled first back-edge (counts two laps)
 // is therefore not covered by an interrupt test.
-const mixed_loop = "local x = 0 while true do x = x + 0.5 end";
+const mixed_loop = keep ++ "local x = 0 while true do x = x + 0.5 end";
 // An inner loop under an outer one: the inner trace is entered through a
 // chain, so the ledger holds more than one row when the poll fires.
-const nested_loop = "local x = 0 while true do for j = 1, 7 do x = x + j end end";
+const nested_loop = keep ++ "local x = 0 while true do for j = 1, 7 do x = x + j end end";
 // A long body keeps the recorder active for many instructions.
-const long_body_loop = "local a, b, c, d = 0, 1, 2, 3 while true do a = a + 1 b = b + a c = c + b d = d + c a = a - d b = b - c c = c - a d = d - b end";
-const for_loop = "local x = 0 for i = 1, math.maxinteger do x = x + i end";
+const long_body_loop = keep ++ "local a, b, c, d = 0, 1, 2, 3 while true do a = a + 1 b = b + a c = c + b d = d + c a = a - d b = b - c c = c - a d = d - b end";
+const for_loop = keep ++ "local x = 0 for i = 1, math.maxinteger do x = x + i end";
 
-test "interrupt: a running tier-1a trace stops at its back-edge (arith)" {
+test "[REQ-4.2] [REQ-5.1] interrupt: a running tier-1a trace stops at its back-edge (arith)" {
     try tracing.run(arith_loop, false);
 }
 
-test "interrupt: a running tier-1a trace stops at its back-edge (call)" {
+test "[REQ-4.2] [REQ-5.1] interrupt: a running tier-1a trace stops at its back-edge (call)" {
     try tracing.run(call_loop, false);
 }
 
-test "interrupt: a running tier-1a trace stops at its back-edge (table)" {
+test "[REQ-4.2] [REQ-5.1] interrupt: a running tier-1a trace stops at its back-edge (table)" {
     try tracing.run(table_loop, false);
 }
 
-test "interrupt: a running tier-1a trace stops at its back-edge (for)" {
+test "[REQ-4.2] [REQ-5.1] interrupt: a running tier-1a trace stops at its back-edge (for)" {
     try tracing.run(for_loop, false);
 }
 
-test "interrupt: a running native trace stops at its back-edge (arith)" {
+test "[REQ-4.3] [REQ-5.1] interrupt: a running native trace stops at its back-edge (arith)" {
     if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     try tracing.run(arith_loop, true);
 }
 
-test "interrupt: a running native trace stops at its back-edge (call)" {
+test "[REQ-4.3] [REQ-5.1] interrupt: a running native trace stops at its back-edge (call)" {
     if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     try tracing.run(call_loop, true);
 }
 
-test "interrupt: a running native trace stops at its back-edge (table)" {
+test "[REQ-4.3] [REQ-5.1] interrupt: a running native trace stops at its back-edge (table)" {
     if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     try tracing.run(table_loop, true);
 }
 
-test "interrupt: a running native trace stops at its back-edge (for)" {
+test "[REQ-4.3] [REQ-5.1] interrupt: a running native trace stops at its back-edge (for)" {
     if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     try tracing.run(for_loop, true);
 }
 
-test "interrupt: a running tier-1a trace on an int-to-float loop stops at its back-edge" {
+test "[REQ-4.2] [REQ-5.1] interrupt: a running tier-1a trace on an int-to-float loop stops at its back-edge" {
     try tracing.run(mixed_loop, false);
 }
 
-test "interrupt: a running native trace on an int-to-float loop stops at its back-edge" {
+test "[REQ-4.3] [REQ-5.1] interrupt: a running native trace on an int-to-float loop stops at its back-edge" {
     if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     try tracing.run(mixed_loop, true);
 }
 
-test "interrupt: a nested loop entered through a chain stops (tier-1a)" {
+test "[REQ-4.2] [REQ-5.1] interrupt: a nested loop entered through a chain stops (tier-1a)" {
     try tracing.run(nested_loop, false);
 }
 
-test "interrupt: a nested loop entered through a chain stops (native)" {
+test "[REQ-4.3] [REQ-5.1] interrupt: a nested loop entered through a chain stops (native)" {
     if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     try tracing.run(nested_loop, true);
 }
 
-test "interrupt: an interrupt during recording leaves no recording active (tier-1a)" {
+test "[REQ-4.4] [REQ-5.1] interrupt: an interrupt during recording leaves no recording active (tier-1a)" {
     try tracing.runRecording(long_body_loop, false);
 }
 
-test "interrupt: an interrupt during recording leaves no recording active (native)" {
+test "[REQ-4.4] [REQ-5.1] interrupt: an interrupt during recording leaves no recording active (native)" {
     if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     try tracing.runRecording(long_body_loop, true);
 }
