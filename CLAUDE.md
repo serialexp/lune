@@ -358,3 +358,11 @@ already-traced code faster cannot close it. The levers, in order:
    side-trace linking" — it's there; the work is making the chain path native.
 3. **Faster tier-0 dispatch** (threaded/computed-goto) for the genuinely-interpreted
    remainder — untouched.
+
+## Reporting results
+
+Bart knows benchmark and codegen numbers move a little with every build and
+every run (code layout, alignment, machine noise). Don't add that hedge to
+result reports. State the numbers, and only call out noise when it changes the
+conclusion (a difference as large as the spread, a load spike that makes a run
+unusable).
