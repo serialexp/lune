@@ -1062,3 +1062,34 @@ test "[REQ-41.2] session: a failing cd says why and does not end the session" {
     try testing.expect(std.mem.indexOf(u8, r.err.written(), "/nope") != null);
     try testing.expect(try r.feed("print(1)") == .done);
 }
+
+/// What the terminal's SIGINT handler does, from another thread: ask the
+/// heap to interrupt, over and over until told to stop, so a request lands
+/// after the line has begun (the session discards one that arrived before).
+fn pester(heap: *gc.Heap, stop: *std.atomic.Value(bool)) void {
+    while (!stop.load(.acquire)) {
+        heap.requestInterrupt();
+        std.Thread.yield() catch {};
+    }
+}
+
+test "[REQ-51.1] [REQ-51.2] [REQ-51.3] session: an interrupted line is reported, and the session and its locals carry on" {
+    const r = try Rig.init(testing.allocator);
+    defer r.deinit(testing.allocator);
+    _ = try r.feed("g = 1");
+    _ = try r.feed("local kept = 7");
+    var stop: std.atomic.Value(bool) = .init(false);
+    const th = try std.Thread.spawn(.{}, pester, .{ r.vm.heap, &stop });
+    const outcome = r.feed("while true do end");
+    stop.store(true, .release);
+    th.join();
+    try testing.expect(try outcome == .done);
+    try testing.expectEqualStrings("interrupted\n", r.err.written());
+    // A request that missed its line is stale and must not stop the next one.
+    r.vm.heap.requestInterrupt();
+    _ = try r.feed("print(g, kept)");
+    _ = try r.feed("kept = kept + 1");
+    _ = try r.feed("kept");
+    try testing.expectEqualStrings("1\t7\n8\n", r.out.written());
+    try testing.expectEqualStrings("interrupted\n", r.err.written());
+}

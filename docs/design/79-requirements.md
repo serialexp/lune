@@ -205,7 +205,13 @@ result, drift found.
   shell*, features REQ-29 session (REQ-32..36), REQ-30 shortcuts
   (REQ-37..41), REQ-31 line editor (REQ-42..46); 15 requirements, 33
   criteria, 8 notes on REQ-28, all verified locally (79 units across docs 75
-  and 77). Not covered: Ctrl-C forwarding to children and VM-close
-  termination (no test; context note on REQ-7), the REPL printing
-  `interrupted`, portability (§7). `cd` translation test now also asserts
-  the OLDPWD/PWD updates its criterion claims.
+  and 77). `cd` translation test now also asserts the OLDPWD/PWD updates
+  its criterion claims. Follow-up the same day: feature REQ-47 *Interrupts,
+  timeouts and cleanup* under REQ-7 (REQ-48 Ctrl-C forwarding, REQ-49
+  timeout ends the group, REQ-50 VM close terminates jobs; 6 criteria) and
+  REQ-51 under the session (an interrupted line; 3 criteria), each proved
+  by a real-process test or a threaded interrupt (88 units verified). The
+  `proc_host.zig` tests, including its older Tail and signal-name tests,
+  were never compiled into `zig build test`; `root.zig` now imports the
+  file. Not covered: handing the terminal to a child that reads it (needs a
+  pty) and portability (§7).

@@ -954,3 +954,105 @@ test "Tail ring wraps without losing order" {
     }
     try testing.expectEqualStrings(expect[55..60], t.finish());
 }
+
+// ---- Real-process tests: Ctrl-C forwarding, timeouts and VM-close cleanup ----
+
+/// Whether anything is left in process group `pgid`, waiting a moment for
+/// the kernel and init to reap what was killed.
+fn groupGone(pgid: posix.pid_t) bool {
+    var tries: usize = 0;
+    while (tries < 600) : (tries += 1) {
+        posix.kill(-pgid, @enumFromInt(0)) catch |e| return e == error.ProcessNotFound;
+        _ = posix.poll(&.{}, 5) catch {};
+    }
+    return false;
+}
+
+fn pidGone(pid: posix.pid_t) bool {
+    return groupGone(pid);
+}
+
+test "[REQ-48.1] [REQ-48.2] Ctrl-C reaches the child's group, and the call ends as the child does" {
+    if (!supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    // A waiting call has installed the handler by the time the child signals
+    // us; hold it from here so the signal cannot arrive before that.
+    Interrupt.acquire();
+    defer Interrupt.release();
+    var cap: Capture = .{};
+    defer cap.deinit(testing.allocator);
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    const r = run(testing.allocator, threaded.io(), null, .{
+        .stages = &.{&.{ "/bin/sh", "-c", "trap 'echo got; exit 7' INT; kill -INT $PPID; while :; do sleep 0.05; done" }},
+        .max_bytes = 64,
+        .timeout_ns = 20 * std.time.ns_per_s,
+    }, &cap);
+    try testing.expect(!r.done.timed_out);
+    try testing.expectEqual(@as(u32, 7), r.done.stages[0].status.exited);
+    try testing.expectEqualStrings("got\n", r.done.stdout);
+}
+
+test "[REQ-49.1] a timeout ends the program and everything it started" {
+    if (!supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var cap: Capture = .{};
+    defer cap.deinit(testing.allocator);
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    const r = run(testing.allocator, threaded.io(), null, .{
+        .stages = &.{&.{ "/bin/sh", "-c", "sleep 30 & echo $!; wait" }},
+        .max_bytes = 64,
+        .timeout_ns = 200 * std.time.ns_per_ms,
+    }, &cap);
+    try testing.expect(r.done.timed_out);
+    const line = std.mem.trimEnd(u8, r.done.stdout, "\n");
+    const grandchild = try std.fmt.parseInt(posix.pid_t, line, 10);
+    try testing.expect(pidGone(grandchild));
+}
+
+/// Start `script` as a background job with its stdout captured, and wait
+/// until it has printed `ready`.
+fn startReady(job: *Job, script: []const u8) !void {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    const fail = start(job, threaded.io(), null, .{
+        .stages = &.{&.{ "/bin/sh", "-c", script }},
+        .max_bytes = 64,
+    }, true);
+    try testing.expect(fail == null);
+    var tries: usize = 0;
+    while (tries < 2000) : (tries += 1) {
+        _ = job.poll();
+        if (job.cap.out.buf.items.len != 0) return;
+        _ = posix.poll(&.{}, 5) catch {};
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "[REQ-50.1] [REQ-50.2] closing the VM ends a running job and everything it started" {
+    if (!supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var cap: Capture = .{};
+    defer cap.deinit(testing.allocator);
+    var job = Job.init(testing.allocator, &cap);
+    defer job.deinit();
+    try startReady(&job, "sleep 30 & echo ready; wait");
+    const pgid = job.pid();
+    try testing.expect(job.running());
+    job.terminate();
+    try testing.expect(!job.running());
+    try testing.expectEqual(Reaped{ .signaled = @intFromEnum(posix.SIG.TERM) }, job.ended[0].?);
+    try testing.expect(groupGone(pgid));
+}
+
+test "[REQ-50.3] closing the VM kills a job that ignores SIGTERM" {
+    if (!supported or builtin.os.tag == .windows) return error.SkipZigTest;
+    var cap: Capture = .{};
+    defer cap.deinit(testing.allocator);
+    var job = Job.init(testing.allocator, &cap);
+    defer job.deinit();
+    try startReady(&job, "trap '' TERM; echo ready; while :; do sleep 0.05; done");
+    const pgid = job.pid();
+    job.terminate();
+    try testing.expect(!job.running());
+    try testing.expectEqual(Reaped{ .signaled = @intFromEnum(posix.SIG.KILL) }, job.ended[0].?);
+    try testing.expect(groupGone(pgid));
+}

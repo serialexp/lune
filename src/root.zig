@@ -179,6 +179,7 @@ test {
     _ = io;
     _ = system;
     _ = host_system;
+    _ = @import("proc_host.zig");
     _ = lineedit;
     _ = repl;
     _ = aio_host;
