@@ -139,6 +139,9 @@ division or modulo by zero".
   raises "attempt to yield across a C-call boundary". The comparator may
   also be a callable table, which Lua refuses. A sort the program calls
   through a builtin (`pcall(table.sort, t, f)`) still cannot yield.
+- A `string.gsub` function replacement can yield; Lua raises "attempt to
+  yield across a C-call boundary". Through a builtin
+  (`pcall(string.gsub, s, p, f)`) it still cannot.
 
 ## Calls
 

@@ -64,6 +64,12 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       every resumable native, gsub and require too); store only the
       state words a step changed, or pack them (eight `setInt`s and eight
       loads per comparison now); hoist `sortTable`'s re-check.
+- [ ] **A `string.gsub` function replacement costs the same frame
+      overhead per callback** (doc 68 §12: `gsub_fn` +19.1% tier-0,
+      +20.3% JIT instructions). Same levers as the sort entry above (the
+      `opRet`-runs-the-step one helps both); also the first step rewinds
+      and re-matches the one match that needed the call, because captures
+      can't travel in a seed.
 - [ ] **`pcall(table.sort, t, f)`: `error(m, 2)` in `f` is located at
       the main chunk** (seen 2026-11-02). Lua 5.4 gives no location: level
       2 is the sort, a C function. Under `pcall` the sort runs through
@@ -1969,8 +1975,8 @@ fraction.
 **UPDATE (2026-08-28, doc 28 string arc landed, LATEST-96):** the "ASCII fast
 paths in the op cores" lever is DONE (exact `str_ascii` bit + seam helpers +
 block paths + known-fact interning; str_manip 23.9 → 18.8 ms, 4.0×). Still on
-the table from the list above: **interning cost** (L3 sparse hash — Bart
-decision pending, doc 28 §5), **rep3 recording**, **tier-0 side-exit
+the table from the list above: **interning cost** (L3 sparse hash — landed
+2026-11-02 as doc 80 U4, doc 28 §5.1), **rep3 recording**, **tier-0 side-exit
 fraction**, and the **decimal renderer** for str_format (doc 28 §7 non-goals).
 
 **UPDATE (2026-08-28, doc 29 matcher/tonumber arc landed, LATEST-97):** the

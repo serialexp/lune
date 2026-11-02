@@ -122,6 +122,14 @@ land; move whole phases to Done once everything inside them is checked.
     frame. Comparators yield, keyframes cut inside them, and the activation
     is never a stop (§7.2.1). Comparisons that need no call stay in Zig.
     `pcall(table.sort, …)` still sorts through `callValue`.
+  - [x] **`string.gsub` with a function replacement** (2026-11-02). Same
+    activation design; the result so far lives in a GC-owned growable byte
+    buffer (heap kind `bytebuf`, keyframe `HeapBytes`, format v21) held in
+    a state register, never program-visible. The first step re-matches the
+    one match that needed the call (captures can't travel in a seed).
+    Measured: `gsub_fn` +19.1% tier-0 / +20.3% JIT instructions per
+    callback (frame push/pop plus per-step overhead; no explicit budget in
+    §10 for gsub), `sort_cmp` +0.23%, `str_gsub` +0.03%. Levers in TODO.md.
 - [ ] **P4 — gates.** Per site: replay-index and `mahina_replay` stops inside
   it (wasm), capture → restore → recapture identity with the replay
   envelope (§9), GC stress, 8-mode equivalence, the benchmark in §10. The

@@ -4,9 +4,9 @@
 //! system proto,
 //!
 //!     [0] native_act  k        step the native
-//!     [1] call        C, 2, 1  the call it asked for
+//!     [1] call        C, n, 1  the call it asked for
 //!     [2] native_act  k        step again, with that call's result
-//!     [3] ret         0, 0     its work is done
+//!     [3] ret         C, r     its work is done
 //!
 //! so the call is an ordinary Lua call of an ordinary frame: a coroutine
 //! can yield inside it, a keyframe captures it, a step debugger stops in
@@ -17,7 +17,10 @@
 //! A step (`Vm.opNativeAct`) runs the native's own Zig code against the
 //! frame's registers until it either needs a call (it writes the callee
 //! and two arguments at `callReg` and the step dispatches `[1]`) or is done
-//! (`[3]`). There is no back-edge, so nothing counts toward a trace.
+//! (`[3]`). There is no back-edge, so nothing counts toward a trace. The
+//! call's argument count `n` is fixed per native, or dynamic (a step sets
+//! `reg_top` past the arguments it wrote, as a multret producer does); a
+//! step that is done leaves its `r` results from `callReg` on.
 //!
 //! The native itself starts as any other: called inline, it does every
 //! step that needs no Lua call in Zig, and only at the first one that does
@@ -30,22 +33,36 @@
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
 
+const value = @import("value.zig");
+
 const Instr = bytecode.Instr;
 const Proto = bytecode.Proto;
+const Value = value.Value;
 
 /// The resumable natives.
 pub const Kind = enum(u8) {
     /// `table.sort` with a comparator, or over values compared by `__lt`.
     sort,
+    /// `string.gsub` with a function replacement.
+    gsub,
 };
 
 /// An activation's register layout: the native's parameters (bound as a
-/// Lua function's are), then its state words, then the call area: the
-/// callee and its two arguments, with the call's one result landing on the
+/// Lua function's are), then its state registers, then the call area: the
+/// callee and its arguments, with the call's one result landing on the
 /// callee's slot.
 const Layout = struct {
     params: u8,
+    /// State registers after the parameters. The first is nil until the
+    /// first step has taken the seed.
     words: u8,
+    /// The call's arguments: all there is room for.
+    call_args: u8,
+    /// Whether the call's argument count is the step's to say (`reg_top`)
+    /// rather than `call_args`.
+    dynamic_args: bool = false,
+    /// The values the activation returns, from `callReg`.
+    results: u8,
     /// How a traceback names it: `module.name`, a `[C]` row.
     module: []const u8,
     name: []const u8,
@@ -53,7 +70,10 @@ const Layout = struct {
 
 fn layoutOf(kind: Kind) Layout {
     return switch (kind) {
-        .sort => .{ .params = 2, .words = 8, .module = "table", .name = "sort" },
+        .sort => .{ .params = 2, .words = 8, .call_args = 2, .results = 0, .module = "table", .name = "sort" },
+        // s, pattern, replacement, n; the buffer, then src, count, max_n
+        // and the pending match's end. A call passes up to 32 captures.
+        .gsub => .{ .params = 4, .words = 5, .call_args = 32, .dynamic_args = true, .results = 2, .module = "string", .name = "gsub" },
     };
 }
 
@@ -79,23 +99,38 @@ pub fn moduleOf(kind: Kind) []const u8 {
 
 /// What a step asks the activation to do next.
 pub const Next = enum {
-    /// Make the call it laid out at `callReg`, then step again.
+    /// Make the call it laid out at `callReg`, then step again. A kind with
+    /// a dynamic argument count has set where they end first
+    /// (`Vm.setActArgsEnd`).
     call,
-    /// Return, with no results.
+    /// Return the results it left at `callReg`.
     done,
 };
+
+/// The count of values the kind's activation returns, and whether its call
+/// takes a step-chosen number of arguments (then `Vm.reg_top` ends them).
+pub fn resultsOf(kind: Kind) u8 {
+    return layoutOf(kind).results;
+}
+
+pub fn dynamicArgs(kind: Kind) bool {
+    return layoutOf(kind).dynamic_args;
+}
 
 /// The pc of the activation's call and of its return.
 pub const call_pc: usize = 1;
 pub const ret_pc: usize = 3;
 
 /// A native's state when it signals `error.ActivateNative`, for the
-/// activation's first step (or the Zig fallback) to carry on from. Only
-/// integers: what the state refers to sits in the native's arguments,
-/// which become the activation's parameters.
+/// activation's first step (or the Zig fallback) to carry on from.
+/// Integers, and at most one heap `value` (the byte buffer `gsub` has
+/// built so far, which `Vm.forEachRootHeader` roots until a step takes it):
+/// what the state refers to otherwise sits in the native's arguments, which
+/// become the activation's parameters.
 pub const Seed = struct {
     kind: Kind,
     words: [max_words]i64,
+    value: Value = Value.nil(),
 };
 
 /// The reserved proto ids, which keyframes name the activations by:
@@ -138,17 +173,18 @@ fn build(comptime kind: Kind) Proto {
     const l = layoutOf(kind);
     const k: u16 = @intFromEnum(kind);
     const c = callReg(kind);
+    const nargs: u16 = if (l.dynamic_args) bytecode.all_results else l.call_args;
     const code = [_]Instr{
         Instr.opAB(.native_act, 0, k),
-        Instr.opABC(.call, c, 2, 1),
+        Instr.opABC(.call, c, nargs, 1),
         Instr.opAB(.native_act, 0, k),
-        Instr.opAB(.ret, 0, 0),
+        Instr.opAB(.ret, c, l.results),
     };
     std.debug.assert(code[call_pc].op == .call and code[ret_pc].op == .ret);
     const frozen = code;
     return .{
         .code = &frozen,
-        .num_registers = c + 3,
+        .num_registers = c + 1 + @max(l.call_args, l.results),
         .num_params = l.params,
         .name = l.name,
         .chunk = "[C]",
@@ -161,6 +197,7 @@ fn build(comptime kind: Kind) Proto {
 
 test "activation ids are reserved and round-trip" {
     try std.testing.expectEqual(@as(?Kind, .sort), kindOfId(idOf(.sort)));
+    try std.testing.expectEqual(@as(?Kind, .gsub), kindOfId(idOf(.gsub)));
     try std.testing.expectEqual(@as(?Kind, null), kindOfId(first_id + 1));
     try std.testing.expectEqual(@as(?Kind, null), kindOfId(first_id - kind_count));
     try std.testing.expectEqual(@as(?Kind, null), kindOfId(0));

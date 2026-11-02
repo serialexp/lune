@@ -809,6 +809,27 @@ pub const resumable_natives_program: [:0]const u8 =
     \\local r, n = co(), 0
     \\while type(r) == "number" do n = n + 1 r = co() end
     \\print(r, n)
+    \\print(string.gsub("hello world", "(o)(%s?)", function(a, b) return "<" .. a .. b .. ">" end))
+    \\print(string.gsub("abc", "%w", function(c) if c == "b" then return false end return c:upper() end))
+    \\print(string.gsub("a b c", "%a", function(c) return (string.gsub(c, ".", function(x) return x .. x end)) end))
+    \\print(string.gsub("abc", "", function() return "-" end))
+    \\print(string.gsub("héllo", "l+", function(m) return #m end, 1))
+    \\print(pcall(function() return string.gsub("abc", "b", function() return {} end) end))
+    \\print(pcall(function() return string.gsub("abc", "b", function() error("rep", 2) end) end))
+    \\print(pcall(string.gsub, "a b", "%a", function(c) return c .. c end))
+    \\print(select("#", string.gsub("x", "x", function() end)))
+    \\local words = {}
+    \\for i = 1, 400 do words[i] = "w" .. i end
+    \\local long, cnt = table.concat(words, " "):gsub("%w+", function(w) return w:upper() .. "!" end)
+    \\print(#long, cnt, long:sub(-12))
+    \\local gco = coroutine.wrap(function()
+    \\  return (string.gsub("x y z", "%a", function(c) return coroutine.yield(c) end))
+    \\end)
+    \\local parts = { gco() }
+    \\parts[2] = gco("A")
+    \\parts[3] = gco("B")
+    \\parts[4] = gco("C")
+    \\print(table.concat(parts, " "))
 ;
 
 /// `resumable_natives_program`'s output.
@@ -823,7 +844,18 @@ pub const resumable_natives_output =
     "5 4 3 2 1\n" ++
     "false\tbad argument #1 to 'string.rep' (string expected, got number)\n" ++
     "1 2 3\n" ++
-    "1 3 5 9\t6\n";
+    "1 3 5 9\t6\n" ++
+    "hell<o >w<o>rld\t2\n" ++
+    "AbC\t3\n" ++
+    "aa bb cc\t3\n" ++
+    "-a-b-c-\t4\n" ++
+    "hé2o\t1\n" ++
+    "false\tmain:47: invalid replacement value (a table)\n" ++
+    "false\trep\n" ++
+    "true\taa bb\t2\n" ++
+    "2\n" ++
+    "2291\t400\t W399! W400!\n" ++
+    "x y z A B C\n";
 
 /// Doc 68 P2: a program that runs Lua code in every kind of metamethod
 /// frame: operators, compare-and-branch, `__index`/`__newindex` (fused

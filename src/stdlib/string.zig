@@ -33,6 +33,9 @@ const decimal = @import("decimal.zig");
 const io = @import("../io.zig");
 const byte_ops = @import("../bytes.zig");
 const gc = @import("../gc.zig");
+const native_act = @import("../native_act.zig");
+const ByteBuf = @import("../bytebuf.zig").ByteBuf;
+const RegWindow = @import("../regwindow.zig").RegWindow;
 const unicode_case = @import("../gen/unicode_case.zig");
 
 const Value = value.Value;
@@ -1717,26 +1720,26 @@ fn addReplTable(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState,
     return invalidReplacement(vm, v.typeNameId());
 }
 
-/// `add_value` for a function replacement: call `repl(captures…)` (the explicit
-/// captures, or the whole match when the pattern has none) via `Vm.callValue`. A
-/// nil/false result keeps the original text; a string/number substitutes; any
-/// other type is an invalid replacement.
+/// The captures a function replacement is called with: the explicit ones, or
+/// the whole match when the pattern has none. Written to `caps`; returns how
+/// many.
 ///
-/// GC: `captureValue` interns the capture strings with no intervening safepoint,
-/// and `callValue` copies them into the rooted VM stack before running `repl`, so
-/// a collection triggered inside `repl` cannot sweep them. The result is captured
-/// before `callValue` shrinks `stack_top`; everything after is pure native code
-/// (no collection), so `rv` stays valid until appended.
-fn addReplFunction(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, subj: *const String, repl: Value, s_off: usize, e_off: usize) anyerror!void {
+/// GC: `captureValue` interns the capture strings with no intervening
+/// safepoint, and the caller puts them in rooted registers (or `callValue`
+/// copies them into the rooted VM stack) before anything can collect.
+fn functionCaps(vm: *Vm, ms: *const pattern.MatchState, subj: *const String, s_off: usize, e_off: usize, caps: *[pattern.max_captures]Value) anyerror!usize {
     const ncap: usize = if (ms.level > 0) ms.level else 1;
-    var caps: [pattern.max_captures]Value = undefined;
     var k: usize = 0;
     while (k < ncap) : (k += 1) caps[k] = try captureValue(vm, ms, subj, k, .{ s_off, e_off });
-    var r: [1]Value = .{Value.nil()};
-    const n = try vm.callValue(repl, caps[0..ncap], r[0..1]);
-    const rv = if (n >= 1) r[0] else Value.nil();
+    return ncap;
+}
+
+/// `add_value` for a function replacement, given what `repl` returned: a
+/// nil/false result keeps the original text `matched`; a string/number
+/// substitutes; any other type is an invalid replacement.
+fn addFunctionResult(vm: *Vm, out: *std.ArrayList(u8), matched: []const u8, rv: Value) anyerror!void {
     if (!rv.isTruthy()) {
-        try out.appendSlice(vm.gpa, ms.src[s_off..e_off]); // keep original
+        try out.appendSlice(vm.gpa, matched); // keep original
         return;
     }
     if (interp.strBytes(rv) != null or rv.isNumber()) {
@@ -1758,11 +1761,140 @@ noinline fn invalidReplacement(vm: *Vm, type_name: Value.TypeName) anyerror {
     return vm.raiseLocatedError(msg, 1);
 }
 
+/// What `gsub` does with a match, by the kind of its replacement. The loop
+/// is specialised on it, so the string and table paths carry nothing of the
+/// function path's state.
+const GsubKind = enum { string, table, number, function };
+
+/// A `gsub` call's operands, once classified.
+const GsubJob = struct {
+    sobj: *const String,
+    pat: []const u8,
+    /// The replacement as given: the callee of a `.function`, the number of
+    /// a `.number`.
+    repl: Value,
+    table: ?*Table,
+    text: ?[]const u8,
+};
+
+/// Where a `gsub` stands between two replacement calls (doc 68 §7.4): the
+/// source position, matches counted, the limit, and the end of the match a
+/// pending call answers. The matcher's own state is rebuilt per match; the
+/// captures are the call's arguments. The output so far is a `ByteBuf`.
+const GsubState = struct {
+    src: usize = 0,
+    count: i64 = 0,
+    max_n: i64,
+    /// The end of the match the replacement call in flight answers, or -1.
+    pending_end: i64 = -1,
+
+    const word_count = 4;
+    comptime {
+        std.debug.assert(word_count <= native_act.max_words);
+    }
+
+    fn toWords(self: GsubState) [native_act.max_words]i64 {
+        var w: [native_act.max_words]i64 = @splat(0);
+        w[0] = @intCast(self.src);
+        w[1] = self.count;
+        w[2] = self.max_n;
+        w[3] = self.pending_end;
+        return w;
+    }
+
+    fn fromWords(w: *const [native_act.max_words]i64) GsubState {
+        return .{ .src = @intCast(w[0]), .count = w[1], .max_n = w[2], .pending_end = w[3] };
+    }
+
+    fn store(self: GsubState, regs: RegWindow, at: usize) void {
+        const w = self.toWords();
+        for (w[0..word_count], at..) |x, r| regs.setInt(r, x);
+    }
+
+    fn load(regs: RegWindow, at: usize) GsubState {
+        var w: [native_act.max_words]i64 = @splat(0);
+        for (w[0..word_count], at..) |*x, r| x.* = regs.get(r).asInt();
+        return fromWords(&w);
+    }
+};
+
+/// The `gsub` advance loop (`str_gsub`), from `st` until the subject is done
+/// (null) or, for a function replacement, a match needs its call: then the
+/// captures are in `caps`, `st` stands at the match with its end pending, and
+/// the capture count is returned. `answer` is what that call returned, when
+/// resuming. Both the Zig native and its activation (`gsubStep`) run it, so
+/// there is one definition of how a match advances.
+inline fn gsubLoop(comptime kind: GsubKind, vm: *Vm, job: *const GsubJob, out: *std.ArrayList(u8), st: *GsubState, caps: *[pattern.max_captures]Value, answer: ?Value) anyerror!?usize {
+    const s = job.sobj.bytes();
+    var ms = pattern.MatchState.init(s, job.pat);
+    var pp: usize = 0;
+    const anchor = job.pat.len > 0 and job.pat[0] == '^';
+    if (anchor) pp = 1;
+
+    var src = st.src;
+    var count = st.count;
+    const max_n = st.max_n;
+    var answered: ?usize = null;
+    if (answer != null) {
+        comptime std.debug.assert(kind == .function);
+        std.debug.assert(st.pending_end >= 0);
+        answered = @intCast(st.pending_end);
+    }
+    while (answered != null or count < max_n) {
+        var e: usize = undefined;
+        if (answered) |pe| {
+            // The call for the match at `src..pe` has answered.
+            answered = null;
+            e = pe;
+            try addFunctionResult(vm, out, s[src..e], answer.?);
+        } else {
+            ms.reset();
+            const e_opt = ms.match(src, pp) catch |err| return raisePatternError(vm, &ms, err);
+            if (e_opt) |m_end| {
+                count += 1;
+                e = m_end;
+                switch (kind) {
+                    .table => try addReplTable(vm, out, &ms, job.sobj, job.table.?, src, e),
+                    .function => {
+                        const ncap = try functionCaps(vm, &ms, job.sobj, src, e, caps);
+                        st.* = .{ .src = src, .count = count, .max_n = max_n, .pending_end = @intCast(e) };
+                        return ncap;
+                    },
+                    .string => try addReplString(vm, out, &ms, job.sobj, job.text.?, src, e),
+                    // numeric replacement: coerce to its text, no captures.
+                    .number => try appendValueText(vm, out, job.repl),
+                }
+            } else if (src < s.len) {
+                const w = ms.seqLen(src);
+                try out.appendSlice(vm.gpa, s[src .. src + w]);
+                src += w;
+                if (anchor) break;
+                continue;
+            } else break;
+        }
+        if (e > src) {
+            src = e;
+        } else if (src < s.len) {
+            // Empty match: copy the unmatched code point whole (S-D) so we
+            // never splice a partial UTF-8 sequence.
+            const w = ms.seqLen(src);
+            try out.appendSlice(vm.gpa, s[src .. src + w]);
+            src += w;
+        } else break;
+        if (anchor) break;
+    }
+    try out.appendSlice(vm.gpa, s[src..]); // tail
+    st.* = .{ .src = src, .count = count, .max_n = max_n };
+    return null;
+}
+
 /// Core of `string.gsub(s, pat, repl [, n])` → `(result, count)`. `repl` may be a
-/// string/number, a table, or a function (called per match via `Vm.callValue`).
+/// string/number, a table, or a function. A function replacement runs in Zig
+/// until a match needs its call, then becomes an activation (doc 68 §7.4): it
+/// hands its output so far, as a `ByteBuf`, and its state to `error.ActivateNative`'s
+/// handler, so the calls are ordinary frames a coroutine can yield in.
 fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     const sobj = try strObjArg(vm, args, 0);
-    const s = sobj.bytes();
     const pat = try strArg(vm, args, 1);
     if (args.len < 3) return vm.badArg(3, "string/function/table", null);
     const repl = args[2];
@@ -1772,11 +1904,11 @@ fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         Table.fromHeader(repl.asHeap())
     else
         null;
-    const repl_fn: ?Value = if (repl_table == null and repl.isHeap() and
-        (repl.heapType() == .function or repl.heapType() == .native)) repl else null;
-    if (repl_table == null and repl_fn == null and interp.strBytes(repl) == null and !repl.isNumber())
+    const is_fn = repl_table == null and repl.isHeap() and
+        (repl.heapType() == .function or repl.heapType() == .native);
+    if (repl_table == null and !is_fn and interp.strBytes(repl) == null and !repl.isNumber())
         return vm.badArg(3, "string/function/table", repl);
-    const repl_str: ?[]const u8 = if (repl_table == null and repl_fn == null)
+    const repl_str: ?[]const u8 = if (repl_table == null and !is_fn)
         (interp.strBytes(repl) orelse null)
     else
         null;
@@ -1784,53 +1916,111 @@ fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     const max_n: i64 = if (args.len >= 4 and !args[3].isNil())
         try vm.optIntArg(args, 3, 0)
     else
-        @as(i64, @intCast(s.len + 1));
+        @as(i64, @intCast(sobj.len + 1));
 
+    const job: GsubJob = .{ .sobj = sobj, .pat = pat, .repl = repl, .table = repl_table, .text = repl_str };
+    var st: GsubState = .{ .max_n = max_n };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(vm.gpa);
+    var caps: [pattern.max_captures]Value = undefined;
 
-    var ms = pattern.MatchState.init(s, pat);
-    var pp: usize = 0;
-    const anchor = pat.len > 0 and pat[0] == '^';
-    if (anchor) pp = 1;
-
-    var src: usize = 0;
-    var count: i64 = 0;
-    while (count < max_n) {
-        ms.reset();
-        const e_opt = ms.match(src, pp) catch |err| return raisePatternError(vm, &ms, err);
-        if (e_opt) |e| {
-            count += 1;
-            if (repl_table) |t| {
-                try addReplTable(vm, &out, &ms, sobj, t, src, e);
-            } else if (repl_fn) |f| {
-                try addReplFunction(vm, &out, &ms, sobj, f, src, e);
-            } else if (repl_str) |r| {
-                try addReplString(vm, &out, &ms, sobj, r, src, e);
-            } else {
-                // numeric replacement: coerce to its text, no captures.
-                try appendValueText(vm, &out, repl);
-            }
-            if (e > src) {
-                src = e;
-            } else if (src < s.len) {
-                // Empty match: copy the unmatched code point whole (S-D) so we
-                // never splice a partial UTF-8 sequence.
-                const w = ms.seqLen(src);
-                try out.appendSlice(vm.gpa, s[src .. src + w]);
-                src += w;
-            } else break;
-        } else if (src < s.len) {
-            const w = ms.seqLen(src);
-            try out.appendSlice(vm.gpa, s[src .. src + w]);
-            src += w;
-        } else break;
-        if (anchor) break;
+    if (is_fn) {
+        if (try gsubLoop(.function, vm, &job, &out, &st, &caps, null) != null) {
+            // A match needs its call. Rewind to before it: the activation's
+            // first step finds the match again (one extra match per `gsub`,
+            // not per match), because its captures are the call's
+            // arguments and can't travel in a seed.
+            st.count -= 1;
+            st.pending_end = -1;
+            const bb = try vm.heap.newByteBuf(out);
+            out = .empty; // the buffer owns it now
+            vm.act_seed = .{ .kind = .gsub, .words = st.toWords(), .value = Value.heap(&bb.header) };
+            return error.ActivateNative;
+        }
+    } else if (repl_table != null) {
+        _ = try gsubLoop(.table, vm, &job, &out, &st, &caps, null);
+    } else if (repl_str != null) {
+        _ = try gsubLoop(.string, vm, &job, &out, &st, &caps, null);
+    } else {
+        _ = try gsubLoop(.number, vm, &job, &out, &st, &caps, null);
     }
-    try out.appendSlice(vm.gpa, s[src..]); // tail
     buf[0] = try vm.heap.internValue(out.items);
-    buf[1] = Value.int(count);
+    buf[1] = Value.int(st.count);
     return 2;
+}
+
+/// The operands of a `gsub` that has become an activation, as its registers
+/// hold them: `gsubCore` checked them before it escalated.
+fn gsubJobOf(s: Value, pat: Value, repl: Value) GsubJob {
+    return .{
+        .sobj = String.fromHeader(s.asHeap()),
+        .pat = interp.strBytes(pat).?,
+        .repl = repl,
+        .table = null,
+        .text = null,
+    };
+}
+
+/// One step of `gsub`'s activation (doc 68 §7.4): `R[0..4]` are its
+/// arguments, `R[4]` the output buffer (nil before the first step, which
+/// takes the native's seed), then the state. Runs to the next match that
+/// needs its call, laid out in the call area as the callee and the
+/// captures, or to the end, leaving the result and the count there.
+pub fn gsubStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
+    const at = native_act.wordReg(.gsub);
+    const c = native_act.callReg(.gsub);
+    var st: GsubState = undefined;
+    var answer: ?Value = null;
+    if (regs.get(at).isNil()) {
+        const seed = vm.takeActSeed();
+        std.debug.assert(seed.kind == .gsub);
+        st = GsubState.fromWords(&seed.words);
+        regs.set(at, seed.value);
+    } else {
+        st = GsubState.load(regs, at + 1);
+        answer = regs.get(c);
+    }
+    const bb = ByteBuf.fromHeader(regs.get(at).asHeap());
+    const job = gsubJobOf(regs.get(0), regs.get(1), regs.get(2));
+    var caps: [pattern.max_captures]Value = undefined;
+    const call = gsubLoop(.function, vm, &job, &bb.list, &st, &caps, answer) catch |e| return interp.narrowError(e);
+    vm.heap.chargeByteBuf(bb);
+    if (call) |ncap| {
+        st.store(regs, at + 1);
+        regs.set(c, job.repl);
+        for (caps[0..ncap], c + 1..) |v, r| regs.set(r, v);
+        vm.setActArgsEnd(c + 1 + ncap);
+        return .call;
+    }
+    // Interned before the result is stored: the register that held the
+    // callee's answer is the first to be overwritten.
+    const result = try vm.heap.internValue(bb.bytes());
+    regs.set(c, result);
+    regs.setInt(c + 1, st.count);
+    return .done;
+}
+
+/// `string.gsub` called from Zig (`Vm.callValue`), where no activation can be
+/// pushed: it finishes from the state the native left, making its calls
+/// through `callValue` (`Vm.activationSync`).
+pub fn gsubSync(vm: *Vm, seed: native_act.Seed, args: []const Value, results_out: []Value) interp.Error!usize {
+    std.debug.assert(seed.kind == .gsub);
+    var st = GsubState.fromWords(&seed.words);
+    // The buffer was only the seed's carrier: take its bytes into a Zig
+    // list, which nothing can sweep while the calls run.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(vm.gpa);
+    try out.appendSlice(vm.gpa, ByteBuf.fromHeader(seed.value.asHeap()).bytes());
+    const job = gsubJobOf(args[0], args[1], args[2]);
+    var caps: [pattern.max_captures]Value = undefined;
+    var answer: ?Value = null;
+    while (gsubLoop(.function, vm, &job, &out, &st, &caps, answer) catch |e| return interp.narrowError(e)) |ncap| {
+        var r: [1]Value = .{Value.nil()};
+        const n = try vm.callValue(job.repl, caps[0..ncap], r[0..1]);
+        answer = if (n >= 1) r[0] else Value.nil();
+    }
+    const result: [2]Value = .{ try vm.heap.internValue(out.items), Value.int(st.count) };
+    return copyOut(&result, results_out);
 }
 
 fn sGsub1(ctx: *anyopaque, args: []const Value) anyerror!Value {
@@ -2319,13 +2509,19 @@ test "string.gsub: string repl with %1, count, table repl, anchor" {
     try testing.expectEqualStrings("Aaa", bytesOf(out[0]));
     try testing.expectEqual(@as(i64, 1), out[1].asInt());
 
-    // Function replacement: `sLen` returns the length of its capture argument as
-    // a number, which substitutes for each match.
+    // A function replacement leaves the native at its first match that needs
+    // the call (doc 68 §7.4): the output before it in a buffer, the state
+    // rewound to before the match, for the activation (or `gsubSync`) to carry
+    // on from. `interp_stdlib_test.zig` runs the whole thing.
     const lenfn = try function.Native.create(vm.gpa, &sLen, "lenfn");
     defer lenfn.destroy(vm.gpa);
-    n = try sGsubN(@ptrCast(&vm), &.{ try sv(&vm, "hello world"), try sv(&vm, "%w+"), Value.heap(&lenfn.header) }, &out);
-    try testing.expectEqualStrings("5 5", bytesOf(out[0]));
-    try testing.expectEqual(@as(i64, 2), out[1].asInt());
+    try testing.expectError(error.ActivateNative, sGsubN(@ptrCast(&vm), &.{ try sv(&vm, "ab cd"), try sv(&vm, "%w+"), Value.heap(&lenfn.header) }, &out));
+    const seed = vm.takeActSeed();
+    try testing.expectEqual(native_act.Kind.gsub, seed.kind);
+    try testing.expectEqual(@as(i64, 0), seed.words[0]); // src: before the first match
+    try testing.expectEqual(@as(i64, 0), seed.words[1]); // count
+    try testing.expectEqual(@as(i64, -1), seed.words[3]); // nothing pending
+    try testing.expectEqualStrings("", ByteBuf.fromHeader(seed.value.asHeap()).bytes());
 }
 
 test "@gmatch_iter walks the state table and stops when exhausted" {

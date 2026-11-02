@@ -255,6 +255,71 @@ test "stdlib: a traceback through table.sort shows it as a C function" {
     );
 }
 
+test "stdlib: gsub calls a function replacement from its activation (doc 68 §7.4)" {
+    // Under GC stress in every tier: captures, a kept original (`nil`/`false`),
+    // a number result, a gsub inside the replacement, an empty match, an anchor,
+    // the limit, a callable that is a native, and the activation returning
+    // both results.
+    try expectProgram(
+        \\print(string.gsub("hello world", "(o)(%s?)", function(a, b) return "<" .. a .. b .. ">" end))
+        \\print(string.gsub("abc", "%w", function(c) if c == "b" then return nil end return 7 end))
+        \\print(string.gsub("a b", "%a", function(c) return (string.gsub(c, ".", function(x) return x .. x end)) end))
+        \\print(string.gsub("ab", "", function() return "-" end))
+        \\print(string.gsub("aaa", "^a", function(c) return "X" end))
+        \\print(string.gsub("aaaa", "a", function(c) return "b" end, 2))
+        \\print(string.gsub("a,b", ",", tostring))
+        \\print(select("#", string.gsub("x", "x", function() end)))
+        \\print(pcall(string.gsub, "a b", "%a", function(c) return c .. c end))
+        \\
+    ,
+        "hell<o >w<o>rld\t2\n" ++
+            "7b7\t3\n" ++
+            "aa bb\t2\n" ++
+            "-a-b-\t3\n" ++
+            "Xaa\t1\n" ++
+            "bbaa\t2\n" ++
+            "a,b\t1\n" ++
+            "2\n" ++
+            "true\taa bb\t2\n",
+    );
+}
+
+test "stdlib: gsub's errors are located as a C function's (doc 68 §7.4)" {
+    // A bad replacement value is the caller's line; `error(m, 2)` in the
+    // replacement points at `gsub`, a C function, so it has no location; a
+    // malformed `%` in a string replacement never reaches the activation; a
+    // pattern error mid-way (the callback ran for the first match) is the
+    // caller's too.
+    try expectProgram(
+        \\print(pcall(function() return string.gsub("abc", "b", function() return {} end) end))
+        \\print(pcall(function() return string.gsub("abc", "b", function() error("rep", 2) end) end))
+        \\print(pcall(function() return string.gsub("abc", "b", function() error("rep", 1) end) end))
+        \\print(pcall(function() return string.gsub("ab", "(%a)", function(c) return c end, "x") end))
+        \\print(pcall(function() return string.gsub("abc", "%a", function(c) return "%" .. c end) end))
+        \\
+    ,
+        "false\tmain:1: invalid replacement value (a table)\n" ++
+            "false\trep\n" ++
+            "false\tmain:3: rep\n" ++
+            "false\tmain:4: bad argument #4 to 'gsub' (number expected, got string)\n" ++
+            "true\t%a%b%c\t3\n",
+    );
+}
+
+test "stdlib: a traceback through gsub shows it as a C function" {
+    try expectProgram(
+        \\local tb
+        \\xpcall(function()
+        \\  string.gsub("a", "a", function(c) error("z") end)
+        \\end, function(m) tb = debug.traceback(m) end)
+        \\print(tb)
+        \\
+    ,
+        "main:3: z\nstack traceback:\n\tmain:4: in function 'anonymous'\n\tmain:3: in function 'anonymous'\n" ++
+            "\t[C]: in function 'string.gsub'\n\tmain:3: in function 'anonymous'\n\tmain:4: in main chunk\n",
+    );
+}
+
 test "stdlib: table.sort without a comparator or __lt raises Lua's compare error" {
     // Unlocated, as Lua's: the comparison fails inside `sort`, a C function there.
     try expectProgram(

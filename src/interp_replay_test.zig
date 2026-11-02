@@ -597,6 +597,33 @@ test "doc 68 defer: the safepoint index stops growing at its limit" {
     try testing.expectEqual(@as(usize, 30), vm.safepoint_lines.items.len);
 }
 
+test "doc 68 §7.4: a gsub replacement is stoppable, its activation is not" {
+    const gpa = testing.allocator;
+    const native_act = @import("native_act.zig");
+    const source: [:0]const u8 =
+        \\local r = string.gsub("a b", "%a", function(c)
+        \\  local x = c
+        \\  return x .. x
+        \\end)
+        \\print(r)
+    ;
+    const index = try recordSafepointIndex(gpa, source);
+    defer gpa.free(index);
+    var in_act: usize = 0;
+    var in_fn: usize = 0;
+    for (index) |sp| {
+        if (native_act.kindOfId(sp.proto_id) != null) {
+            try testing.expect(!sp.stoppable);
+            in_act += 1;
+        } else if (sp.line == 2 or sp.line == 3) {
+            try testing.expect(sp.stoppable);
+            in_fn += 1;
+        }
+    }
+    try testing.expect(in_act > 0);
+    try testing.expect(in_fn > 0);
+}
+
 test "doc 68 §5.1: a table.sort comparator is stoppable, its activation is not" {
     const gpa = testing.allocator;
     const native_act = @import("native_act.zig");

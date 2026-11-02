@@ -1003,8 +1003,9 @@ pub const Vm = struct {
     /// `error.ActivateNative`, for its activation's first step (or the Zig
     /// fallback, `nativeUnparkedFailed`) to take. Set and taken within one
     /// call, never across a stop (an activation's first pc is a system
-    /// proto's, which no suspend stops at), so it is never serialized.
-    /// Integers only, so no GC root.
+    /// proto's, which no suspend stops at), so it is never serialized. Its
+    /// `value` is a GC root (`forEachRootHeader`): the activation's entry
+    /// dispatches an instruction, a safepoint, before its first step.
     act_seed: ?native_act.Seed = null,
     /// Open upvalues, keyed by absolute stack index and kept in ascending
     /// slot order, one cell per slot. Searched from the end on capture (to
@@ -3887,19 +3888,30 @@ pub const Vm = struct {
             // `yield` signals only where it can yield, and nothing called
             // from Zig can (`native_reentry_depth` is raised).
             .co_yield => unreachable,
-            .native_act => self.activationSync(args),
+            .native_act => self.activationSync(args, results_out),
         };
     }
 
     /// Doc 68 §5.1: a resumable native called from Zig that needs a Lua
     /// call finishes here, from the state it left (`act_seed`), making its
-    /// calls through `callValue`. It returns no results.
-    fn activationSync(self: *Vm, args: []const Value) Error!usize {
+    /// calls through `callValue`. Returns the count of results it wrote.
+    fn activationSync(self: *Vm, args: []const Value, results_out: []Value) Error!usize {
         const seed = self.takeActSeed();
         switch (seed.kind) {
-            .sort => try stdtable.sortSync(self, seed, args),
+            .sort => {
+                try stdtable.sortSync(self, seed, args);
+                return 0;
+            },
+            .gsub => return stdstring.gsubSync(self, seed, args, results_out),
         }
-        return 0;
+    }
+
+    /// A resumable native step whose activation call takes a dynamic number
+    /// of arguments (`native_act.dynamicArgs`) says where they end, register
+    /// `end` of its frame: the span is a multret producer's, which the
+    /// activation's call consumes at once.
+    pub fn setActArgsEnd(self: *Vm, end: usize) void {
+        self.setPendingTop(self.frames[self.depth - 1].base + end);
     }
 
     /// The state the resumable native that just signalled left.
@@ -4533,6 +4545,7 @@ pub const Vm = struct {
         //    its catch. Load-bearing for the `xpcall` handler path, which allocates
         //    (and so may collect) while the error value waits to be handed over.
         if (self.pending_error) |ev| if (ev.isHeap()) cb(ctx, ev.asHeap());
+        if (self.act_seed) |seed| if (seed.value.isHeap()) cb(ctx, seed.value.asHeap());
         // 8. metamethod-dispatch roots: every interned metamethod-name string and
         //    the shared string metatable. Referenced from the VM (not `globals`),
         //    so they must be marked explicitly or a collection mid-dispatch would
@@ -10130,6 +10143,7 @@ pub const Vm = struct {
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const next = switch (@as(native_act.Kind, @enumFromInt(instr.b))) {
                     .sort => stdtable.sortStep(vm, regs),
+                    .gsub => stdstring.gsubStep(vm, regs),
                 } catch |e| return parkErr(st, e);
                 switch (next) {
                     .call => {
@@ -12697,7 +12711,7 @@ fn forRemainingTrips(idx: Value, limit: Value, step: Value) u64 {
 
 /// Narrow a native's `anyerror` back into the interpreter's error set. Known
 /// runtime errors map across; anything else is surfaced as a `HostError`.
-fn narrowError(e: anyerror) Error {
+pub fn narrowError(e: anyerror) Error {
     return switch (e) {
         error.OutOfMemory => Error.OutOfMemory,
         error.LuaError => Error.LuaError,
