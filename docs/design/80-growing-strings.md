@@ -301,6 +301,12 @@ API's `push_string`.
 
 ### 5.2 What (B) touches
 
+(B) is doc 28 §5's **L3**, designed and reviewed on 2026-08-28 (Codex
+must-fixes folded in: fixed little-endian sampled loads, the determinism
+argument, and collision hardening shipping in the same change) and left
+open as a separate decision for Bart. It was never built. Doc 28 §5 is the
+decision text; this section only adds what growing strings change.
+
 `String.hash` is read only by the intern table (`strtabLookup`,
 `strtabInsert`, rebuild); table keys hash by id. So (B) is local to
 `gc.zig` and `string.zig`: the hash function for strings past a length
