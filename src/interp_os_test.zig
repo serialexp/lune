@@ -331,7 +331,7 @@ test "os: a group that is off installs none of its functions" {
     try testing.expectEqualStrings("nil\tnil\tnil\tnil\tnil\tnil\ttrue\n", r.out);
 }
 
-test "os: os.environ lists the host environment, sorted, as a fresh table each call" {
+test "[REQ-26.1] os: os.environ lists the host environment, sorted, as a fresh table each call" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.vars = &.{ .{ "ZED", "last" }, .{ "HOME", "/home/bart" }, .{ "EMPTY", "" }, .{ "HOME", "dup" } };
@@ -353,7 +353,7 @@ test "os: os.environ lists the host environment, sorted, as a fresh table each c
     try testing.expectEqual(@as(usize, 4), n);
 }
 
-test "os: os.environ leaves out variables it cannot show as strings" {
+test "[REQ-26.2] os: os.environ leaves out variables it cannot show as strings" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.vars = &.{ .{ "OK", "fine" }, .{ "BAD", "\xff\xfe" }, .{ "A=B", "x" }, .{ "", "x" } };
@@ -366,7 +366,7 @@ test "os: os.environ leaves out variables it cannot show as strings" {
     try testing.expectEqualStrings("OK\tfine\n1\n", r.out);
 }
 
-test "os: os.environ is empty on a host that lists nothing, and absent without the env group" {
+test "[REQ-26.3] [REQ-27.6] os: os.environ is empty on a host that lists nothing, and absent without the env group" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     const r = try run(testing.allocator, .{ .host = &host }, "print(next(os.environ()))");
@@ -377,7 +377,7 @@ test "os: os.environ is empty on a host that lists nothing, and absent without t
     try testing.expectEqualStrings("nil\n", none.out);
 }
 
-test "os: a replayed environ record that is malformed refuses the replay" {
+test "[REQ-26.4] os: a replayed environ record that is malformed refuses the replay" {
     // One pair promised, the value's length word missing.
     var log: interp.EffectLog = .{};
     defer log.deinit(testing.allocator);
@@ -387,7 +387,7 @@ test "os: a replayed environ record that is malformed refuses the replay" {
     try testing.expectError(error.EffectKindMismatch, run(testing.allocator, .{ .mode = .replay, .log = bad }, "os.environ()"));
 }
 
-test "os: setenv and chdir hand the host the change, and a replay makes no host call" {
+test "[REQ-27.1] [REQ-27.5] os: setenv and chdir hand the host the change, and a replay makes no host call" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     const r = try recordReplay(testing.allocator, &host, .{},
@@ -410,7 +410,7 @@ test "os: setenv and chdir hand the host the change, and a replay makes no host 
     try testing.expectEqual(@as(usize, 1), cwds);
 }
 
-test "os: setenv refuses a name or value the environment cannot hold, before the host is asked" {
+test "[REQ-27.2] os: setenv refuses a name or value the environment cannot hold, before the host is asked" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     const r = try run(testing.allocator, .{ .host = &host },
@@ -433,7 +433,7 @@ test "os: setenv refuses a name or value the environment cannot hold, before the
     try testing.expectEqual(@as(usize, 6), n);
 }
 
-test "os: a failed chdir or setenv is a failure value, and a replay returns it" {
+test "[REQ-27.3] os: a failed chdir or setenv is a failure value, and a replay returns it" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.chdir_result = .not_found;
@@ -448,7 +448,7 @@ test "os: a failed chdir or setenv is a failure value, and a replay returns it" 
     try testing.expect(std.mem.endsWith(u8, r.out, "\nnil\n"));
 }
 
-test "os: getcwd raises when the host cannot say, and the replay raises the same" {
+test "[REQ-27.4] os: getcwd raises when the host cannot say, and the replay raises the same" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.cwd = .{ .fail = .not_found };
@@ -463,7 +463,7 @@ test "os: getcwd raises when the host cannot say, and the replay raises the same
     try testing.expectEqual(calls, host.calls);
 }
 
-test "os: setenv, chdir and getcwd are absent without the env group" {
+test "[REQ-27.6] os: setenv, chdir and getcwd are absent without the env group" {
     const r = try run(testing.allocator, .{ .groups = .{} }, "print(os.setenv, os.chdir, os.getcwd)");
     defer r.deinit(testing.allocator);
     try testing.expectEqualStrings("nil\tnil\tnil\n", r.out);

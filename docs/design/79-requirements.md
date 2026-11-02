@@ -192,3 +192,14 @@ result, drift found.
   early arm that the code does not have (recorded as a `context` note). The
   tier-0 criterion (REQ-4.1) comes from the interrupt landed under doc 75 §4,
   which this doc builds on.
+- **Doc 75, process spawning** (2026-11-02, serialexp/lune; spawning and
+  `os` environment only): area REQ-6 *Tooling*, epic REQ-7 *Process
+  spawning*, features REQ-8 `proc.run` (REQ-12..18), REQ-9 `proc.pipe`
+  (REQ-19..21), REQ-10 `proc.spawn` (REQ-22..25), REQ-11 environment and
+  working directory (REQ-26..27). 20 requirements, 46 criteria, all `draft`,
+  no notes yet (the doc's decisions and open questions still to be moved).
+  Trace pass: all 46 criteria verified by `gt requirement verify` against a
+  local report. Three tests added to prove what criteria claim (poll returns
+  the result once ended; signalled and timed-out jobs raise on wait; kill
+  defaults to `TERM`). Not yet converted: the REPL/line editor (§6), Ctrl-C
+  forwarding, portability (§7), and the notes.

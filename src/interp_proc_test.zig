@@ -75,7 +75,7 @@ const stage_term = [_]system.ProcStage{.{ .status = .{ .signaled = "SIGTERM" }, 
 
 const done_ok: system.ProcResult = .{ .done = .{ .stages = &stage_ok, .stdout = "hello\n", .timed_out = false, .truncated = false } };
 
-test "proc: a finished program is a table of how it ended and what it wrote" {
+test "[REQ-12.1] [REQ-17.3] proc: a finished program is a table of how it ended and what it wrote" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = done_ok;
@@ -90,7 +90,7 @@ test "proc: a finished program is a table of how it ended and what it wrote" {
     try testing.expectEqual(@as(usize, 2), host.proc_argc);
 }
 
-test "proc: each call hands back fresh byte arrays" {
+test "[REQ-12.2] proc: each call hands back fresh byte arrays" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = done_ok;
@@ -103,7 +103,7 @@ test "proc: each call hands back fresh byte arrays" {
     try testing.expectEqualStrings("104\n", r.out);
 }
 
-test "proc: a failed exit raises a table that reads as a message" {
+test "[REQ-13.1] [REQ-13.3] proc: a failed exit raises a table that reads as a message" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = .{ .done = .{ .stages = &stage_exit3, .stdout = "out", .timed_out = false, .truncated = false } };
@@ -123,7 +123,7 @@ test "proc: a failed exit raises a table that reads as a message" {
     );
 }
 
-test "proc: a signal and a timeout are results too, and raise by default" {
+test "[REQ-13.2] [REQ-13.3] proc: a signal and a timeout are results too, and raise by default" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = .{ .done = .{ .stages = &stage_segv, .stdout = "", .timed_out = false, .truncated = false } };
@@ -148,7 +148,7 @@ test "proc: a signal and a timeout are results too, and raise by default" {
     try testing.expectEqual(@as(?u64, 2_000_000_000), host.proc_timeout_ns);
 }
 
-test "proc: streams that are not captured are absent" {
+test "[REQ-16.2] proc: streams that are not captured are absent" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = .{ .done = .{ .stages = &stage_ok, .stdout = "", .timed_out = false, .truncated = false, .stdout_captured = false, .stderr_captured = false } };
@@ -167,7 +167,7 @@ test "proc: streams that are not captured are absent" {
     try testing.expectEqualStrings("table\tnil\n", s.out);
 }
 
-test "proc: a program that cannot be started raises, whatever check says, and replays the same" {
+test "[REQ-14.1] proc: a program that cannot be started raises, whatever check says, and replays the same" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = .{ .fail = .{ .class = .not_found } };
@@ -179,7 +179,7 @@ test "proc: a program that cannot be started raises, whatever check says, and re
     try testing.expectEqualStrings("false\tcannot run 'nope': not found\nfalse\tcannot run 'nope': not found\n", r.out);
 }
 
-test "proc: options are checked, and a typo is an error rather than ignored" {
+test "[REQ-15.1] proc: options are checked, and a typo is an error rather than ignored" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = done_ok;
@@ -222,7 +222,7 @@ test "proc: options are checked, and a typo is an error rather than ignored" {
     try testing.expectEqual(@as(usize, 0), host.proc_calls);
 }
 
-test "proc: max_bytes and timeout reach the host" {
+test "[REQ-16.1] proc: max_bytes and timeout reach the host" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = done_ok;
@@ -236,7 +236,7 @@ test "proc: max_bytes and timeout reach the host" {
     try testing.expectEqual(@as(?u64, null), host.proc_timeout_ns);
 }
 
-test "proc: a call no recording could replay is fatal before anything runs, but runs when not recording" {
+test "[REQ-17.1] proc: a call no recording could replay is fatal before anything runs, but runs when not recording" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = done_ok;
@@ -254,7 +254,7 @@ test "proc: a call no recording could replay is fatal before anything runs, but 
     try testing.expectEqual(@as(usize, 4), host.proc_calls);
 }
 
-test "proc: a recording makes room for the worst case before the program runs" {
+test "[REQ-17.2] proc: a recording makes room for the worst case before the program runs" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = done_ok;
@@ -267,7 +267,7 @@ test "proc: a recording makes room for the worst case before the program runs" {
     try testing.expectEqual(@as(usize, 1), host.proc_calls);
 }
 
-test "proc: a replayed record that was not written by this recorder refuses the replay" {
+test "[REQ-17.4] proc: a replayed record that was not written by this recorder refuses the replay" {
     var log: interp.EffectLog = .{};
     defer log.deinit(testing.allocator);
     // Ended 'exited', then a record cut short.
@@ -277,7 +277,7 @@ test "proc: a replayed record that was not written by this recorder refuses the 
     try testing.expectError(error.EffectKindMismatch, run(testing.allocator, .{ .mode = .replay, .log = bad }, "proc.run({'x'})"));
 }
 
-test "proc: absent without the proc group" {
+test "[REQ-18.1] proc: absent without the proc group" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     const r = try run(testing.allocator, .{ .host = &host, .groups = .{ .files = true, .env = true } }, "print(proc)");
@@ -285,7 +285,7 @@ test "proc: absent without the proc group" {
     try testing.expectEqualStrings("nil\n", r.out);
 }
 
-test "proc: a host without proc cannot start anything" {
+test "[REQ-18.1] proc: a host without proc cannot start anything" {
     const r = try run(testing.allocator, .{}, "print(pcall(proc.run, {'x'}))");
     defer r.deinit(testing.allocator);
     try testing.expect(std.mem.endsWith(u8, r.out, "cannot run 'x': input/output error\n"));
@@ -315,7 +315,7 @@ const pipe_sigpipe_last = [_]system.ProcStage{
     .{ .status = .{ .signaled = "SIGPIPE" }, .stderr = "" },
 };
 
-test "proc.pipe: a pipeline is one result with the last stdout and each stage's story" {
+test "[REQ-19.1] proc.pipe: a pipeline is one result with the last stdout and each stage's story" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = .{ .done = .{ .stages = &pipe_exits_ok, .stdout = "42\n", .timed_out = false, .truncated = false } };
@@ -330,7 +330,7 @@ test "proc.pipe: a pipeline is one result with the last stdout and each stage's 
     try testing.expectEqual(@as(usize, 3), host.proc_stages);
 }
 
-test "proc.pipe: it fails like pipefail, on the rightmost failing stage" {
+test "[REQ-20.1] proc.pipe: it fails like pipefail, on the rightmost failing stage" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = .{ .done = .{ .stages = &pipe_exits_mid, .stdout = "out", .timed_out = false, .truncated = false } };
@@ -350,7 +350,7 @@ test "proc.pipe: it fails like pipefail, on the rightmost failing stage" {
     );
 }
 
-test "proc.pipe: a reader that stopped early is not a failure, but SIGPIPE at the end is" {
+test "[REQ-20.2] proc.pipe: a reader that stopped early is not a failure, but SIGPIPE at the end is" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = .{ .done = .{ .stages = &pipe_sigpipe_first, .stdout = "y\n", .timed_out = false, .truncated = false } };
@@ -370,7 +370,7 @@ test "proc.pipe: a reader that stopped early is not a failure, but SIGPIPE at th
     try testing.expectEqualStrings("signal\tSIGPIPE\tcommand 'b' was killed by SIGPIPE\n", b.out);
 }
 
-test "proc.pipe: a timeout names the whole pipeline" {
+test "[REQ-21.2] proc.pipe: a timeout names the whole pipeline" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = .{ .done = .{ .stages = &pipe_last_fails, .stdout = "", .timed_out = true, .truncated = false } };
@@ -382,7 +382,7 @@ test "proc.pipe: a timeout names the whole pipeline" {
     try testing.expectEqualStrings("timeout\ta | b | c\tnil\tcommand 'a | b | c' timed out after 3 seconds\n", r.out);
 }
 
-test "proc.pipe: a stage that cannot start names itself, and a record of another shape refuses" {
+test "[REQ-21.1] proc.pipe: a stage that cannot start names itself, and a record of another shape refuses" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = .{ .fail = .{ .stage = 1, .class = .permission_denied } };
@@ -397,7 +397,7 @@ test "proc.pipe: a stage that cannot start names itself, and a record of another
     try testing.expectError(error.EffectKindMismatch, run(testing.allocator, .{ .mode = .replay, .log = rec.log }, "proc.pipe({{'x'}, {'y'}})"));
 }
 
-test "proc.pipe: the table is checked, and the shared rules apply to every stage" {
+test "[REQ-21.3] [REQ-21.4] proc.pipe: the table is checked, and the shared rules apply to every stage" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.proc_result = done_ok;
@@ -438,7 +438,7 @@ test "proc.pipe: the table is checked, and the shared rules apply to every stage
 const job_done_out = system.ProcJobState{ .done = .{ .stages = &stage_exit3, .stdout = "out", .timed_out = false, .truncated = false, .stderr_captured = true } };
 const job_done_ok = system.ProcJobState{ .done = .{ .stages = &stage_ok, .stdout = "fine\n", .timed_out = false, .truncated = false } };
 
-test "proc.spawn: a job has a pid and methods, and is only ever live" {
+test "[REQ-22.1] [REQ-22.2] proc.spawn: a job has a pid and methods, and is only ever live" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.job_states = &.{ .running, .running, job_done_ok };
@@ -456,7 +456,52 @@ test "proc.spawn: a job has a pid and methods, and is only ever live" {
     try testing.expect(host.proc_stdout_inherit);
 }
 
-test "proc.spawn: a job that ended badly raises on wait unless check is false" {
+test "[REQ-22.2] proc.spawn: poll hands back the result once the job has ended" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.job_states = &.{ .running, job_done_ok };
+    const r = try run(testing.allocator, .{ .host = &host },
+        \\local j = proc.spawn({"x"})
+        \\print(j:poll())
+        \\local r = j:poll()
+        \\print(r.ok, r.code, string.decode(r.stdout))
+    );
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("nil\ntrue\t0\tfine\n\n", r.out);
+}
+
+test "[REQ-23.1] proc.spawn: a job that was signalled or timed out raises on wait too" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    host.job_states = &.{.{ .done = .{ .stages = &stage_segv, .stdout = "", .timed_out = false, .truncated = false } }};
+    const sig = try run(testing.allocator, .{ .host = &host },
+        \\local j = proc.spawn({"x"})
+        \\local ok, e = pcall(j.wait, j)
+        \\print(ok, e.kind, e.signal, tostring(e))
+        \\print(proc.spawn({"x", check = false}):wait().signal)
+    );
+    defer sig.deinit(testing.allocator);
+    try testing.expectEqualStrings("false\tsignal\tSIGSEGV\tcommand 'x' was killed by SIGSEGV\nSIGSEGV\n", sig.out);
+    host.job_states = &.{.{ .done = .{ .stages = &stage_term, .stdout = "", .timed_out = true, .truncated = false } }};
+    const t = try run(testing.allocator, .{ .host = &host },
+        \\local j = proc.spawn({"x", timeout = 2})
+        \\local ok, e = pcall(j.wait, j)
+        \\print(ok, e.kind, e.timed_out)
+    );
+    defer t.deinit(testing.allocator);
+    try testing.expectEqualStrings("false\ttimeout\ttrue\n", t.out);
+}
+
+test "[REQ-24.1] proc.spawn: kill sends TERM by default" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    const r = try run(testing.allocator, .{ .host = &host }, "print(proc.spawn({'x'}):kill())");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("true\n", r.out);
+    try testing.expectEqualStrings("TERM", host.kill_signal[0..host.kill_signal_len]);
+}
+
+test "[REQ-23.1] [REQ-23.2] proc.spawn: a job that ended badly raises on wait unless check is false" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.job_states = &.{job_done_out};
@@ -476,7 +521,7 @@ test "proc.spawn: a job that ended badly raises on wait unless check is false" {
     try testing.expectEqual(@as(?u64, 5_000_000_000), host.proc_timeout_ns);
 }
 
-test "proc.spawn: kill names the signal, and says whether it was sent" {
+test "[REQ-24.1] [REQ-24.2] proc.spawn: kill names the signal, and says whether it was sent" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     const r = try run(testing.allocator, .{ .host = &host },
@@ -496,7 +541,7 @@ test "proc.spawn: kill names the signal, and says whether it was sent" {
     try testing.expect(std.mem.indexOf(u8, b.out, "unknown signal 'NOPE'") != null);
 }
 
-test "proc.spawn: a job the host does not know is gone, and a spawn that fails raises" {
+test "[REQ-25.1] [REQ-25.2] proc.spawn: a job the host does not know is gone, and a spawn that fails raises" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.job_states = &.{.gone};
@@ -509,7 +554,7 @@ test "proc.spawn: a job the host does not know is gone, and a spawn that fails r
     try testing.expect(std.mem.endsWith(u8, f.out, "cannot run 'nope': not found\n"));
 }
 
-test "proc.spawn: a recording refuses a job outright, and a job's methods are live-only" {
+test "[REQ-22.3] proc.spawn: a recording refuses a job outright, and a job's methods are live-only" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try testing.expectError(error.ProcNotRecordable, run(testing.allocator, .{ .host = &host, .mode = .record }, "proc.spawn({'x'})"));
