@@ -101,6 +101,23 @@ land; move whole phases to Done once everything inside them is checked.
     become non-recursive except the `pcall` body, which never raises
     `native_reentry_depth`. It lands with the first converted native
     that runs inside a host function's dispatch.
+
+    **Audit (2026-11-03), all P3 sites converted:** no such native exists.
+    Every path from a host frame into guest code raises
+    `native_reentry_depth` for the whole nested run: `callValue`, and the
+    C API's `runPushedFrame` (`mh_call`), `runProtected` (`mh_run`,
+    `mh_eval`) and `indexGet`/`indexSet` (`mh_table_get`/`set`) through
+    `callValue`. A host function called straight from bytecode runs no
+    guest code unless it re-enters by one of those. The converted natives'
+    activations are frames of whichever dispatch called them, so inside a
+    host re-entry they sit under the raised depth: a due suspend is
+    deferred and `encodeSnapshot` refuses, as §8 decided, with no new
+    counter. The C API never returns `.suspended` (it runs everything
+    under `runProtected`); only a Zig embedder driving `Vm.start`
+    suspends, and its host functions re-enter through `callValue`. A
+    separate `host_boundary_depth` would only be a second name for
+    `native_reentry_depth > 0` until some entry runs guest code without
+    raising it. Left unbuilt; reopen if one appears.
 - [x] **P2 — metamethods.** The shared callable driver; every metamethod
   site in §3, fused reads and stores included, runs as a continuation frame;
   `__call` chains stay bounded (§6).
