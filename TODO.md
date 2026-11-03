@@ -64,6 +64,12 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       every resumable native, gsub and require too); store only the
       state words a step changed, or pack them (eight `setInt`s and eight
       loads per comparison now); hoist `sortTable`'s re-check.
+- [ ] **`string.format("%s", x)` and the uncaught-error report still call a
+      Lua `__tostring` through `metaToString`/`callValue`** (doc 68 §7.5
+      converted `tostring` and `print` only). A yield there is still an
+      error. Also: a `tostring`/`print` of an object with a Lua
+      `__tostring` costs ~+570 instructions as an activation (doc 68 §12
+      style; same levers as the sort entry above).
 - [ ] **A `string.gsub` function replacement costs the same frame
       overhead per callback** (doc 68 §12: `gsub_fn` +19.1% tier-0,
       +20.3% JIT instructions). Same levers as the sort entry above (the

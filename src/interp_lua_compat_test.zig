@@ -300,6 +300,35 @@ test "doc 68 §7.3: require runs a Lua searcher and loader as an activation: the
         "false\tmodule 'zz' not found:\n\tA\n\tB\n");
 }
 
+test "doc 68 §7.5: a Lua __tostring runs from an activation in tostring and print: it yields, and what was printed stays" {
+    try expectProgram(
+        \\local o = setmetatable({}, {__tostring = function() return {} end})
+        \\print(pcall(function() return tostring(o) end))
+        \\print(pcall(function() print("a", o) end))
+        \\local o2 = setmetatable({}, {__tostring = function() return 42 end})
+        \\print(tostring(o2), select('#', tostring(o2)))
+        \\local function y(s) return setmetatable({}, {__tostring = function() coroutine.yield(s) return s:upper() end}) end
+        \\local c1 = coroutine.wrap(function() return tostring(y("t")) end)
+        \\print(c1())
+        \\print(c1())
+        \\local c2 = coroutine.wrap(function() print("a", y("p"), "b", y("q"), "c") return "end" end)
+        \\print(c2())
+        \\print(c2())
+        \\print(c2())
+        \\print(select('#', print()))
+        \\print(pcall(print, 1, y("L"), 3))
+        \\print(pcall(tostring, y("M")))
+    , "false\tmain:2: '__tostring' must return a string\n" ++
+        "a\tfalse\tmain:3: '__tostring' must return a string\n" ++
+        "42\t1\n" ++
+        "t\nT\n" ++
+        "a\tp\nP\tb\tq\nQ\tc\nend\n" ++
+        "\n0\n" ++
+        // what was printed before the failing argument stays written
+        "1\tfalse\tattempt to yield from outside a coroutine\n" ++
+        "false\tattempt to yield from outside a coroutine\n");
+}
+
 test "__tostring may return a number but not a table" {
     try expectProgram(
         \\print(tostring(setmetatable({}, {__tostring = function() return 42 end})))

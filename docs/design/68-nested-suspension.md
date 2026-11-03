@@ -122,6 +122,17 @@ land; move whole phases to Done once everything inside them is checked.
     yield and keyframes cut inside it. Nothing follows the call, so its
     results are the activation's with no step between (`Layout.tail`).
     `pcall(dofile, …)` runs the chunk through `callValue`.
+  - [x] **`tostring` and `print`** (2026-11-03). A `__tostring` that is a
+    Lua function is called from an activation (`Kind.tostring`: two steps,
+    the call and the check of its answer; `Kind.print`: a vararg
+    activation whose state is the index of the argument being called, read
+    from the frame's varargs). The pieces already written stay written. A
+    native or callable-table handler is still called in place. Located
+    errors are unchanged. Measured: a `tostring` of an object with a Lua
+    `__tostring` +69% tier-0 / +87% JIT instructions (activation + handler
+    frames + two steps; ~1400 vs ~820 per call); `tostring` of a number
+    -0.9% tier-0. `string.format("%s")` and the uncaught-error report keep
+    `metaToString`.
   - [x] **`require`** (2026-11-02). The cache check and the built-in
     (native) searchers run inline in Zig; the first searcher or loader that
     is a Lua function moves the rest into an activation (`Kind.require`),

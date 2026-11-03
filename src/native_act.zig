@@ -51,6 +51,10 @@ pub const Kind = enum(u8) {
     dofile,
     /// `require`, from the first searcher or loader that is a Lua function.
     require,
+    /// `tostring` of a value whose `__tostring` is a Lua function.
+    tostring,
+    /// `print`, from the first argument whose `__tostring` is a Lua function.
+    print,
 };
 
 /// An activation's register layout: the native's parameters (bound as a
@@ -78,6 +82,9 @@ const Layout = struct {
     dynamic_results: bool = false,
     /// How many results the call writes back, from `callReg`.
     call_results: u8 = 1,
+    /// The native takes any number of arguments: its activation is a vararg
+    /// function, with none of them bound (a step reads them as `...`).
+    vararg: bool = false,
     /// How a traceback names it: `module.name`, a `[C]` row.
     module: []const u8,
     name: []const u8,
@@ -93,6 +100,11 @@ fn layoutOf(kind: Kind) Layout {
         // the loader) and the loader's data. A call is a searcher's or the
         // loader's: its one or two arguments, and (up to) two results.
         .require => .{ .params = 1, .words = 4, .call_args = 2, .dynamic_args = true, .dynamic_results = true, .results = 0, .call_results = 2, .module = "", .name = "require" },
+        // v; a marker that is nil until the first step. The call is
+        // `__tostring(v)`; its answer is checked in the second step.
+        .tostring => .{ .params = 1, .words = 1, .call_args = 1, .results = 1, .module = "", .name = "tostring" },
+        // ...; the index of the argument whose `__tostring` is being called.
+        .print => .{ .params = 0, .words = 1, .call_args = 1, .results = 0, .vararg = true, .module = "", .name = "print" },
         // path; the chunk is called with no arguments
         .dofile => .{ .params = 1, .words = 0, .call_args = 0, .results = 0, .tail = true, .module = "", .name = "dofile" },
     };
@@ -209,6 +221,7 @@ fn build(comptime kind: Kind) Proto {
         .code = &frozen,
         .num_registers = c + 1 + @max(l.call_args, l.results, l.call_results),
         .num_params = l.params,
+        .is_vararg = l.vararg,
         .name = l.name,
         .chunk = "[C]",
         // To Lua the frame is the native running: no step stops in it, and
@@ -222,6 +235,7 @@ test "activation ids are reserved and round-trip" {
     try std.testing.expectEqual(@as(?Kind, .sort), kindOfId(idOf(.sort)));
     try std.testing.expectEqual(@as(?Kind, .gsub), kindOfId(idOf(.gsub)));
     try std.testing.expectEqual(@as(?Kind, .dofile), kindOfId(idOf(.dofile)));
+    try std.testing.expectEqual(@as(?Kind, .print), kindOfId(idOf(.print)));
     try std.testing.expectEqual(@as(?Kind, null), kindOfId(first_id + 1));
     try std.testing.expectEqual(@as(?Kind, null), kindOfId(first_id - kind_count));
     try std.testing.expectEqual(@as(?Kind, null), kindOfId(0));

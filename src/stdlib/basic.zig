@@ -69,7 +69,16 @@ fn bType(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn bToString(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const v = try anyArg(vm, args, 0);
-    if (try vm.metaToString(v)) |s| return s; // `__tostring` handler
+    // A `__tostring` that is a Lua function is called from an activation
+    // (doc 68 §7.5), so it can yield.
+    const h = vm.tostringHandler(v);
+    if (!h.isNil()) {
+        if (interp.isLuaFunction(h)) {
+            vm.act_seed = .{ .kind = .tostring, .words = @splat(0), .values = .{ h, Value.nil() } };
+            return error.ActivateNative;
+        }
+        return vm.callToString(h, v);
+    }
     if (v.isHeap() and v.heapType() == .string) return v; // already a string
     // Non-string renderings are bounded: scalars (<~32 bytes) and the
     // "kind: 0x<id>" identity form for heap objects. 128 bytes is ample.

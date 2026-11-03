@@ -3905,6 +3905,8 @@ pub const Vm = struct {
             .gsub => return stdstring.gsubSync(self, seed, args, results_out),
             .dofile => return stdload.dofileSync(self, seed, results_out),
             .require => return stdpackage.requireSync(self, seed, args, results_out),
+            .tostring => return tostringSync(self, seed, args, results_out),
+            .print => return printSync(self, seed, args),
         }
     }
 
@@ -10148,6 +10150,8 @@ pub const Vm = struct {
                     .gsub => stdstring.gsubStep(vm, regs),
                     .dofile => stdload.dofileStep(vm, regs),
                     .require => stdpackage.requireStep(vm, regs),
+                    .tostring => tostringStep(vm, regs),
+                    .print => printStep(vm, regs),
                 } catch |e| return parkErr(st, e);
                 switch (next) {
                     .call => {
@@ -12142,15 +12146,33 @@ pub const Vm = struct {
     pub fn metaToString(self: *Vm, v: Value) Error!?Value {
         const handler = self.metamethod(v, self.mm.tostring);
         if (handler.isNil()) return null;
-        const r = try self.callMeta(handler, &.{v});
+        return try self.callToString(handler, v);
+    }
+
+    /// `v`'s `__tostring`, or nil. A Lua function (`isLuaFunction`) is what a
+    /// resumable native (`tostring`, `print`) calls from an activation (doc 68
+    /// §7.5); any other handler is called in place with `callToString`.
+    pub fn tostringHandler(self: *Vm, v: Value) Value {
+        return self.metamethod(v, self.mm.tostring);
+    }
+
+    /// `handler(v)` called in place, as the string it answers.
+    pub fn callToString(self: *Vm, handler: Value, v: Value) Error!Value {
+        return self.tostringAnswer(try self.callMeta(handler, &.{v}));
+    }
+
+    /// What a `__tostring` handler returned, as a string: a string is itself,
+    /// a number is converted (as `luaL_tolstring` does), anything else raises.
+    pub fn tostringAnswer(self: *Vm, r: Value) Error!Value {
         if (r.isHeap() and r.heapType() == .string) return r;
-        // A number is accepted and converted, as `luaL_tolstring` does.
         if (r.isNumber()) {
             var buf: [64]u8 = undefined;
             return try self.heap.internValue(coerceConcat(r, &buf) catch unreachable);
         }
         return self.raiseLocatedError("'__tostring' must return a string", 1);
     }
+
+
 
     /// Upper bound on `__index`/`__newindex` table-chain hops before we declare a
     /// loop. Deterministic and generous — real inheritance chains are a handful
@@ -13226,23 +13248,140 @@ fn nativeGetenv(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return Value.nil();
 }
 
-fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    const vm: *Vm = @ptrCast(@alignCast(ctx));
+pub fn isLuaFunction(v: Value) bool {
+    return v.isHeap() and v.heapType() == .function;
+}
+
+/// `print`'s arguments, as the native has them (a slice) or its activation
+/// has them (its frame's varargs).
+const PrintSliceArgs = struct {
+    items: []const Value,
+    fn len(self: @This()) usize {
+        return self.items.len;
+    }
+    fn at(self: @This(), i: usize) Value {
+        return self.items[i];
+    }
+};
+
+const PrintVarArgs = struct {
+    vm: *Vm,
+    base: usize,
+    n: usize,
+    fn len(self: @This()) usize {
+        return self.n;
+    }
+    fn at(self: @This(), i: usize) Value {
+        return self.vm.regGet(self.base + i);
+    }
+};
+
+/// `print`'s loop (doc 68 §7.5) from argument `i.*`. `answer`, when given, is
+/// what the `__tostring` call for that argument returned, whose tab is
+/// already written. Returns the `__tostring` Lua function it needs called for
+/// argument `i.*` (the tab before it written), or null once the line is done.
+/// What was written stays written.
+fn printLoop(vm: *Vm, args: anytype, i: *usize, answer: ?Value) anyerror!?Value {
     const to_stdout = vm.out == null;
     const w = vm.out orelse io.stdout();
-    for (args, 0..) |arg, i| {
-        if (i != 0) try w.writeAll("\t");
+    if (answer) |a| {
+        try w.writeAll(strBytes(try vm.tostringAnswer(a)).?);
+        i.* += 1;
+    }
+    while (i.* < args.len()) : (i.* += 1) {
+        const arg = args.at(i.*);
+        if (i.* != 0) try w.writeAll("\t");
         // Honour `__tostring` when present; otherwise the default rendering
         // (no interning on the common path).
-        if (try vm.metaToString(arg)) |s| {
-            try w.writeAll(strBytes(s).?);
-        } else {
+        const h = vm.tostringHandler(arg);
+        if (h.isNil()) {
             try io.writeValue(w, arg);
+        } else if (isLuaFunction(h)) {
+            return h;
+        } else {
+            try w.writeAll(strBytes(try vm.callToString(h, arg)).?);
         }
     }
     try w.writeAll("\n");
     if (to_stdout) io.stdoutWrote(true);
+    return null;
+}
+
+/// `print`. A `__tostring` that is a Lua function is called from an
+/// activation (doc 68 §7.5), so it can yield; the rest runs here.
+fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    var i: usize = 0;
+    if (try printLoop(vm, PrintSliceArgs{ .items = args }, &i, null) != null) {
+        var w: [native_act.max_words]i64 = @splat(0);
+        w[0] = @intCast(i);
+        vm.act_seed = .{ .kind = .print, .words = w };
+        return error.ActivateNative;
+    }
     return Value.nil();
+}
+
+/// One step of `print`'s activation: `R0` is the index of the argument whose
+/// `__tostring` is being called (nil before the first step, which takes the
+/// native's seed and makes that call). Later steps write the answer and run
+/// on to the next such argument, or to the end.
+fn printStep(vm: *Vm, regs: RegWindow) Error!native_act.Next {
+    const c = native_act.callReg(.print);
+    const f = &vm.frames[vm.depth - 1];
+    const args = PrintVarArgs{ .vm = vm, .base = f.varargs_base, .n = f.varargs_count };
+    var i: usize = undefined;
+    var handler: ?Value = undefined;
+    if (regs.get(0).isNil()) {
+        const seed = vm.takeActSeed();
+        std.debug.assert(seed.kind == .print);
+        i = @intCast(seed.words[0]);
+        handler = vm.tostringHandler(args.at(i));
+    } else {
+        i = @intCast(regs.get(0).asInt());
+        handler = printLoop(vm, args, &i, regs.get(c)) catch |e| return narrowError(e);
+    }
+    const h = handler orelse return .done;
+    regs.setInt(0, @intCast(i));
+    regs.set(c, h);
+    regs.set(c + 1, args.at(i));
+    return .call;
+}
+
+/// `print` called from Zig (`Vm.callValue`): it finishes from the state the
+/// native left, calling the handlers through `callValue`.
+fn printSync(vm: *Vm, seed: native_act.Seed, args: []const Value) Error!usize {
+    std.debug.assert(seed.kind == .print);
+    var i: usize = @intCast(seed.words[0]);
+    var handler = vm.tostringHandler(args[i]);
+    while (true) {
+        var r: [1]Value = .{Value.nil()};
+        const n = try vm.callValue(handler, &.{args[i]}, r[0..1]);
+        handler = (printLoop(vm, PrintSliceArgs{ .items = args }, &i, if (n >= 1) r[0] else Value.nil()) catch |e| return narrowError(e)) orelse return 0;
+    }
+}
+
+/// The two steps of `tostring`'s activation: the first makes the call of the
+/// `__tostring` the native found (its seed), the second checks the answer.
+fn tostringStep(vm: *Vm, regs: RegWindow) Error!native_act.Next {
+    const c = native_act.callReg(.tostring);
+    if (regs.get(1).isNil()) {
+        const seed = vm.takeActSeed();
+        std.debug.assert(seed.kind == .tostring);
+        regs.setInt(1, 1);
+        regs.set(c, seed.values[0]);
+        regs.set(c + 1, regs.get(0));
+        return .call;
+    }
+    regs.set(c, try vm.tostringAnswer(regs.get(c)));
+    return .done;
+}
+
+fn tostringSync(vm: *Vm, seed: native_act.Seed, args: []const Value, results_out: []Value) Error!usize {
+    std.debug.assert(seed.kind == .tostring);
+    var r: [1]Value = .{Value.nil()};
+    const n = try vm.callValue(seed.values[0], &.{args[0]}, r[0..1]);
+    results_out[0] = try vm.tostringAnswer(if (n >= 1) r[0] else Value.nil());
+    return 1;
 }
 
 /// `warn(msg1, ···)` — Lua 5.4 diagnostic warnings (lbaselib.c `luaB_warn` +

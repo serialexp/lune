@@ -139,6 +139,10 @@ division or modulo by zero".
   raises "attempt to yield across a C-call boundary". The comparator may
   also be a callable table, which Lua refuses. A sort the program calls
   through a builtin (`pcall(table.sort, t, f)`) still cannot yield.
+- A Lua `__tostring` called by `tostring` or `print` can yield; Lua raises
+  "attempt to yield across a C-call boundary". Through a builtin
+  (`pcall(print, x)`) it still cannot. `string.format("%s", x)` and the
+  report of an uncaught error object still call it without yielding.
 - A module loader, or a searcher, run by `require` can yield; Lua raises
   "attempt to yield across a C-call boundary". Through a builtin
   (`pcall(require, name)`) it still cannot.
