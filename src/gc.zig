@@ -1287,22 +1287,28 @@ pub const Heap = struct {
         // destroyed strings their bytes, so the debt is what the survivors
         // hold.
         self.setGcTarget(@max(initial_gc_threshold, (live +| self.debt()) *| heap_growth));
-        self.strtabMaybeShrink();
+        self.strtabAfterSweep();
         // Doc 73: stacks pooled since the last collection hand their pages
         // back, so an idle pool holds no committed stack memory.
         self.stack_pool.trim();
     }
 
-    /// Optional post-sweep maintenance: halve the bucket array when live entries
-    /// fall below a quarter of it (hysteresis against grow's 100%-load trigger:
-    /// a shrink needs the population to halve twice, a re-grow needs it to double
-    /// twice — sawtooth populations near a boundary do not thrash). One halving
-    /// per sweep. OOM keeps the current (larger) table — geometry is runtime-
-    /// private, so this costs memory, never correctness or determinism of output.
-    fn strtabMaybeShrink(self: *Heap) void {
-        if (self.strtab.len <= strtab_min_size) return;
-        if (self.strtab_count >= self.strtab.len / 4) return;
-        const new_len = @max(strtab_min_size, self.strtab.len / 2);
+    /// Post-sweep maintenance. Halve the bucket array when live entries fall
+    /// below a quarter of it (hysteresis against grow's 100%-load trigger: a
+    /// shrink needs the population to halve twice, a re-grow needs it to
+    /// double twice — sawtooth populations near a boundary do not thrash). One
+    /// halving per sweep. And with dense buckets about, rebuild at the same
+    /// size so the marks follow the survivors (doc 28 §5.1): the groups that
+    /// made them are mostly garbage by now, and a mark that outlives them
+    /// makes every later string in its bucket pay both hashes. Short-lived
+    /// strings that collide (a day's dates differing only in the hour) would
+    /// otherwise mark every bucket of a table that never grows. OOM keeps the
+    /// current table and marks — geometry is runtime-private, so this costs
+    /// memory or time, never correctness or determinism of output.
+    fn strtabAfterSweep(self: *Heap) void {
+        const shrink = self.strtab.len > strtab_min_size and self.strtab_count < self.strtab.len / 4;
+        if (!shrink and !self.strtab_any_dense) return;
+        const new_len = if (shrink) @max(strtab_min_size, self.strtab.len / 2) else self.strtab.len;
         // strtabRebuild re-chains without touching strtab_count, which the sweep
         // walk above has just recounted.
         self.strtabRebuild(new_len) catch return;
@@ -1664,8 +1670,10 @@ test "doc 28 §5: sparse collisions intern exactly, and their chain is rehashed 
     try strtabCheckIntegrity(&heap);
     for (ptrs, 0..) |p, i| try testing.expectEqual(@as(?*String, p), heap.internedLookup(sparseColliders(&buf, i)));
 
-    // The sweep re-chains survivors by their stored hash, marks unchanged.
+    // The sweep re-decides the marks for the survivors: two colliders are
+    // no group, so they hash sparsely again.
     try collectWithRoots(&heap, &.{ &ptrs[3].header, &ptrs[150].header });
+    try testing.expect(!heap.strtab_any_dense);
     try strtabCheckIntegrity(&heap);
     try testing.expectEqual(@as(?*String, ptrs[3]), heap.internedLookup(sparseColliders(&buf, 3)));
     try testing.expectEqual(@as(?*String, ptrs[150]), heap.internedLookup(sparseColliders(&buf, 150)));
@@ -1730,13 +1738,16 @@ test "doc 28 §5: a rebuild keeps a same-hash group dense while it is larger tha
     for (group) |g| try testing.expect(g.hash != string.sparseHash(g.bytes()));
     try strtabCheckIntegrity(&heap);
 
-    // Four survive, so the next rebuild (a shrink after the sweep) may hash
-    // them sparsely again; then the fifth promotes them once more.
-    var roots: [Heap.strtab_max_ident]*GcHeader = undefined;
+    // Five survive a collection: the sweep's rebuild keeps them dense.
+    var roots: [Heap.strtab_max_ident + 1]*GcHeader = undefined;
     for (&roots, 0..) |*r, i| r.* = &group[i].header;
     try collectWithRoots(&heap, &roots);
+    try testing.expect(heap.strtab_any_dense);
     try strtabCheckIntegrity(&heap);
-    try heap.strtabRebuild(heap.strtab.len);
+
+    // Four survive, so the sweep hashes them sparsely again; then the fifth
+    // promotes them once more.
+    try collectWithRoots(&heap, roots[0..Heap.strtab_max_ident]);
     try testing.expect(!heap.strtab_any_dense);
     try strtabCheckIntegrity(&heap);
     for (group[0..Heap.strtab_max_ident], 0..) |g, i| try testing.expectEqual(@as(?*String, g), heap.internedLookup(sparseColliders(&buf, i)));
@@ -1752,6 +1763,7 @@ test "doc 28 §5: once the colliders are gone, the next rebuild hashes sparsely 
     for (0..100) |i| _ = try heap.intern(sparseColliders(&buf, i));
     try testing.expect(heap.strtab_any_dense);
     try collectWithRoots(&heap, &.{});
+    try testing.expect(!heap.strtab_any_dense);
     var name: [16]u8 = undefined;
     var keep: [1500]*String = undefined;
     for (&keep, 0..) |*k, i| k.* = try heap.intern(std.fmt.bufPrint(&name, "g{d}", .{i}) catch unreachable);

@@ -32,7 +32,11 @@ land; move whole units to Done once everything inside them is checked.
 - [x] **U4 — long strings, as (B)** (§5.4). Doc 28 §5's L3: the sparse
   hash, widened to the first and last eight bytes, LuaJIT's chain guard
   with its weighting, and an identical-hash trigger that the rebuild keeps.
-  str_concat_grow −61%, io_read_all −53%; os_date +7.7% (below).
+  str_concat_grow −61%, io_read_all −53%; os_date +0.9% once the sweep
+  re-decides the marks (doc 28 §5.1).
+- [x] **The sweep re-decides the dense marks** (doc 28 §5.1). os_date's
+  +7.7% came from marks that outlived the strings that made them, in a
+  table that never grew: every bucket ended up marked.
 
 ### Outstanding
 
@@ -42,12 +46,10 @@ land; move whole units to Done once everything inside them is checked.
 - [ ] **n-ary concat** (§4.2): `a .. b .. c .. d` is three binary concats
   with two intermediate strings; Lua's `OP_CONCAT` joins a register range
   once. A bytecode change; not started.
-- [ ] **The identical-hash trigger counts compares, not their cost**
-  (§5.4). os_date's date strings form groups of more than four that are
-  cheap to compare. Promoting them costs every later string with that
-  sparse hash a dense hash too: +7.7% instructions. A budget of compared
-  bytes would promote only groups whose compares are expensive. Not
-  measured.
+- [ ] **The trigger counts compares, not their cost** (§5.4). Short
+  same-hash groups that die young still get promoted: os_date pays +0.9%
+  where a build without the trigger pays −1.9%. A budget of compared bytes
+  might promote only groups whose compares are expensive. Not measured.
 - [ ] **Embedders** (§2.3): document `LargeBlockCache` in the embedding
   guide; the C API does not install it today.
 
@@ -349,7 +351,8 @@ review. In short:
 
 The 80k `s = s .. "x"` loop takes 0.07 s (U1–U3: 0.15 s; lua5.4 0.09 s).
 Every intern still pays a sparse hash, and a promoted bucket pays the
-dense one as well: that is os_date's +7.7% (checklist).
+dense one as well. os_date's +7.7% came from marks that outlived their
+strings; the sweep now re-decides them (doc 28 §5.1), which leaves +0.9%.
 
 ## References
 

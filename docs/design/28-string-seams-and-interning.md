@@ -275,17 +275,39 @@ the same within a point):
 | gsub_fn, str_find_match, str_gsub, str_gmatch | −1.0 to −1.6% |
 | io_lines | −0.8% |
 | scalar | +1.6% (tier 0 +0.3%) |
-| **os_date** | **+7.7%** |
+| **os_date** | **+7.7%**, then +0.9% (below) |
 
 The 80k `s = s .. "x"` loop takes 0.07 s, against 0.15 s before and
 lua5.4's 0.09 s.
 
-The os_date cost is the trigger's, and was known when it was picked. Date
-strings that differ only in the hour or the seconds form groups of more
-than four. Promoting them makes every later string with that sparse hash
-pay both hashes, which costs more than the short compares it saves. The
-trigger counts compares, not their cost; a byte budget instead of a count
-is the open refinement (doc 80 checklist).
+**os_date, and marks that outlived their strings (follow-up, 2026-11-03).**
+The +7.7% was not the cost of the compares the trigger counts, as first
+assumed. Counters showed that all 512 buckets of os_date's table ended up
+marked: 7.7M dense lookups against 113k sparse ones. Date strings that
+differ only in the hour form groups that die at the next collection, but
+only a rebuild cleared a mark. A table that never grows is never rebuilt,
+so every bucket got marked in turn, and every intern in the program paid
+both hashes. LuaJIT's marks stick the same way; its higher threshold just
+marks fewer buckets.
+
+The fix: while any bucket is marked, the sweep rebuilds the table at the
+same size (`strtabAfterSweep`), so the marks follow the survivors. That
+costs one pass over the live strings per collection, and only while marks
+exist. On os_date, 25 buckets end up marked and 4% of lookups are dense:
+−6.3% against the first landing, +0.9% against full Wyhash. Nothing else
+moved by more than 0.2%.
+
+A build without the trigger runs os_date at −1.9%. The trigger stays
+because of strings that differ only between the samples, in groups too
+small for the weighted guard. Measured against full Wyhash (instruction
+counts, JIT tier):
+
+| keys, all hit 300k times | no trigger | trigger |
+|---|---|---|
+| 12 of 75 B, differing at bytes 50–54 | +10.0% | +1.9% |
+| 12 of 425 B, the same | +19.0% | +1.2% |
+| 6 of 425 B | +4.2% | +1.2% |
+| 64 of 75 B (the guard promotes at 17 anyway) | +1.9% | +1.9% |
 
 ## 6. L4 — intern with a known cp_len
 
