@@ -212,6 +212,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_jit_unwind_tests.step);
 
+    // The real CLI on a pseudo-terminal (tests/pty_foreground_test.zig): the
+    // terminal handed to a child that reads it. The test runs in the
+    // directory the CLI was built into and executes `./mahina` from there.
+    const pty_mod = b.createModule(.{
+        .root_source_file = b.path("tests/pty_foreground_test.zig"),
+        .target = target,
+    });
+    runner.addImports(pty_mod);
+    const pty_tests = b.addTest(.{ .root_module = pty_mod, .filters = test_filters, .test_runner = runner.config() });
+    const run_pty_tests = b.addRunArtifact(pty_tests);
+    run_pty_tests.setCwd(exe.getEmittedBin().dirname());
+    junitReport(run_pty_tests, test_junit);
+    test_step.dependOn(&run_pty_tests.step);
+
     // --- embedding C ABI (doc 59) -------------------------------------------
     //
     // `zig build lib` — `libmahina.a` + `include/mahina.h`: the C-ABI embedding

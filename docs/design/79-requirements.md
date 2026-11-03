@@ -213,5 +213,8 @@ result, drift found.
   by a real-process test or a threaded interrupt (88 units verified). The
   `proc_host.zig` tests, including its older Tail and signal-name tests,
   were never compiled into `zig build test`; `root.zig` now imports the
-  file. Not covered: handing the terminal to a child that reads it (needs a
-  pty) and portability (§7).
+  file. REQ-52 (the terminal handed to a child that
+  inherits stdin; 3 criteria) is proved by `tests/pty_foreground_test.zig`,
+  which runs the real CLI (`./mahina`, from the directory it was built
+  into) as session leader of a pseudo-terminal; with the handover
+  disabled both tests fail. Not covered: portability (§7).
