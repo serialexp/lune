@@ -2,7 +2,7 @@
 
 Status: draft; the model is adopted from Gothab. A prototype of the Zig citation scheme and JUnit report works locally (Q1, Q2); CI upload and a reusable package are not done. No doc is converted yet.
 Owner: Bart
-Last updated: 2026-11-02
+Last updated: 2026-11-09
 
 ## Implementation status
 
@@ -241,3 +241,18 @@ result, drift found.
   landed and REQ-65 proves files close with their scope (doc 65 not yet
   edited). Not converted: performance budgets (§9, benchmarks) and the
   reopen flag (open question on REQ-53).
+- **Doc 82 — string interpolation** (2026-11-09): area REQ-99 *String
+  interpolation* with epic REQ-100 and features REQ-101 template syntax
+  (REQ-102 basic form, REQ-103 escapes, REQ-104 newlines, REQ-105 malformed
+  templates, REQ-106 a hole ends at its own brace), REQ-107 evaluation
+  (REQ-108 schedule, REQ-109 conversion, REQ-110 result), REQ-111 REPL and
+  editor (REQ-112, REQ-113) and REQ-114 hot code (REQ-115). 17 nodes, 42
+  criteria, 17 notes, all `draft`. REQ-103.3 was replaced by REQ-103.5 once
+  the test showed that `\\u{41}` is a backslash, the letter u and a hole, not
+  a backslash and a hole. Trace pass: every criterion except REQ-115.1–3
+  (tracing, doc 82 phase 3) is verified by `gt requirement verify` against a
+  local report. REQ-113.4 is proved by a Bun test (the Tree-sitter drift
+  check), which Bun's JUnit reporter reports without the `requirements`
+  property, so its fragment was written by hand for the local run: the CI half
+  of Q2 needs that mapping.
+

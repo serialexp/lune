@@ -1,8 +1,8 @@
 # 82 — String interpolation — Design
 
-Status: draft, not yet implemented
+Status: partial — phases 0, 1, 2 and 4 landed (tier-0 only); phase 3 (tracing), phase 5 and Q5 outstanding
 Owner: Bart
-Last updated: 2026-11-09
+Last updated: 2026-11-09 (implementation)
 
 ## Implementation status
 
@@ -32,33 +32,43 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Q8 — a hole is one value** (§3.1): decided 2026-11-09. The first
   result of the expression, or nil if it returns none; a trailing call or `...`
   is never expanded.
+- [x] **Phase 0 — lexer.** `interp_simple`/`interp_begin`/`interp_mid`/
+  `interp_end` tokens carrying their delimiters; a per-template brace depth
+  and a template stack of `max_template_depth` (200); the `{{`, unterminated
+  and too-deep diagnostics (`E0006`–`E0008`). Tests are `template: …` in
+  `lexer.zig`.
+- [x] **Phase 1 — parser and compiler.** `ast.Expr.string_interp` (chunks +
+  holes), `parseTemplate` (an empty hole is `expected_expression`, a hole not
+  closed by its `}` is `expected_template_hole_end`, `E0141`); the resolver and
+  the editor's syntax walker visit the holes. Lowering (`compileInterp`): text
+  chunks (escapes `\`` `\{` `\}` plus the string escapes; raw line breaks
+  normalised to LF in `decodeEscapes`) and hole values go to consecutive
+  registers, one `tostr` per hole in source order after all holes are
+  evaluated, then one `interp a, b, c`; a template with no hole is a constant,
+  a lone hole is `tostr` plus a `move`. `tostr` converts in place and runs a
+  Lua `__tostring` as a continuation frame (`finishOp`), so it may yield;
+  `interp` joins the strings like `concat` (stack buffer or one built
+  allocation, operand character facts reused). Tests:
+  `src/interp_template_test.zig`, across every GC and trace-mode leg.
+- [x] **Phase 2 — REPL.** `failedWith` treats `unterminated_template` as
+  incomplete input, so an unfinished text, hole, nested template or trailing
+  backslash waits for more lines in both the expression probe and statement
+  input, while an empty hole is reported at once (`repl.zig` test).
+- [x] **Phase 4 — tools.** `contextAt` calls template text a string and a hole
+  code, including an unterminated hole while typing; semantic tokens mark text
+  as string (the braces and the hole's own tokens are not); a name in a hole
+  resolves for go-to-definition, references and rename through the resolver.
+  The Tree-sitter grammar parses templates (`template_text`, `template_escape`,
+  `template_hole`), with a corpus case and a drift test that reads
+  `tests/lang/interpolation.lua`; the grammar also gained doc 76's attributes
+  and `global` declarations, which the drift check had been failing on.
 
 ### Outstanding
 
-- [ ] **Phase 0 — lexer.** Text and expression modes with a per-template
-  brace depth and a template stack (§3.6); the escape set on delimiter-free
-  chunks; the `{{`, empty-hole and unterminated errors; a backtick outside a
-  template stays an error.
-- [ ] **Phase 1 — parser and compiler.** `stringinterp` as an expression with
-  an exact shape (§3.1); hole expressions are ordinary expressions for the
-  resolver (locals, upvalues, strict globals, doc 81); one intrinsic
-  conversion per hole and one construction op (§5).
-- [ ] **Phase 2 — REPL.** A structured "incomplete input" status distinct from
-  a malformed template, covering unfinished text, holes, nested templates and
-  escapes, in both the expression probe and statement input (§3.3). Today
-  `failedWith` treats only an error at or past the end of the input, or an
-  unterminated long string or block comment, as incomplete; an unterminated
-  template is reported at its opening backtick, so it needs its own
-  diagnostic code and a `failedWith` case, and the probe's `\n)` suffix must
-  not be absorbed as template text.
 - [ ] **Phase 3 — tracing.** The recorder gains what templates need: today it
   has no `concat` recording (it falls back as `.nyi_opcode`) and its string
   conversion rejects heap operands. Templates must record, commit and execute
   in tier-1a and native, not only match output (§5).
-- [ ] **Phase 4 — tools.** The language server (completion contexts: text vs
-  code, and code inside an unterminated hole while typing, which `contextAt`
-  would otherwise call a string; semantic tokens; hole symbols) and the Tree-sitter grammar (doc 74),
-  with a drift test each.
 - [ ] **Phase 5 — command words.** Whether a template is one argv element in a
   REPL command line, and how it requests more input; owned by doc 75 §6.1.
   `repl.zig`'s `nextWord` knows only `'` and `"` today, so a backtick word
