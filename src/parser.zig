@@ -24,6 +24,63 @@ const Span = ast.Span;
 
 const Error = error{ ParseError, OutOfMemory };
 
+/// A stack the parser builds one kind of list on. A list grows here, in the
+/// parse's `gpa`, and the arena receives one copy of exactly the finished
+/// list: grown in the arena itself, every growth step would leave its old
+/// buffer behind (doc 83 §10 measured half the arena as such buffers). A
+/// site takes `mark()`, defers `reset(mark)` so an error unwinding through it
+/// leaves nothing behind, pushes, and `take`s its items; lists nest, so a
+/// stack holds the open lists of every enclosing construct, innermost on top.
+fn Stack(comptime T: type) type {
+    return struct {
+        list: std.ArrayList(T) = .empty,
+
+        const Self = @This();
+
+        fn mark(s: *const Self) usize {
+            return s.list.items.len;
+        }
+
+        fn reset(s: *Self, top: usize) void {
+            s.list.shrinkRetainingCapacity(top);
+        }
+
+        fn push(s: *Self, gpa: std.mem.Allocator, v: T) Error!void {
+            try s.list.append(gpa, v);
+        }
+
+        /// The items pushed since `top`, copied into `arena`.
+        fn take(s: *const Self, arena: std.mem.Allocator, top: usize) Error![]T {
+            return arena.dupe(T, s.list.items[top..]);
+        }
+
+        fn deinit(s: *Self, gpa: std.mem.Allocator) void {
+            s.list.deinit(gpa);
+        }
+    };
+}
+
+/// The parser's list stacks, one per element type.
+const Scratch = struct {
+    stmts: Stack(Stmt) = .{},
+    exprs: Stack(*Expr) = .{},
+    fields: Stack(ast.TableField) = .{},
+    branches: Stack(Stmt.Branch) = .{},
+    idents: Stack(ast.Ident) = .{},
+    names: Stack(ast.TypedName) = .{},
+    strs: Stack([]const u8) = .{},
+
+    fn deinit(s: *Scratch, gpa: std.mem.Allocator) void {
+        s.stmts.deinit(gpa);
+        s.exprs.deinit(gpa);
+        s.fields.deinit(gpa);
+        s.branches.deinit(gpa);
+        s.idents.deinit(gpa);
+        s.names.deinit(gpa);
+        s.strs.deinit(gpa);
+    }
+};
+
 /// The deepest a syntax tree may go, as in Lua and LuaJIT (200 levels). Each
 /// pass after the parser recurses once per level, and a deeper tree would
 /// overflow the stack, the browser's (1 MiB) first. Every nested statement,
@@ -61,14 +118,19 @@ pub fn parseFormat(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnos
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const tokens = try lexer.tokenizeTrivia(a, source, diags, trivia);
+    // Lexed in `gpa` and copied once, for the reason `Stack` gives.
+    const lexed = try lexer.tokenizeTrivia(gpa, source, diags, trivia);
+    defer gpa.free(lexed);
+    const tokens = try a.dupe(Token, lexed);
 
     var p = Parser{
         .tokens = tokens,
         .source = source,
         .arena = a,
+        .gpa = gpa,
         .diags = diags,
     };
+    defer p.s.deinit(gpa);
     const root = try p.parseChunk();
 
     return .{
@@ -82,6 +144,9 @@ const Parser = struct {
     pos: u32 = 0,
     source: [:0]const u8,
     arena: std.mem.Allocator,
+    /// Owns the list stacks.
+    gpa: std.mem.Allocator,
+    s: Scratch = .{},
     diags: *Diagnostics,
     /// A syntax error has been reported: stray tokens after it are probably
     /// its aftermath, not new mistakes.
@@ -183,14 +248,15 @@ const Parser = struct {
     // =====================================================================
 
     fn parseChunk(self: *Parser) Error!ast.Block {
-        var stmts: std.ArrayList(Stmt) = .empty;
+        const top = self.s.stmts.mark();
+        defer self.s.stmts.reset(top);
         while (true) {
-            try stmts.appendSlice(self.arena, try self.parseBlock());
+            try self.parseBlockItems();
             if (self.check(.eof)) break;
             if (self.too_deep) {
                 // What was left unparsed stands as one error node.
                 const rest: Span = .{ .start = self.current().start, .end = @intCast(self.source.len) };
-                try stmts.append(self.arena, .{ .span = rest, .data = .err });
+                try self.s.stmts.push(self.gpa, .{ .span = rest, .data = .err });
                 break;
             }
             // A block-closing token with nothing to close. After an earlier
@@ -200,9 +266,9 @@ const Parser = struct {
             const t = self.current();
             if (!self.had_error) _ = self.fail(.expected_end_of_input) catch {};
             _ = self.advance();
-            try stmts.append(self.arena, .{ .span = tokSpan(t), .data = .err });
+            try self.s.stmts.push(self.gpa, .{ .span = tokSpan(t), .data = .err });
         }
-        return try stmts.toOwnedSlice(self.arena);
+        return self.s.stmts.take(self.arena, top);
     }
 
     fn atBlockEnd(self: *const Parser) bool {
@@ -213,7 +279,14 @@ const Parser = struct {
     }
 
     fn parseBlock(self: *Parser) Error!ast.Block {
-        var stmts: std.ArrayList(Stmt) = .empty;
+        const top = self.s.stmts.mark();
+        defer self.s.stmts.reset(top);
+        try self.parseBlockItems();
+        return self.s.stmts.take(self.arena, top);
+    }
+
+    /// A block's statements, pushed onto the statement stack.
+    fn parseBlockItems(self: *Parser) Error!void {
         while (!self.atBlockEnd()) {
             if (self.check(.semicolon)) {
                 _ = self.advance();
@@ -225,25 +298,24 @@ const Parser = struct {
                 const ret = self.parseReturn() catch |e| switch (e) {
                     Error.ParseError => {
                         if (self.too_deep) break;
-                        try stmts.append(self.arena, try self.dropped(start_pos, start));
+                        try self.s.stmts.push(self.gpa, try self.dropped(start_pos, start));
                         continue;
                     },
                     else => return e,
                 };
-                try stmts.append(self.arena, ret);
+                try self.s.stmts.push(self.gpa, ret);
                 break; // `return` ends the block
             }
             const stmt = self.parseStatement() catch |e| switch (e) {
                 Error.ParseError => {
                     if (self.too_deep) break;
-                    try stmts.append(self.arena, try self.dropped(start_pos, start));
+                    try self.s.stmts.push(self.gpa, try self.dropped(start_pos, start));
                     continue;
                 },
                 else => return e,
             };
-            try stmts.append(self.arena, stmt);
+            try self.s.stmts.push(self.gpa, stmt);
         }
-        return try stmts.toOwnedSlice(self.arena);
     }
 
     /// The statement that began at token `start_pos` (source offset `start`)
@@ -404,7 +476,8 @@ const Parser = struct {
     /// name instead (Lua 5.5 §3.3.7).
     fn parseAttNameList(self: *Parser, kind: DeclKind) Error![]const ast.TypedName {
         const prefix = try self.parseAttrib(.none, kind);
-        var names: std.ArrayList(ast.TypedName) = .empty;
+        const top = self.s.names.mark();
+        defer self.s.names.reset(top);
         var closing = false;
         while (true) {
             const name_tok = try self.expect(.identifier, .expected_variable_name);
@@ -416,7 +489,7 @@ const Parser = struct {
                 closing = true;
             }
             const ty = try self.parseOptionalType();
-            try names.append(self.arena, .{
+            try self.s.names.push(self.gpa, .{
                 .name = name_tok.lexeme(self.source),
                 .name_span = tokSpan(name_tok),
                 .type = ty,
@@ -424,7 +497,7 @@ const Parser = struct {
             });
             if (!self.match(.comma)) break;
         }
-        return try names.toOwnedSlice(self.arena);
+        return self.s.names.take(self.arena, top);
     }
 
     /// `['<' Name '>']`, or `default` when there is none. A misspelt or
@@ -526,15 +599,18 @@ const Parser = struct {
         }
 
         if (self.check(.assign) or self.check(.comma)) {
-            var targets: std.ArrayList(*Expr) = .empty;
-            try targets.append(self.arena, first);
+            const top = self.s.exprs.mark();
+            defer self.s.exprs.reset(top);
+            try self.s.exprs.push(self.gpa, first);
             while (self.match(.comma)) {
                 var target_free = true;
-                try targets.append(self.arena, try self.parseSuffixed(&target_free));
+                const target = try self.parseSuffixed(&target_free);
+                try self.s.exprs.push(self.gpa, target);
             }
+            const targets = try self.s.exprs.take(self.arena, top);
             _ = try self.expect(.assign, .expected_assign);
             const values = try self.parseExprList();
-            for (targets.items) |t| {
+            for (targets) |t| {
                 if (!t.isAssignable()) {
                     self.diags.report(.cannot_assign, t.span.start, t.span.end, 0);
                     return Error.ParseError;
@@ -542,7 +618,7 @@ const Parser = struct {
             }
             return .{
                 .span = self.spanFrom(start),
-                .data = .{ .assign = .{ .targets = try targets.toOwnedSlice(self.arena), .values = values } },
+                .data = .{ .assign = .{ .targets = targets, .values = values } },
             };
         }
 
@@ -553,17 +629,20 @@ const Parser = struct {
     fn parseIf(self: *Parser) Error!Stmt {
         const open = self.advance(); // 'if'
         const start = open.start;
-        var branches: std.ArrayList(Stmt.Branch) = .empty;
+        const top = self.s.branches.mark();
+        defer self.s.branches.reset(top);
 
         const cond = try self.parseExpr(0);
         _ = try self.expect(.keyword_then, .expected_then);
-        try branches.append(self.arena, .{ .kw_start = open.start, .cond = cond, .body = try self.parseBlock() });
+        const first_body = try self.parseBlock();
+        try self.s.branches.push(self.gpa, .{ .kw_start = open.start, .cond = cond, .body = first_body });
 
         while (self.check(.keyword_elseif)) {
             const kw = self.advance();
             const c = try self.parseExpr(0);
             _ = try self.expect(.keyword_then, .expected_then);
-            try branches.append(self.arena, .{ .kw_start = kw.start, .cond = c, .body = try self.parseBlock() });
+            const body = try self.parseBlock();
+            try self.s.branches.push(self.gpa, .{ .kw_start = kw.start, .cond = c, .body = body });
         }
 
         var else_body: ?ast.Block = null;
@@ -576,7 +655,7 @@ const Parser = struct {
         _ = try self.expectClosing(.keyword_end, .expected_end_if, open, "'if' opened here");
         return .{
             .span = self.spanFrom(start),
-            .data = .{ .if_ = .{ .branches = try branches.toOwnedSlice(self.arena), .else_body = else_body, .else_start = else_start } },
+            .data = .{ .if_ = .{ .branches = try self.s.branches.take(self.arena, top), .else_body = else_body, .else_start = else_start } },
         };
     }
 
@@ -627,19 +706,21 @@ const Parser = struct {
         }
 
         // generic for: for a, b in explist do ... end
-        var names: std.ArrayList(ast.Ident) = .empty;
-        try names.append(self.arena, self.ident(first_name));
+        const top = self.s.idents.mark();
+        defer self.s.idents.reset(top);
+        try self.s.idents.push(self.gpa, self.ident(first_name));
         while (self.match(.comma)) {
             const n = try self.expect(.identifier, .expected_loop_variable);
-            try names.append(self.arena, self.ident(n));
+            try self.s.idents.push(self.gpa, self.ident(n));
         }
+        const names = try self.s.idents.take(self.arena, top);
         _ = try self.expect(.keyword_in, .expected_in);
         const exprs = try self.parseExprList();
         _ = try self.expect(.keyword_do, .expected_do);
         const body = try self.parseBlock();
         _ = try self.expectClosing(.keyword_end, .expected_end_for, open, "'for' opened here");
         return .{ .span = self.spanFrom(start), .data = .{ .generic_for = .{
-            .names = try names.toOwnedSlice(self.arena),
+            .names = names,
             .exprs = exprs,
             .body = body,
         } } };
@@ -656,13 +737,15 @@ const Parser = struct {
     fn parseFunctionDecl(self: *Parser, is_async: bool) Error!Stmt {
         const fn_tok = self.advance(); // 'function'
         const start = fn_tok.start;
-        var path: std.ArrayList(ast.Ident) = .empty;
+        const top = self.s.idents.mark();
+        defer self.s.idents.reset(top);
         const first = try self.expect(.identifier, .expected_function_name);
-        try path.append(self.arena, self.ident(first));
+        try self.s.idents.push(self.gpa, self.ident(first));
         while (self.match(.dot)) {
             const n = try self.expect(.identifier, .expected_name_after_dot);
-            try path.append(self.arena, self.ident(n));
+            try self.s.idents.push(self.gpa, self.ident(n));
         }
+        const path = try self.s.idents.take(self.arena, top);
         var method: ?ast.Ident = null;
         if (self.match(.colon)) {
             const m = try self.expect(.identifier, .expected_method_name);
@@ -675,7 +758,7 @@ const Parser = struct {
         const final_body = if (method) |m| try self.prependSelf(body, m.span.start) else body;
 
         return .{ .span = self.spanFrom(start), .data = .{ .function_decl = .{
-            .name = .{ .path = try path.toOwnedSlice(self.arena), .method = method },
+            .name = .{ .path = path, .method = method },
             .body = final_body,
         } } };
     }
@@ -683,10 +766,10 @@ const Parser = struct {
     /// `at` is where `self` would be written if it were: the method name's start,
     /// as a zero-width span, so no navigation lands on the whole function.
     fn prependSelf(self: *Parser, body: *ast.FunctionBody, at: u32) Error!*ast.FunctionBody {
-        var params: std.ArrayList(ast.Param) = .empty;
-        try params.append(self.arena, .{ .name = "self", .name_span = .{ .start = at, .end = at }, .type = null });
-        try params.appendSlice(self.arena, body.params);
-        body.params = try params.toOwnedSlice(self.arena);
+        const params = try self.arena.alloc(ast.Param, body.params.len + 1);
+        params[0] = .{ .name = "self", .name_span = .{ .start = at, .end = at }, .type = null };
+        @memcpy(params[1..], body.params);
+        body.params = params;
         return body;
     }
 
@@ -710,7 +793,8 @@ const Parser = struct {
         const start = self.current().start;
         _ = try self.expect(.lparen, .expected_lparen_params);
 
-        var params: std.ArrayList(ast.Param) = .empty;
+        const top = self.s.names.mark();
+        defer self.s.names.reset(top);
         var is_vararg = false;
         if (!self.check(.rparen)) {
             while (true) {
@@ -720,7 +804,7 @@ const Parser = struct {
                 }
                 const name_tok = try self.expect(.identifier, .expected_param_name);
                 const ty = try self.parseOptionalType();
-                try params.append(self.arena, .{
+                try self.s.names.push(self.gpa, .{
                     .name = name_tok.lexeme(self.source),
                     .name_span = .{ .start = name_tok.start, .end = name_tok.end },
                     .type = ty,
@@ -729,6 +813,7 @@ const Parser = struct {
             }
         }
         _ = try self.expect(.rparen, .expected_rparen_params);
+        const params = try self.s.names.take(self.arena, top);
 
         const ret_type = try self.parseOptionalType();
         const body = try self.parseBlock();
@@ -737,7 +822,7 @@ const Parser = struct {
         const fb = try self.arena.create(ast.FunctionBody);
         fb.* = .{
             .span = self.spanFrom(start),
-            .params = try params.toOwnedSlice(self.arena),
+            .params = params,
             .is_vararg = is_vararg,
             .ret_type = ret_type,
             .body = body,
@@ -750,18 +835,19 @@ const Parser = struct {
     fn parseOptionalType(self: *Parser) Error!?*ast.TypeExpr {
         if (!self.match(.colon)) return null;
         const start = self.current().start;
-        var path: std.ArrayList([]const u8) = .empty;
+        const top = self.s.strs.mark();
+        defer self.s.strs.reset(top);
         const first = try self.expect(.identifier, .expected_type_name);
-        try path.append(self.arena, first.lexeme(self.source));
+        try self.s.strs.push(self.gpa, first.lexeme(self.source));
         while (self.match(.dot)) {
             const n = try self.expect(.identifier, .expected_type_name_after_dot);
-            try path.append(self.arena, n.lexeme(self.source));
+            try self.s.strs.push(self.gpa, n.lexeme(self.source));
         }
         const is_opt = self.matchOptionalMarker();
         const te = try self.arena.create(ast.TypeExpr);
         te.* = .{
             .span = self.spanFrom(start),
-            .path = try path.toOwnedSlice(self.arena),
+            .path = try self.s.strs.take(self.arena, top),
             .optional = is_opt,
         };
         return te;
@@ -936,12 +1022,14 @@ const Parser = struct {
     }
 
     fn parseExprList(self: *Parser) Error![]const *Expr {
-        var list: std.ArrayList(*Expr) = .empty;
-        try list.append(self.arena, try self.parseExpr(0));
-        while (self.match(.comma)) {
-            try list.append(self.arena, try self.parseExpr(0));
+        const top = self.s.exprs.mark();
+        defer self.s.exprs.reset(top);
+        while (true) {
+            const e = try self.parseExpr(0);
+            try self.s.exprs.push(self.gpa, e);
+            if (!self.match(.comma)) break;
         }
-        return try list.toOwnedSlice(self.arena);
+        return self.s.exprs.take(self.arena, top);
     }
 
     /// The text of a template token without its delimiters (`` ` `` `{` `}`).
@@ -953,24 +1041,27 @@ const Parser = struct {
     /// is exactly one expression; an empty or unterminated one is an error.
     fn parseTemplate(self: *Parser) Error!*Expr {
         const first = self.current();
-        var chunks: std.ArrayList([]const u8) = .empty;
-        var holes: std.ArrayList(*Expr) = .empty;
+        const chunks_top = self.s.strs.mark();
+        defer self.s.strs.reset(chunks_top);
+        const holes_top = self.s.exprs.mark();
+        defer self.s.exprs.reset(holes_top);
         var opener = first;
         while (true) {
             const t = self.advance();
-            try chunks.append(self.arena, templateChunk(t.lexeme(self.source)));
+            try self.s.strs.push(self.gpa, templateChunk(t.lexeme(self.source)));
             opener = t;
             if (self.check(.interp_mid) or self.check(.interp_end)) return self.fail(.expected_expression);
-            try holes.append(self.arena, try self.parseExpr(0));
+            const hole = try self.parseExpr(0);
+            try self.s.exprs.push(self.gpa, hole);
             if (self.check(.interp_mid)) continue;
             if (self.check(.interp_end)) break;
             return self.failRelated(.expected_template_hole_end, .{ .start = opener.start, .end = opener.end, .label = "interpolation opened here" });
         }
         const end = self.advance();
-        try chunks.append(self.arena, templateChunk(end.lexeme(self.source)));
+        try self.s.strs.push(self.gpa, templateChunk(end.lexeme(self.source)));
         return self.newExpr(.{ .start = first.start, .end = end.end }, .{ .string_interp = .{
-            .chunks = try chunks.toOwnedSlice(self.arena),
-            .holes = try holes.toOwnedSlice(self.arena),
+            .chunks = try self.s.strs.take(self.arena, chunks_top),
+            .holes = try self.s.exprs.take(self.arena, holes_top),
         } });
     }
 
@@ -1054,7 +1145,8 @@ const Parser = struct {
     fn parseTable(self: *Parser) Error!*Expr {
         const open = self.advance(); // '{'
         const start = open.start;
-        var fields: std.ArrayList(ast.TableField) = .empty;
+        const top = self.s.fields.mark();
+        defer self.s.fields.reset(top);
         while (!self.check(.rbrace)) {
             if (self.check(.lbracket)) {
                 _ = self.advance();
@@ -1062,20 +1154,21 @@ const Parser = struct {
                 _ = try self.expect(.rbracket, .expected_rbracket_key);
                 _ = try self.expect(.assign, .expected_assign_after_key);
                 const value = try self.parseExpr(0);
-                try fields.append(self.arena, .{ .keyed = .{ .key = key, .value = value } });
+                try self.s.fields.push(self.gpa, .{ .keyed = .{ .key = key, .value = value } });
             } else if (self.check(.identifier) and self.peekAt(1).tag == .assign) {
                 const name_tok = self.advance();
                 _ = self.advance(); // '='
                 const value = try self.parseExpr(0);
-                try fields.append(self.arena, .{ .named = .{ .name = name_tok.lexeme(self.source), .name_span = tokSpan(name_tok), .value = value } });
+                try self.s.fields.push(self.gpa, .{ .named = .{ .name = name_tok.lexeme(self.source), .name_span = tokSpan(name_tok), .value = value } });
             } else {
                 const value = try self.parseExpr(0);
-                try fields.append(self.arena, .{ .positional = value });
+                try self.s.fields.push(self.gpa, .{ .positional = value });
             }
             if (!self.match(.comma) and !self.match(.semicolon)) break;
         }
         const close = try self.expectClosing(.rbrace, .expected_rbrace, open, "'{' opened here");
-        return self.newExpr(.{ .start = start, .end = close.end }, .{ .table = try fields.toOwnedSlice(self.arena) });
+        const fields = try self.s.fields.take(self.arena, top);
+        return self.newExpr(.{ .start = start, .end = close.end }, .{ .table = fields });
     }
 };
 
