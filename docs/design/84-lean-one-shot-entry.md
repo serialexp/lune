@@ -31,6 +31,17 @@ land; move whole phases to Done once everything inside them is checked.
   only inserts and removals outside the bulk clears. The gate already had
   `bumpGateEntry`/`clearDispatchGate`; the member-amnesty loop now goes
   through the latter too.
+- [x] **Check: `opJFuncHead`'s bypass set omits `pending_ret_anchor`.**
+  The omission is sound: `pending_ret_anchor` is always null at a
+  `jfunc_head` handler. Every setter (`onRetResume`, `onHostCallTerminal`,
+  the probe and want transfers) flips to `.full` and parks at the anchor's
+  resume pc. That pc's prologue consumes or discards the anchor
+  (`maybeStartCont`). The one pending that survives a prologue is kept at
+  its host call's pc. That pc holds a `call` op, and pc 0 never does: the
+  compiler loads the callee first. `opJCont` needs the term because a
+  continuation can sit over a `call` (the outer call in `f(g())`). A
+  Safe-build assert in `opJFuncHead` now pins this. Phase 2's word can
+  carry the bit for both opcodes at no cost.
 - [x] **Phase 1 — a per-anchor quiet predicate** (§4.1). Every trace
   carries `anchor_penalty` and `anchor_gate`. `headEpisodeQuiet` and the
   productive legacy receipt read them instead of the program-wide
@@ -65,9 +76,6 @@ land; move whole phases to Done once everything inside them is checked.
   (§4.6). A `.global` seed is a hash lookup per entry in `nativeSeedFn`.
   Doc 81's load-time cells make it a load. This doc does no seed work of
   its own until E2 lands.
-- [ ] **Check: `opJFuncHead`'s bypass set omits `pending_ret_anchor`**,
-  which `opJCont`'s includes (`interp.zig` ~9551 against ~9662). Find out
-  whether that is deliberate before Phase 2 merges both into one word.
 - [ ] **Defer — the loop-anchor lane.** Doc 44 D9 already deferred the
   loop-anchor quiet episode. It stays deferred until the one-shot lane has
   proved itself (§5).

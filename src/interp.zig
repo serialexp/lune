@@ -9559,6 +9559,13 @@ pub const Vm = struct {
                 {
                     return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
                 }
+                // Not `pending_ret_anchor`, unlike jcont's set: it is always
+                // null here. Every setter flips to `.full` and parks at the
+                // anchor's resume pc, whose prologue consumes or discards it
+                // (`maybeStartCont`). The one pending that survives a
+                // prologue is kept at its host call's pc, which is a `call`;
+                // pc 0 never is (the callee is loaded first). Doc 84.
+                if (std.debug.runtime_safety) std.debug.assert(self.trace.pending_ret_anchor == null);
                 // Doc 45 D6.1 fast decline: a prior full walk proved every
                 // candidate at this anchor is native-unsupported (memo keyed
                 // to `cache_gen`; any commit/retirement invalidates it). Run
