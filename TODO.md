@@ -59,11 +59,17 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       frame** (doc 68 §12: `sort_cmp` +14.9% tier-0, +16.2% JIT, over
       §10's 10%). Per comparison: ~210 in `opNativeAct` with the call
       inlined, ~180 in `sortStep`, ~120 in `opRet`. The old `callValue`
-      was ~250. Levers: have `opRet` into an activation run its step
-      without dispatching `native_act` through a prologue (this helps
-      every resumable native, gsub and require too); store only the
-      state words a step changed, or pack them (eight `setInt`s and eight
-      loads per comparison now); hoist `sortTable`'s re-check.
+      was ~250. **Tried 2026-11-09:** payload-only state stores after the
+      first step (tags stay int): -0.8% instructions (2.698 G -> 2.676 G on
+      `sort_cmp 20000`; baseline before the activation 2.349 G, so +13.9%).
+      Writing the words without the `toWords` array changed nothing (LLVM
+      already did it). Skipping the dispatch prologue into `native_act`
+      would save ~10 instructions per comparison (the `.fast` prologue is
+      small) and must still advance `safepoint_seq` for replay numbering,
+      so it was not built. What is left is structural: an ordinary
+      return into the activation plus its step's prologue/load/run/store
+      against `callValue`'s boundary return. Remaining lever: hoist
+      `sortTable`'s re-check.
 - [ ] **`string.format("%s", x)` and the uncaught-error report still call a
       Lua `__tostring` through `metaToString`/`callValue`** (doc 68 §7.5
       converted `tostring` and `print` only). A yield there is still an

@@ -427,15 +427,19 @@ const SortState = struct {
         return .{ .n = w[0], .start = w[1], .end = w[2], .root = w[3], .lim = w[4], .child = w[5], .extracting = w[6] != 0, .step = @enumFromInt(w[7]) };
     }
 
-    /// Keep it in the registers from `at` on, as integers.
-    fn store(s: SortState, regs: RegWindow, at: usize) void {
-        const w = s.toWords();
-        for (w[0..word_count], at..) |x, r| regs.setInt(r, x);
+    /// Keep it in the registers from `at` on, as integers. `tagged` says
+    /// they already are (a step that `load`ed them): only the payloads change
+    /// then, which is half the stores per comparison.
+    fn store(s: SortState, regs: RegWindow, at: usize, comptime tagged: bool) void {
+        const w: [word_count]i64 = .{ s.n, s.start, s.end, s.root, s.lim, s.child, @intFromBool(s.extracting), @intFromEnum(s.step) };
+        inline for (w, 0..) |x, k| {
+            if (tagged) regs.payloads[at + k] = @bitCast(x) else regs.setInt(at + k, x);
+        }
     }
 
     fn load(regs: RegWindow, at: usize) SortState {
         var w: [word_count]i64 = undefined;
-        for (&w, at..) |*x, r| x.* = regs.get(r).asInt();
+        for (&w, at..) |*x, r| x.* = @bitCast(regs.bitsAt(r));
         return fromWords(&w);
     }
 };
@@ -532,7 +536,8 @@ pub fn sortStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
     const t = try sortTable(vm, regs.get(0));
     var s: SortState = undefined;
     var result: ?bool = null;
-    if (regs.get(at).isNil()) {
+    const first = regs.get(at).isNil();
+    if (first) {
         const seed = vm.takeActSeed();
         std.debug.assert(seed.kind == .sort);
         s = SortState.fromWords(&seed.words);
@@ -541,7 +546,7 @@ pub fn sortStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
         result = regs.get(c).isTruthy();
     }
     const call = try s.run(vm, t, regs.get(1), result) orelse return .done;
-    s.store(regs, at);
+    if (first) s.store(regs, at, false) else s.store(regs, at, true);
     regs.set(c, call.f);
     regs.set(c + 1, call.a);
     regs.set(c + 2, call.b);

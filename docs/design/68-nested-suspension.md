@@ -97,7 +97,7 @@ land; move whole phases to Done once everything inside them is checked.
     pcall/xpcall bodies, caught errors included, resumes after restore),
     `interp_semantics_test` "a collection inside a protected body keeps
     the call's own slots". Numbers are in §12.
-  - [ ] **`host_boundary_depth`.** Not needed yet: no re-entry has
+  - [x] **`host_boundary_depth`** (closed unneeded, 2026-11-09). Not needed: no re-entry has
     become non-recursive except the `pcall` body, which never raises
     `native_reentry_depth`. It lands with the first converted native
     that runs inside a host function's dispatch.
@@ -117,7 +117,7 @@ land; move whole phases to Done once everything inside them is checked.
     suspends, and its host functions re-enter through `callValue`. A
     separate `host_boundary_depth` would only be a second name for
     `native_reentry_depth > 0` until some entry runs guest code without
-    raising it. Left unbuilt; reopen if one appears.
+    raising it. Closed unbuilt (Bart, 2026-11-09); reopen if one appears.
 - [x] **P2 — metamethods.** The shared callable driver; every metamethod
   site in §3, fused reads and stores included, runs as a continuation frame;
   `__call` chains stay bounded (§6).
@@ -849,6 +849,16 @@ Three first cuts were worse and are why the design looks as it does:
 - Sharing `callTail(.call)` with `opCall` made LLVM stop inlining
   `opCallFast` into it, which cost 8 instructions per Lua call
   (recursive-fib tier-0 +0.6%).
+
+### Sort overhead levers tried (2026-11-09)
+
+Payload-only state stores after a sort activation's first step: `sort_cmp
+20000` 2.698 G → 2.676 G instructions (-0.8%), against 2.349 G before the
+activation (+13.9%, still over §10's 10%). Rebuilding the words without the
+intermediate array changed nothing. Skipping the dispatch prologue into the
+activation's `native_act` would save ~10 instructions per comparison and has
+to keep `safepoint_seq` advancing, so it was left. The rest is the cost of an
+ordinary return plus a step per call, which is the design.
 
 ### P4 benchmark: `tostring` through a Lua `__tostring` (2026-11-09)
 
