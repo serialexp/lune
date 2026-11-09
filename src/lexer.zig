@@ -584,6 +584,7 @@ pub fn contextAt(gpa: std.mem.Allocator, source: [:0]const u8, offset: u32) std.
     var seen: usize = 0;
     while (true) {
         // `next` records the comments before its token first.
+        const before = lx.index;
         const t = lx.next();
         if (trivia.incomplete) return error.OutOfMemory;
         for (trivia.comments.items[seen..]) |c| {
@@ -592,10 +593,16 @@ pub fn contextAt(gpa: std.mem.Allocator, source: [:0]const u8, offset: u32) std.
         }
         seen = trivia.comments.items.len;
         if (t.tag == .eof or t.start >= offset) return .code;
+        // A template's text chunk is a string up to its end, which is the hole
+        // opener or the closing backtick (doc 82 §6.3): right after either is
+        // code or the end of it. An unterminated chunk is `.invalid` from its
+        // opening backtick or hole-closing brace. An unterminated hole is
+        // `.invalid` too, but reaches back to its template's backtick, before
+        // where this token's scan began: that is code, being typed.
         const quoted = switch (t.tag) {
-            .string_literal => offset < t.end,
-            .invalid => switch (source[t.start]) {
-                '"', '\'', '[' => offset <= t.end,
+            .string_literal, .interp_simple, .interp_begin, .interp_mid, .interp_end => offset < t.end,
+            .invalid => if (t.start < before) false else switch (source[t.start]) {
+                '"', '\'', '[', '`', '}' => offset <= t.end,
                 else => false,
             },
             else => false,
@@ -659,6 +666,27 @@ test "contextAt: code, strings and comments" {
     try testing.expectEqual(Context.comment, try contextOf("--[==[ a ]] b| ]==] x"));
     try testing.expectEqual(Context.comment, try contextOf("--[[ unterminated|"));
     try testing.expectEqual(Context.code, try contextOf("x = a - |b"));
+}
+
+test "[REQ-113.1] contextAt: a template's text is a string and its holes are code" {
+    try testing.expectEqual(Context.string, try contextOf("x = `ab|c`"));
+    try testing.expectEqual(Context.string, try contextOf("x = `ab|c{y}d`"));
+    try testing.expectEqual(Context.string, try contextOf("x = `a{y}b|c`"));
+    try testing.expectEqual(Context.string, try contextOf("x = `a{y}b|c{z}d`"));
+    try testing.expectEqual(Context.code, try contextOf("x = `a{y|}b`"));
+    try testing.expectEqual(Context.code, try contextOf("x = `a{|y}b`"));
+    try testing.expectEqual(Context.code, try contextOf("x = `abc`|"));
+    // Typing: nothing closed yet.
+    try testing.expectEqual(Context.string, try contextOf("x = `abc|"));
+    try testing.expectEqual(Context.string, try contextOf("x = `a{y}bc|"));
+    try testing.expectEqual(Context.code, try contextOf("x = `a{fo|"));
+    try testing.expectEqual(Context.code, try contextOf("x = `a{y}b{fo|"));
+    try testing.expectEqual(Context.code, try contextOf("x = `a{`b{fo|"));
+    try testing.expectEqual(Context.string, try contextOf("x = `a{`bc|"));
+    // A nested template inside a hole, and code after the template.
+    try testing.expectEqual(Context.string, try contextOf("x = `a{`in|ner`}b`"));
+    try testing.expectEqual(Context.code, try contextOf("x = `a{f(|)}b`"));
+    try testing.expectEqual(Context.code, try contextOf("x = `abc` .. fo|"));
 }
 
 /// Lex `source` and assert the produced tags (excluding the trailing eof).

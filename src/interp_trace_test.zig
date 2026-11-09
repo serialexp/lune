@@ -3329,23 +3329,110 @@ test "recorder: a set_upval in the loop body aborts cleanly" {
     try testing.expect(!vm.trace.isRecording());
 }
 
-test "recorder: a set_global in the loop body aborts cleanly" {
+/// The ops of `t`'s recorded IR that doc 81 §7's global stores add.
+const GlobalStoreShape = struct { hload: usize = 0, hstore: usize = 0, globals_seeds: usize = 0, global_seeds: usize = 0 };
+
+fn globalStoreShape(t: anytype) GlobalStoreShape {
+    var s: GlobalStoreShape = .{};
+    for (t.code.instrs) |ins| {
+        if (ins.op == .hload) s.hload += 1;
+        if (ins.op == .hstore) s.hstore += 1;
+    }
+    for (t.code.inputs) |seed| {
+        if (seed.kind == .globals) s.globals_seeds += 1;
+        if (seed.kind == .global) s.global_seeds += 1;
+    }
+    return s;
+}
+
+test "recorder (doc 81 §7): a write-only set_global records an hstore on the FIRST attempt" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // The global counterpart: a `set_global` writes the snapshotted cell, so the
-    // recorder aborts rather than recording a stale-input trace.
+    // `last = j` never reads `last` in the loop, so no snapshot names it and
+    // the store records straight away, rooted on one `.globals` seed.
+    var chunk = try runForTrace(&vm, gpa,
+        \\last = 0
+        \\local s = 0
+        \\for j = 1, 80 do last = j; s = s + j end
+        \\print(s, last)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expectEqual(@as(u32, 0), vm.trace.record_gate.count());
+    try testing.expectEqual(@as(u32, 0), vm.trace.global_mutable_memo.count());
+    const s = globalStoreShape(vm.trace.registry.cache.items[0]);
+    try testing.expectEqual(@as(usize, 1), s.hstore);
+    try testing.expectEqual(@as(usize, 0), s.hload);
+    try testing.expectEqual(@as(usize, 1), s.globals_seeds);
+    try testing.expectEqual(@as(usize, 0), s.global_seeds);
+}
+
+test "recorder (doc 81 §7): an RMW (g = g + j) aborts once with the memo, then the retry records hload+hstore" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // First attempt: the read of `g` is a snapshot, so the store to `g`
+    // aborts `.global_mutable` and memos the anchor. 400 iterations outlast
+    // the record gate's first window, and the retry loads `g` per iteration.
     var chunk = try runForTrace(&vm, gpa,
         \\g = 0
         \\local s = 0
-        \\for j = 1, 80 do g = g + j; s = s + j end
+        \\for j = 1, 400 do g = g + j; s = s + j end
+        \\print(s, g)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expect(vm.trace.record_gate.count() >= 1);
+    try testing.expectEqual(@as(u32, 1), vm.trace.global_mutable_memo.count());
+    const s = globalStoreShape(vm.trace.registry.cache.items[0]);
+    try testing.expectEqual(@as(usize, 1), s.hload);
+    try testing.expectEqual(@as(usize, 1), s.hstore);
+    try testing.expectEqual(@as(usize, 1), s.globals_seeds);
+    try testing.expectEqual(@as(usize, 0), s.global_seeds);
+}
+
+test "recorder (doc 81 §7): a store to one global keeps the snapshot of another" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `step` is read and never stored, `pos` is stored and never read before
+    // the store: `step` stays a per-entry snapshot, and no memo is needed.
+    var chunk = try runForTrace(&vm, gpa,
+        \\step = 3
+        \\pos = 0
+        \\local p = 0
+        \\for j = 1, 80 do p = p + step; pos = p end
+        \\print(pos)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    try testing.expectEqual(@as(u32, 0), vm.trace.global_mutable_memo.count());
+    const s = globalStoreShape(vm.trace.registry.cache.items[0]);
+    try testing.expectEqual(@as(usize, 1), s.global_seeds);
+    try testing.expectEqual(@as(usize, 1), s.hstore);
+    try testing.expectEqual(@as(usize, 0), s.hload);
+}
+
+test "recorder (doc 81 §7): a set_global of a function value still aborts" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The hash store records scalars and booleans only.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function a() end
+        \\cb = a
+        \\local s = 0
+        \\for j = 1, 80 do cb = a; s = s + j end
         \\print(s)
     , true);
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
-    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
-    try testing.expect(!vm.trace.isRecording());
+    try testing.expect(vm.trace.record_gate.count() >= 1);
 }
 
 test "recorder S1: inlined callee slots are seeded — no callee-index slot_load" {

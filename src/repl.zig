@@ -443,7 +443,7 @@ pub const Session = struct {
         const end = std.mem.trimEnd(u8, src, " \t\r\n").len;
         for (diags.list.items) |d| {
             if (d.severity != .@"error") continue;
-            if (d.start >= end or d.code == .unterminated_long_string or d.code == .unterminated_block_comment)
+            if (d.start >= end or d.code == .unterminated_long_string or d.code == .unterminated_block_comment or d.code == .unterminated_template)
                 return .incomplete;
         }
         if (report) {
@@ -931,6 +931,27 @@ test "[REQ-33.1] [REQ-33.2] session: a chunk that ends early waits for more line
     try testing.expect(try r.feed("x = (1 +") == .more);
     r.session.abandon();
     try testing.expect(!r.session.continuing());
+}
+
+test "[REQ-112.1] [REQ-112.2] [REQ-112.3] session: an unfinished template waits for more lines" {
+    const r = try Rig.init(testing.allocator);
+    defer r.deinit(testing.allocator);
+    // In the text, in a hole, in a nested template, after a backslash.
+    try testing.expect(try r.feed("s = `a") == .more);
+    try testing.expect(try r.feed("b`") == .done);
+    try testing.expect(try r.feed("t = `x{1 +") == .more);
+    try testing.expect(try r.feed("2}y`") == .done);
+    try testing.expect(try r.feed("u = `a{`b{1}") == .more);
+    try testing.expect(try r.feed("`}c`") == .done);
+    try testing.expect(try r.feed("w = `a\\") == .more);
+    try testing.expect(try r.feed("b`") == .done);
+    try testing.expect(try r.feed("s, t, u, #w") == .done);
+    try testing.expectEqualStrings("a\nb\tx3y\tab1\nc\t3\n", r.out.written());
+    try testing.expectEqualStrings("", r.err.written());
+    // A malformed one is reported at once.
+    try testing.expect(try r.feed("v = `a{}b`") == .done);
+    try testing.expect(!r.session.continuing());
+    try testing.expect(std.mem.startsWith(u8, r.err.written(), "stdin:1: "));
 }
 
 test "[REQ-34.1] session: a syntax error is reported once and the line is dropped" {

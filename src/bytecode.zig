@@ -402,6 +402,17 @@ pub const OpCode = enum(u8) {
     ///             protos hold it (`native_act.zig`); the compiler never
     ///             emits it. Goes on to the activation's `call` or its `ret`.
     native_act,
+
+    // ---- string interpolation (doc 82 §5) ----
+    /// `a`         R[a] = the string form of R[a], in place: a string is itself,
+    ///             a `__tostring` result is checked to be a string, anything
+    ///             else prints as `tostring` would. A `__tostring` Lua handler
+    ///             runs as a continuation frame (`finishOp`).
+    tostr,
+    /// `a, b, c`   R[a] = the concatenation of the c strings R[b .. b+c). Every
+    ///             operand is already a string (`tostr`), so it cannot fault but
+    ///             on the length limit.
+    interp,
 };
 
 /// The most values one `set_list` stores from fixed registers (a longer
@@ -1309,7 +1320,7 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
     switch (instr.op) {
         .halt => {},
         .jmp => try w.print(" {d:>4}", .{instr.aux}),
-        .load_nil, .close_upvalues, .close, .vararg_first, .vararg_len, .vararg_spread => try w.print(" r{d}", .{instr.a}),
+        .load_nil, .close_upvalues, .close, .vararg_first, .vararg_len, .vararg_spread, .tostr => try w.print(" r{d}", .{instr.a}),
         .new_table => try w.print(" r{d}  {d}", .{ instr.a, instr.c }),
         .set_list => if (instr.b == all_results)
             try w.print(" r{d}  *  r{d}  {d}", .{ instr.a, instr.c, instr.aux })

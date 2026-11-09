@@ -267,6 +267,22 @@ test "completion: nothing in strings, comments, declarations or after a member d
     try testing.expect((try completeAt(a, "x = a ..|")).len > 0);
 }
 
+test "[REQ-113.1] completion: code in a template's holes, none in its text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // In a hole, closed or being typed, at any depth.
+    try testing.expect(find(try completeAt(a, "local x = 1\nlocal s = `a{x + fo|}b`"), "x") != null);
+    try testing.expect(find(try completeAt(a, "local x = 1\nlocal s = `a{fo|"), "x") != null);
+    try testing.expect(find(try completeAt(a, "local x = 1\nlocal s = `a{y}b{fo|"), "x") != null);
+    try testing.expect(find(try completeAt(a, "local x = 1\nlocal s = `a{`b{fo|"), "x") != null);
+    // In the text, closed or being typed.
+    try testing.expectEqual(@as(usize, 0), (try completeAt(a, "local s = `ab|c`")).len);
+    try testing.expectEqual(@as(usize, 0), (try completeAt(a, "local s = `a{1}b|c`")).len);
+    try testing.expectEqual(@as(usize, 0), (try completeAt(a, "local s = `ab|")).len);
+    try testing.expectEqual(@as(usize, 0), (try completeAt(a, "local s = `a{1}b|")).len);
+}
+
 test "completion: a library's members after its dot, and nothing else there" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

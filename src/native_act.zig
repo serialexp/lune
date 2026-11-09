@@ -7,8 +7,14 @@
 //!     [1] call        C, n, 1  the call it asked for
 //!     [2] native_act  k        step again, with that call's result
 //!     [3] ret         C, r     its work is done
-//! (A native with nothing to do after its call, `dofile`, returns the call's
-//! results as they are: `call C, 0, all` and `ret C, all` at [2] and [3].)
+//! (A native with nothing to do after its call, `dofile`, calls with
+//! `call C, 0, all`, its second step is only `done`, and its `ret C, all` at
+//! [3] returns the call's results as they are.)
+//!
+//! None of these instructions is a step of the program: `Vm.opNativeAct`
+//! takes the dispatch's `safepoint_seq` count back and `dispatchPostGc` does
+//! not index them, and `done` jumps to `[3]` without a dispatch, so the
+//! step index and the replay's step numbers are the program's own.
 //!
 //! so the call is an ordinary Lua call of an ordinary frame: a coroutine
 //! can yield inside it, a keyframe captures it, a step debugger stops in
@@ -74,8 +80,8 @@ const Layout = struct {
     /// The values the activation returns, from `callReg`.
     results: u8,
     /// The call's results are the activation's own, however many: the call
-    /// wants them all and what follows it is a `ret` of them all, with no
-    /// step between. Such a native has nothing to do after its call.
+    /// wants them all and what follows it is a `ret` of them all. Such a
+    /// native has nothing to do after its call: its second step is `done`.
     tail: bool = false,
     /// The activation returns however many values the step leaves (it ends
     /// them with `Vm.setActArgsEnd`), not `results`.
@@ -212,7 +218,7 @@ fn build(comptime kind: Kind) Proto {
     const code = [_]Instr{
         Instr.opAB(.native_act, 0, k),
         Instr.opABC(.call, c, nargs, if (l.tail) bytecode.all_results else l.call_results),
-        if (l.tail) ret_all else Instr.opAB(.native_act, 0, k),
+        Instr.opAB(.native_act, 0, k),
         if (l.tail or l.dynamic_results) ret_all else Instr.opAB(.ret, c, l.results),
     };
     std.debug.assert(code[call_pc].op == .call and code[ret_pc].op == .ret);

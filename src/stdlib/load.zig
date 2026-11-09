@@ -272,9 +272,13 @@ fn dofileCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
     return error.ActivateNative;
 }
 
-/// The one step of `dofile`'s activation: lay out the call of the loaded
-/// chunk, which the seed carried. What it returns is the activation's.
+/// `dofile`'s activation's first step lays out the call of the loaded
+/// chunk, which the seed carried; its second is done, as what the call
+/// returned is the activation's.
 pub fn dofileStep(vm: *Vm, regs: RegWindow) interp.Error!native_act.Next {
+    // The second step: the chunk's call has returned its results, which
+    // are the activation's own.
+    if (vm.act_seed == null) return .done;
     const seed = vm.takeActSeed();
     std.debug.assert(seed.kind == .dofile);
     regs.set(native_act.callReg(.dofile), seed.values[0]);

@@ -100,6 +100,7 @@ const NodeCollector = struct {
         switch (e.data) {
             .nil, .bool, .int, .float, .string_raw, .name, .vararg, .intrinsic, .err => {},
             .paren => |inner| try self.expr(inner),
+            .string_interp => |si| try self.exprs(si.holes),
             .unary => |u| try self.expr(u.operand),
             .binary => |b| {
                 try self.expr(b.lhs);

@@ -112,16 +112,14 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       the file `__close` are no longer globals, and the file methods table
       (`@file`) is `Vm.file_methods`.
 
-## Viz "steps inside nested calls skipped" note is now wrong (noted 2026-11-09)
+## Multret-feeding steps are not stops (noted 2026-11-09)
 
-`store.ts` `countUnstoppable` counts every step with `safepointStoppable == 0`.
-After doc 68 P3 those are an activation proto's own steps (in no chunk: 16 in
-a sort/gsub/tostring/print program) and multret-feeding steps on user protos
-(`print(f())`, `reg_top_pending`, 4 in the same program), not nested code. The
-`ReplayPanel.tsx` note therefore shows with a misleading text for any program
-using those natives. Options: stop counting chunk-less steps and reword the
-note for the multret case, or keep the steps out of the index. The latter
-changes replay step numbering (native side), so it wants a decision.
+After doc 68 P4 an activation's instructions take no step number, so the
+only unstoppable steps left in a plain program are the ones that feed a
+multi-value call (`print(f())`: `reg_top_pending`, `Vm.canSuspendHere`), plus
+code a host function re-enters (`pcall(table.sort, ...)`). The viz note now
+says so (`ReplayPanel.tsx`). Making the multret steps stoppable needs a
+keyframe to carry the pending `reg_top` window: a separate piece of work.
 
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
@@ -859,6 +857,18 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       entry's cost goes (the dispatcher, the entry snapshot, the
       `NativeResult` setup; see the memcpy below) and cut it until a
       one-line body breaks even. Then count `pcall` bodies again.
+      Bart chose this as the next step (2026-11-09), after recording
+      `set_global` made `bench/globals_script.lua` +18.2% instructions on
+      the JIT (doc 81 §7.1): `rand` (two lines) now has a head trace,
+      entered 631k times at ~270 cycles per call. On 2dade3b a pure
+      `local function f(n) local x = (n * 16807) % 2147483647 return x %
+      7 end`, called 600k times from a loop that can't trace (`if a ~= b`
+      on two tables), runs 931M instructions with `--trace --jit-native`
+      against 531M on tier 0. Instruction samples:
+      `enterHeadNativeQuiet`, `ordinaryProbeNeeded`, `noteResume`,
+      `headEpisodeQuiet` and `opJFuncHead`, then the exit stub, because
+      the trace leaves at the `ret` and tier 0 runs it. The trace is 3.4 KB
+      of x86-64 for four bytecodes.
 - [ ] **(C) Record through `pcall`.** LuaJIT's `recff_pcall` records the
       call as a frame tag on the trace, so a hot loop that calls `pcall`
       stays one trace. Mahina's recorder aborts at the native today.
@@ -3583,12 +3593,12 @@ nothing at all.
       body's `emitGStore`; add a parity test once the recorder allows it.
 - [ ] **`set_upval` on an OPEN upvalue is NYI in the recorder**
       (`recSetUpval` aborts `nyi_opcode` when `cell.isOpen()`; closed
-      cells record as `ustore`). The same goes for `set_global`. Both
-      stop whole loops from tracing (`u = u + i` in a nested function
-      whose parent is still running; `G = G + i`). It blocks some
-      exit-side recordings too. `bench/globals_script.lua` (2026-11-09)
-      is the script-shaped case: `set_global` aborts in five of its
-      functions, and it runs 15.5% native.
+      cells record as `ustore`). It stops whole loops from tracing
+      (`u = u + i` in a nested function whose parent is still running),
+      and it blocks some exit-side recordings too. `set_global` had the
+      same gap until 2026-11-09 (now a hash store into the globals table,
+      doc 81 §7.1); its per-name aliasing rule (`global_mutable`, then
+      reads as `hload`) is a model for the open-cell case.
 - [ ] **`set_global` costs twice a read at tier 0** (doc 81 §7: 114
       instructions against `gget`'s 54; LuaJIT `-joff` 38). `opSetGlobal`
       has no inline hinted fast path: it checks `readonly`, calls

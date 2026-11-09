@@ -1,7 +1,8 @@
 # 81 — `load` honours its env: chunk environments — Design
 
 Status: draft, not yet implemented. Strictness, opt-out and the access
-model decided (§6); Phase 0 measured (§7); E2's design still to write
+model decided (§6); Phase 0 measured (§7); `set_global` records (§7.1);
+E2's design still to write
 Owner: Bart
 Last updated: 2026-11-09
 
@@ -27,15 +28,16 @@ land; move whole phases to Done once everything inside them is checked.
   file keeps implicit globals; a `.mah` file is strict, and may write
   `global *` to opt out. Bart: "decide by extension, but allow specifying
   global * in mah files".
+- [x] **`set_global` recorded by the JIT** (§7.1): landed 2026-11-09, first
+  by Bart's order. It records as a hash store into the globals table. Its
+  recorded store changes shape under E2 (a cell store); the aliasing
+  machinery around it carries over. It exposes TODO.md's head-trace entry
+  cost (B) on `globals_script` (§7.1), which Bart chose to fix next.
 
 ### Outstanding
 
 - [ ] **E2's design** (§6.2): the cell layout, how a table environment
   keeps stable cells, and what a `.lua` chunk's implicit globals bind to.
-- [ ] **`set_global` recorded by the JIT** (§7): first, by Bart's order
-  (2026-11-09). Its recorded store changes shape under E2 (a cell store);
-  the recording machinery around it carries over.
-
 - [ ] **Q1 — the environment model** (§3): (A) Lua 5.4 lexical `_ENV`
   everywhere, (B) a per-closure environment, inherited at closure creation,
   or (C) B for implicit globals, plus A only in chunks that name `_ENV`.
@@ -185,7 +187,7 @@ rest is the dispatch every op pays. A cell would replace the lookup with
 about three dependent loads, so E2 could save roughly 20 of the ~50, at
 tier 0 only. (B) adds about one load.
 
-**Stores don't trace.** `set_global` is NYI in the recorder (`nyi_opcode`,
+**Stores don't trace** (since fixed, §7.1). `set_global` is NYI in the recorder (`nyi_opcode`,
 TODO.md "`set_upval` on an OPEN upvalue"), so `g1 = i` in a loop runs at
 tier 0 under the JIT, and the `--trace` run costs 18% more than tier 0
 alone (4007M against 3400M). This is independent of Q3.
@@ -223,6 +225,38 @@ A store costs twice a read: `opSetGlobal` checks `readonly`, calls
 `Table.setHinted` out of line (which normalizes the key), then runs the
 write barrier. A call's cost is the call's: `call1` from a local is 361
 too.
+
+### 7.1 Recording `set_global` (landed 2026-11-09)
+
+A recorded `set_global k` is a hash store into the globals table, the
+shape `set_field` records on any table: `href`, a hash guard and `hstore`.
+The trace roots it on a `.globals` input seed, `vm.globals` itself,
+reseeded at every entry. Reads stay what they were, an entry snapshot of
+the value (`recInputGet(.global)`), unless one of two things holds:
+
+- **The trace already stored to that name.** The read becomes an `hload`
+  through the globals table, so it sees the store (`global_store_keys`).
+- **The trace stores to a name it snapshotted.** The recording aborts
+  `global_mutable`, and the anchor is memoized, as doc 43 P5 does for
+  `upvalue_mutable`. The retry records every scalar global read as an
+  `hload` (`route_global_reads`), so the store and its later reads agree.
+
+The check is per name (`global_seed_keys`), so a trace that reads `step`
+and stores `pos` keeps `step` as a snapshot. Stores through a `_G` handle
+keep doc 43 P0b's coarse rule. Function values stored to a global still
+abort. The recorder tests are in `interp_trace_test.zig`, and the
+tier-equivalence corpus g01–g10 is in `trace_p0_alias_test.zig`.
+
+**What it moved.** The board is unchanged beyond 0.3%, except
+`globals_script` on the JIT: 3.53 G → 4.18 G instructions (+18.2%). Tier 0
+is 6.28 G either way. `rand`, `move` and `bounce` used to abort on their
+store and now trace as head traces (doc 44), entered from tier 0 at every
+call: `rand` 631k times at ~270 cycles per call, because the loop in
+`collide` that calls it still aborts (`jeq` on two tables). The cost is
+the entry, not the store. On HEAD before this change, a two-line pure
+function called from a loop that can't trace runs 931M instructions on the
+JIT against 531M on tier 0. That is TODO.md's head-trace entry cost (B).
+Bart chose to land this and fix (B) next.
 
 ## References
 

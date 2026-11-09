@@ -696,6 +696,7 @@ const Walker = struct {
             .err => try self.res.damaged.append(self.gpa, e.span),
             .name => |n| try self.use(n, e.span, .read),
             .paren => |inner| try self.expr(inner),
+            .string_interp => |si| try self.exprList(si.holes),
             .unary => |u| try self.expr(u.operand),
             .binary => |b| {
                 try self.expr(b.lhs);

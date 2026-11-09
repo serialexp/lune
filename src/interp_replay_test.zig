@@ -279,19 +279,18 @@ const nested_reentry_programs = [_][:0]const u8{
     \\print(pcall(function() error("boom") end))
     \\print(xpcall(function() return nil + 1 end, function(e) return "handled" end))
     ,
-    // table.sort comparator.
+    // table.sort comparator, under `pcall(table.sort, …)`: a native called
+    // from Zig (`callValue`) finishes there, so its comparator is a re-entry.
     \\local t = {5, 3, 9, 1, 7}
-    \\table.sort(t, function(a, b) return a > b end)
+    \\pcall(table.sort, t, function(a, b) return a > b end)
     \\print(table.concat(t, ","))
     ,
-    // gsub with a function replacement.
-    \\print((string.gsub("a1b22c333", "%d+", function(d) return "<" .. #d .. ">" end)))
+    // gsub with a function replacement, the same way.
+    \\print(pcall(string.gsub, "a1b22c333", "%d+", function(d) return "<" .. #d .. ">" end))
     ,
-    // A native metamethod's own callback: `tostring` as `__index` calls
-    // `__tostring`.
+    // `tostring` called from Zig calls `__tostring` through a re-entry.
     \\local o = setmetatable({}, {__tostring = function() return "T" end})
-    \\local w = setmetatable({}, {__index = function(t, k) return tostring(o) .. k end})
-    \\print(w.k)
+    \\print(pcall(tostring, o))
     ,
 };
 
@@ -623,28 +622,47 @@ const p4_all_sites: [:0]const u8 =
     \\print(tostring(o), o)
 ;
 
-test "doc 68 P4: with every native converted, only an activation's own steps are not stops" {
+test "doc 68 P4: with every native converted, the index holds only the program's steps, every one a stop" {
     const gpa = testing.allocator;
     const native_act = @import("native_act.zig");
     const index = try recordSafepointIndexWith(gpa, p4_all_sites, &installP4Fs);
     defer gpa.free(index);
-    var per_kind: [@typeInfo(native_act.Kind).@"enum".field_names.len]usize = @splat(0);
     for (index) |sp| {
-        if (native_act.kindOfId(sp.proto_id)) |kind| {
-            try testing.expect(!sp.stoppable);
-            per_kind[@intFromEnum(kind)] += 1;
-        } else if (!sp.stoppable) {
-            std.debug.print("unstoppable step outside an activation: proto {d} line {d}\n", .{ sp.proto_id, sp.line });
+        if (native_act.kindOfId(sp.proto_id) != null) {
+            std.debug.print("activation step in the index: proto {d} line {d}\n", .{ sp.proto_id, sp.line });
+            return error.TestUnexpectedResult;
+        }
+        if (!sp.stoppable) {
+            std.debug.print("unstoppable step: proto {d} line {d}\n", .{ sp.proto_id, sp.line });
             return error.TestUnexpectedResult;
         }
     }
-    // Every kind the program reaches has activation steps in the index.
-    for ([_]native_act.Kind{ .sort, .gsub, .dofile, .require, .tostring, .print }) |kind| {
-        try testing.expect(per_kind[@intFromEnum(kind)] > 0);
-    }
 }
 
-test "doc 68 §7.4: a gsub replacement is stoppable, its activation is not" {
+test "doc 68 P4: an activation's instructions take no step number: the index and safepoint_seq agree" {
+    const gpa = testing.allocator;
+    const index = try recordSafepointIndexWith(gpa, p4_all_sites, &installP4Fs);
+    defer gpa.free(index);
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, p4_all_sites, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, p4_all_sites, tree.root, &diags);
+    defer chunk.deinit();
+    try installP4Fs(&vm, chunk.proto);
+    _ = try vm.run(chunk.proto);
+    // The whole run counted exactly the steps the index lists.
+    try testing.expectEqual(@as(u64, index.len), vm.safepoint_seq);
+}
+
+test "doc 68 §7.4: a gsub replacement is stoppable, and its activation has no steps" {
     const gpa = testing.allocator;
     const native_act = @import("native_act.zig");
     const source: [:0]const u8 =
@@ -656,22 +674,18 @@ test "doc 68 §7.4: a gsub replacement is stoppable, its activation is not" {
     ;
     const index = try recordSafepointIndex(gpa, source);
     defer gpa.free(index);
-    var in_act: usize = 0;
     var in_fn: usize = 0;
     for (index) |sp| {
-        if (native_act.kindOfId(sp.proto_id) != null) {
-            try testing.expect(!sp.stoppable);
-            in_act += 1;
-        } else if (sp.line == 2 or sp.line == 3) {
+        try testing.expect(native_act.kindOfId(sp.proto_id) == null);
+        if (sp.line == 2 or sp.line == 3) {
             try testing.expect(sp.stoppable);
             in_fn += 1;
         }
     }
-    try testing.expect(in_act > 0);
     try testing.expect(in_fn > 0);
 }
 
-test "doc 68 §5.1: a table.sort comparator is stoppable, its activation is not" {
+test "doc 68 §5.1: a table.sort comparator is stoppable, and its activation has no steps" {
     const gpa = testing.allocator;
     const native_act = @import("native_act.zig");
     const source: [:0]const u8 =
@@ -684,20 +698,16 @@ test "doc 68 §5.1: a table.sort comparator is stoppable, its activation is not"
     ;
     const index = try recordSafepointIndex(gpa, source);
     defer gpa.free(index);
-    // The activation is the native running: no step stops in it. Every step
-    // in the comparator (lines 3-4) does.
-    var in_act: usize = 0;
+    // The activation is the native running: it is no step of the program.
+    // Every step in the comparator (lines 3-4) is a stop.
     var in_cmp: usize = 0;
     for (index) |sp| {
-        if (native_act.kindOfId(sp.proto_id) != null) {
-            try testing.expect(!sp.stoppable);
-            in_act += 1;
-        } else if (sp.line == 3 or sp.line == 4) {
+        try testing.expect(native_act.kindOfId(sp.proto_id) == null);
+        if (sp.line == 3 or sp.line == 4) {
             try testing.expect(sp.stoppable);
             in_cmp += 1;
         }
     }
-    try testing.expect(in_act > 0);
     try testing.expect(in_cmp > 0);
 }
 

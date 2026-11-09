@@ -264,6 +264,17 @@ test "navigation: a local's definition and references follow shadowing" {
     try testing.expectEqual(@as(usize, 1), without.len);
 }
 
+test "[REQ-113.3] navigation: a name in a template's hole resolves like any other use" {
+    var f = try Fixture.init("local x = 1\nprint(`v={x} {x + 1}`)");
+    defer f.deinit();
+    try testing.expectEqual(f.at("x = 1", 0), definition(&f.an, f.occ("x}", 0)).?.start);
+    try testing.expectEqual(f.at("x = 1", 0), definition(&f.an, f.occ("x + 1", 0)).?.start);
+    const refs = try references(testing.allocator, &f.an, f.occ("x}", 0).binding, true);
+    defer testing.allocator.free(refs);
+    try testing.expectEqual(@as(usize, 3), refs.len);
+    try testing.expectEqual(Check.ok, try f.check("x = 1", 0, "y"));
+}
+
 test "navigation: a global is defined where it is first assigned, a built-in nowhere" {
     var f = try Fixture.init("print(g)\ng = 1\nprint(g)");
     defer f.deinit();

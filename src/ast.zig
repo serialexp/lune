@@ -140,6 +140,10 @@ pub const Expr = struct {
         /// Raw string lexeme *including* quotes; escape decoding is deferred to
         /// Phase 3 (when string objects are built). Stored as a source slice.
         string_raw: []const u8,
+        /// A backtick template (doc 82): `chunks.len == holes.len + 1`. Each
+        /// chunk is the raw, still-escaped source text between holes (without
+        /// delimiters); each hole is a single-valued expression.
+        string_interp: struct { chunks: []const []const u8, holes: []const *Expr },
         /// Identifier reference.
         name: []const u8,
         /// `...`

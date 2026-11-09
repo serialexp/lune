@@ -611,7 +611,8 @@ heap values is deferred with its own bullet).
   (`InputSeed` is runtime-only today; a rebindable cell-source recipe is
   future keyframe work) — stated, not accidental.
 - **Still aborting, deliberately**: `set_upval` on an *open* cell (the
-  LuaJIT SSA-redirect case, deferred), `set_global` (unchanged), heap-valued
+  LuaJIT SSA-redirect case, deferred), `set_global` (unchanged here;
+  it records since 2026-11-09, doc 81 §7.1), heap-valued
   stores (deferred), `close_upvalues` and on-trace `.closure` (the euler14
   arc), stores where the recorder can't resolve the cell (MAY class).
 

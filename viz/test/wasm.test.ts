@@ -446,11 +446,9 @@ test("multi-file: the step index and coverage say which file each line is in", (
   const files = new Set(Array.from(result.safepointProtos, (id) => chunkOf(result, id)));
   expect(files.has(0)).toBe(true);
   expect(files.has(1)).toBe(true);
-  // A step in no chunk is an activation's own (doc 68: require, sort, ... run
-  // their Lua calls from a system proto), and a replay never stops there.
-  for (let k = 0; k < result.safepointProtos.length; k++) {
-    if (chunkOf(result, result.safepointProtos[k]) === -1) expect(result.safepointStoppable[k]).toBe(0);
-  }
+  // Every step is a step of a file: the activations require, sort, ...
+  // run their Lua calls from (doc 68) take no step number.
+  expect(files.has(-1)).toBe(false);
   // The module's loop line (4) is stepped through, as a line of the module.
   const modLines = Array.from(result.safepointLines).filter((_, k) => chunkOf(result, result.safepointProtos[k]) === 1);
   expect(modLines).toContain(4);
@@ -490,23 +488,20 @@ test("errors name the entry's chunk, and a replay given the run's argv names it 
 });
 
 // Doc 68 §7.3 (P3): the module's top level runs from require's activation, so
-// every step of the module is one a replay stops at. Only the activation's own
-// steps (a system proto, in no chunk) are not stops: a stop asked for there
-// lands on the next stoppable step.
-test("multi-file: the module's own steps inside require stop exactly; the activation's are deferred", () => {
+// every step of the module is one a replay stops at, and the activation itself
+// takes no step number: a stop in the module lands exactly, and nothing in the
+// index is unstoppable.
+test("multi-file: every step of require's run of the module is a stop, and replays to itself", () => {
   const run = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
-  const stoppable = Array.from(run.safepointStoppable);
-  expect(stoppable.some((f, i) => f === 0 && chunkOf(run, run.safepointProtos[i]) === 1)).toBe(false);
-  const k = stoppable.findIndex((f, i) => f === 0 && chunkOf(run, run.safepointProtos[i]) === -1);
-  expect(k).toBeGreaterThanOrEqual(0);
-  const next = stoppable.findIndex((f, i) => i > k && f === 1);
-  expect(next).toBeGreaterThan(k);
-  const step = mod.replay(MULTI_MAIN, run.effects, k + 1, ["main.mah"]);
-  expect(step.status).toBe(0);
-  expect(step.finished).toBe(false);
-  expect(step.stoppedAt).toBe(next + 1);
-  expect(chunkOf(run, step.protoId)).toBe(chunkOf(run, run.safepointProtos[next]));
-  expect(step.currentLine).toBe(run.safepointLines[next]);
+  expect(Array.from(run.safepointStoppable).every((f) => f === 1)).toBe(true);
+  const inModule = Array.from(run.safepointProtos).flatMap((id, i) => (chunkOf(run, id) === 1 ? [i] : []));
+  expect(inModule.length).toBeGreaterThan(0);
+  for (const k of inModule) {
+    const step = mod.replay(MULTI_MAIN, run.effects, k + 1, ["main.mah"]);
+    expect(step.stoppedAt).toBe(k + 1);
+    expect(chunkOf(run, step.protoId)).toBe(1);
+    expect(step.currentLine).toBe(run.safepointLines[k]);
+  }
 });
 
 // The other re-entry sites the VM owns: Run no longer traps on any of them, and
@@ -528,6 +523,9 @@ test("nested code (pcall, sort, gsub, metamethods): every stoppable step replays
   const run = mod.runSource(src);
   expect(run.status).toBe(0);
   expect(run.stdout).toBe("true\t42\nfalse\thandled\n9,5,3,1\na<1>b<2>\nhi\t42\nstr\nstr\n");
+  // The activations of sort, gsub, tostring and print take no step number;
+  // what is left unstoppable is the steps that feed a multi-value call.
+  for (const id of run.safepointProtos) expect(chunkOf(run, id)).toBeGreaterThanOrEqual(0);
   expect(run.safepointStoppable.includes(0)).toBe(true);
   for (let k = 1; k <= run.safepointCount; k++) {
     if (run.safepointStoppable[k - 1] !== 1) continue;

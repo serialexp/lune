@@ -1881,6 +1881,8 @@ pub const Vm = struct {
                 // was copied into the TRACE's const pool at record time (the
                 // hash_cell precedent), so resolution is proto-free.
                 .callee_global => self.seedGlobal(ct.consts[seed.source]),
+                // Doc 81 §7: the globals table a recorded `set_global` roots on.
+                .globals => Value.heap(&self.globals.header),
             };
             self.regSet(base + seed.slot, v);
         }
@@ -2025,6 +2027,8 @@ pub const Vm = struct {
                 // Doc 43 P4: same as seedTraceInputs's callee_global arm — the
                 // name lives in the trace const pool, resolution is proto-free.
                 .callee_global => self.seedGlobal(ct.consts[seed.source]),
+                // Doc 81 §7: same as seedTraceInputs's globals arm.
+                .globals => Value.heap(&self.globals.header),
             };
             self.regSet(ctx.base + seed.slot, v);
         }
@@ -5724,7 +5728,9 @@ pub const Vm = struct {
         // in `.fast`). A failed append parks-and-returns leaving
         // exactly the old partial state: `safepoint_seq` already
         // incremented, nothing after this step run (§4.2).
-        if (mode == .full and self.record_safepoint_lines) {
+        // An activation's instructions are not steps of the program
+        // (`opNativeAct` takes their count back), so they are not indexed.
+        if (mode == .full and self.record_safepoint_lines and native_act.kindOf(st.proto) == null) {
             const proto = st.proto;
             const sp_line: u32 = if (pc < proto.spans.len) proto.spans[pc].line else 0;
             const limit: usize = if (self.suspend_ctl) |sc| sc.index_limit else std.math.maxInt(usize);
@@ -8333,6 +8339,8 @@ pub const Vm = struct {
             .bnot => opBnot(mode),
             .len => opLen(mode),
             .concat => opConcat(mode),
+            .tostr => opTostr(mode),
+            .interp => opInterp(mode),
             .eq, .ne => opEqNe(mode, op),
             .eq_p, .ne_p => opEqP(mode, op),
             .eq_s, .ne_s => opEqS(mode, op),
@@ -8785,6 +8793,35 @@ pub const Vm = struct {
                     Error.TypeError => (self.binMeta(self.mm.concat, lhs, rhs, Error.TypeError) catch |e2| return parkErr(st, e2)) orelse return enterMetaFrame(mode, st, vm),
                     else => return parkErr(st, e),
                 });
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    // ---- string interpolation (doc 82 §5) ----
+
+    /// `tostr a`: `R[a]` becomes its string form, in place. A `__tostring`
+    /// Lua handler gets a continuation frame, finished by `finishOp`.
+    fn opTostr(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                const v = regs.get(instr.a);
+                if (!(v.isHeap() and v.heapType() == .string)) {
+                    const r = vm.tostrValue(v) catch |e| return parkErr(st, e);
+                    regs.set(instr.a, r orelse return enterMetaFrame(mode, st, vm));
+                }
+                return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
+            }
+        }.h;
+    }
+
+    /// `interp a, b, c`: `R[a] = R[b] .. … .. R[b+c-1]`, every operand a string.
+    fn opInterp(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
+                regs.set(instr.a, vm.interpJoin(regs, instr.b, instr.c) catch |e| return parkErr(st, e));
                 return dispatchTailFrom(mode, st, pc, instrNext(instr), vm, tags, payloads);
             }
         }.h;
@@ -10144,6 +10181,9 @@ pub const Vm = struct {
         return struct {
             fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
                 _ = pc;
+                // Not a step of the program: take back the count the
+                // dispatch just made (`dispatchPostGc` did not index it).
+                vm.safepoint_seq -= 1;
                 const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
                 const next = switch (@as(native_act.Kind, @enumFromInt(instr.b))) {
                     .sort => stdtable.sortStep(vm, regs),
@@ -10159,7 +10199,11 @@ pub const Vm = struct {
                         st.frame.pc = at;
                         return callTail(mode, .native_act, st, at + 1, &st.code[at], vm, tags, payloads);
                     },
-                    .done => return dispatchTailFrom(mode, st, native_act.ret_pc, &st.code[native_act.ret_pc], vm, tags, payloads),
+                    // Into the `ret` with no dispatch: it is no step either.
+                    .done => {
+                        st.frame.pc = native_act.ret_pc;
+                        return @call(.always_tail, opRet(mode), .{ st, native_act.ret_pc, &st.code[native_act.ret_pc], vm, tags, payloads });
+                    },
                 }
             }
         }.h;
@@ -11364,7 +11408,7 @@ pub const Vm = struct {
     /// caller against it.
     pub fn finishesOp(op: bytecode.OpCode) bool {
         return switch (op) {
-            .neg, .bnot, .len, .concat, .get_index, .get_field, .eq, .ne, .lt, .le, .gt, .ge => true,
+            .neg, .bnot, .len, .concat, .tostr, .get_index, .get_field, .eq, .ne, .lt, .le, .gt, .ge => true,
             .set_index, .set_field, .get_index2, .set_index2, .close, .ret_close => true,
             else => bytecode.arithFormOf(op) != null or bytecode.cmpBranchOf(op) != null,
         };
@@ -11376,6 +11420,7 @@ pub const Vm = struct {
         const next = p + 1;
         switch (ins.op) {
             .neg, .bnot, .len, .concat, .get_index, .get_field => regs.set(ins.a, result),
+            .tostr => regs.set(ins.a, vm.tostringAnswer(result) catch |e| return parkErr(st, e)),
             .eq, .lt, .le, .gt, .ge => regs.setBool(ins.a, result.isTruthy()),
             .ne => regs.setBool(ins.a, !result.isTruthy()),
             .set_index, .set_field => {},
@@ -11821,6 +11866,59 @@ pub const Vm = struct {
         defer sb.deinit(self.gpa);
         sb.append(pa.bytes, pa.cp_len, pa.ascii);
         sb.append(pb.bytes, pb.cp_len, pb.ascii);
+        const s = try self.heap.internBuilt(&sb);
+        return Value.heap(&s.header);
+    }
+
+    /// The string form of non-string `v` for `tostr` (doc 82 §4): its
+    /// `__tostring` answer, else the rendering `tostring` and `print` use.
+    /// Null when a Lua `__tostring` has been given a frame (`pushMetaFrame`),
+    /// whose return `finishOp` completes.
+    fn tostrValue(self: *Vm, v: Value) Error!?Value {
+        const handler = self.tostringHandler(v);
+        if (!handler.isNil()) {
+            const r = (try self.metaCall(handler, &.{v}, 0)) orelse return null;
+            return try self.tostringAnswer(r);
+        }
+        var buf: [128]u8 = undefined;
+        var w = io.Writer.fixed(&buf);
+        io.writeValue(&w, v) catch unreachable; // a scalar or "kind: 0x<id>" always fits
+        return try self.heap.internValue(w.buffered());
+    }
+
+    /// The concatenation of the `c` strings in `regs[b ..]` (`interp`), laid out
+    /// as `concat` does: short results on the stack, long ones in the string's
+    /// own allocation; the operands' character facts stand in for the scan.
+    fn interpJoin(self: *Vm, regs: RegWindow, b: u16, c: u16) Error!Value {
+        var len: usize = 0;
+        var cps: usize = 0;
+        var ascii = true;
+        var i: u16 = 0;
+        while (i < c) : (i += 1) {
+            const s = string.String.fromHeader(regs.get(b + i).asHeap());
+            len = std.math.add(usize, len, s.bytes().len) catch return Error.OutOfMemory;
+            cps += s.cpLen();
+            ascii = ascii and s.isAscii();
+        }
+        if (len <= concat_stack_max) {
+            var buf: [concat_stack_max]u8 = undefined;
+            var at: usize = 0;
+            i = 0;
+            while (i < c) : (i += 1) {
+                const bytes = string.String.fromHeader(regs.get(b + i).asHeap()).bytes();
+                @memcpy(buf[at..][0..bytes.len], bytes);
+                at += bytes.len;
+            }
+            const s = try self.heap.internKnown(buf[0..len], .{ .cp_len = cps, .ascii = ascii });
+            return Value.heap(&s.header);
+        }
+        var sb = try string.String.Builder.init(self.gpa, len);
+        defer sb.deinit(self.gpa);
+        i = 0;
+        while (i < c) : (i += 1) {
+            const s = string.String.fromHeader(regs.get(b + i).asHeap());
+            sb.append(s.bytes(), s.cpLen(), s.isAscii());
+        }
         const s = try self.heap.internBuilt(&sb);
         return Value.heap(&s.header);
     }
@@ -13566,4 +13664,5 @@ test {
     _ = @import("interp_exit_side_test.zig");
     _ = @import("interp_nest_test.zig");
     _ = @import("interp_bool_test.zig");
+    _ = @import("interp_template_test.zig");
 }

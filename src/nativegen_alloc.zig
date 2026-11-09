@@ -3008,7 +3008,7 @@ pub fn computeSeedPlan(
             // non-hash_cell family active preserves seed-order dependencies
             // (this seed reads `slots[callee_slot]`, which an earlier
             // upvalue/global seed may populate).
-            .upvalue, .global, .callee_upvalue, .callee_global, .upvalue_cell, .upvalue_slot_alias => plan.activate(i),
+            .upvalue, .global, .callee_upvalue, .callee_global, .upvalue_cell, .upvalue_slot_alias, .globals => plan.activate(i),
             .hash_cell => {
                 for (t.instrs) |ins| {
                     if (ins.op != .href) continue;

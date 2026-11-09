@@ -926,6 +926,36 @@ const Parser = struct {
         return try list.toOwnedSlice(self.arena);
     }
 
+    /// The text of a template token without its delimiters (`` ` `` `{` `}`).
+    fn templateChunk(lexeme: []const u8) []const u8 {
+        return lexeme[1 .. lexeme.len - 1];
+    }
+
+    /// `interp_begin hole (interp_mid hole)* interp_end` (doc 82 §3). A hole
+    /// is exactly one expression; an empty or unterminated one is an error.
+    fn parseTemplate(self: *Parser) Error!*Expr {
+        const first = self.current();
+        var chunks: std.ArrayList([]const u8) = .empty;
+        var holes: std.ArrayList(*Expr) = .empty;
+        var opener = first;
+        while (true) {
+            const t = self.advance();
+            try chunks.append(self.arena, templateChunk(t.lexeme(self.source)));
+            opener = t;
+            if (self.check(.interp_mid) or self.check(.interp_end)) return self.fail(.expected_expression);
+            try holes.append(self.arena, try self.parseExpr(0));
+            if (self.check(.interp_mid)) continue;
+            if (self.check(.interp_end)) break;
+            return self.failRelated(.expected_template_hole_end, .{ .start = opener.start, .end = opener.end, .label = "interpolation opened here" });
+        }
+        const end = self.advance();
+        try chunks.append(self.arena, templateChunk(end.lexeme(self.source)));
+        return self.newExpr(.{ .start = first.start, .end = end.end }, .{ .string_interp = .{
+            .chunks = try chunks.toOwnedSlice(self.arena),
+            .holes = try holes.toOwnedSlice(self.arena),
+        } });
+    }
+
     fn parsePrimary(self: *Parser) Error!*Expr {
         const t = self.current();
         switch (t.tag) {
@@ -949,6 +979,13 @@ const Parser = struct {
                 _ = self.advance();
                 return self.newExpr(.{ .start = t.start, .end = t.end }, .{ .string_raw = t.lexeme(self.source) });
             },
+            .interp_simple => {
+                _ = self.advance();
+                const chunks = try self.arena.alloc([]const u8, 1);
+                chunks[0] = templateChunk(t.lexeme(self.source));
+                return self.newExpr(.{ .start = t.start, .end = t.end }, .{ .string_interp = .{ .chunks = chunks, .holes = &.{} } });
+            },
+            .interp_begin => return self.parseTemplate(),
             .ellipsis => {
                 _ = self.advance();
                 return self.newExpr(.{ .start = t.start, .end = t.end }, .vararg);

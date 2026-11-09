@@ -191,10 +191,14 @@ land; move whole phases to Done once everything inside them is checked.
     hashgate modes.
   - [x] **`mahina_replay` / viz (wasm)** (2026-11-09). A step inside
     require's module run now stops exactly (the old "deferred" test is
-    flipped: only the activation's own chunk-less steps defer), and the
-    nested-code test covers tostring and print. Not met: the viz "steps inside
-    nested calls skipped" note still shows, because chunk-less activation steps
-    and multret-feeding steps count as unstoppable (TODO.md).
+    flipped), and the nested-code test covers tostring and print. An
+    activation's own instructions are not steps of the program: `opNativeAct`
+    takes the dispatch's `safepoint_seq` count back, `done` jumps into the
+    `ret` without a dispatch, and the index does not list them (`dofile`'s
+    second step is now a `native_act` that says `done`, so no activation
+    instruction is dispatched uncounted). The index and `safepoint_seq` agree
+    again, and the viz note is reworded for what is still unstoppable:
+    multret-feeding steps and host re-entries (TODO.md).
 
 ## 1. Why this exists
 

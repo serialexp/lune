@@ -69,6 +69,7 @@ pub const Code = enum(u16) {
     unknown_attribute = 138,
     global_close = 139,
     multiple_close = 140,
+    expected_template_hole_end = 141,
 
     // ---- compiler ----
     function_too_large = 201,
@@ -162,6 +163,7 @@ pub const Code = enum(u16) {
             .unknown_attribute => "unknown attribute (expected 'const' or 'close')",
             .global_close => "a global cannot be to-be-closed",
             .multiple_close => "more than one to-be-closed variable in one list",
+            .expected_template_hole_end => "expected '}' to close the interpolation",
 
             .function_too_large => "function too large (2^31 instruction limit)",
             .too_many_registers => "function needs too many registers",

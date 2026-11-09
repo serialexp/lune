@@ -151,6 +151,13 @@ pub const AbortReason = enum {
     /// records (the LuaJIT-flavoured penalty/retry answer to doc 43 §8's read-
     /// routing question — read-only loops keep their free snapshot hoist).
     upvalue_mutable,
+    /// Doc 81 §7, the global twin of `.upvalue_mutable`: a `set_global` named
+    /// a global this recording already baked into a per-entry snapshot (a
+    /// `.global`/`.callee_global` seed). The abort memoizes the anchor
+    /// (`TraceState.global_mutable_memo`); the retry arms with
+    /// `route_global_reads`, so scalar global reads load from the globals
+    /// table per iteration from the start, and the store then records.
+    global_mutable,
     /// Doc 44 D12b: a `.cont` (continuation-anchor) recording met a loop
     /// back-edge — at the tier-0 back-edge funnel (`onBackEdge`), or at the
     /// recorder's own link sites (`recForPrepLink` running-loop path,
@@ -1008,6 +1015,25 @@ pub const RecordingSession = struct {
     /// (they cannot be stored — v1 is scalar-only — and the callee-loading
     /// machinery depends on their `slot_load` shape).
     route_upvalue_reads: bool = false,
+    /// Doc 81 §7: the names (interned strings) whose global value this
+    /// recording baked into a per-entry snapshot. A later `set_global` to one
+    /// aborts `.global_mutable`. A store to any other name leaves every
+    /// snapshot good: it overwrites a present cell in place (`hstore`), which
+    /// moves no other cell.
+    global_seed_keys: std.AutoHashMapUnmanaged(ObjIdentity, void) = .empty,
+    /// Doc 81 §7: the names a recorded `set_global` stored to. A later read
+    /// of one loads from the globals table (`recGlobalLoad`), so it sees the
+    /// stored value.
+    global_store_keys: std.AutoHashMapUnmanaged(ObjIdentity, void) = .empty,
+    /// The `.globals` seed's `slot_load`, once a `set_global` or a routed read
+    /// needed the globals table on trace.
+    globals_ref: ?Ref = null,
+    /// Doc 81 §7 read routing: set at arm time from the anchor's
+    /// `global_mutable_memo`. When true, SCALAR-observed global reads load
+    /// from the globals table per iteration instead of a per-entry snapshot,
+    /// so a later `set_global` to the same name can record. Function- and
+    /// table-valued reads stay snapshots (a `set_global` stores scalars only).
+    route_global_reads: bool = false,
     /// Doc 45 D2 deterministic re-recording: set at arm time from the
     /// anchor's `precise_anchor_memo`. When false, the first bytecode that
     /// needs per-instruction deopt precision (`new_table` today) cancels the
@@ -1865,8 +1891,10 @@ pub const RecordingSession = struct {
             // `set_upval` records since doc 43 P5 (closed cells, scalar values)
             // — see `recSetUpval`; the snapshot-staleness concern is enforced by
             // `snapshot_read_cells` + the `.upvalue_mutable` memo/retry.
-            .get_upval => try self.recInputGet(.upvalue, instr.a, instr.b, resolved, proto),
-            .get_global => try self.recInputGet(.global, instr.a, instr.b, resolved, proto),
+            .get_upval => try self.recInputGet(.upvalue, instr.a, instr.b, resolved, proto, regs),
+            .get_global => try self.recInputGet(.global, instr.a, instr.b, resolved, proto, regs),
+            // Doc 81 §7: a store into the globals table (`recSetGlobal`).
+            .set_global => try self.recSetGlobal(instr, regs, proto),
             // Doc 43 P5: a write through a CLOSED upvalue cell records as
             // `uref`/`ustore` (scalar values only in v1); everything else —
             // open cells, heap values, snapshot-staled reads — aborts, and the
@@ -2487,24 +2515,43 @@ pub const RecordingSession = struct {
         };
     }
 
-    /// Slot frame for the read shapes: `dst` receives the loaded value.
+    /// A table operand no register holds: the globals table, which a
+    /// `get_global`/`set_global` names implicitly (doc 81 §7). `ref` is its
+    /// `.globals` seed.
+    pub const TabIn = struct { ref: Ref, value: Value };
+
+    /// Slot frame for the read shapes: `dst` receives the loaded value. The
+    /// table is register `tab` unless `tab_in` gives it.
     pub const GetFrame = struct {
         dst: u16,
-        tab: u16,
+        tab: u16 = 0,
+        tab_in: ?TabIn = null,
         key: Operand,
         tab_od: OperandDesig,
         key_od: OperandDesig,
     };
 
     /// Slot frame for the write shapes: `val` is the stored value's register.
+    /// The table is register `tab` unless `tab_in` gives it.
     pub const SetFrame = struct {
-        tab: u16,
+        tab: u16 = 0,
+        tab_in: ?TabIn = null,
         key: Operand,
         val: u16,
         tab_od: OperandDesig,
         key_od: OperandDesig,
         val_od: OperandDesig,
     };
+
+    /// The observed table of a get or set frame.
+    fn frameTabValue(regs: RegWindow, tab: u16, tab_in: ?TabIn) Value {
+        return if (tab_in) |t| t.value else regs.get(tab);
+    }
+
+    /// The SSA ref of a get or set frame's table.
+    fn frameTabRef(self: *RecordingSession, tab: u16, tab_in: ?TabIn) !Ref {
+        return if (tab_in) |t| t.ref else self.refOf(tab);
+    }
 
     /// Record `t[k]` (`get_index`, `dst=a b=table c=key`) as an array read.
     ///
@@ -3316,7 +3363,7 @@ pub const RecordingSession = struct {
     /// never specialize an observed absence into an unconditional result.
     fn recordAbsentGet(self: *RecordingSession, regs: RegWindow, f: GetFrame) !void {
         const key = operandValue(regs, f.key);
-        const rtab = try self.refOf(f.tab);
+        const rtab = try self.frameTabRef(f.tab, f.tab_in);
         const rkey = if (key.isNumber())
             try self.keyRefNarrowed(f.key.reg, f.key_od, key)
         else
@@ -3324,9 +3371,10 @@ pub const RecordingSession = struct {
         if (!key.isNumber() and self.konstValueOf(rkey) == null) return self.abort(.bad_type);
         // Pending mutations are not yet in the executor heap. The existing
         // forwarding paths either resolve them or refuse ambiguous aliases.
+        const vtab = frameTabValue(regs, f.tab, f.tab_in);
         if (key.isNumber()) {
-            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, keyIndexOf(key).?, regs.get(f.tab).asHeap())) return;
-        } else if (try self.forwardPendingHashLoad(f.dst, rtab, rkey, regs.get(f.tab).asHeap())) return;
+            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, keyIndexOf(key).?, vtab.asHeap())) return;
+        } else if (try self.forwardPendingHashLoad(f.dst, rtab, rkey, vtab.asHeap())) return;
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_absent, .a = rtab, .b = rkey }), .present, .loaded, .neutral);
         self.setReg(f.dst, try self.konst(Value.nil()));
@@ -3337,7 +3385,7 @@ pub const RecordingSession = struct {
     }
 
     pub fn hashGetShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) !void {
-        const vtab = regs.get(f.tab);
+        const vtab = frameTabValue(regs, f.tab, f.tab_in);
         const vkey = operandValue(regs, f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
@@ -3389,7 +3437,7 @@ pub const RecordingSession = struct {
         const rkey = try self.operandRef(f.key);
         if (self.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
 
-        const rtab = try self.refOf(f.tab);
+        const rtab = try self.frameTabRef(f.tab, f.tab_in);
         // Resolve against the deferred-store buffer BEFORE emitting the load chain
         // (doc 08 §2026-08-20): a MUST-alias forwards the pending value (the store
         // side already emitted `guard_table`/`href`/`guard_hash`/`guardNum` on this
@@ -3472,11 +3520,13 @@ pub const RecordingSession = struct {
     }
 
     pub fn hashSetShape(self: *RecordingSession, regs: RegWindow, f: SetFrame) !void {
-        const vtab = regs.get(f.tab);
+        const vtab = frameTabValue(regs, f.tab, f.tab_in);
         const vkey = operandValue(regs, f.key);
         const vval = regs.get(f.val);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
-        if (self.globalsStoreBars(vtab)) return self.abort(.aliased_input);
+        // A `set_global` (`tab_in`) checks its own key against the seeds
+        // (`recSetGlobal`); a store through a `_G` handle keeps the coarse rule.
+        if (f.tab_in == null and self.globalsStoreBars(vtab)) return self.abort(.aliased_input);
         if (vval.isNil()) return self.abort(.bad_type); // delete — out of scope
         // Value restriction, the store mirror of `hashGetShape`'s read rule:
         // int/float (runtime-pinned by the `guardNum` below) and bool (statically
@@ -3522,7 +3572,7 @@ pub const RecordingSession = struct {
         } else {
             try self.guardNum(rval, vval, .value_type, f.val_od);
         }
-        const rtab = try self.refOf(f.tab);
+        const rtab = try self.frameTabRef(f.tab, f.tab_in);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_WRITABLE }), .container_type, f.tab_od, .neutral);
         // Seed the cell pointer for native (H1) — see `recHashGet`. An RMW's read and
         // write `href`s dedup onto the same slot via `seedHashCell`. A dynamic
@@ -5888,7 +5938,7 @@ pub const RecordingSession = struct {
     /// anchor-frame `upvalue`/`global` or regular `slot_load` input), so seed
     /// ordering is correct by construction. Global reads at inline_depth > 0 still
     /// abort — globals use proto-specific constant pool indices.
-    pub fn recInputGet(self: *RecordingSession, comptime kind: InputKind, dest: u16, source: u16, resolved: Value, proto: *const Proto) !void {
+    pub fn recInputGet(self: *RecordingSession, comptime kind: InputKind, dest: u16, source: u16, resolved: Value, proto: *const Proto, regs: RegWindow) !void {
         // Doc 43 §3.1 (P0a): fail closed on an OPEN upvalue cell that aliases the
         // trace-writable window. The per-entry snapshot is a copy; an on-trace
         // write to the backing register leaves it stale (confirmed tier-1a
@@ -5923,10 +5973,26 @@ pub const RecordingSession = struct {
                     return self.recUpvalSlotAlias(dest, source, open_idx);
             }
         }
-        // Doc 43 §3.2 (P0b): a global snapshot cannot coexist with a recorded
-        // store into the globals table (the store stales the snapshot). If such
-        // a store already landed this recording, fail closed; otherwise remember
-        // the seed so a later globals store aborts symmetrically.
+        // Doc 81 §7: a global this recording stores to, or (under the
+        // anchor's `global_mutable_memo`) any scalar global, loads from the
+        // globals table per iteration, so it sees the trace's own stores.
+        // Every other read is a snapshot, and its name is remembered so a
+        // later `set_global` to it aborts `.global_mutable`. Depth-free: the
+        // name is the reading frame's constant.
+        if (kind == .global) {
+            const name = proto.constants[source];
+            if (!name.isHeap()) return self.abort(.bad_type);
+            const id = objIdentity(name.asHeap());
+            const scalar = resolved.isInt() or resolved.isFloat() or resolved.isBool();
+            if (self.global_store_keys.contains(id) or (self.route_global_reads and scalar))
+                return self.recGlobalLoad(regs, dest, name);
+            try self.global_seed_keys.put(self.gpa, id, {});
+        }
+        // Doc 43 §3.2 (P0b): a global snapshot cannot coexist with a store
+        // into the globals table through a `_G` handle (the store stales the
+        // snapshot). If such a store already landed this recording, fail
+        // closed; otherwise remember the seed so a later one aborts
+        // symmetrically. A `set_global` checks its own name instead.
         if (kind == .global) {
             if (self.recorded_global_store) return self.abort(.aliased_input);
             self.recorded_global_seed = true;
@@ -5998,6 +6064,68 @@ pub const RecordingSession = struct {
             try self.guardNum(ref, resolved, .operand_type, .a);
         }
         self.setReg(dest, ref);
+    }
+
+    /// Doc 81 §7: the globals table as a trace value, a `slot_load` of a
+    /// `.globals` seed (the dispatch loop writes `vm.globals` into it at every
+    /// entry), so the hash shapes can root `href` on it and native can seed
+    /// its cells (`seedHashCell` needs a `slot_load` root). One per recording.
+    fn globalsTableRef(self: *RecordingSession) !?Ref {
+        if (self.globals_ref) |r| return r;
+        if (self.context.globals_header == null) {
+            self.abort(.nyi_opcode);
+            return null;
+        }
+        if (self.input_seeds.items.len >= MAX_TRACE_INPUTS or self.next_input_slot == std.math.maxInt(u16)) {
+            self.abort(.input_cap);
+            return null;
+        }
+        const slot = self.next_input_slot;
+        self.next_input_slot += 1;
+        const ref = try self.emit(.{ .op = .slot_load, .aux = @intCast(slot), .ty = .unknown });
+        try self.entry_slots.append(self.gpa, slot);
+        try self.input_seeds.append(self.gpa, .{ .kind = .globals, .source = 0, .slot = slot });
+        self.globals_ref = ref;
+        return ref;
+    }
+
+    /// Doc 81 §7: `get_global` as a per-iteration load from the globals
+    /// table: `hashGetShape` rooted on the `.globals` seed, so a pending
+    /// `set_global` of the same name forwards and an emitted one is read back.
+    fn recGlobalLoad(self: *RecordingSession, regs: RegWindow, dest: u16, name: Value) !void {
+        const rtab = (try self.globalsTableRef()) orelse return;
+        const gh = self.context.globals_header.?;
+        return self.hashGetShape(regs, .{
+            .dst = dest,
+            .tab_in = .{ .ref = rtab, .value = Value.heap(@constCast(gh)) },
+            .key = .{ .konst = name },
+            .tab_od = .none,
+            .key_od = .b,
+        });
+    }
+
+    /// Doc 81 §7: record `set_global` (`a` = value register, `K[b]` = name)
+    /// as a store into the globals table, `hashSetShape` rooted on the
+    /// `.globals` seed: a present name, a scalar or bool value, no metatable,
+    /// not frozen. A name this recording already snapshotted aborts
+    /// `.global_mutable` and memoizes the anchor, so the retry loads that read
+    /// per iteration instead (`route_global_reads`).
+    pub fn recSetGlobal(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        const name = proto.constants[instr.b];
+        if (!name.isHeap()) return self.abort(.bad_type);
+        const id = objIdentity(name.asHeap());
+        if (self.global_seed_keys.contains(id)) return self.abort(.global_mutable);
+        const rtab = (try self.globalsTableRef()) orelse return;
+        const gh = self.context.globals_header.?;
+        try self.hashSetShape(regs, .{
+            .tab_in = .{ .ref = rtab, .value = Value.heap(@constCast(gh)) },
+            .key = .{ .konst = name },
+            .val = instr.a,
+            .tab_od = .none,
+            .key_od = .b,
+            .val_od = .a,
+        });
+        if (self.active) try self.global_store_keys.put(self.gpa, id, {});
     }
 
     /// Doc 53: canonicalize a `get_upval` whose OPEN cell aliases the ANCHOR
@@ -6709,6 +6837,8 @@ pub const RecordingSession = struct {
         self.upvalue_cell_classes.deinit(gpa);
         self.upvalue_path_dedup.deinit(gpa);
         self.snapshot_read_cells.deinit(gpa);
+        self.global_seed_keys.deinit(gpa);
+        self.global_store_keys.deinit(gpa);
         self.instrs.deinit(gpa);
         self.consts.deinit(gpa);
         self.entry_slots.deinit(gpa);
@@ -6776,6 +6906,10 @@ pub const RecordingSession = struct {
         self.upvalue_cell_classes.clearRetainingCapacity();
         self.upvalue_path_dedup.clearRetainingCapacity();
         self.snapshot_read_cells.clearRetainingCapacity();
+        self.global_seed_keys.clearRetainingCapacity();
+        self.global_store_keys.clearRetainingCapacity();
+        self.globals_ref = null;
+        self.route_global_reads = false; // doc 81 §7: arm() seeds the anchor memo after reset
         self.route_upvalue_reads = false; // doc 43 P5: arm() seeds the anchor memo after reset
         self.precise = false; // doc 45 D2: arm() seeds the anchor memo after reset
         self.force_ordinary = false; // A1' (task 27): arm() sets it from the pending's policy

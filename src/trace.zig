@@ -1145,6 +1145,12 @@ pub const TraceState = struct {
     /// Grows monotonically (an anchor set is never cleared: the loop's shape
     /// is lexical); bounded by the number of distinct upvalue-mutating loops.
     upvalue_mutable_memo: AnchorMap(void) = .empty,
+    /// Doc 81 §7, the global twin of `upvalue_mutable_memo`: anchors where a
+    /// recording aborted `.global_mutable` (a `set_global` named a global the
+    /// same recording had snapshotted). The retry arms with
+    /// `route_global_reads`. Grows monotonically, bounded by the number of
+    /// distinct global-storing loops.
+    global_mutable_memo: AnchorMap(void) = .empty,
     /// Doc 45 D2 (deterministic re-recording): anchors whose recording met a
     /// bytecode that needs per-instruction precise deopt (`new_table` today).
     /// The `.needs_precise` cancel memoizes here without a gate strike and
@@ -2271,6 +2277,7 @@ pub const TraceState = struct {
         self.lleave_count.deinit(self.gpa);
         self.unroll_fail.deinit(self.gpa);
         self.upvalue_mutable_memo.deinit(self.gpa);
+        self.global_mutable_memo.deinit(self.gpa);
         self.precise_anchor_memo.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
@@ -3894,6 +3901,8 @@ pub const TraceState = struct {
         // after an `.upvalue_mutable` abort routes scalar closed-cell reads
         // through `uload` from the first instruction.
         self.rec.route_upvalue_reads = self.upvalue_mutable_memo.contains(.{ .proto = proto, .pc = target_pc, .proto_id = proto.id });
+        // Doc 81 §7: likewise for scalar global reads after `.global_mutable`.
+        self.rec.route_global_reads = self.global_mutable_memo.contains(.{ .proto = proto, .pc = target_pc, .proto_id = proto.id });
         // Doc 45 D2: arm with the anchor's precise-mode memo, so a retry after
         // a `.needs_precise` cancel records per-bytecode snapshots from the
         // first instruction (deterministic re-recording, never a retroactive
@@ -3962,6 +3971,11 @@ pub const TraceState = struct {
         // simply re-aborts and re-tries the memo, never a hotter path.
         if (reason == .upvalue_mutable) {
             self.upvalue_mutable_memo.put(self.gpa, notice.anchor, {}) catch {};
+        }
+        // Doc 81 §7: the same memo-then-retry for a `set_global` whose name
+        // was snapshotted.
+        if (reason == .global_mutable) {
+            self.global_mutable_memo.put(self.gpa, notice.anchor, {}) catch {};
         }
         // Doc 45 D2: `.needs_precise` is a non-penalizing cancellation, not a
         // strike — the shape isn't untraceable, it just needs the anchor

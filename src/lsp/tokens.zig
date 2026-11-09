@@ -85,7 +85,12 @@ fn classify(t: token.Token, an: *const Analysis, known_globals: []const []const 
     const span: Span = .{ .start = t.start, .end = t.end };
     switch (t.tag) {
         .int_literal, .float_literal => return .{ .span = span, .kind = .number },
-        .string_literal => return .{ .span = span, .kind = .string },
+        .string_literal, .interp_simple => return .{ .span = span, .kind = .string },
+        // A template's text is a string; the hole opener and closer that
+        // delimit it are not, and the hole's own tokens come between.
+        .interp_begin => return .{ .span = .{ .start = span.start, .end = span.end - 1 }, .kind = .string },
+        .interp_mid => return if (span.end - span.start > 2) .{ .span = .{ .start = span.start + 1, .end = span.end - 1 }, .kind = .string } else null,
+        .interp_end => return if (span.end - span.start > 2) .{ .span = .{ .start = span.start + 1, .end = span.end }, .kind = .string } else null,
         .identifier => return identifier(an, known_globals, span, occ_i),
         // Brackets, separators and what the lexer could not read are left to
         // the editor's own bracket matching and its error marks.
@@ -218,6 +223,30 @@ test "tokens: keywords, numbers, names by binding, built-ins, properties and com
         try testing.expectEqual(w.start, t.span.start);
         try testing.expectEqual(w.kind, t.kind);
         try testing.expectEqual(w.modifiers, t.modifiers);
+    }
+}
+
+test "[REQ-113.2] tokens: a template's text is a string and its holes are code" {
+    const src = "local x = 1\nlocal s = `a{x}b{2}c`";
+    var an = try analysis_mod.analyse(testing.allocator, src, &.{}, .{});
+    defer an.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const toks = try collect(arena.allocator(), &an, &.{});
+    const base: u32 = 12 + 10; // the line's start and `local s = `
+    const want = [_]struct { start: u32, end: u32, kind: Type }{
+        .{ .start = base, .end = base + 2, .kind = .string }, // `a
+        .{ .start = base + 3, .end = base + 4, .kind = .variable }, // x
+        .{ .start = base + 5, .end = base + 6, .kind = .string }, // b
+        .{ .start = base + 7, .end = base + 8, .kind = .number }, // 2
+        .{ .start = base + 9, .end = base + 11, .kind = .string }, // c`
+    };
+    for (want) |w| {
+        const tok = for (toks) |tk| {
+            if (tk.span.start == w.start) break tk;
+        } else return error.TestExpectedToken;
+        try testing.expectEqual(w.end, tok.span.end);
+        try testing.expectEqual(w.kind, tok.kind);
     }
 }
 

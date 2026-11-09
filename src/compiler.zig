@@ -1730,6 +1730,7 @@ const Compiler = struct {
         return switch (e.data) {
             .nil, .bool, .int, .float, .string_raw, .name, .vararg, .intrinsic, .err => false,
             .function => true,
+            .string_interp => |si| anyHasFunction(si.holes),
             .paren => |inner| hasFunction(inner),
             .unary => |u| hasFunction(u.operand),
             .binary => |b| hasFunction(b.lhs) or hasFunction(b.rhs),
@@ -2111,6 +2112,50 @@ const Compiler = struct {
 
     // ---- expressions ----
 
+    /// A backtick template (doc 82 §5): the text chunks (empty ones omitted)
+    /// and the holes' values go to consecutive registers, every hole is
+    /// evaluated left to right, then each hole's value is converted with
+    /// `tostr` in order, then `interp` joins the run. A template with no
+    /// hole is a constant. Every operand is read before `dest` is written.
+    fn compileInterp(self: *Compiler, chunks: []const []const u8, holes: []const *ast.Expr, span: ast.Span, dest: u16) Error!void {
+        std.debug.assert(chunks.len == holes.len + 1);
+        if (holes.len == 0) {
+            const k = try self.stringConstant(try self.decodeTemplateChunk(chunks[0], span));
+            _ = try self.emit(Instr.opAB(.load_const, dest, k));
+            return;
+        }
+        const mark = self.next_reg;
+        const base = self.next_reg;
+        var count: u16 = 0;
+        var converted: std.ArrayList(struct { reg: u16, span: ast.Span }) = .empty;
+        for (chunks, 0..) |raw, i| {
+            const text = try self.decodeTemplateChunk(raw, span);
+            if (text.len > 0) {
+                const r = try self.alloc1();
+                self.cur_span = span;
+                _ = try self.emit(Instr.opAB(.load_const, r, try self.stringConstant(text)));
+                count += 1;
+            }
+            if (i < holes.len) {
+                const r = try self.alloc1();
+                try self.compileExprTo(holes[i], r);
+                try converted.append(self.arena, .{ .reg = r, .span = holes[i].span });
+                count += 1;
+            }
+        }
+        for (converted.items) |c| {
+            self.cur_span = c.span;
+            _ = try self.emit(Instr.opA(.tostr, c.reg));
+        }
+        self.cur_span = span;
+        if (count == 1) {
+            _ = try self.emit(Instr.opAB(.move, dest, base));
+        } else {
+            _ = try self.emit(Instr.opABC(.interp, dest, base, count));
+        }
+        self.freeTo(mark);
+    }
+
     /// Emit code so that `R[dest]` holds the value of `e`.
     fn compileExprTo(self: *Compiler, e: *const ast.Expr, dest: u16) Error!void {
         self.cur_span = e.span;
@@ -2126,6 +2171,7 @@ const Compiler = struct {
                 const k = try self.stringConstant(bytes);
                 _ = try self.emit(Instr.opAB(.load_const, dest, k));
             },
+            .string_interp => |si| try self.compileInterp(si.chunks, si.holes, e.span, dest),
             .name => try self.loadName(self.bindingAt(e.span), dest, e.span),
             .paren => |inner| try self.compileExprTo(inner, dest),
             .unary => |u| try self.compileUnary(u.op, u.operand, dest),
@@ -2674,7 +2720,17 @@ const Compiler = struct {
         // always opens with `"`/`'`, so a leading `[` is an unambiguous marker.
         // No escapes; one leading newline is dropped (Lua 5.4 §3.1).
         if (raw[0] == '[') return self.decodeLongString(raw, span);
-        const inner = raw[1 .. raw.len - 1];
+        return self.decodeEscapes(raw[1 .. raw.len - 1], span, false);
+    }
+
+    /// Decode one text chunk of a backtick template (doc 82 §3): `inner` is
+    /// the source between the delimiters. The escapes of an ordinary string
+    /// plus ``\` ``, `\{` and `\}`; a raw line break of any kind is one `\n`.
+    fn decodeTemplateChunk(self: *Compiler, inner: []const u8, span: ast.Span) Error![]const u8 {
+        return self.decodeEscapes(inner, span, true);
+    }
+
+    fn decodeEscapes(self: *Compiler, inner: []const u8, span: ast.Span, template: bool) Error![]const u8 {
         var buf: std.ArrayList(u8) = .empty;
         try buf.ensureTotalCapacity(self.arena, inner.len);
 
@@ -2682,8 +2738,11 @@ const Compiler = struct {
         while (i < inner.len) {
             const ch = inner[i];
             if (ch != '\\') {
-                try buf.append(self.arena, ch);
                 i += 1;
+                if (template and (ch == '\n' or ch == '\r')) {
+                    if (i < inner.len and (inner[i] == '\n' or inner[i] == '\r') and inner[i] != ch) i += 1;
+                    try buf.append(self.arena, '\n');
+                } else try buf.append(self.arena, ch);
                 continue;
             }
             i += 1;
@@ -2701,6 +2760,7 @@ const Compiler = struct {
                 '\\' => try buf.append(self.arena, '\\'),
                 '"' => try buf.append(self.arena, '"'),
                 '\'' => try buf.append(self.arena, '\''),
+                '`', '{', '}' => if (template) try buf.append(self.arena, esc) else return self.fail(span, .invalid_escape),
                 // A backslash before a newline (LF, CR, CRLF or LFCR) is one `\n`.
                 '\n', '\r' => {
                     if (i < inner.len and (inner[i] == '\n' or inner[i] == '\r') and inner[i] != esc) i += 1;

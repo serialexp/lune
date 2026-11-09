@@ -89,7 +89,10 @@ pub const LanePin = struct { guard_ref: u32, table_id: u32 };
 /// is re-proven at entry. ANY failure (missing/open cell, non-function callee,
 /// verifier mismatch) declines the whole candidate to tier-0 — `uref` has no
 /// operands to re-derive from, so no tier-1a downgrade exists.
-pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue, callee_global, upvalue_cell, upvalue_slot_alias };
+/// `globals` (doc 81 §7): the VM's globals table itself, the root a
+/// recorded `set_global` (and a global read it routes) stores and loads
+/// through. `source` is unused.
+pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue, callee_global, upvalue_cell, upvalue_slot_alias, globals };
 
 /// `upvalue_cell` sentinel for `callee_slot`: resolve through the ANCHOR
 /// closure (a depth-0 `get_upval`/`set_upval` path). Never a real slab slot —

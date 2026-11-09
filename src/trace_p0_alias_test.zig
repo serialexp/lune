@@ -249,3 +249,121 @@ test "P0 corpus a20: per-round append + immediate aggregate (P0d-adjacent)" {
         \\print(s)
     , "20000\n");
 }
+
+// Doc 81 §7: `set_global` records as a store into the globals table. Each
+// shape below pins one way a recorded global store meets a global read, a
+// `_G` handle, or a change to the globals table.
+
+test "P0 corpus g01: set_global then get_global of the same name reads the store" {
+    try expectProgram(
+        \\x = 0
+        \\local s = 0
+        \\for i = 1, 2000 do x = i; s = s + x end
+        \\print(s, x)
+    , "2001000\t2000\n");
+}
+
+test "P0 corpus g02: get_global then set_global of the same name (the memo retry)" {
+    try expectProgram(
+        \\x = 0
+        \\local s = 0
+        \\for i = 1, 2000 do s = s + x; x = i end
+        \\print(s, x)
+    , "1999000\t2000\n");
+}
+
+test "P0 corpus g03: a global counter RMW" {
+    try expectProgram(
+        \\n = 0
+        \\for i = 1, 2000 do n = n + 1 end
+        \\print(n)
+    , "2000\n");
+}
+
+test "P0 corpus g04: set_global of one name, a _G-handle store and read of another" {
+    try expectProgram(
+        \\x = 0
+        \\y = 0
+        \\local g = _G
+        \\local s = 0
+        \\for i = 1, 2000 do y = i; g.x = i; s = s + x + y end
+        \\print(s)
+    , "4002000\n");
+}
+
+test "P0 corpus g05: an inlined callee's RNG seed is a global RMW" {
+    try expectProgram(
+        \\seed = 1
+        \\local function rnd() seed = (seed * 16807) % 2147483647; return seed % 10 end
+        \\local s = 0
+        \\for i = 1, 2000 do s = s + rnd() end
+        \\print(s, seed)
+    , "8899\t75099568\n");
+}
+
+test "P0 corpus g06: freezing _G mid-loop stops the recorded store" {
+    try expectProgram(
+        \\x = 0
+        \\local s = 0
+        \\local ok = pcall(function()
+        \\  for i = 1, 2000 do
+        \\    if i == 1000 then table.freeze(_G) end
+        \\    x = i
+        \\    s = s + i
+        \\  end
+        \\end)
+        \\print(ok, s, x)
+    , "false\t499500\t999\n");
+}
+
+test "P0 corpus g07: new globals mid-loop change the table under a recorded store" {
+    try expectProgram(
+        \\x = 0
+        \\local s = 0
+        \\for i = 1, 2000 do
+        \\  x = x + 1
+        \\  if i % 500 == 0 then _G["k" .. i] = i end
+        \\  s = s + x
+        \\end
+        \\print(s, k1000)
+    , "2001000\t1000\n");
+}
+
+test "P0 corpus g08: a global deleted and re-created under a recorded store" {
+    try expectProgram(
+        \\x = 0
+        \\local s = 0
+        \\for i = 1, 2000 do
+        \\  x = i
+        \\  if i == 1500 then x = nil end
+        \\  s = s + (x or 0)
+        \\end
+        \\print(s, x)
+    , "1999500\t2000\n");
+}
+
+test "P0 corpus g09: a global function swapped while a counter is stored" {
+    try expectProgram(
+        \\local function f1() return 1 end
+        \\local function f2() return 1000 end
+        \\f = f1
+        \\c = 0
+        \\local s = 0
+        \\for i = 1, 2000 do
+        \\  c = c + 1
+        \\  if i == 1000 then f = f2 end
+        \\  s = s + f()
+        \\end
+        \\print(s, c)
+    , "1001999\t2000\n");
+}
+
+test "P0 corpus g10: two globals stored by an inlined callee, one read back" {
+    try expectProgram(
+        \\a = 0
+        \\b = 0
+        \\local function bump() a = a + 1; b = b + a end
+        \\for i = 1, 2000 do bump() end
+        \\print(a, b)
+    , "2000\t2001000\n");
+}
