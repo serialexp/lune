@@ -68,6 +68,18 @@ pub const Trivia = struct {
     }
 };
 
+/// How many templates may be open at once (a hole holding a template holding
+/// a hole...): the parser's `max_depth`, past which it gives up anyway.
+pub const max_template_depth = 200;
+
+/// A template the lexer is inside (doc 82 §3.6): where it opened, and how many
+/// of its hole's own braces (table constructors) are open.
+const TemplateFrame = struct {
+    depth: u32,
+    start: u32,
+    line: u32,
+};
+
 pub const Lexer = struct {
     source: [:0]const u8,
     index: u32 = 0,
@@ -75,6 +87,11 @@ pub const Lexer = struct {
     diags: *Diagnostics,
     /// Where skipped comments go, if anyone wants them.
     trivia: ?*Trivia = null,
+    /// The templates open around the current position, outermost first. The
+    /// lexer alone decides text against code mode: the parser lexes the whole
+    /// source before it reads a token.
+    templates: [max_template_depth]TemplateFrame = undefined,
+    templates_len: u32 = 0,
 
     pub fn init(source: [:0]const u8, diags: *Diagnostics) Lexer {
         return .{ .source = source, .diags = diags };
@@ -97,7 +114,28 @@ pub const Lexer = struct {
         const start_line = self.line;
         const c = self.peek();
 
-        if (c == 0) return self.make(.eof, start, start_line);
+        if (c == 0) {
+            // End of input inside a hole: the innermost open template is the
+            // one that never closed.
+            if (self.templates_len > 0) {
+                const f = self.templates[self.templates_len - 1];
+                self.templates_len = 0;
+                self.diags.report(.unterminated_template, f.start, self.index, f.line);
+                return self.make(.invalid, f.start, f.line);
+            }
+            return self.make(.eof, start, start_line);
+        }
+        if (c == '`') return self.templateText(start, start_line, .open);
+        if (self.templates_len > 0) switch (c) {
+            '{' => self.templates[self.templates_len - 1].depth += 1,
+            '}' => {
+                const f = &self.templates[self.templates_len - 1];
+                // The hole's own closing brace: back to text.
+                if (f.depth == 0) return self.templateText(start, start_line, .cont);
+                f.depth -= 1;
+            },
+            else => {},
+        };
 
         if (isAlpha(c)) return self.identifier(start, start_line);
         if (isDigit(c)) return self.number(start, start_line);
@@ -291,6 +329,72 @@ pub const Lexer = struct {
                     }
                     self.index += 1;
                 },
+            }
+        }
+    }
+
+    /// Scan template text (doc 82 §3): from a backtick (`.open`) or from a
+    /// hole's closing brace (`.cont`) to the next hole opener or the closing
+    /// backtick. A backslash skips the next character, so an escaped backtick,
+    /// brace or backslash ends nothing, and `\u{...}` is one escape rather than
+    /// a hole. A raw newline is part of the text and counts a line.
+    fn templateText(self: *Lexer, start: u32, line: u32, kind: enum { open, cont }) Token {
+        self.index += 1; // the backtick or the closing brace
+        if (kind == .open) {
+            if (self.templates_len == max_template_depth) {
+                self.diags.report(.template_too_deep, start, self.index, line);
+                return self.make(.invalid, start, line);
+            }
+            self.templates[self.templates_len] = .{ .depth = 0, .start = start, .line = line };
+            self.templates_len += 1;
+        }
+        while (true) {
+            switch (self.peek()) {
+                0 => {
+                    const f = self.templates[self.templates_len - 1];
+                    self.templates_len = 0;
+                    self.diags.report(.unterminated_template, f.start, self.index, f.line);
+                    return self.make(.invalid, start, line);
+                },
+                '`' => {
+                    self.index += 1;
+                    self.templates_len -= 1;
+                    return self.make(if (kind == .open) .interp_simple else .interp_end, start, line);
+                },
+                '{' => {
+                    // `{{` would read as a hole holding a table constructor, which
+                    // Luau forbids; the hole still opens, so the rest lexes.
+                    if (self.peekNext() == '{') self.diags.report(.template_double_brace, self.index, self.index + 2, self.line);
+                    self.index += 1;
+                    return self.make(if (kind == .open) .interp_begin else .interp_mid, start, line);
+                },
+                '\\' => {
+                    self.index += 1;
+                    switch (self.peek()) {
+                        0 => {}, // reported as unterminated next round
+                        '\n', '\r' => self.newline(),
+                        'z' => {
+                            self.index += 1;
+                            while (true) switch (self.peek()) {
+                                ' ', '\t', 0x0B, 0x0C => self.index += 1,
+                                '\n', '\r' => self.newline(),
+                                else => break,
+                            };
+                        },
+                        'u' => {
+                            // `\u{41}`: the brace belongs to the escape.
+                            self.index += 1;
+                            if (self.peek() == '{') {
+                                self.index += 1;
+                                while (isHexDigit(self.peek())) self.index += 1;
+                                if (self.peek() == '}') self.index += 1;
+                            }
+                        },
+                        else => self.index += 1,
+                    }
+                },
+                '\n', '\r' => self.newline(),
+                else => self.index += 1,
             }
         }
     }
@@ -785,4 +889,102 @@ test "lexeme slices map back to source" {
     defer testing.allocator.free(toks);
     try testing.expectEqualStrings("foo", toks[0].lexeme(src));
     try testing.expectEqualStrings("123", toks[2].lexeme(src));
+}
+
+test "template: one token per chunk, delimiters included" {
+    try expectTags("`plain`", &.{.interp_simple});
+    try expectTags("`a{1}b`", &.{ .interp_begin, .int_literal, .interp_end });
+    try expectTags("`{1}{2}`", &.{ .interp_begin, .int_literal, .interp_mid, .int_literal, .interp_end });
+    try expectTags("`{x}`", &.{ .interp_begin, .identifier, .interp_end });
+    try expectTags("x = `a`", &.{ .identifier, .assign, .interp_simple });
+    try expectTags("``", &.{.interp_simple});
+}
+
+test "template: a hole ends at its own brace, whatever it holds" {
+    // A table constructor keeps its braces, a nested template its own.
+    try expectTags("`{({a = 1}).a}`", &.{
+        .interp_begin, .lparen,     .lbrace, .identifier, .assign, .int_literal, .rbrace, .rparen, .dot,
+        .identifier,   .interp_end,
+    });
+    try expectTags("`a{`b{1}`}c`", &.{ .interp_begin, .interp_begin, .int_literal, .interp_end, .interp_end });
+    // A brace in a string, a long string or a comment is not a brace.
+    try expectTags("`{f(\"}\")}`", &.{ .interp_begin, .identifier, .lparen, .string_literal, .rparen, .interp_end });
+    try expectTags("`{[=[}]=]}`", &.{ .interp_begin, .string_literal, .interp_end });
+    try expectTags("`{1 --}\n}`", &.{ .interp_begin, .int_literal, .interp_end });
+    // A backtick in a string inside a hole starts nothing.
+    try expectTags("`{\"`\"}`", &.{ .interp_begin, .string_literal, .interp_end });
+}
+
+test "template: escapes keep their character out of the structure" {
+    try expectTags("`\\``", &.{.interp_simple}); // \` is a backtick
+    try expectTags("`\\{1}`", &.{.interp_simple}); // \{ is a brace, not a hole
+    try expectTags("`\\}`", &.{.interp_simple});
+    try expectTags("`\\\\{1}`", &.{ .interp_begin, .int_literal, .interp_end }); // \\ then a hole
+    try expectTags("`\\u{41}`", &.{.interp_simple}); // the Unicode escape, not a hole
+    try expectTags("`\\\\u{41}`", &.{ .interp_begin, .int_literal, .interp_end }); // \\ then u then a hole
+    try expectTags("`a\\z  \n  b`", &.{.interp_simple});
+}
+
+test "template: raw newlines and backslash-newlines are text and count lines" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    const toks = try tokenize(testing.allocator, "`a\nb\\\r\nc{1\n}d`\nx", &diags);
+    defer testing.allocator.free(toks);
+    try testing.expect(!diags.hasErrors());
+    try testing.expectEqual(Token.Tag.interp_begin, toks[0].tag);
+    // The identifier after the template is on line 5: the text held 3 breaks,
+    // the hole 1, and the one after the closing backtick.
+    try testing.expectEqual(@as(u32, 5), toks[toks.len - 2].line);
+}
+
+test "template: {{ is reported, and the hole still opens" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    const toks = try tokenize(testing.allocator, "`{{1}}`", &diags);
+    defer testing.allocator.free(toks);
+    try testing.expectEqual(@as(usize, 1), diags.list.items.len);
+    try testing.expectEqual(@import("diag.zig").Code.template_double_brace, diags.list.items[0].code);
+    try testing.expectEqual(@as(u32, 1), diags.list.items[0].start);
+    // A space between them, or a parenthesis, is fine.
+    var ok = Diagnostics.init(testing.allocator);
+    defer ok.deinit();
+    const t2 = try tokenize(testing.allocator, "`{ {1} }` `{({1})}`", &ok);
+    defer testing.allocator.free(t2);
+    try testing.expect(!ok.hasErrors());
+}
+
+test "template: an unterminated template is reported at its opening backtick" {
+    const Code = @import("diag.zig").Code;
+    const cases = [_][:0]const u8{ "x = `abc", "x = `abc{1", "x = `abc{1}", "x = `a{`b", "x = `abc\\" };
+    for (cases) |src| {
+        var diags = Diagnostics.init(testing.allocator);
+        defer diags.deinit();
+        const toks = try tokenize(testing.allocator, src, &diags);
+        defer testing.allocator.free(toks);
+        try testing.expectEqual(@as(usize, 1), diags.list.items.len);
+        try testing.expectEqual(Code.unterminated_template, diags.list.items[0].code);
+        // The innermost template that never closed: `x = `a{`b` opens at 6.
+        const want: u32 = if (std.mem.eql(u8, src, "x = `a{`b")) 7 else 4;
+        try testing.expectEqual(want, diags.list.items[0].start);
+        try testing.expectEqual(Token.Tag.eof, toks[toks.len - 1].tag);
+    }
+}
+
+test "template: nesting past the limit is an error, not a crash" {
+    const Code = @import("diag.zig").Code;
+    const depth = max_template_depth + 5;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    for (0..depth) |_| try buf.appendSlice(testing.allocator, "`{");
+    try buf.append(testing.allocator, 0);
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    const src: [:0]const u8 = buf.items[0 .. buf.items.len - 1 :0];
+    const toks = try tokenize(testing.allocator, src, &diags);
+    defer testing.allocator.free(toks);
+    var too_deep = false;
+    for (diags.list.items) |d| if (d.code == Code.template_too_deep) {
+        too_deep = true;
+    };
+    try testing.expect(too_deep);
 }

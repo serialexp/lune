@@ -24,6 +24,9 @@ pub const Code = enum(u16) {
     malformed_number = 3,
     unterminated_string = 4,
     unexpected_character = 5,
+    unterminated_template = 6,
+    template_double_brace = 7,
+    template_too_deep = 8,
 
     // ---- parser ----
     expected_end_of_input = 101,
@@ -115,6 +118,9 @@ pub const Code = enum(u16) {
             .malformed_number => "malformed number",
             .unterminated_string => "unterminated string",
             .unexpected_character => "unexpected character",
+            .unterminated_template => "unterminated template",
+            .template_double_brace => "'{{' in a template: write \\{ for a brace, or put a space between the hole's brace and a table constructor",
+            .template_too_deep => "templates nested too deeply (more than 200 levels)",
 
             .expected_end_of_input => "expected end of input",
             .expected_function_after_async => "expected 'function' after 'async'",

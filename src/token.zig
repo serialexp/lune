@@ -28,6 +28,16 @@ pub const Token = struct {
         int_literal,
         float_literal,
         string_literal,
+        /// Doc 82: a template (`` `...` ``) is one token per text chunk. The
+        /// lexeme of each includes its delimiters; the text is between them.
+        /// A template with no hole: `` `text` ``.
+        interp_simple,
+        /// `` `text{ ``: the first chunk of a template with holes.
+        interp_begin,
+        /// `}text{`: between two holes.
+        interp_mid,
+        /// `}text` followed by the closing backtick: the last chunk.
+        interp_end,
         identifier,
 
         // keywords
@@ -122,6 +132,7 @@ pub const Token = struct {
                 .int_literal => "integer",
                 .float_literal => "float",
                 .string_literal => "string",
+                .interp_simple, .interp_begin, .interp_mid, .interp_end => "template",
                 .identifier => "identifier",
                 .eof => "end of file",
                 .invalid => "invalid token",
