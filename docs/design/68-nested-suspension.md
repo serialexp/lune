@@ -179,6 +179,20 @@ land; move whole phases to Done once everything inside them is checked.
   index's unstoppable steps shrink to embedder host frames only, and
   the viz "steps inside nested calls skipped" note never shows in the wasm
   playground, which has no embedder.
+  - [x] **Native side** (2026-11-09). Index: with every site converted the
+    only unstoppable steps are an activation proto's own steps, and each of
+    sort/gsub/dofile/require/tostring/print has some
+    (`interp_replay_test`). Keyframes: a cut at every safepoint through
+    require, tostring and print resumes (`keyframeser_resume_test`), and
+    through dofile, require and sort after committed effects with the
+    envelope (`keyframeser_replay_test`). 8-mode + GC stress:
+    `interp_stdlib_test` (require/tostring/print) and `interp_effects_test`
+    (dofile in a loop). Benchmark: `bench/stdlib/tostring_meta.lua`, three
+    hashgate modes.
+  - [ ] **`mahina_replay` / viz (wasm).** Blocked on the wasm build; the
+    obsolete "stop inside require's run … deferred" test in
+    `viz/test/wasm.test.ts` must flip, and the nested-code test extends to
+    dofile/require/tostring/print stops.
 
 ## 1. Why this exists
 
@@ -833,6 +847,15 @@ Three first cuts were worse and are why the design looks as it does:
 - Sharing `callTail(.call)` with `opCall` made LLVM stop inlining
   `opCallFast` into it, which cost 8 instructions per Lua call
   (recursive-fib tier-0 +0.6%).
+
+### P4 benchmark: `tostring` through a Lua `__tostring` (2026-11-09)
+
+`bench/stdlib/tostring_meta.lua 2000000` (three objects per iteration, 6 M
+calls), against the build before the print/tostring commit: tier-0 0.28 s →
+0.41 s, JIT 0.30 s → 0.47 s, about +22 ns per call. This is the same
+per-call activation overhead the sort and gsub rows show (frame push/pop plus
+per-step cost); it is over the §10 budget and the levers are in TODO.md.
+Output is identical in t0/trace/jit (hashgate rows).
 
 ## 13. References
 

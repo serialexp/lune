@@ -597,6 +597,53 @@ test "doc 68 defer: the safepoint index stops growing at its limit" {
     try testing.expectEqual(@as(usize, 30), vm.safepoint_lines.items.len);
 }
 
+var p4_fs = util.FakeFs{ .entries = &.{
+    .{ .path = "d.lua", .content = "local a = 1\nreturn a + 1, 'd'" },
+} };
+
+fn installP4Fs(vm: *Vm, root: *const Proto) anyerror!void {
+    _ = root;
+    vm.effect_mode = .record;
+    vm.system = p4_fs.system();
+}
+
+/// Doc 68 P4: a program that reaches every resumable native directly (no
+/// `pcall` of one, which still runs through `callValue`), with no multret
+/// result feeding a call (`reg_top_pending` is its own gate, not a nested one).
+const p4_all_sites: [:0]const u8 =
+    \\local t = {3, 1, 2}
+    \\table.sort(t, function(a, b) return a < b end)
+    \\local r, n = string.gsub("a b", "%a", function(c) return c .. c end)
+    \\print(r, n)
+    \\local d1, d2 = dofile("d.lua")
+    \\print(d1, d2)
+    \\package.preload.m = function(n) return {n = n} end
+    \\print(require("m").n)
+    \\local o = setmetatable({}, {__tostring = function() return "O" end})
+    \\print(tostring(o), o)
+;
+
+test "doc 68 P4: with every native converted, only an activation's own steps are not stops" {
+    const gpa = testing.allocator;
+    const native_act = @import("native_act.zig");
+    const index = try recordSafepointIndexWith(gpa, p4_all_sites, &installP4Fs);
+    defer gpa.free(index);
+    var per_kind: [@typeInfo(native_act.Kind).@"enum".field_names.len]usize = @splat(0);
+    for (index) |sp| {
+        if (native_act.kindOfId(sp.proto_id)) |kind| {
+            try testing.expect(!sp.stoppable);
+            per_kind[@intFromEnum(kind)] += 1;
+        } else if (!sp.stoppable) {
+            std.debug.print("unstoppable step outside an activation: proto {d} line {d}\n", .{ sp.proto_id, sp.line });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Every kind the program reaches has activation steps in the index.
+    for ([_]native_act.Kind{ .sort, .gsub, .dofile, .require, .tostring, .print }) |kind| {
+        try testing.expect(per_kind[@intFromEnum(kind)] > 0);
+    }
+}
+
 test "doc 68 §7.4: a gsub replacement is stoppable, its activation is not" {
     const gpa = testing.allocator;
     const native_act = @import("native_act.zig");

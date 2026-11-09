@@ -1141,6 +1141,27 @@ test "doc 68 §7.3: a dofile'd chunk runs as an activation: it yields, and all i
     try testing.expectEqualStrings("1\n7\tdone\tnil\n0\ntrue\nfalse\tboom\nfalse\tboom\n2\n", sink.buffered());
 }
 
+var dofile_gate_fs = FakeFs{ .entries = &.{
+    .{ .path = "d.lua", .content = "local s = 0\nfor i = 1, 50 do s = s + i end\nreturn s, 'd', coroutine.isyieldable()" },
+} };
+
+fn installDofileGateFs(vm: *Vm) anyerror!void {
+    vm.effect_mode = .record;
+    vm.system = dofile_gate_fs.system();
+}
+
+test "doc 68 §7.3: dofile in a loop agrees in every tier and under GC stress" {
+    try util.expectProgramTuned(
+        \\local total = 0
+        \\for i = 1, 30 do
+        \\  local s, d, y = dofile("d.lua")
+        \\  total = total + s
+        \\end
+        \\print(total, dofile("d.lua"))
+        \\
+    , "38250\t1275\td\tfalse\n", .{ .setup = &installDofileGateFs });
+}
+
 test "L-3: record→serialize→replay reproduces output with the FS detached" {
     const gpa = testing.allocator;
     // `add.lua` is a vararg chunk loaded by `loadfile` and then called with args;

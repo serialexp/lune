@@ -320,6 +320,10 @@ test "stdlib: a traceback through gsub shows it as a C function" {
     );
 }
 
+test "stdlib: require, tostring and print call Lua from their activations, in every tier and under GC stress (doc 68 §7.3, §7.5)" {
+    try util.expectProgram(util.resumable_natives_program2, util.resumable_natives_output2);
+}
+
 test "stdlib: table.sort without a comparator or __lt raises Lua's compare error" {
     // Unlocated, as Lua's: the comparison fails inside `sort`, a C function there.
     try expectProgram(

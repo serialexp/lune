@@ -172,6 +172,105 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
     try testing.expectEqual(ref.log.len, vm_r.effect_cursor);
 }
 
+// Doc 68 §9: a keyframe anywhere is resumable, with the replay envelope: the
+// effect log and its cursor, the PRNG, the output so far. A cut inside a
+// `dofile`'d chunk, a `require`'d module or a sort comparator comes after file
+// reads and a random draw committed in nested code, so it needs all of them.
+test "doc 68 §9: every cut through dofile, require and sort after committed effects resumes with the envelope" {
+    const gpa = testing.allocator;
+    const effectser = @import("effectser.zig");
+    const testutil = @import("interp_testutil.zig");
+    var ffs = testutil.FakeFs{ .entries = &.{
+        .{ .path = "d.lua", .content = "local r = math.random(1000)\nlocal s = 0\nfor i = 1, 3 do s = s + i end\nreturn r, s" },
+        .{ .path = "./mod.lua", .content = "local r = math.random(1000)\nreturn { v = 'm', r = r }" },
+    } };
+    const source: [:0]const u8 =
+        \\local a, b = dofile("d.lua")
+        \\print(a, b)
+        \\local m = require("mod")
+        \\print(m.v, m.r)
+        \\local t = {5, 3, 9, 1}
+        \\table.sort(t, function(x, y) return x < y end)
+        \\print(table.concat(t, ","), math.random(100))
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    // --- record: the reference output, the serialized log, the safepoint count.
+    var ref_buf: [256]u8 = undefined;
+    var ref_len: usize = 0;
+    var log_bytes: []u8 = undefined;
+    var safepoints: u64 = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var sink = io.Writer.fixed(&ref_buf);
+        vm.out = &sink;
+        vm.effect_mode = .record;
+        vm.system = ffs.system();
+        var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        ref_len = sink.buffered().len;
+        safepoints = vm.safepoint_seq;
+        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+    }
+    defer gpa.free(log_bytes);
+    const ref_out = ref_buf[0..ref_len];
+    try testing.expect(safepoints > 20);
+
+    var cut: u64 = 1;
+    while (cut < safepoints) : (cut += 1) {
+        // --- replay to the cut.
+        var vm2 = try Vm.init(gpa);
+        defer vm2.deinit();
+        var buf2: [256]u8 = undefined;
+        var sink2 = io.Writer.fixed(&buf2);
+        vm2.out = &sink2;
+        try effectser.decodeInto(&vm2.effect_log, gpa, vm2.heap, log_bytes);
+        vm2.effect_mode = .replay;
+        var chunk2 = try mahina_compiler.compile(gpa, vm2.heap, source, tree.root, &diags);
+        defer chunk2.deinit();
+        vm2.setSuspendCtl(.{ .after_safepoints = cut });
+        try testing.expect((try vm2.start(chunk2.proto)) == .suspended);
+        const out_before = try gpa.dupe(u8, sink2.buffered());
+        defer gpa.free(out_before);
+        const mid = try encodeSnapshot(gpa, &vm2);
+        defer gpa.free(mid);
+
+        // --- restore: recapture is the identity, then the envelope goes back.
+        const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
+        defer {
+            vm_r.deinit();
+            gpa.destroy(vm_r);
+        }
+        {
+            const again = try encodeSnapshot(gpa, vm_r);
+            defer gpa.free(again);
+            try testing.expectEqualSlices(u8, mid, again);
+        }
+        var buf_r: [256]u8 = undefined;
+        var sink_r = io.Writer.fixed(&buf_r);
+        vm_r.out = &sink_r;
+        try effectser.decodeInto(&vm_r.effect_log, gpa, vm_r.heap, log_bytes);
+        vm_r.effect_mode = .replay;
+        vm_r.effect_cursor = vm2.effect_cursor;
+        vm_r.rng = vm2.rng;
+        vm_r.setSuspendCtl(null);
+        try testing.expect((try vm_r.exec()) == .finished);
+
+        var combined: [512]u8 = undefined;
+        @memcpy(combined[0..out_before.len], out_before);
+        @memcpy(combined[out_before.len..][0..sink_r.buffered().len], sink_r.buffered());
+        try testing.expectEqualStrings(ref_out, combined[0 .. out_before.len + sink_r.buffered().len]);
+        // Every effect consumed exactly once across the cut.
+        try testing.expectEqual(vm_r.effect_log.entries.items.len, vm_r.effect_cursor);
+    }
+}
+
 const NativeF2cCut = struct {
     keyframe: []u8,
     effects: []u8,

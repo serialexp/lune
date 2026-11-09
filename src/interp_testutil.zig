@@ -857,6 +857,52 @@ pub const resumable_natives_output =
     "2291\t400\t W399! W400!\n" ++
     "x y z A B C\n";
 
+/// Doc 68 P3: the other resumable natives, with no file: `require` with a
+/// Lua loader from `package.preload`, a Lua searcher and a failing search,
+/// both under a coroutine that yields in them; `tostring` and `print` of
+/// objects whose `__tostring` is a Lua function, one that yields while
+/// `print` has already written.
+pub const resumable_natives_program2: [:0]const u8 =
+    \\package.preload.a = function(n) return {n = n} end
+    \\local m, d = require("a")
+    \\print(m.n, d, select("#", require("a")))
+    \\package.searchers[#package.searchers + 1] = function(n)
+    \\  if n == "late" then return function(nn, dd) return nn .. "!", "ld" end, "ldata" end
+    \\  return "\n\tno late"
+    \\end
+    \\print(require("late"))
+    \\local co = coroutine.wrap(function()
+    \\  package.preload.y = function(n) return coroutine.yield("loader") end
+    \\  return require("y")
+    \\end)
+    \\print(co())
+    \\print(co(7))
+    \\local O = setmetatable({}, {__tostring = function() return "O" end})
+    \\print(tostring(O), O, 1, O)
+    \\local Y = setmetatable({}, {__tostring = function() return coroutine.yield("ts") end})
+    \\local c2 = coroutine.wrap(function() print("a", Y, "b") return tostring(Y) end)
+    \\print(c2())
+    \\print(c2("S1"))
+    \\print(c2("S2"))
+    \\package.searchers = {function() return "\n\tA" end}
+    \\print(pcall(require, "nope"))
+    \\print(pcall(function() return require("nope") end))
+;
+
+/// `resumable_natives_program2`'s output.
+pub const resumable_natives_output2 =
+    "a\t:preload:\t1\n" ++
+    "late!\tldata\n" ++
+    "loader\n" ++
+    "7\t:preload:\n" ++
+    "O\tO\t1\tO\n" ++
+    "a\tts\n" ++
+    "S1\tb\n" ++
+    "ts\n" ++
+    "S2\n" ++
+    "false\tmodule 'nope' not found:\n\tA\n" ++
+    "false\tmodule 'nope' not found:\n\tA\n";
+
 /// Doc 68 P2: a program that runs Lua code in every kind of metamethod
 /// frame: operators, compare-and-branch, `__index`/`__newindex` (fused
 /// steps on either side), `__close` on block exit and on `return f()`, a

@@ -1227,6 +1227,19 @@ test "doc 68 §5.1: every cut through table.sort's activation resumes after rest
     }
 }
 
+test "doc 68 §7.3, §7.5: every cut through require's, tostring's and print's activations resumes after restore" {
+    const gpa = testing.allocator;
+    const programs = @import("interp_testutil.zig");
+    const source = programs.resumable_natives_program2;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    try testing.expectEqualStrings(programs.resumable_natives_output2, ref.full_out);
+    var cut: u64 = 1;
+    while (cut < ref.total_safepoints) : (cut += 1) {
+        gpa.free(try expectResume(gpa, source, .{ .after_safepoints = cut }, ref));
+    }
+}
+
 test "keyframe cut before a sweep: a re-interned unreachable string keeps its id across restore" {
     // TODO.md "Keyframe cut before a sweep loses an intern hit on restore".
     // `mk`'s string is unreachable once its frame returns and the print
