@@ -45,20 +45,31 @@ land; move whole phases to Done once everything inside them is checked.
   conversion per hole and one construction op (§5).
 - [ ] **Phase 2 — REPL.** A structured "incomplete input" status distinct from
   a malformed template, covering unfinished text, holes, nested templates and
-  escapes, in both the expression probe and statement input (§3.3).
+  escapes, in both the expression probe and statement input (§3.3). Today
+  `failedWith` treats only an error at or past the end of the input, or an
+  unterminated long string or block comment, as incomplete; an unterminated
+  template is reported at its opening backtick, so it needs its own
+  diagnostic code and a `failedWith` case, and the probe's `\n)` suffix must
+  not be absorbed as template text.
 - [ ] **Phase 3 — tracing.** The recorder gains what templates need: today it
   has no `concat` recording (it falls back as `.nyi_opcode`) and its string
   conversion rejects heap operands. Templates must record, commit and execute
   in tier-1a and native, not only match output (§5).
 - [ ] **Phase 4 — tools.** The language server (completion contexts: text vs
-  code; semantic tokens; hole symbols) and the Tree-sitter grammar (doc 74),
+  code, and code inside an unterminated hole while typing, which `contextAt`
+  would otherwise call a string; semantic tokens; hole symbols) and the Tree-sitter grammar (doc 74),
   with a drift test each.
 - [ ] **Phase 5 — command words.** Whether a template is one argv element in a
   REPL command line, and how it requests more input; owned by doc 75 §6.1.
-- [ ] **Q5 — the construction op.** One n-ary construction (linear in
-  fragments plus bytes) versus Luau's `string.format` with `%*`. A binary
-  `..` chain is excluded by §5's cost rule. Settled by the Phase 3
-  measurement; the allocation protocol must not differ across tiers.
+  `repl.zig`'s `nextWord` knows only `'` and `"` today, so a backtick word
+  containing a space would be split.
+- [ ] **Q5 — the allocation protocol.** One n-ary construction op (linear in
+  fragments plus bytes) is the lowering; `string.format` and a binary `..`
+  chain are excluded by §5. What remains is whether every tier allocates an
+  interned intermediate string per converted hole or none does; settled by
+  the Phase 3 measurement, and it must be the same in every tier.
+- [ ] **Defer — constant folding.** `` `a{"b"}c` `` folding to one literal at
+  compile time (Luau does this). Not in v1.
 
 ## Why this exists
 
@@ -93,7 +104,8 @@ stringinterp ::= <INTERP_SIMPLE>
               | <INTERP_BEGIN> exp {<INTERP_MID> exp} <INTERP_END>
 ```
 
-A template is an expression. It has exactly one more text chunk than holes;
+A template is an expression, `string_interp` in `ast.zig`: the chunk spans and
+the hole expressions. It has exactly one more text chunk than holes;
 chunks may be empty, and holes may be adjacent or at either end. `INTERP_SIMPLE`
 is the no-hole form (`` `plain` ``), which is the string itself. The
 expression in a hole is any Lua expression, including calls, table
@@ -106,9 +118,13 @@ constructors and nested templates, but it is a single-value context (Q8):
 Inside a template a backslash escapes `` ` ``, `{` and itself; the ordinary
 string escapes (`\n`, `\t`, `\x..`, `\z`, ...) work as in strings, and
 `\u{...}` is the Unicode escape, not a hole (`\\u{41}` is a backslash, then a
-hole). A literal brace is `\{`; a `}` in the text needs no escape. Chunks are
-decoded without surrounding delimiters (the existing string decoder assumes
-them), including empty chunks and a trailing backslash (an error).
+hole). A literal brace is `\{`; `\}` is accepted too (decoding to `}`), and a bare `}`
+in the text needs no escape. Chunks are decoded by a template-chunk decoder
+of their own: the existing `decodeString` asserts surrounding quotes, rejects
+`` \` `` and `\{`, and does not fold raw `\r`/`\r\n` into `\n`. The new decoder
+takes delimiter-free spans, including empty ones. A backslash at the very end
+of the input is an unclosed escape: incomplete input in the REPL, an error
+elsewhere.
 
 `{{` is a syntax error only where text scanning meets a hole opener
 immediately followed by a table constructor opener. Table constructors inside
@@ -144,10 +160,14 @@ The lexer has a text mode and an expression mode. On `{` in text it enters
 expression mode with brace depth 0; braces count only as code tokens there
 (strings, long strings and comments inside the hole are scanned by their own
 scanners, so `` `{f("}")}` `` and `` `{[=[}]=]}` `` are fine). A `}` at depth 0
-returns to text mode. A backtick in expression mode starts a nested template,
+returns to text mode: that `}` is consumed by the lexer (it emits no `rbrace`),
+and text scanning continues to the next `{` (token `INTERP_MID`) or closing
+backtick (`INTERP_END`). An empty hole, including one holding only blanks or
+comments, is a parse error when an expression is expected and `INTERP_MID` or
+`INTERP_END` arrives. A backtick in expression mode starts a nested template,
 so the lexer keeps a stack. The parser tokenizes the whole source first, so
-the lexer alone decides modes. Nesting depth is bounded, with a clear error
-past the limit; EOF in either mode is the unterminated error with the opening
+the lexer alone decides modes. Nesting depth is bounded by the parser's
+`max_depth` (200), with a clear error past the limit; EOF in either mode is the unterminated error with the opening
 backtick's position.
 
 ## 4. Semantics
@@ -171,9 +191,13 @@ Constraints, not yet a choice (Q5):
 - **Linear cost.** Construction work is proportional to the fragment count
   plus the output bytes, with checked size accumulation. A chain of binary
   `Vm.concat` calls materialises and interns every intermediate, which is
-  quadratic in bytes for many equal fragments, so it is excluded. Candidates:
-  one n-ary construction op, or Luau's `string.format` with a new `%*` (which
-  needs `%` in the text doubled and widens `string.format`).
+  quadratic in bytes for many equal fragments, so it is excluded. The
+  lowering is one n-ary construction op after one intrinsic conversion per
+  hole.
+- **Not `string.format`.** Luau lowers to `string.format` with a new `%*`.
+  mahina's `string.format` is a synchronous native call that rejects strings
+  containing NUL ("string contains zeros") and is reached through the name
+  `string`, so it breaks the next constraint, 8-bit cleanliness and Q7.
 - **Intrinsic conversion** (Q7), sharing the existing resumable `tostring`
   implementation. A Lua `__tostring` runs as an activation frame (doc 68), so
   a template survives a yield, a replay stop and a keyframe capture inside it,
@@ -182,9 +206,11 @@ Constraints, not yet a choice (Q5):
 - **One allocation protocol across tiers** (doc 24). Object ids enter
   snapshots and affect observable order, so tier-0, tier-1a and native must
   allocate the same objects in the same order; equal output is not enough.
-- **The recorder** has no `concat` support today and rejects heap operands in
-  its string conversion, so without Phase 3 work every template would run in
-  tier-0. Tests must show committed and executed traces, not only equal
+- **The recorder** has no `concat` support today, and its string conversion
+  aborts on any operand that is not a number (a string hole included), so
+  without Phase 3 work every template would run in tier-0. Phase 3 adds: a
+  string guard that passes strings through, an IR op for the n-ary
+  construction, and the destination allocation in the GC headroom check. Tests must show committed and executed traces, not only equal
   output.
 
 ## Decisions
@@ -206,8 +232,18 @@ hygiene (Q7), lexer modes (§3.6), REPL incomplete input (Phase 2), the raw
 newline extension (§3.3), escape decoding (§3.2), zero-hole grammar (§3.1),
 `{{` scope (§3.2), hole arity (Q8), linear cost and allocation protocol (§5),
 resumable conversion (§5), conversion contract (§3.5, §4), tooling (Phase 4),
-command words (Phase 5). Antigravity's review timed out after 15 minutes and
-returned nothing, so this doc has one review, not two.
+command words (Phase 5).
+
+Antigravity reviewed it the same day (10 findings, after a first attempt timed
+out at 15 minutes); applied: `string.format` removed as a lowering (§5, Q5),
+the REPL's `failedWith` and the probe suffix (Phase 2), `contextAt` inside an
+unterminated hole (Phase 4), the AST node and a template-chunk decoder (§3.1,
+§3.2), the cross-tier intermediate-string rule (Q5), the recorder's wider gap
+(§5), `}` handling and empty holes in the lexer (§3.6), `\}` and a trailing
+backslash (§3.2), `nextWord` and backticks (Phase 5), the nesting bound and
+deferred constant folding (§3.6, Q5). One claim is unverified: Antigravity says
+Luau's RFC also accepts `\}`; the RFC text I read lists only `` ` ``, `{` and `\`.
+Accepting `\}` is a superset, so Luau code still lexes.
 
 ## References
 
