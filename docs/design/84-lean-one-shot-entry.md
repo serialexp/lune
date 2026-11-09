@@ -1,7 +1,7 @@
 # 84 — The lean one-shot entry lane — Design
 
-Status: draft, not yet implemented. The evidence (§2) is measured; the
-options in §4 wait on Bart's picks (§7)
+Status: designed, not yet implemented. Evidence measured (§2); Q1-Q4
+settled (§7) after reviews by Codex and Antigravity
 Owner: Bart
 Last updated: 2026-11-10
 
@@ -18,6 +18,16 @@ land; move whole phases to Done once everything inside them is checked.
   return on an anchor that has no trace and is barred from recording. The
   pure probe (§2.1) went from +662 to +573 instructions per call. This doc
   is step 2.
+- [x] **Q1 — per-anchor knowledge: (b), two membership bits** (§4.1).
+- [x] **Q2 — admission: (a), a blocker word of its own** (§4.2).
+- [x] **Q3 — completion counters: (a), in the runtime** (§4.3).
+- [x] **Q4 — heads and continuations together** (§5).
+
+  Settled 2026-11-10. Bart asked for second opinions from Codex and
+  Antigravity and for the tiebreak to be settled here. Both reviewers
+  picked the same four options independently. Their factual corrections
+  were checked against the code and folded into §4.1–§4.4 as follow-up
+  paragraphs ("Review, 2026-11-10").
 
 ### Outstanding
 
@@ -42,10 +52,11 @@ land; move whole phases to Done once everything inside them is checked.
   (§4.6). A `.global` seed is a hash lookup per entry in `nativeSeedFn`.
   Doc 81's load-time cells make it a load. This doc does no seed work of
   its own until E2 lands.
-- [ ] **Q1 — per-anchor penalty/gate knowledge** (§4.1).
-- [ ] **Q2 — the admission word** (§4.2).
-- [ ] **Q3 — where completion counters are bumped** (§4.3).
-- [ ] **Q4 — scope: heads and continuations together** (§5).
+- [ ] **Phase 1 prerequisite — one funnel for penalty mutations** (§4.1).
+  Penalty entries are inserted and removed in at least four places today.
+- [ ] **Check: `opJFuncHead`'s bypass set omits `pending_ret_anchor`**,
+  which `opJCont`'s includes (`interp.zig` ~9551 against ~9662). Find out
+  whether that is deliberate before Phase 2 merges both into one word.
 - [ ] **Defer — the loop-anchor lane.** Doc 44 D9 already deferred the
   loop-anchor quiet episode. It stays deferred until the one-shot lane has
   proved itself (§5).
@@ -283,6 +294,30 @@ are exact, so the lane's behaviour stays byte-identical:
   struck on every iteration keeps bumping `penalty_gen`, so the memo
   misses at the same rate.
 
+**Review, 2026-11-10: (b), with two bits.** (a) puts back the hashes
+the lane exists to remove. (c) is invalidated by every unrelated strike,
+which is exactly binary-trees' state. `gate_gen` also counts record-gate
+changes, which a productive receipt never touches. What (b) needs:
+
+- **Two bits, not one: `has_penalty` and `has_dispatch_gate`.** Then
+  removing a penalty never has to look in the gate map to know whether
+  the combined answer changed. The lane needs both clear. It tests
+  membership, not whether the gate's cooldown is currently in force: a
+  productive receipt removes an expired gate entry too.
+- **One funnel for penalty mutations first.** Today penalties are
+  inserted by the legacy receipt (`trace_regionops.zig` ~154), inserted
+  and removed by region decisions (~314-363), removed by member amnesty
+  (~1464, which also removes a gate directly) and cleared in bulk by
+  `clearCache` (`trace_link.zig` ~3082). Each of these goes through one
+  pair of operations that keeps the bits, as `noteGatesChanged` now does
+  for gates.
+- **The bits belong to the anchor.** A mutation finds the patch through
+  an anchor-to-slot index, so it doesn't scan `entry_patches`. Whichever
+  sibling trace runs, it reads the same bits.
+- **A new or reused patch is initialised from the maps** before its
+  opcode is published (`installEntryPatch`, `trace_entry_registry.zig`
+  ~167-198).
+
 ### 4.2 Phase 2 — one admission test
 
 The bypass set (seven loads in `opJFuncHead`/`opJCont`), the decline
@@ -307,6 +342,36 @@ lane runs. If not, today's code runs unchanged.
   adjacent fields so that one or two wide loads and a mask test answer
   it. No funnel discipline is needed. The prelude's per-call work (§3.3)
   still needs its own trimming.
+
+**Review, 2026-11-10: (a).** The tree already has this pattern:
+`TraceState.fast_block` and `FastBit` (`trace.zig` ~3200-3280). They
+already have owned setters, a Safe-build reference check, and the store
+discipline that avoids a measured store-forwarding stall. Ten of the
+conditions the lane needs already have bits there. (b) re-checks every
+patch after any unrelated recording or arm. (c) can't flatten
+`receiptsInert()` (three maps) or the per-trace eligibility. What (a)
+needs:
+
+- **A word of its own.** `fast_block` stays 16 bits: `hostcall_x64.S`
+  asserts `TRACE_FAST_BLOCK_SIZE == 2`. The lane's word is a separate
+  `one_shot_blockers`, which mirrors the `fast_block` bits it needs
+  through the same setters.
+- **Pending walk evidence is a blocker.** That covers `head_walk_fail`,
+  `pending_descent_fail`, `wants_head_sibling` and an outstanding
+  ordinary probe. While any of them is live, the entry takes today's
+  prelude, which consumes or pairs it. The same goes for pending patch
+  work (`drainEntryPatchWork`) and a non-zero strike count on the patch.
+- **Failing admission still has three outcomes.** Recording and
+  suspension run the canonical instruction. A dead patch runs the
+  deferred-unpatch recovery. Anything else runs the full path. The word
+  only decides "lane or not". The existing dispatch picks among the
+  rest.
+- **Funnels that don't exist yet get one.** For example,
+  `receiptsInert()` changes with the physical index as well as with
+  `refreshObserverFast` (`trace_region_policy.zig` ~313-369). The Safe
+  assert checks the full reference verdict on both admission and
+  refusal. Tests drive every blocker's transitions, including the
+  out-of-memory paths.
 
 Whichever is picked, the prelude's per-call work (§3.3) moves behind the
 admission test. On the lane, the walk state is never set up, because
@@ -336,6 +401,29 @@ one terminal kind that files a continuation anchor. Admission can't
 exclude it, because it is a property of the terminal, not of the program
 state.
 
+**Review, 2026-11-10: (a), and there is no threshold.** The framing
+above misread `accountTraceRun` (`trace_regionops.zig` ~1641):
+
+- `hit_count` rises only when one receipt's `completed >= min_useful`.
+  A scalar one-shot completion passes 1 against a default of 8, so it
+  normally leaves `hit_count` alone.
+- Patch installation is marked only for a trace whose patch is
+  `.eligible`. On the lane, the patch is already installed (`.bound`).
+  One-shot patches qualify at commit (`trace.zig` ~4406).
+- The entered charge resets `consec_refusals`; it doesn't count anything
+  (`accountCandidateCharge`).
+- `entries` and `native_entries` count before the run, so seed declines
+  and guard failures count too. They stay where they are.
+
+So the runtime completion is one shared function holding exactly what is
+left: the `min_useful` compare, the `consec_refusals` reset, the
+diagnostic `last_exit_instr`, and `noteHostCallTerminal` for
+`call_interp`. Wrapping and saturating arithmetic stay as they are
+today. (b) would also bake addresses inside the movable `Vm`
+(`nativegen_emit.zig` ~1082: "`Vm` is movable, never baked"). It would
+need a mode bit so that fused and full consumers don't charge twice, all
+to save a few instructions.
+
 ### 4.4 Phase 4 — a thin native call for one-shot pages
 
 One-shot pages get an entry wrapper with a small fixed result: the exit
@@ -346,6 +434,17 @@ already branches on exactly those. `prepareNativeEpisode`'s stores run
 only for pages whose seed plan or frame motion reads the ctx: the page
 knows this at compile time and can carry the flag. The lease is raised
 only on paths that can retire a trace.
+
+**Review, 2026-11-10: one-shot doesn't mean scalar.** Continuation
+pages emit frame pushes and return pops as well as head pages
+(`nativegen.zig` ~2554, ~2689). The comment in `enterPatchedTrace` that
+says otherwise is stale. The emitted push reads `descent_budget` from
+`NativeResult` before deciding whether to push (`nativegen_emit.zig`
+~1106). A dynamic-window plain terminal reads the episode ctx even with
+no active seed (`nativegen.zig` ~2786). So the thin call is a capability
+the compiler grants a page: no frame-motion sequence reachable, no ctx
+read, no ledger append. Its eligibility is a flag on the page, and pages
+without it keep today's result.
 
 This is the half of the LuaJIT seam that is codegen work. LuaJIT's
 `vm_exit_interp` is cheap because the trace has already written its
@@ -380,7 +479,16 @@ treats both as one-shot anchors (`one_shot`), and they share
 `headEpisodeQuiet`/`enterHeadNativeQuiet`. binary-trees enters both
 (`opJFuncHead` 71, `opJCont` 127 per entry). The lane is written for the
 one-shot class. Splitting it by kind would mean two lanes to keep in
-step.
+step. Settled this way (Q4). The real differences stay explicit:
+
+- only a head consumes the descent carry;
+- the continuation side refuses on `pending_ret_anchor` (see the check
+  in Outstanding);
+- a continuation's anchor pc is tagged (`contAnchorPc`), so membership
+  and sibling lookups keep using the exact anchor, never the resume pc.
+
+`headEpisodeQuiet` and `enterHeadNativeQuiet` already serve
+continuations. The lane's functions are named for the one-shot class.
 
 **Non-goals.**
 
@@ -409,7 +517,7 @@ full board A/B on the pinned pool. Hashgate must stay byte-identical in
 both builds after every phase. Each phase's Safe-build assert is the
 proof of exactness that the hashgate cannot give on its own.
 
-## 7. Open questions for review
+## 7. Questions (settled 2026-11-10; kept for the record)
 
 - **Q1 (§4.1):** per-anchor penalty/gate knowledge through (a) a hash
   lookup per entry, (b) a membership bit kept by the funnels, or (c) a
