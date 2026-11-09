@@ -433,7 +433,10 @@ const F = struct {
 
     /// `local`/`global` and the names (with attributes and types), up to the
     /// `=`: read from the tokens, so an attribute stays where it was written.
+    /// A list too long for the line is filled: as many names per line as
+    /// fit, the continuation lines indented once.
     fn declHead(f: *F, span: ast.Span) Error!Doc {
+        var parts: std.ArrayList(Doc) = .empty;
         var buf: std.ArrayList(u8) = .empty;
         var prev: ?Tag = null;
         var i = f.tokIdx(span.start);
@@ -442,8 +445,15 @@ const F = struct {
             if (prev) |p| if (spaceBetween(p, tk.tag)) try buf.append(f.a, ' ');
             try buf.appendSlice(f.a, f.lexeme(tk));
             prev = tk.tag;
+            if (tk.tag == .comma) {
+                try parts.append(f.a, try f.t(buf.items));
+                buf = .empty;
+                prev = null;
+            }
         }
-        return f.t(buf.items);
+        try parts.append(f.a, try f.t(buf.items));
+        if (parts.items.len == 1) return parts.items[0];
+        return f.b.indent(try f.b.fill(parts.items));
     }
 
     // ---- expressions ----
@@ -1222,6 +1232,14 @@ test "format: a long method chain breaks before each link after the first call" 
     try expectFmt(
         "local result = builder:set_name(\"some long name here that is long\", \"and another string here to fill the width\", 1)",
         "local result = builder:set_name(\n    \"some long name here that is long\",\n    \"and another string here to fill the width\",\n    1\n)\n",
+    );
+}
+
+test "format: a name list too long for the line wraps after a comma" {
+    try expectFmt("local a, b <const>, c = 1, 2, 3", "local a, b <const>, c = 1, 2, 3\n");
+    try expectFmt(
+        "local alpha_alpha_alpha, beta_beta_beta, gamma_gamma_gamma, delta_delta_delta, epsilon_epsilon, zeta_zeta_zeta = f()",
+        "local alpha_alpha_alpha, beta_beta_beta, gamma_gamma_gamma, delta_delta_delta, epsilon_epsilon,\n    zeta_zeta_zeta = f()\n",
     );
 }
 

@@ -1,6 +1,6 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 to 7 landed (printer, tokens, comments, builder, corpus gate, CLI, language server, wasm/C API/viz, the repo formatted with its gate) and the benchmark (Q2) and the CRLF rule (Q3) are settled; method-chain breaking, name-list wrapping and the peak-memory footprint outstanding. Every style decision made by Bart
+Status: partial — phases 0 to 7 landed (printer, tokens, comments, builder, corpus gate, CLI, language server, wasm/C API/viz, the repo formatted with its gate) and the benchmark (Q2) and the CRLF rule (Q3) are settled; the peak-memory footprint and expression-interior comments outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
@@ -130,14 +130,21 @@ land; move whole phases to Done once everything inside them is checked.
   `\n` (`#[[a<CRLF>b]]` is 3), so the formatter writes them as `\n` and the
   output is LF throughout with no exemption in the gate. Done 2026-11-10.
 
+- [x] **Method-chain breaking and name-list wrapping** (§6.4, §6.6): a
+  postfix chain with more than two calls that does not fit breaks before
+  every `.`/`:` link after the first call, one per line, indented once
+  (`F.chain`, one pass over the chain). A `local`/`global` name list too long
+  for the line is filled (as many names per line as fit, continuation
+  indented once) rather than one name per line, which read badly on the one
+  repo case (`src/stdlib/task.lua`'s twelve-name parameter list). Done
+  2026-11-10.
+
 ### Outstanding
 
 - [ ] **Peak memory** (§10): 12 MB for a 165 KB file, 1.1 GB for the 26 MB
   adversarial one, i.e. 40–80× the input. Linear, so within the editor use,
   but the document nodes are the place to look if it ever matters.
 
-- [ ] **Method-chain breaking and name-list wrapping** (§6): not built in
-  phase 2; long chains and name lists currently stay on one line.
 - [ ] **Comments inside expressions** (§5): refused in v1; place them or keep
   refusing, decided once real code hits it.
 

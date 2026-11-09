@@ -8,7 +8,8 @@
 -- A task is a table marked by TAG. It runs its function in a coroutine of
 -- its own, which yields only from `await`: (TAG, the awaited task). The
 -- ready queue holds the tasks the task they wait on has woken, in order.
-local create, resume, yield, running, status, close, error, select, unpack, type, rawget, host_wait = ...
+local create, resume, yield, running, status, close, error, select, unpack, type, rawget,
+    host_wait = ...
 
 local TAG = {}
 local queue, head, tail = {}, 1, 0
