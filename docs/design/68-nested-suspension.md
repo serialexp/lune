@@ -189,10 +189,12 @@ land; move whole phases to Done once everything inside them is checked.
     `interp_stdlib_test` (require/tostring/print) and `interp_effects_test`
     (dofile in a loop). Benchmark: `bench/stdlib/tostring_meta.lua`, three
     hashgate modes.
-  - [ ] **`mahina_replay` / viz (wasm).** Blocked on the wasm build; the
-    obsolete "stop inside require's run … deferred" test in
-    `viz/test/wasm.test.ts` must flip, and the nested-code test extends to
-    dofile/require/tostring/print stops.
+  - [x] **`mahina_replay` / viz (wasm)** (2026-11-09). A step inside
+    require's module run now stops exactly (the old "deferred" test is
+    flipped: only the activation's own chunk-less steps defer), and the
+    nested-code test covers tostring and print. Not met: the viz "steps inside
+    nested calls skipped" note still shows, because chunk-less activation steps
+    and multret-feeding steps count as unstoppable (TODO.md).
 
 ## 1. Why this exists
 

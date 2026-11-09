@@ -106,6 +106,17 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       the file `__close` are no longer globals, and the file methods table
       (`@file`) is `Vm.file_methods`.
 
+## Viz "steps inside nested calls skipped" note is now wrong (noted 2026-11-09)
+
+`store.ts` `countUnstoppable` counts every step with `safepointStoppable == 0`.
+After doc 68 P3 those are an activation proto's own steps (in no chunk: 16 in
+a sort/gsub/tostring/print program) and multret-feeding steps on user protos
+(`print(f())`, `reg_top_pending`, 4 in the same program), not nested code. The
+`ReplayPanel.tsx` note therefore shows with a misleading text for any program
+using those natives. Options: stop counting chunk-less steps and reword the
+note for the multret case, or keep the steps out of the index. The latter
+changes replay step numbering (native side), so it wants a decision.
+
 ## Doc 63 Phase 3 leftovers (noted 2026-10-29)
 
 - [ ] **A precise host trace native can't compile runs on tier-1a.** The

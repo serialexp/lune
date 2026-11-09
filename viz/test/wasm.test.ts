@@ -446,7 +446,11 @@ test("multi-file: the step index and coverage say which file each line is in", (
   const files = new Set(Array.from(result.safepointProtos, (id) => chunkOf(result, id)));
   expect(files.has(0)).toBe(true);
   expect(files.has(1)).toBe(true);
-  expect(files.has(-1)).toBe(false);
+  // A step in no chunk is an activation's own (doc 68: require, sort, ... run
+  // their Lua calls from a system proto), and a replay never stops there.
+  for (let k = 0; k < result.safepointProtos.length; k++) {
+    if (chunkOf(result, result.safepointProtos[k]) === -1) expect(result.safepointStoppable[k]).toBe(0);
+  }
   // The module's loop line (4) is stepped through, as a line of the module.
   const modLines = Array.from(result.safepointLines).filter((_, k) => chunkOf(result, result.safepointProtos[k]) === 1);
   expect(modLines).toContain(4);
@@ -485,13 +489,15 @@ test("errors name the entry's chunk, and a replay given the run's argv names it 
   expect(whole.stdout).toBe(run.stdout);
 });
 
-// Doc 68 §8 (defer): the module's top level runs inside `require`, which
-// re-enters the VM from Zig, so a replay cannot stop there yet. The index says
-// so, and a stop asked for there lands on the next stoppable step, back in main.
-test("multi-file: a stop inside require's run of the module is deferred to the next stoppable step", () => {
+// Doc 68 §7.3 (P3): the module's top level runs from require's activation, so
+// every step of the module is one a replay stops at. Only the activation's own
+// steps (a system proto, in no chunk) are not stops: a stop asked for there
+// lands on the next stoppable step.
+test("multi-file: the module's own steps inside require stop exactly; the activation's are deferred", () => {
   const run = mod.runSource(MULTI_MAIN, ["main.mah"], MULTI_FILES);
   const stoppable = Array.from(run.safepointStoppable);
-  const k = stoppable.findIndex((f, i) => f === 0 && chunkOf(run, run.safepointProtos[i]) === 1);
+  expect(stoppable.some((f, i) => f === 0 && chunkOf(run, run.safepointProtos[i]) === 1)).toBe(false);
+  const k = stoppable.findIndex((f, i) => f === 0 && chunkOf(run, run.safepointProtos[i]) === -1);
   expect(k).toBeGreaterThanOrEqual(0);
   const next = stoppable.findIndex((f, i) => i > k && f === 1);
   expect(next).toBeGreaterThan(k);
@@ -515,10 +521,13 @@ test("nested code (pcall, sort, gsub, metamethods): every stoppable step replays
     "print((string.gsub('a1b22', '%d+', function(d) return '<' .. #d .. '>' end)))",
     "local o = setmetatable({}, { __index = function(_, k) return k end, __add = function() return 42 end })",
     "print(o.hi, o + 1)",
+    "local s = setmetatable({}, { __tostring = function() return 'str' end })",
+    "print(tostring(s))",
+    "print(s)",
   ].join("\n") + "\n";
   const run = mod.runSource(src);
   expect(run.status).toBe(0);
-  expect(run.stdout).toBe("true\t42\nfalse\thandled\n9,5,3,1\na<1>b<2>\nhi\t42\n");
+  expect(run.stdout).toBe("true\t42\nfalse\thandled\n9,5,3,1\na<1>b<2>\nhi\t42\nstr\nstr\n");
   expect(run.safepointStoppable.includes(0)).toBe(true);
   for (let k = 1; k <= run.safepointCount; k++) {
     if (run.safepointStoppable[k - 1] !== 1) continue;
