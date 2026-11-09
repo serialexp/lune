@@ -61,7 +61,66 @@ pub const Translated = union(enum) {
     bad: []const u8,
 };
 
-const WordError = error{ UnterminatedQuote, WriteFailed, OutOfMemory };
+const WordError = error{ UnterminatedQuote, UnterminatedTemplate, WriteFailed, OutOfMemory };
+
+/// The index just past the template that opens with the backtick at `start`
+/// (doc 82 Phase 5). A word is shell syntax, so the scan is its own small
+/// lexer: `\` escapes the next byte in the text, `{` opens a hole that ends at
+/// its own `}`, and inside a hole quotes, long strings and nested templates
+/// hide their braces, as in the real lexer.
+fn skipTemplate(text: []const u8, start: usize) WordError!usize {
+    var p = start + 1;
+    while (p < text.len) {
+        switch (text[p]) {
+            '`' => return p + 1,
+            '\\' => p += 2,
+            '{' => p = try skipHole(text, p + 1),
+            else => p += 1,
+        }
+    }
+    return error.UnterminatedTemplate;
+}
+
+/// The index just past the `}` that closes the hole whose contents start at `p`.
+fn skipHole(text: []const u8, start: usize) WordError!usize {
+    var p = start;
+    var depth: usize = 1;
+    while (p < text.len) {
+        switch (text[p]) {
+            '{' => {
+                depth += 1;
+                p += 1;
+            },
+            '}' => {
+                depth -= 1;
+                p += 1;
+                if (depth == 0) return p;
+            },
+            '`' => p = try skipTemplate(text, p),
+            '\'', '"' => |q| {
+                p += 1;
+                while (p < text.len and text[p] != q) p += if (text[p] == '\\') 2 else 1;
+                if (p >= text.len) return error.UnterminatedTemplate;
+                p += 1;
+            },
+            '[' => {
+                // A long string hides its braces: `[`, any `=`s, `[` ... `]`, the same `=`s, `]`.
+                var eq: usize = 0;
+                while (p + 1 + eq < text.len and text[p + 1 + eq] == '=') eq += 1;
+                if (p + 1 + eq < text.len and text[p + 1 + eq] == '[') {
+                    var close: [34]u8 = undefined;
+                    close[0] = ']';
+                    @memset(close[1 .. 1 + eq], '=');
+                    close[1 + eq] = ']';
+                    const at = std.mem.indexOfPos(u8, text, p + 2 + eq, close[0 .. eq + 2]) orelse return error.UnterminatedTemplate;
+                    p = at + eq + 2;
+                } else p += 1;
+            },
+            else => p += 1,
+        }
+    }
+    return error.UnterminatedTemplate;
+}
 
 /// The next shell word of `text` from `i`: [start, end) of its raw bytes,
 /// quotes included. Null at the end.
@@ -80,6 +139,7 @@ fn nextWord(text: []const u8, i: *usize) WordError!?[]const u8 {
                 if (p >= text.len) return error.UnterminatedQuote;
                 p += 1;
             },
+            '`' => p = try skipTemplate(text, p),
             '\\' => p += if (p + 1 < text.len) 2 else 1,
             else => p += 1,
         }
@@ -124,6 +184,13 @@ fn writeWordExpr(gpa: Allocator, w: *Writer, raw: []const u8) WordError!void {
             n.* += 1;
             l.clearRetainingCapacity();
         }
+        fn expr(wr: *Writer, src: []const u8, n: *usize) Writer.Error!void {
+            if (n.* > 0) try wr.writeAll(" .. ");
+            try wr.writeAll("(");
+            try wr.writeAll(src);
+            try wr.writeAll(")");
+            n.* += 1;
+        }
         fn env(wr: *Writer, name: []const u8, n: *usize) Writer.Error!void {
             if (n.* > 0) try wr.writeAll(" .. ");
             try wr.writeAll("(os.getenv(");
@@ -148,6 +215,14 @@ fn writeWordExpr(gpa: Allocator, w: *Writer, raw: []const u8) WordError!void {
             '\\' => {
                 if (i + 1 < raw.len) try lit.append(gpa, raw[i + 1]);
                 i += 2;
+            },
+            // A template is one argument, evaluated by the session like any
+            // Lua expression (its locals are visible) and never split again.
+            '`' => {
+                const end = try skipTemplate(raw, i);
+                try Flush.lit_(w, &lit, &parts);
+                try Flush.expr(w, raw[i..end], &parts);
+                i = end;
             },
             '"', '$' => {
                 // Inside double quotes everything but `\`, `"` and `$` is literal.
@@ -226,6 +301,10 @@ pub fn translate(gpa: Allocator, word: []const u8, rest: []const u8) Allocator.E
         error.UnterminatedQuote => {
             aw.deinit();
             return .{ .bad = "unterminated quote" };
+        },
+        error.UnterminatedTemplate => {
+            aw.deinit();
+            return .{ .bad = "unterminated template" };
         },
     };
     switch (r) {
@@ -821,6 +900,34 @@ test "[REQ-38.1] [REQ-38.2] translate: cd reads its path as a shell word" {
     try testing.expect(std.mem.indexOf(u8, e, "os.chdir((os.getenv(\"HOME\") or \"\"))") != null);
     try testing.expect(std.mem.indexOf(u8, d, "os.setenv(\"OLDPWD\", __o) os.setenv(\"PWD\", os.getcwd())") != null);
     try testing.expectEqualStrings("cd: too many arguments", (try translate(gpa, "cd", "a b")).bad);
+}
+
+test "[REQ-116.1] translate: a template word is one argument, even with spaces" {
+    const gpa = testing.allocator;
+    const a = try luaOf(gpa, "cd", "`my {name} dir`");
+    defer gpa.free(a);
+    try testing.expect(std.mem.indexOf(u8, a, "os.chdir((`my {name} dir`))") != null);
+    // Quotes and braces inside a hole do not end it; text around it joins in.
+    const b = try luaOf(gpa, "export", "P=~/`{t[\"}\"]} {[[}]]}`/x");
+    defer gpa.free(b);
+    try testing.expect(std.mem.indexOf(u8, b, "(`{t[\"}\"]} {[[}]]}`) .. \"/x\"") != null);
+    // Two words are still two: the template did not swallow the space after it.
+    try testing.expectEqualStrings("cd: too many arguments", (try translate(gpa, "cd", "`a b` c")).bad);
+}
+
+test "[REQ-116.1] [REQ-116.2] session: cd with a template word uses the session's variables" {
+    const r = try Rig.init(testing.allocator);
+    defer r.deinit(testing.allocator);
+    _ = try r.feed("local dir = 'my dir'");
+    try testing.expect(try r.feed("cd `/tmp/{dir}/{1 + 1}`") == .done);
+    try testing.expectEqualStrings("", r.err.written());
+    try testing.expectEqualStrings("/tmp/my dir/2", r.host.chdir_path[0..r.host.chdir_path_len]);
+}
+
+test "[REQ-116.3] translate: an unterminated template word is reported" {
+    const gpa = testing.allocator;
+    try testing.expectEqualStrings("unterminated template", (try translate(gpa, "cd", "`a {b")).bad);
+    try testing.expectEqualStrings("unterminated template", (try translate(gpa, "export", "A=`x")).bad);
 }
 
 test "[REQ-39.1] [REQ-39.2] [REQ-39.3] translate: export and unset" {

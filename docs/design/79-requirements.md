@@ -246,7 +246,8 @@ result, drift found.
   (REQ-102 basic form, REQ-103 escapes, REQ-104 newlines, REQ-105 malformed
   templates, REQ-106 a hole ends at its own brace), REQ-107 evaluation
   (REQ-108 schedule, REQ-109 conversion, REQ-110 result), REQ-111 REPL and
-  editor (REQ-112, REQ-113) and REQ-114 hot code (REQ-115). 17 nodes, 42
+  editor (REQ-112, REQ-113) and REQ-114 hot code (REQ-115), plus REQ-116
+  (a template in a shortcut command word, doc 82 phase 5). 18 nodes, 45
   criteria, 17 notes, all `draft`. REQ-103.3 was replaced by REQ-103.5 once
   the test showed that `\\u{41}` is a backslash, the letter u and a hole, not
   a backslash and a hole. Trace pass: every criterion, REQ-115.1–3 (tracing,

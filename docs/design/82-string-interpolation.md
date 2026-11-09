@@ -1,6 +1,6 @@
 # 82 — String interpolation — Design
 
-Status: partial — phases 0–4 landed; phase 5 (command words) outstanding
+Status: complete — phases 0–5 landed
 Owner: Bart
 Last updated: 2026-11-09 (implementation)
 
@@ -10,6 +10,16 @@ Tracking the gap between this design and what's on master. Tick items as they
 land; move whole phases to Done once everything inside them is checked.
 
 ### Done
+
+- [x] **Phase 5 — command words.** Decided by Bart 2026-11-10: a backtick
+  word in a shortcut (`cd`, `export`) is one argument and is evaluated by the
+  session as a template, so its holes see the session's locals and globals,
+  and its result is never split again. `nextWord` and `writeWordExpr` scan
+  it with `skipTemplate`/`skipHole` (escapes, nested braces, quotes, long
+  strings and nested templates hide their braces); it joins neighbouring text
+  in the word (`~/`{x}`/y`). An unterminated one is reported at once as
+  "unterminated template", as an unterminated quote is: shortcut lines do not
+  wait for more input. REQ-116.1–3.
 
 - [x] **Phase 3 — tracing.** `tostr` and `interp` record. A number hole is
   `guardNum` plus `tostr_int`/`tostr_num`; nil and bool fold to their interned
@@ -86,10 +96,7 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Phase 5 — command words.** Whether a template is one argv element in a
-  REPL command line, and how it requests more input; owned by doc 75 §6.1.
-  `repl.zig`'s `nextWord` knows only `'` and `"` today, so a backtick word
-  containing a space would be split.
+_(nothing outstanding)_
 ## Why this exists
 
 Building a string from values is `..` chains or `string.format`. Both are
