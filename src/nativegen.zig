@@ -192,7 +192,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, arena: ?*
     if (heap == null) {
         for (t.instrs) |ins| {
             switch (ins.op) {
-                .guard_gc, .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower => return null,
+                .guard_gc, .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .sjpart, .sjoin => return null,
                 // Doc 45 D6: tnew calls `Heap.newTable` — heap mandatory. (A
                 // precise body always carries the eager guard_gc too, so this
                 // row is belt on top of that suspender.)
@@ -710,6 +710,7 @@ const emitStr2NumCallout = emit.emitStr2NumCallout;
 const emitSgmSetposCallout = emit.emitSgmSetposCallout;
 const emitHrefCallout = emit.emitHrefCallout;
 const emitGuardAbsent = emit.emitGuardAbsent;
+const emitGuardTostring = emit.emitGuardTostring;
 const emitHStore = emit.emitHStore;
 const emitAStore = emit.emitAStore;
 const emitGStore = emit.emitGStore;
@@ -1469,12 +1470,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // Doc 24 D4/c3: the snew class — mid-body callouts into the shared
             // `stralloc` shims (which run THE SAME cores as tier-0). Side-exit
             // on null (OOM or the collapsed tier-0 raise).
-            .ssub, .srev, .schar1, .srep2, .supper, .slower => try emitSnewCallout(a, alloc, heap.?, ins, i, exit_labels),
+            .ssub, .srev, .schar1, .srep2, .supper, .slower, .sjpart, .sjoin => try emitSnewCallout(a, alloc, heap.?, ins, i, exit_labels),
             // Doc 26 D3/D4: string.codepoint — the non-allocating string
             // reader. No heap arg; −1 sentinel → side-exit (tier-0 replays
             // the call to its nil result).
             .scp => try emitScpCallout(a, alloc, ins, i, exit_labels),
             .guard_absent => try emitGuardAbsent(a, alloc, kinds, ins, i, exit_labels),
+            .guard_tostring => try emitGuardTostring(a, alloc, ins, i, exit_labels),
             // --- doc 30: the pattern/str2num callout class -------------------
             // (compileImpl bailed heapless traces containing the heap-needing
             // members, so `heap.?` cannot trip for smatch/sgmatch/scap_*.)

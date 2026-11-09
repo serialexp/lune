@@ -249,8 +249,8 @@ result, drift found.
   editor (REQ-112, REQ-113) and REQ-114 hot code (REQ-115). 17 nodes, 42
   criteria, 17 notes, all `draft`. REQ-103.3 was replaced by REQ-103.5 once
   the test showed that `\\u{41}` is a backslash, the letter u and a hole, not
-  a backslash and a hole. Trace pass: every criterion except REQ-115.1–3
-  (tracing, doc 82 phase 3) is verified by `gt requirement verify` against a
+  a backslash and a hole. Trace pass: every criterion, REQ-115.1–3 (tracing,
+  doc 82 phase 3) included, is verified by `gt requirement verify` against a
   local report. REQ-113.4 is proved by a Bun test (the Tree-sitter drift
   check), which Bun's JUnit reporter reports without the `requirements`
   property, so its fragment was written by hand for the local run: the CI half

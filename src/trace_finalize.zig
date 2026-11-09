@@ -673,7 +673,7 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             .uref => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
             // `uload` reads its uref; `ustore` reads uref + value.
             .uload => std.debug.assert(ins.a < i),
-            .ustore, .guard_absent => std.debug.assert(ins.a < i and ins.b < i),
+            .ustore, .guard_absent, .guard_tostring => std.debug.assert(ins.a < i and ins.b < i),
             .konst => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len),
             .loop => std.debug.assert(i == last), // the only loop, and it is terminal
             // `.link` (doc 15): terminal hand-off to an inner root. Like `.loop`
@@ -709,7 +709,7 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             // `slen`/`guard_string` their string operand — all prior nodes.
             // Doc 26: `supper`/`slower` read their string operand like `srev`.
             .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1, .supper, .slower => std.debug.assert(ins.a < i),
-            .srep2 => {
+            .srep2, .sjpart, .sjoin => {
                 std.debug.assert(ins.a < i);
                 std.debug.assert(ins.b < i);
             },

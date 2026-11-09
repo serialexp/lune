@@ -1,6 +1,6 @@
 # 82 — String interpolation — Design
 
-Status: partial — phases 0, 1, 2 and 4 landed (tier-0 only); phase 3 (tracing), phase 5 and Q5 outstanding
+Status: partial — phases 0–4 landed; phase 5 (command words) outstanding
 Owner: Bart
 Last updated: 2026-11-09 (implementation)
 
@@ -10,6 +10,27 @@ Tracking the gap between this design and what's on master. Tick items as they
 land; move whole phases to Done once everything inside them is checked.
 
 ### Done
+
+- [x] **Phase 3 — tracing.** `tostr` and `interp` record. A number hole is
+  `guardNum` plus `tostr_int`/`tostr_num`; nil and bool fold to their interned
+  rendering; a string is pinned. The join is two new ops: `sjpart` (keeps part
+  k, stores it in `Heap.join_parts`) and `sjoin` (one `Heap.internJoin` over
+  the n parts), the same function tier-0's `interp` ends in, so every tier
+  interns the same strings at the same ids. A table hole with a Lua-closure
+  `__tostring` records `guard_tostring` (the metatable's raw `__tostring` is
+  still a closure of that proto id; one callout, shared by tier-1a and native)
+  and inlines the handler like a call; its `ret` applies `tostringAnswer`
+  (string pinned, number converted, anything else aborts). A deopt re-runs the
+  iteration in tier-0 (the coarse model), so nothing runs twice. Proved by
+  REQ-115.1–3: recorded, committed, entered natively, snapshot and next object
+  id byte-identical in every trace mode, handler swapped between runs.
+  Templates with more than `gc.join_max` (32) parts stay in tier-0.
+- [x] **Q5 — the allocation protocol.** Decided by Phase 3: one intern per
+  number hole (what `tostring(n)` makes) plus one for the join, no
+  intermediate strings, identical in every tier. Limits kept as context: only
+  self-contained handlers trace (any table access on a metatable-bearing
+  table aborts, so a handler reading a field of its argument stays in
+  tier-0), and precise-mode loops never inline handlers.
 
 - [x] **Q1 — syntax follows Luau** (§3): decided 2026-11-09. Backticks with
   `{expr}` holes, the form of Luau's implemented RFC (the only interpolation in
@@ -65,22 +86,10 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Phase 3 — tracing.** The recorder gains what templates need: today it
-  has no `concat` recording (it falls back as `.nyi_opcode`) and its string
-  conversion rejects heap operands. Templates must record, commit and execute
-  in tier-1a and native, not only match output (§5).
 - [ ] **Phase 5 — command words.** Whether a template is one argv element in a
   REPL command line, and how it requests more input; owned by doc 75 §6.1.
   `repl.zig`'s `nextWord` knows only `'` and `"` today, so a backtick word
   containing a space would be split.
-- [ ] **Q5 — the allocation protocol.** One n-ary construction op (linear in
-  fragments plus bytes) is the lowering; `string.format` and a binary `..`
-  chain are excluded by §5. What remains is whether every tier allocates an
-  interned intermediate string per converted hole or none does; settled by
-  the Phase 3 measurement, and it must be the same in every tier.
-- [ ] **Defer — constant folding.** `` `a{"b"}c` `` folding to one literal at
-  compile time (Luau does this). Not in v1.
-
 ## Why this exists
 
 Building a string from values is `..` chains or `string.format`. Both are

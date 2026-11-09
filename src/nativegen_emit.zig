@@ -2042,7 +2042,7 @@ pub fn emitTostrCallout(
 /// decline/OOM split on this set, so it must match the emitters exactly.
 pub fn isStrAllocOp(op: trace.IrOp) bool {
     return switch (op) {
-        .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str => true,
+        .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str, .sjpart, .sjoin => true,
         else => false,
     };
 }
@@ -2110,7 +2110,7 @@ pub fn emitSnewCallout(
             try placeToReg(a, .rcx, placeOfRef(alloc, @intCast(ins.aux)));
         },
         // srep2(heap, s, n): count in rdx.
-        .srep2 => try placeToReg(a, .rdx, placeOfRef(alloc, ins.b)),
+        .srep2, .sjpart, .sjoin => try placeToReg(a, .rdx, placeOfRef(alloc, ins.b)),
         .srev, .schar1, .supper, .slower => {},
         else => unreachable,
     }
@@ -2124,6 +2124,8 @@ pub fn emitSnewCallout(
         .srev => @intFromPtr(&stralloc.srevRuntime),
         .schar1 => @intFromPtr(&stralloc.schar1Runtime),
         .srep2 => @intFromPtr(&stralloc.srep2Runtime),
+        .sjpart => @intFromPtr(&stralloc.sjpartRuntime),
+        .sjoin => @intFromPtr(&stralloc.sjoinRuntime),
         .supper => @intFromPtr(&stralloc.supperRuntime),
         .slower => @intFromPtr(&stralloc.slowerRuntime),
         else => unreachable,
@@ -2609,6 +2611,33 @@ pub fn emitGuardAbsent(
     try a.cmpRegImm32(.rcx, 0);
     try jccNativeExit(a, exit_labels, i, .e); // helper says "not absent" → guard fails
     a.bind(pass);
+}
+
+/// `guard_tostring` (doc 82 §5): the table's metatable still carries the
+/// `__tostring` closure the inlined handler call was recorded against. One
+/// callout into `stralloc.tostringHandlerRuntime`, THE predicate tier-1a runs
+/// (a type check, a metatable load, a hash lookup, a proto-id compare: no
+/// inline fast path worth the layout coupling). rdi = the value, rsi = the
+/// interned key, rdx = the proto id; 0 → side-exit.
+pub fn emitGuardTostring(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    try emitCalloutSave(a, alloc);
+    try placeToReg(a, .rdi, placeOfRef(alloc, ins.a));
+    try placeToReg(a, .rsi, placeOfRef(alloc, ins.b));
+    try a.movRegImm64(.rdx, @as(i64, ins.aux));
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&stralloc.tostringHandlerRuntime))));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+    try a.movRegReg(.rcx, .rax);
+    try emitCalloutRestore(a, alloc);
+    try a.cmpRegImm32(.rcx, 0);
+    try jccNativeExit(a, exit_labels, i, .e); // not the recorded handler → guard fails
 }
 
 pub fn emitHStore(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr) !void {

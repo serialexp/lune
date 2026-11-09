@@ -154,7 +154,7 @@ fn kindOf(op: IrOp) OpKind {
         .aref, .href, .uref => .aref,
         // Two-operand memory guard: effect root, never CSE/hoisted. Reuse
         // the ordered two-operand effect class, not unary guard dedup.
-        .guard_absent, .guard_gcol => .astore,
+        .guard_absent, .guard_gcol, .guard_tostring => .astore,
         // Grid-cell address chain (doc 14, Phase 8): `garow` (table+row → row base)
         // and `gcell` (row base+col → cell) are memory-address producers, same
         // canonical-to-self memory-op treatment as `aref` so a later `gstore` can't
@@ -231,6 +231,9 @@ fn kindOf(op: IrOp) OpKind {
         // canonical-to-themselves already, so no extra work). ssub's third
         // operand rides `aux` as a ref — every operand walk below handles it.
         .ssub, .srev, .schar1, .srep2 => .alloc,
+        // Doc 82 §5: the template join, `srep2`-shaped (a string, b a konst
+        // count/index). `.alloc` keeps the parts in order and never CSE'd.
+        .sjpart, .sjoin => .alloc,
         // Doc 26 D2: the case-mapping pair joins the snew `.alloc` discipline
         // wholesale (never DCE'd/CSE'd/hoisted/reordered; scratch precedes the
         // intern, so a repeat is a fallible operation — codex #8's rule).
@@ -799,7 +802,7 @@ pub fn optimize(
                 // reads nothing (`a` unused).
                 .alloc => {
                     live[canon[ins.a]] = true;
-                    if (ins.op == .ssub or ins.op == .srep2) live[canon[ins.b]] = true;
+                    if (ins.op == .ssub or ins.op == .srep2 or ins.op == .sjpart or ins.op == .sjoin) live[canon[ins.b]] = true;
                     if (ins.op == .ssub) live[canon[@intCast(ins.aux)]] = true;
                 },
                 .gcguard => {},
@@ -957,7 +960,7 @@ pub fn optimize(
             },
             .alloc => {
                 out.a = new_index[canon[ins.a]];
-                if (ins.op == .ssub or ins.op == .srep2) out.b = new_index[canon[ins.b]];
+                if (ins.op == .ssub or ins.op == .srep2 or ins.op == .sjpart or ins.op == .sjoin) out.b = new_index[canon[ins.b]];
                 if (ins.op == .ssub) out.aux = @intCast(new_index[canon[@intCast(ins.aux)]]);
             },
             // `.pure3` (scp): remap all three — a missed `aux` here is a wild

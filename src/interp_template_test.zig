@@ -8,6 +8,16 @@ const diag = @import("diag.zig");
 const parser = @import("parser.zig");
 const util = @import("interp_testutil.zig");
 
+const interp = @import("interp.zig");
+const compiler = @import("compiler.zig");
+const io = @import("io.zig");
+const nativegen = @import("nativegen.zig");
+const keyframeser = @import("keyframeser.zig");
+const ktu = @import("keyframeser_testutil.zig");
+const schema = @import("gen/trace_schema.zig");
+const trace_ir = @import("trace_ir.zig");
+
+const Vm = interp.Vm;
 const testing = std.testing;
 const expectProgram = util.expectProgram;
 
@@ -277,4 +287,189 @@ test "[REQ-110.3] a template in a loop gives the same output in every mode" {
         \\end
         \\print(acc)
     , "64936\n");
+}
+
+// ---- REQ-115: tracing (doc 82 §5) ----
+
+/// The ways a program can run under the tracer, the last being native code.
+const JitMode = enum { record_only, tier1a_raw, tier1a_opt, native };
+
+const JitRun = struct {
+    /// The final snapshot (caller frees).
+    snap: []u8,
+    entries: u64,
+    native_entries: u64,
+    /// `sjoin` ops across the committed traces: templates that were recorded.
+    joins: usize,
+    /// `guard_tostring` ops across the committed traces: inlined handlers.
+    handler_guards: usize,
+};
+
+/// Run `source` on a fresh VM under `mode`, asserting its output is `expected`.
+fn jitRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: JitMode, expected: []const u8) !JitRun {
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [1024]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = mode != .record_only;
+    vm.trace.config.optimize = mode == .tier1a_opt or mode == .native;
+    vm.trace.config.native_codegen = mode == .native;
+    vm.trace.config.hotloop = 4;
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(expected, sink.buffered());
+    var joins: usize = 0;
+    var handler_guards: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        for (t.code.instrs) |ins| {
+            if (ins.op == .sjoin) joins += 1;
+            if (ins.op == .guard_tostring) handler_guards += 1;
+        }
+    }
+    return .{
+        .snap = try keyframeser.encodeSnapshot(gpa, &vm),
+        .entries = vm.trace.entries,
+        .native_entries = vm.trace.native_entries,
+        .joins = joins,
+        .handler_guards = handler_guards,
+    };
+}
+
+/// A hot loop that builds templates from number and string holes, then reads
+/// the strings back in id-dependent order (`pairs` over strings interned after
+/// the loop), so a different set of allocations shows in the output.
+const number_and_string_loop =
+    \\local name = "ann"
+    \\local total = 0
+    \\for i = 1, 400 do
+    \\  local s = `item {i} is {name} at {i * 0.5}`
+    \\  total = total + #s
+    \\end
+    \\local tbl = {}
+    \\for i = 1, 26 do tbl[string.char(64 + i)] = i end
+    \\local ks = 0
+    \\for k, v in pairs(tbl) do ks = (ks * 31 + v + #k) % 1000003 end
+    \\print(total, ks)
+;
+
+test "[REQ-115.1] a hot loop building a template is recorded and runs on the trace" {
+    const gpa = testing.allocator;
+    const ref = try ktu.referenceRun(gpa, number_and_string_loop);
+    defer ref.deinit(gpa);
+    const modes = [_]JitMode{ .tier1a_raw, .tier1a_opt, .native };
+    for (modes) |mode| {
+        if (mode == .native and !nativegen.is_x64_linux) continue;
+        const run = try jitRun(gpa, number_and_string_loop, mode, ref.full_out);
+        defer gpa.free(run.snap);
+        // The template was recorded (an `sjoin` is in a committed trace) and
+        // that trace ran, natively where the platform has native code.
+        try testing.expect(run.joins > 0);
+        try testing.expect(run.entries > 0);
+        if (mode == .native) try testing.expect(run.native_entries > 0);
+    }
+}
+
+test "[REQ-115.2] a snapshot after a template loop is byte-identical in every trace mode, with the same next object id" {
+    const gpa = testing.allocator;
+    const ref = try ktu.referenceRun(gpa, number_and_string_loop);
+    defer ref.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ref_file = try schema.SnapshotFile.decode(arena.allocator(), ref.final_snap);
+    // The loop interns thousands of strings, so the id counter is not trivially equal.
+    try testing.expect(ref_file.keyframe.next_obj_id > 800);
+    const modes = [_]JitMode{ .record_only, .tier1a_raw, .tier1a_opt, .native };
+    for (modes) |mode| {
+        if (mode == .native and !nativegen.is_x64_linux) continue;
+        const run = try jitRun(gpa, number_and_string_loop, mode, ref.full_out);
+        defer gpa.free(run.snap);
+        try testing.expectEqualSlices(u8, ref.final_snap, run.snap);
+        const file = try schema.SnapshotFile.decode(arena.allocator(), run.snap);
+        try testing.expectEqual(ref_file.keyframe.next_obj_id, file.keyframe.next_obj_id);
+    }
+}
+
+/// Holes that are tables with a `__tostring`: a handler that answers a string,
+/// one that answers a number, and a number hole beside them.
+const handler_loop =
+    \\local sm = setmetatable({}, { __tostring = function() return "str" end })
+    \\local nm = setmetatable({}, { __tostring = function() return 42 end })
+    \\local total = 0
+    \\for i = 1, 400 do
+    \\  local s = `{sm}/{nm}/{i}`
+    \\  total = total + #s
+    \\end
+    \\local tbl = {}
+    \\for i = 1, 26 do tbl[string.char(64 + i)] = i end
+    \\local ks = 0
+    \\for k, v in pairs(tbl) do ks = (ks * 31 + v + #k) % 1000003 end
+    \\print(total, ks)
+;
+
+/// The loop runs once with one handler and is then run again after the
+/// metatable's `__tostring` is replaced by a handler that counts its calls
+/// (which a trace cannot contain), and once more with a hole whose type
+/// changes after the handler hole was converted.
+const handler_change_loop =
+    \\local calls = 0
+    \\local mt = { __tostring = function() return "A" end }
+    \\local obj = setmetatable({}, mt)
+    \\local function run(n, v)
+    \\  local total = 0
+    \\  for i = 1, n do
+    \\    local s = `{obj}:{v}:{i}`
+    \\    total = total + #s
+    \\  end
+    \\  return total
+    \\end
+    \\local t1 = run(400, 7)
+    \\mt.__tostring = function() calls = calls + 1; return "BB" end
+    \\local t2 = run(400, 7)
+    \\local t3 = run(400, "seven")
+    \\local tbl = {}
+    \\for i = 1, 26 do tbl[string.char(64 + i)] = i end
+    \\local ks = 0
+    \\for k, v in pairs(tbl) do ks = (ks * 31 + v + #k) % 1000003 end
+    \\print(t1, t2, t3, calls, ks)
+;
+
+test "[REQ-115.1] a table hole with a __tostring is recorded with its handler inlined" {
+    const gpa = testing.allocator;
+    const ref = try ktu.referenceRun(gpa, handler_loop);
+    defer ref.deinit(gpa);
+    const modes = [_]JitMode{ .tier1a_raw, .tier1a_opt, .native };
+    for (modes) |mode| {
+        if (mode == .native and !nativegen.is_x64_linux) continue;
+        const run = try jitRun(gpa, handler_loop, mode, ref.full_out);
+        defer gpa.free(run.snap);
+        try testing.expect(run.joins > 0);
+        try testing.expect(run.handler_guards > 0);
+        try testing.expect(run.entries > 0);
+        if (mode == .native) try testing.expect(run.native_entries > 0);
+        try testing.expectEqualSlices(u8, ref.final_snap, run.snap);
+    }
+}
+
+test "[REQ-115.3] a guard failure inside a template runs no hole or __tostring twice" {
+    const gpa = testing.allocator;
+    const ref = try ktu.referenceRun(gpa, handler_change_loop);
+    defer ref.deinit(gpa);
+    // Tier-0 calls the replaced handler once per iteration of the second and
+    // third runs (2 x 400); every trace mode must agree, output and snapshot.
+    try testing.expect(std.mem.indexOf(u8, ref.full_out, "\t800\t") != null);
+    const modes = [_]JitMode{ .record_only, .tier1a_raw, .tier1a_opt, .native };
+    for (modes) |mode| {
+        if (mode == .native and !nativegen.is_x64_linux) continue;
+        const run = try jitRun(gpa, handler_change_loop, mode, ref.full_out);
+        defer gpa.free(run.snap);
+        try testing.expectEqualSlices(u8, ref.final_snap, run.snap);
+    }
 }

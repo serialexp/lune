@@ -97,6 +97,10 @@ pub inline fn stringUnits(len: usize) usize {
 /// recorded in `subj`. Slot indices are fixed by doc 30 §3: 0 = start char,
 /// 1 = end char, 2 = whole-match span, 3.. = captures in capture order,
 /// `slot_next_pos` = the gmatch cursor.
+/// The most string operands a template join keeps in `Heap.join_parts`; a
+/// longer template is not recorded (tier-0 joins any number).
+pub const join_max = 32;
+
 pub const MatchScratch = extern struct {
     /// `*const String` of the subject the last match op ran on (`scap_str`
     /// interns spans out of its bytes). Raw address, valid only within the
@@ -254,6 +258,11 @@ pub const Heap = struct {
     /// ignore it by construction (nothing walks `Heap` fields; strings are
     /// reached via `objects`/`strtab`, and this holds no `Value`s).
     match_scratch: MatchScratch = .{},
+    /// Doc 82 §5: the template-join scratch. `sjpart` ops store the string
+    /// operands of a template here (raw header addresses, valid only inside
+    /// the trace iteration that wrote them); `sjoin` joins the first `n`.
+    /// Plain memory like `match_scratch`: no roots, no serialization.
+    join_parts: [join_max]u64 = @splat(0),
 
     pub fn init(gpa: std.mem.Allocator) Heap {
         return .{ .gpa = gpa };
@@ -941,6 +950,40 @@ pub const Heap = struct {
         errdefer s.destroy(self.gpa);
         try self.linkNew(s);
         return s;
+    }
+
+    /// The string of `parts` laid end to end (doc 82 `interp`), each a string
+    /// header's address. Short results are assembled on the stack, long ones
+    /// in the string's own allocation; the parts' character facts stand in
+    /// for the scan. The ONE join: tier-0's `interp` and the trace's `sjoin`
+    /// both end here, so they intern the same string at the same id.
+    pub fn internJoin(self: *Heap, parts: []const u64) std.mem.Allocator.Error!*String {
+        var len: usize = 0;
+        var cps: usize = 0;
+        var ascii = true;
+        for (parts) |p| {
+            const s = String.fromHeader(@ptrFromInt(@as(usize, @intCast(p))));
+            len = std.math.add(usize, len, s.bytes().len) catch return error.OutOfMemory;
+            cps += s.cpLen();
+            ascii = ascii and s.isAscii();
+        }
+        if (len <= nominal_object_bytes) {
+            var buf: [nominal_object_bytes]u8 = undefined;
+            var at: usize = 0;
+            for (parts) |p| {
+                const part = String.fromHeader(@ptrFromInt(@as(usize, @intCast(p)))).bytes();
+                @memcpy(buf[at..][0..part.len], part);
+                at += part.len;
+            }
+            return self.internKnown(buf[0..len], .{ .cp_len = cps, .ascii = ascii });
+        }
+        var sb = try String.Builder.init(self.gpa, len);
+        defer sb.deinit(self.gpa);
+        for (parts) |p| {
+            const s = String.fromHeader(@ptrFromInt(@as(usize, @intCast(p))));
+            sb.append(s.bytes(), s.cpLen(), s.isAscii());
+        }
+        return self.internBuilt(&sb);
     }
 
     /// The miss path every intern entry ends in (doc 28 §6 [MF], doc 24 D5):

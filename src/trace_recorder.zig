@@ -536,6 +536,9 @@ pub const InlineFrame = struct {
     /// `recCall`'s push; read by `currentPath`. Behaviour-neutral (recorder-only).
     caller_proto_id: u32,
     call_pc: u32,
+    /// A `__tostring` handler's frame (doc 82 `recTostrHandler`): its return
+    /// is converted as `tostringAnswer` does, before it lands in `ret_dest`.
+    tostr_answer: bool = false,
 };
 
 /// Build a guard's ordered inline-path prefix (doc 17, A-i.2) from the recorder's
@@ -1919,11 +1922,129 @@ pub const RecordingSession = struct {
                 self.setReg(instr.a, try self.emitAlloc(.{ .op = .tnew, .ty = .heap }));
             },
 
+            // Doc 82 §5: a template's per-hole conversion and its one join.
+            .tostr => try self.recTostr(instr, regs, proto),
+            .interp => try self.recInterp(instr, regs),
+
             // closures, concat, for_prep, len, …: each pulls in heap-effect
             // / cross-frame / invalidation machinery that is later work. Abort
             // cleanly.
             else => self.abort(.nyi_opcode),
         }
+    }
+
+    /// `tostr a` (doc 82 §5): `R[a]` becomes its string form in place. A
+    /// string is itself (as tier-0's `opTostr` leaves it; the join pins it).
+    /// A number records `tostr_int`/`tostr_num` through `emitAlloc`, the
+    /// intern `tostring(n)` makes, so the id stream is tier-0's; a pinned
+    /// nil/bool folds to its already-interned rendering. Anything else (a
+    /// table, whose `__tostring` or `table: 0x..` rendering needs the VM)
+    /// aborts, and tier-0 owns the loop.
+    fn recTostr(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        const slot: u16 = instr.a;
+        const v = regs.get(slot);
+        if (v.isHeap() and v.heapType() == .string) return;
+        if (v.isHeap() and v.heapType() == .table) return self.recTostrHandler(instr, regs, proto, v);
+        try self.recTostrScalar(slot, v);
+    }
+
+    /// `tostr` of a table whose metatable carries a Lua-closure `__tostring`
+    /// (doc 82 §5): `guard_tostring` pins that closure (proto id), then the
+    /// handler is inlined exactly as `recCall` inlines a call, on the window
+    /// tier-0's `pushMetaFrame` uses. The frame is flagged `tostr_answer`, so
+    /// `recRet` converts its answer the way `tostringAnswer` does. A deopt
+    /// anywhere inside re-runs the iteration in tier-0 (the coarse model), so
+    /// the handler never runs twice: nothing it does is on the trace until
+    /// the whole iteration commits. Precise recordings never inline.
+    fn recTostrHandler(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, v: Value) !void {
+        _ = regs;
+        if (self.pending_link_close != null or self.precise) return self.abort(.nyi_opcode);
+        const mt = table_mod.Table.fromHeader(v.asHeap()).metatable orelse return self.abort(.bad_type);
+        const key_ref = (try self.foldInternedStr("__tostring")) orelse return self.abort(.bad_type);
+        const handler = mt.getHeap(self.konstValueOf(key_ref).?);
+        // Absent: the `table: 0x..` rendering; native: the host boundary.
+        if (!handler.isHeap() or handler.heapType() != .function) return self.abort(.bad_type);
+        const cp = function.Closure.fromHeader(handler.asHeap()).proto;
+        if (cp.is_vararg) return self.abort(.cross_frame);
+        if (self.inline_depth >= MAX_INLINE_DEPTH) return self.abort(.too_deep);
+        const callee_base_off: u32 = self.base_off + proto.num_registers;
+        if (@as(usize, callee_base_off) + cp.num_registers > self.reg_map.len)
+            return self.abort(.frame_bounds);
+
+        const tref = try self.refOf(instr.a);
+        self.stampProv(try self.emit(.{ .op = .guard_tostring, .a = tref, .b = key_ref, .aux = @bitCast(cp.id) }), .callee_identity, .a, .neutral);
+        var i: u16 = 0;
+        while (i < cp.num_registers) : (i += 1) {
+            const seed: Ref = if (i == 0 and cp.num_params > 0) tref else try self.konst(Value.nil());
+            self.defineSlotAbs(callee_base_off + i, seed);
+        }
+        self.frames[self.inline_depth] = .{
+            .base_off = self.base_off,
+            .ret_dest = instr.a,
+            .ret_count = 1,
+            .caller_proto_id = proto.id,
+            .call_pc = self.cur_pc - 1,
+            .tostr_answer = true,
+        };
+        self.inline_depth += 1;
+        self.base_off = callee_base_off;
+    }
+
+    /// The `ret` of a `tostr_answer` frame: `tostringAnswer` on the returned
+    /// value. A string stays (pinned), a number is converted, and anything
+    /// else (or no value) raises in tier-0, so the recording aborts and
+    /// tier-0 owns it.
+    fn recTostrAnswer(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 1) return self.abort(.cross_frame);
+        const v = regs.get(instr.a);
+        if (v.isNumber()) return self.recTostrScalar(instr.a, v);
+        if (!v.isHeap() or v.heapType() != .string) return self.abort(.bad_type);
+        _ = (try self.stringArgRef(instr.a, regs, .a)) orelse return;
+    }
+
+    /// A non-string, non-table `tostr` operand in `slot` (the current frame's
+    /// register): nil/bool fold, numbers record the intern.
+    fn recTostrScalar(self: *RecordingSession, slot: u16, v: Value) !void {
+        const raw = try self.refOf(slot);
+        const ref = (try self.pinPrim(raw, v, .a)) orelse raw;
+        if (self.konstValueOf(ref)) |kv| {
+            if (kv.isHeap()) return self.abort(.bad_type);
+            var buf: [128]u8 = undefined;
+            var w = io.Writer.fixed(&buf);
+            io.writeValue(&w, kv) catch unreachable; // scalars render in <32 bytes
+            const kref = (try self.foldInternedStr(w.buffered())) orelse return self.abort(.bad_type);
+            self.setReg(slot, kref);
+            return;
+        }
+        if (!v.isNumber()) return self.abort(.bad_type);
+        try self.guardNum(ref, v, .operand_type, .a);
+        const op: IrOp = if (v.isInt()) .tostr_int else .tostr_num;
+        self.setReg(slot, try self.emitAlloc(.{ .op = op, .a = ref, .ty = .heap }));
+    }
+
+    /// `interp a, b, c` (doc 82 §5): `R[a]` is the `c` strings in `R[b ..]`
+    /// joined. Every part is pinned a string, then recorded as an `sjpart`
+    /// (kept, in order) and one `sjoin` that interns the whole: the single
+    /// intern tier-0's `Heap.internJoin` makes, with no intermediate strings.
+    /// A template with more than `gc.join_max` parts is left to tier-0.
+    fn recInterp(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+        const n: u16 = instr.c;
+        if (n == 0 or n > gc.join_max) return self.abort(.nyi_opcode);
+        var refs: [gc.join_max]Ref = undefined;
+        var k: u16 = 0;
+        while (k < n) : (k += 1) {
+            refs[k] = (try self.stringArgRef(instr.b + k, regs, .b)) orelse return;
+        }
+        // `sjpart` links nothing: it joins the body's allocating class without
+        // adding to the bound `A` (only `sjoin`, one link, does).
+        try self.ensureAllocGuard();
+        var last: Ref = refs[0];
+        k = 0;
+        while (k < n) : (k += 1) {
+            last = try self.emit(.{ .op = .sjpart, .a = refs[k], .b = try self.konst(Value.int(k)), .ty = .heap });
+        }
+        const count = try self.konst(Value.int(n));
+        self.setReg(instr.a, try self.emitAlloc(.{ .op = .sjoin, .a = last, .b = count, .ty = .heap }));
     }
 
     // --- recording helpers -------------------------------------------------
@@ -1987,11 +2108,19 @@ pub const RecordingSession = struct {
     /// premise holds at its exit. The guard's `aux` (the bound `A`) is a
     /// placeholder until `commit()` stamps the final `alloc_count`.
     pub fn emitAlloc(self: *RecordingSession, ins: IrInstr) !Ref {
+        try self.ensureAllocGuard();
+        self.alloc_count += 1;
+        return self.emit(ins);
+    }
+
+    /// The body's one `guard_gc`, emitted before its first allocating op. An
+    /// op that belongs to the allocating class but links nothing (`sjpart`)
+    /// calls this and goes through `emit`, so it adds no allocation to the
+    /// bound `A`.
+    fn ensureAllocGuard(self: *RecordingSession) !void {
         if (self.guard_gc_ref == null) {
             self.guard_gc_ref = try self.emit(.{ .op = .guard_gc });
         }
-        self.alloc_count += 1;
-        return self.emit(ins);
     }
 
     /// Intern a constant into the trace's pool and emit a `konst` for it. A
@@ -3210,7 +3339,7 @@ pub const RecordingSession = struct {
             // `uload` (doc 43 P5) is a heap read for the C1 store-sink
             // decision: a store following it is a read-modify-write whose
             // write must defer below every guard.
-            if (ins.op == .aload or ins.op == .hload or ins.op == .gload or ins.op == .uload or ins.op == .guard_absent) return true;
+            if (ins.op == .aload or ins.op == .hload or ins.op == .gload or ins.op == .uload or ins.op == .guard_absent or ins.op == .guard_tostring) return true;
         }
         return false;
     }
@@ -3673,7 +3802,13 @@ pub const RecordingSession = struct {
             try self.recCloseScope(proto, pc - 1, 0, regs);
             if (!self.active) return;
         }
-        if (self.inline_depth > 0) return self.recReturn(instr, multret);
+        if (self.inline_depth > 0) {
+            if (self.frames[self.inline_depth - 1].tostr_answer) {
+                try self.recTostrAnswer(instr, regs);
+                if (!self.active) return;
+            }
+            return self.recReturn(instr, multret);
+        }
         // Depth-0 return. A one-shot recording (`.head`/`.cont`, doc 44)
         // CLOSES here — the one-shot terminal, set before tier-0 executes the
         // ret — unless the ret window is dynamic (`b == all_results` reads
@@ -5068,7 +5203,7 @@ pub const RecordingSession = struct {
     /// string-typed results by construction.
     pub fn isProvenStringRef(self: *const RecordingSession, r: Ref) bool {
         return switch (self.instrs.items[@intCast(r)].op) {
-            .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower => true,
+            .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .sjpart, .sjoin => true,
             // Doc 30: an interned capture span is a string by construction.
             .scap_str => true,
             else => false,

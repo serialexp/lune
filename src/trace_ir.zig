@@ -817,6 +817,27 @@ pub const IrOp = enum(u8) {
     // φ instead. Stamps its recording pc in `aux` like the other type guards.
     // Wire ordinal 100.
     guard_bool,
+    /// `sjpart` (doc 82 §5): keep part `b` (a konst-int index) of a template
+    /// join — `a` = the part's proven-string ref, `ty = .heap`, the result IS
+    /// that string. Snew-class shape (a callout; kind `.alloc`: never DCE'd,
+    /// CSE'd or reordered, so the parts reach `Heap.join_parts` in order),
+    /// though it links nothing. Wire ordinal 101.
+    sjpart,
+    /// `sjoin` (doc 82 §5): intern the template's `b` (a konst int) parts,
+    /// which the preceding `sjpart` ops stored — `a` = the last part's result
+    /// (the data dependence). `ty = .heap`. At most one `Heap.link`, through
+    /// the ONE `Heap.internJoin` tier-0's `interp` also uses; the id stream
+    /// is therefore tier-0's. Wire ordinal 102.
+    sjoin,
+    /// `guard_tostring` (doc 82 §5): `a` = a table value ref, `b` = the konst
+    /// ref of the interned key `"__tostring"`, `aux` = a `Proto.id`. Passes
+    /// iff `a` is a table whose metatable's raw `__tostring` is a Lua closure
+    /// of that proto: the identity an inlined handler call was recorded
+    /// against (the `guard_func` discipline, reached through the metatable).
+    /// Reads the heap, so it is ordered like `guard_absent` (`.astore` kind)
+    /// and counts as a heap read for the store-after-load rule. One shared
+    /// predicate (`stralloc.tostringHandlerIs`) in every tier. Wire ordinal 103.
+    guard_tostring,
 };
 
 /// Doc 63 §5.1: one host call site of a precise trace, indexed by
@@ -1007,7 +1028,7 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
 /// is side-trace evidence, not thrash.
 pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
-        .guard_absent => true,
+        .guard_absent, .guard_tostring => true,
         .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => true,
         .guard_step_up, .guard_step_down, .guard_for_nov => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
@@ -1055,7 +1076,7 @@ pub fn requiresPreciseSnapshot(op: IrOp) bool {
         .neg, .not, .bnot, .eq, .ne, .lt, .le => true,
         .fsqrt, .fsin, .fcos, .ffloor, .fceil => true,
         .aload, .href, .hload, .uload => true,
-        .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2, .supper, .slower => true,
+        .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2, .supper, .slower, .sjpart, .sjoin => true,
         .scp, .sfindp, .smatch, .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f, .sgm_setpos => true,
         .tnew, .tset => true,
         .guard_native, .call_host, .guard_host_epoch, .host_result => true,

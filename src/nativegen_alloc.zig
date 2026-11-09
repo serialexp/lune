@@ -517,7 +517,7 @@ pub fn isTransient(op: trace_ir.IrOp) bool {
         // doc 24: tostr_* materialize the interned `*GcHeader` in a GP home;
         // slen the cp_len int. The snew class (c3) likewise materializes its
         // fresh-or-interned `*GcHeader` result in a GP home.
-        .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2 => true,
+        .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2, .sjpart, .sjoin => true,
         // doc 26: the case producers materialize their `*GcHeader` in a GP
         // home like the snew class; scp its scalar codepoint int.
         .supper, .slower, .scp => true,
@@ -587,7 +587,7 @@ fn stringPinned(t: *const Trace, ref: u16) bool {
 /// facts (`slen`, snew operands).
 pub fn isStringProducerOp(op: trace_ir.IrOp) bool {
     return switch (op) {
-        .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str => true,
+        .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str, .sjpart, .sjoin => true,
         else => false,
     };
 }
@@ -1131,7 +1131,8 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
     // classification arm above; this block is the invariant half only.)
     // Doc 63: the other path is a `guard_native`-covered host callee, which
     // its body guard identity-checks against the native constant, so it needs
-    // no type pin.
+    // no type pin. Doc 82: a `guard_tostring`-covered table is the third: its
+    // callout type-checks the header every time it runs (never `is_string`).
     for (slots.items) |*s| {
         if (s.class != .invariant or s.kind != .heap) continue;
         const lr: u16 = @intCast(s.load_ref);
@@ -1139,7 +1140,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         var host = false;
         for (t.instrs) |g| {
             if (g.op == .guard_string and g.a == lr) string = true;
-            if (g.op == .guard_native and g.a == lr) host = true;
+            if ((g.op == .guard_native or g.op == .guard_tostring) and g.a == lr) host = true;
         }
         if (!string and !host) return error.Bail;
         s.is_string = string;
@@ -2677,6 +2678,7 @@ pub fn opMayExitInBody(
         .guard_bounds,
         .guard_present,
         .guard_absent,
+        .guard_tostring,
         .guard_fits,
         .guard_append,
         .int_of_float,
@@ -2704,6 +2706,9 @@ pub fn opMayExitInBody(
         .srev,
         .schar1,
         .srep2,
+        // Doc 82: the template join exits on a failure word (OOM or decline).
+        .sjpart,
+        .sjoin,
         // Doc 26: the case producers exit on a null return (OOM); scp exits
         // on the −1 sentinel (empty range — tier-0 replays to nil).
         .supper,
@@ -2796,6 +2801,9 @@ pub const BodyCallout = enum {
     resolve_hash_cell,
     /// Full raw lookup, no mutation/allocation/collection.
     table_absent,
+    /// `stralloc.tostringHandlerRuntime` (doc 82): a metatable field read and
+    /// a proto-id compare; allocates and collects nothing.
+    tostring_handler,
     /// `fmath.sinRuntime`: the shared noinline `math.sin` kernel (doc 23 D4) —
     /// a pure f64 → f64 function; allocates nothing.
     fsin,
@@ -2840,6 +2848,12 @@ pub const BodyCallout = enum {
     /// `stralloc.srep2Runtime`: separator-less `string.rep` via `rep2Core`.
     /// Same split; a negative/zero count resolves inside the core.
     srep2,
+    /// `stralloc.sjpartRuntime` (doc 82): keeps a template part in the heap's
+    /// join scratch and returns it. Allocates and collects nothing.
+    sjpart,
+    /// `stralloc.sjoinRuntime` (doc 82): interns the kept parts through
+    /// `Heap.internJoin`. may_allocate = true (≤1 link), may_collect = false.
+    sjoin,
     /// `stralloc.supperRuntime` (doc 26): full-Unicode `string.upper` via the
     /// shared `caseCore`. **may_allocate = true** (host scratch first, then at
     /// most ONE `Heap.link` at the final intern — the D5 audit rule; an intern
@@ -2903,10 +2917,10 @@ pub const BodyCallout = enum {
 /// per-row above and accounted by the `guard_gc` budget instead.
 pub fn calloutMayCollect(c: BodyCallout) bool {
     return switch (c) {
-        .resolve_hash_cell, .table_absent => false,
+        .resolve_hash_cell, .table_absent, .tostring_handler => false,
         .fsin, .fcos, .ffloor, .fceil, .fpow, .fmod, .ffloordiv => false,
         .tostr_int, .tostr_num => false,
-        .ssub, .srev, .schar1, .srep2 => false,
+        .ssub, .srev, .schar1, .srep2, .sjpart, .sjoin => false,
         .supper, .slower, .scp => false,
         // Doc 30: the matchers/projection/parse/commit shims never reach
         // `Vm.collect` — scapStr's intern merely ALLOCATES (≤1 link, budgeted
@@ -2937,6 +2951,7 @@ pub fn bodyCalloutOf(
         .href => if (isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a) and
             trace_ir.HrefAux.decode(effectiveHrefAux(t, kinds, slots, slot_id_of_ref, idx)) == null) .resolve_hash_cell else null,
         .guard_absent => .table_absent,
+        .guard_tostring => .tostring_handler,
         .fsin => .fsin,
         .fcos => .fcos,
         .ffloor => .ffloor,
@@ -2955,6 +2970,8 @@ pub fn bodyCalloutOf(
         .slower => .slower,
         .scp => .scp,
         .srep2 => .srep2,
+        .sjpart => .sjpart,
+        .sjoin => .sjoin,
         // Doc 30. scap_int is NOT here: it lowers to a baked absolute load,
         // no call, so it needs no save area and invalidates nothing.
         .sfindp => .sfindp,

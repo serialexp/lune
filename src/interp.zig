@@ -11886,40 +11886,10 @@ pub const Vm = struct {
         return try self.heap.internValue(w.buffered());
     }
 
-    /// The concatenation of the `c` strings in `regs[b ..]` (`interp`), laid out
-    /// as `concat` does: short results on the stack, long ones in the string's
-    /// own allocation; the operands' character facts stand in for the scan.
+    /// The concatenation of the `c` strings in `regs[b ..]` (`interp`): the
+    /// heap's one join (`Heap.internJoin`), which the trace's `sjoin` shares.
     fn interpJoin(self: *Vm, regs: RegWindow, b: u16, c: u16) Error!Value {
-        var len: usize = 0;
-        var cps: usize = 0;
-        var ascii = true;
-        var i: u16 = 0;
-        while (i < c) : (i += 1) {
-            const s = string.String.fromHeader(regs.get(b + i).asHeap());
-            len = std.math.add(usize, len, s.bytes().len) catch return Error.OutOfMemory;
-            cps += s.cpLen();
-            ascii = ascii and s.isAscii();
-        }
-        if (len <= concat_stack_max) {
-            var buf: [concat_stack_max]u8 = undefined;
-            var at: usize = 0;
-            i = 0;
-            while (i < c) : (i += 1) {
-                const bytes = string.String.fromHeader(regs.get(b + i).asHeap()).bytes();
-                @memcpy(buf[at..][0..bytes.len], bytes);
-                at += bytes.len;
-            }
-            const s = try self.heap.internKnown(buf[0..len], .{ .cp_len = cps, .ascii = ascii });
-            return Value.heap(&s.header);
-        }
-        var sb = try string.String.Builder.init(self.gpa, len);
-        defer sb.deinit(self.gpa);
-        i = 0;
-        while (i < c) : (i += 1) {
-            const s = string.String.fromHeader(regs.get(b + i).asHeap());
-            sb.append(s.bytes(), s.cpLen(), s.isAscii());
-        }
-        const s = try self.heap.internBuilt(&sb);
+        const s = try self.heap.internJoin(regs.payloads[b..][0..c]);
         return Value.heap(&s.header);
     }
 

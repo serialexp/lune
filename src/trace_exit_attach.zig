@@ -194,11 +194,12 @@ pub fn resumeClass(op: IrOp) ResumeClass {
         .guard_gc,
         .guard_sid,
         .guard_absent,
+        .guard_tostring,
         => .neutral,
         .aref, .href, .garow, .gcell, .uref => .neutral,
         .aload, .hload, .gload, .uload => .neutral,
         .smatch, .sgmatch => .neutral,
-        .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str => .neutral,
+        .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str, .sjpart, .sjoin => .neutral,
         .astore, .hstore, .gstore, .ustore => .flush_store,
         .astore_append, .sgm_setpos, .tnew, .tset => .effect,
         // Doc 63 §5.1: the host call is an effect. The checks around it

@@ -120,6 +120,9 @@ export const IR_OP_NAMES = [
   "guard_step_down", // 98  numeric-for step counts downward, !(0 < a), NaN included — aux=pc
   "guard_for_nov", // 99  numeric-for int index within bound a can step by b without overflow — aux=pc
   "guard_bool", // 100 type guard: a is a boolean, either value (doc 63 §5.10.7) — aux=pc
+  "sjpart", // 101 keep template part b (konst int index) — a=string ref; result is a (doc 82)
+  "sjoin", // 102 intern the template's b parts (konst int) — a=last part; allocating (doc 82)
+  "guard_tostring", // 103 table a's metatable __tostring (key konst b) is a closure of proto aux (doc 82)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];

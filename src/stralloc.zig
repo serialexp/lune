@@ -191,6 +191,46 @@ pub noinline fn srep2Runtime(heap: *gc.Heap, s: *object.GcHeader, n: i64) callco
     return .ok(&r.header);
 }
 
+/// Is `header` a table whose metatable's raw `__tostring` (the interned `key`)
+/// is a Lua closure of proto `proto_id`? The ONE predicate behind
+/// `guard_tostring`: tier-1a and the native callout both run it. Reads only.
+pub fn tostringHandlerIs(header: *object.GcHeader, key: *object.GcHeader, proto_id: u32) bool {
+    if (header.type != .table) return false;
+    const mt = table_mod.Table.fromHeader(header).metatable orelse return false;
+    const h = mt.getHeap(Value.heap(key));
+    if (!h.isHeap() or h.heapType() != .function) return false;
+    return function_mod.Closure.fromHeader(h.asHeap()).proto.id == proto_id;
+}
+
+/// `guard_tostring` body: 1 when `tostringHandlerIs`, else 0.
+pub noinline fn tostringHandlerRuntime(header: *object.GcHeader, key: *object.GcHeader, proto_id: i64) callconv(.c) u64 {
+    return @intFromBool(tostringHandlerIs(header, key, @truncate(@as(u64, @bitCast(proto_id)))));
+}
+
+/// `sjpart` body (doc 82 §5): keep the string `s` as part `k` of the template
+/// being joined, and hand it back (the op's result is the part itself, which
+/// keeps the part live and the ops ordered). Allocates and links nothing; a
+/// slot past the scratch declines, which the recorder rules out by never
+/// recording a template with more than `gc.join_max` parts.
+pub noinline fn sjpartRuntime(heap: *gc.Heap, s: *object.GcHeader, k: i64) callconv(.c) StrResult {
+    if (k < 0 or k >= gc.join_max) return .decline;
+    heap.join_parts[@intCast(k)] = @intFromPtr(s);
+    return .ok(s);
+}
+
+/// `sjoin` body (doc 82 §5): intern the first `n` parts `sjpart` stored, the
+/// one string tier-0's `interp` builds (`Heap.internJoin`). `last` is only
+/// the data dependence on the final part. At most one `Heap.link`; the
+/// intern fails before linking, so a failure leaves the id stream clean.
+pub noinline fn sjoinRuntime(heap: *gc.Heap, last: *object.GcHeader, n: i64) callconv(.c) StrResult {
+    _ = last;
+    if (n < 1 or n > gc.join_max) return .decline;
+    armCharge(heap);
+    defer disarmCharge(heap);
+    const r = heap.internJoin(heap.join_parts[0..@intCast(n)]) catch return chargeFailure(heap);
+    return .ok(&r.header);
+}
+
 /// `supper` body: `string.upper(s)` via the shared `caseCore` (doc 26 D2).
 /// Deliberately heap-only — the Unicode-version pin is a committed-trace
 /// invariant (doc 26 D1), never re-derived on trace.
@@ -230,6 +270,7 @@ pub noinline fn scpRuntime(s: *object.GcHeader, i: i64, j: i64) callconv(.c) i64
 // ---------------------------------------------------------------------------
 
 const table_mod = @import("table.zig");
+const function_mod = @import("function.zig");
 const arith = @import("arith.zig");
 
 /// `smatch` body (find/match flavor): locate + scratch fill. Status result:

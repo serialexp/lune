@@ -804,6 +804,18 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     if (record) rec.exit(i, .guard, values[ins.a]);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+                // Doc 82 §5: the table's metatable still has the recorded
+                // `__tostring` closure. The predicate native calls out to.
+                .guard_tostring => {
+                    const tab = values[ins.a];
+                    const key = values[ins.b];
+                    if (tab.isHeap() and key.isHeap() and stralloc.tostringHandlerIs(tab.asHeap(), key.asHeap(), @bitCast(ins.aux))) {
+                        if (record) rec.guardPass(i, tab);
+                    } else {
+                        if (record) rec.exit(i, .guard, tab);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
                 .guard_absent => {
                     const tab = values[ins.a];
                     if (tab.isHeap() and @import("table_runtime.zig").isAbsent(tab.asHeap(), values[ins.b])) {
@@ -1030,6 +1042,30 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     if (sv.isHeap() and sv.heapType() == .string and nv.isInt()) {
                         if (ctx.heap) |heap| {
                             const r = stralloc.srep2Runtime(heap, sv.asHeap(), nv.asInt());
+                            if (r.hdr()) |h| {
+                                values[i] = Value.heap(h);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            }
+                            runtime_error = strFailure(t, r);
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, sv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                // Doc 82 §5: the template join, `srep2`'s shape: `sjpart` keeps
+                // string `a` as part `b` of the join and answers it; `sjoin`
+                // interns the `b` parts kept so far. The same shims native
+                // calls, so every tier joins through `Heap.internJoin`.
+                .sjpart, .sjoin => {
+                    const sv = values[ins.a];
+                    const nv = values[ins.b];
+                    if (sv.isHeap() and sv.heapType() == .string and nv.isInt()) {
+                        if (ctx.heap) |heap| {
+                            const r = if (ins.op == .sjpart)
+                                stralloc.sjpartRuntime(heap, sv.asHeap(), nv.asInt())
+                            else
+                                stralloc.sjoinRuntime(heap, sv.asHeap(), nv.asInt());
                             if (r.hdr()) |h| {
                                 values[i] = Value.heap(h);
                                 if (record) rec.value(i, values[i]);

@@ -393,6 +393,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (r >= i) return false; // not linear SSA → malformed
                 if (t.instrs[r].op == .slot_load) host_guarded[r] = true;
             },
+            // Doc 82: the guard's own callout type-checks the value; the
+            // slot_load only needs to be a heap pointer (tag-lane check).
+            .guard_tostring => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                if (t.instrs[r].op == .slot_load) host_guarded[r] = true;
+            },
             // guard_string (doc 24 c3): on a slot_load it pins the observed-string
             // input for the prologue (marked here); on anything else Pass B decides
             // — a guard on a proven-string producer discharges to nothing, any
@@ -741,6 +748,15 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.b] != .int and !(kinds[ins.b] == .heap and is_string[ins.b])) return false;
                 kinds[i] = .none;
             },
+            // Doc 82 `guard_tostring`: a = the table value (a real runtime
+            // heap value — the callout type-checks it), b = the interned key
+            // string konst. Produces nothing.
+            .guard_tostring => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
+                if (!(kinds[ins.b] == .heap and is_string[ins.b])) return false;
+                kinds[i] = .none;
+            },
             // guard_func (U1, cross-frame): covers the callee-snapshot slot_load
             // (proven `.func`) — pinned to a prologue identity check (closure type
             // + recorded `Proto.id`), lowering to nothing in the body, like
@@ -874,7 +890,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 kinds[i] = .heap;
                 is_string[i] = true;
             },
-            .srep2 => {
+            .srep2, .sjpart, .sjoin => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (!is_string[ins.a]) return false;
                 if (kinds[ins.b] != .int) return false;
@@ -1704,7 +1720,7 @@ pub fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         // table through aref.a, so they read only the aref token (a). astore reads
         // the aref token (a) plus the value to write (b). astore_append is the grow
         // analogue (aref token + value).
-        .aref, .astore, .astore_append, .guard_absent => .{ .a = true, .b = true },
+        .aref, .astore, .astore_append, .guard_absent, .guard_tostring => .{ .a = true, .b = true },
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
         // guard_func reads the callee-snapshot value it identity-checks (a).
         .guard_func => .{ .a = true, .b = false },
@@ -1728,7 +1744,7 @@ pub fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         // doc 26: scp reads string (a) + start index (b) — its END index ref
         // rides `aux` (the ssub encoding), extended in `analyzeInner` exactly
         // like ssub's. supper/slower read only their string (a), like srev.
-        .ssub, .srep2, .scp => .{ .a = true, .b = true },
+        .ssub, .srep2, .sjpart, .sjoin, .scp => .{ .a = true, .b = true },
         .srev, .schar1, .guard_string, .supper, .slower => .{ .a = true, .b = false },
         // doc 30: sfindp/smatch read string (a) + init (b) — their pattern
         // ref rides `aux` (the ssub encoding), extended in `analyzeInner`.
