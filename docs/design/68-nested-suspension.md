@@ -852,6 +852,10 @@ Three first cuts were worse and are why the design looks as it does:
 
 ### Sort overhead levers tried (2026-11-09)
 
+Bart accepted the remaining per-call cost (sort +13.9%, gsub callbacks +20%,
+`__tostring` +22 ns) on 2026-11-09 in exchange for yields, snapshots and
+replay stops inside these calls; improving it is later work.
+
 Payload-only state stores after a sort activation's first step: `sort_cmp
 20000` 2.698 G → 2.676 G instructions (-0.8%), against 2.349 G before the
 activation (+13.9%, still over §10's 10%). Rebuilding the words without the
