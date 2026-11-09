@@ -56,6 +56,9 @@ module.exports = grammar({
         $.call_statement,
         $.local_declaration,
         $.local_function_declaration,
+        $.global_declaration,
+        $.global_all_declaration,
+        $.global_function_declaration,
         $.function_declaration,
         $.if_statement,
         $.while_statement,
@@ -109,7 +112,22 @@ module.exports = grammar({
       seq("for", sep1(field("name", $.identifier), ","), "in", sep1($._expression, ","), "do", block($), "end"),
 
     local_declaration: ($) =>
-      seq("local", sep1($.typed_name, ","), optional(seq("=", sep1($._expression, ",")))),
+      seq("local", optional($.attribute), sep1($._attributed_name, ","), optional(seq("=", sep1($._expression, ",")))),
+
+    // Doc 76: `global x`, `global <const> a, b = 1, 2`, `global *`,
+    // `global function f() end`.
+    global_declaration: ($) =>
+      seq("global", optional($.attribute), sep1($._attributed_name, ","), optional(seq("=", sep1($._expression, ",")))),
+
+    global_all_declaration: ($) => seq("global", optional($.attribute), "*"),
+
+    global_function_declaration: ($) =>
+      seq("global", optional("async"), "function", field("name", $.identifier), $._function_body),
+
+    // `<const>` or `<close>`, before a list of names or after one name.
+    attribute: ($) => seq("<", field("name", $.identifier), ">"),
+
+    _attributed_name: ($) => seq($.typed_name, optional($.attribute)),
 
     typed_name: ($) => seq(field("name", $.identifier), optional($.type_annotation)),
 
@@ -173,6 +191,7 @@ module.exports = grammar({
         $.number,
         $.string,
         $.long_string,
+        $.template,
         $.vararg,
         $.function_expression,
         $.table,
@@ -249,6 +268,25 @@ module.exports = grammar({
           seq("'", repeat(choice(/[^'\\\n]/, /\\(.|\n)/)), "'"),
         ),
       ),
+
+    // A backtick template (doc 82). Its text must not be skipped as extras, so
+    // every piece after the opener is `immediate`; the hole's own expression is
+    // ordinary code. `\u{41}` is one escape, not a hole.
+    template: ($) =>
+      seq(
+        "`",
+        repeat(choice($.template_text, $.template_escape, $.template_hole)),
+        alias(token.immediate("`"), "`"),
+      ),
+
+    template_text: (_) => token.immediate(prec(1, /[^`{\\]+/)),
+
+    template_escape: (_) =>
+      token.immediate(
+        prec(2, choice(seq("\\u{", /[0-9a-fA-F]+/, "}"), /\\(.|\n)/)),
+      ),
+
+    template_hole: ($) => seq(alias(token.immediate("{"), "{"), $._expression, "}"),
 
     identifier: (_) => /[A-Za-z_][A-Za-z0-9_]*/,
   },

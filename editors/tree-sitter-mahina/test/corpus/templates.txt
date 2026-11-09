@@ -1,0 +1,49 @@
+================
+a template: text, an escape and holes
+================
+local s = `a{x}\n{f(1)}\u{41}`
+---
+
+(chunk
+  (local_declaration
+    (typed_name
+      name: (identifier))
+    (template
+      (template_text)
+      (template_hole
+        (identifier))
+      (template_escape)
+      (template_hole
+        (call
+          function: (identifier)
+          (arguments
+            (number))))
+      (template_escape))))
+
+================
+nested templates, a table in a hole, and text with spaces and newlines
+================
+local s = `  {`in {x}`}
+ {({a = 1}).a}  `
+---
+
+(chunk
+  (local_declaration
+    (typed_name
+      name: (identifier))
+    (template
+      (template_text)
+      (template_hole
+        (template
+          (template_text)
+          (template_hole
+            (identifier))))
+      (template_text)
+      (template_hole
+        (field
+          object: (parenthesized_expression
+            (table
+              key: (identifier)
+              value: (number)))
+          name: (identifier)))
+      (template_text))))

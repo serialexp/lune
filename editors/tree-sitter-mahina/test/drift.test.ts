@@ -23,6 +23,18 @@ function trackedSources(): string[] {
     .filter((p) => p !== "" && !p.startsWith("vendor/"));
 }
 
+test("[REQ-113.4] the grammar parses the template sample, as a template tree, without an ERROR node", () => {
+  // tests/lang/interpolation.lua holds every template form src/parser.zig
+  // accepts and is run by mahina itself; the grammar must read each as a template.
+  const sample = `${repo}/tests/lang/interpolation.lua`;
+  const r = spawnSync(cli, ["parse", sample], { cwd: here, encoding: "utf8" });
+  expect(r.status).toBe(0);
+  expect(r.stdout).toContain("(template ");
+  expect(r.stdout).toContain("(template_hole ");
+  expect(r.stdout).toContain("(template_escape ");
+  expect(r.stdout).not.toContain("ERROR");
+});
+
 test("the grammar parses every tracked mahina source without an ERROR node", () => {
   const sources = trackedSources();
   expect(sources.length).toBeGreaterThan(0);

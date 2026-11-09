@@ -1,0 +1,31 @@
+================
+attributes and global declarations (doc 76)
+================
+local <const> a, b <close> = 1, nil
+global <const> c = 1
+global *
+global function f() end
+---
+
+(chunk
+  (local_declaration
+    (attribute
+      (identifier))
+    (typed_name
+      (identifier))
+    (typed_name
+      (identifier))
+    (attribute
+      (identifier))
+    (number)
+    (nil))
+  (global_declaration
+    (attribute
+      (identifier))
+    (typed_name
+      (identifier))
+    (number))
+  (global_all_declaration)
+  (global_function_declaration
+    (identifier)
+    (parameters)))

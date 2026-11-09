@@ -6,13 +6,17 @@
 
 (string) @string
 (long_string) @string
+(template_text) @string
+(template_escape) @string.escape
+(template "`" @string)
+(template_hole "{" @punctuation.special "}" @punctuation.special)
 (number) @number
 
 [(nil) (true) (false)] @constant.builtin
 (vararg) @variable.special
 
 [
-  "local" "function" "async" "await" "return" "end" "do" "then"
+  "local" "global" "function" "async" "await" "return" "end" "do" "then"
   "if" "elseif" "else" "while" "repeat" "until" "for" "in"
 ] @keyword
 (break_statement) @keyword
@@ -31,6 +35,8 @@
 (identifier) @variable
 
 (type_name (identifier) @type)
+
+(attribute name: (identifier) @attribute)
 
 (parameters (typed_name name: (identifier) @variable.parameter))
 
