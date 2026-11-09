@@ -60,6 +60,13 @@ pub const Node = union(enum) {
     fill: []const Doc,
     /// Queued text, written at the next newline (or at the end).
     line_suffix: []const u8,
+    /// `brk` in a broken group, `flat` in a flat one (a trailing comma that
+    /// only the one-entry-per-line form has).
+    if_break: struct { brk: Doc, flat: Doc },
+    /// Two layouts of one thing, for a call whose last argument is hugged:
+    /// `hugged` if its text up to its first newline fits where it stands,
+    /// else `expanded`.
+    alt: struct { hugged: Doc, expanded: Doc },
 };
 
 pub const empty: Doc = &.{ .empty = {} };
@@ -111,6 +118,14 @@ pub const Builder = struct {
 
     pub fn lineSuffix(b: Builder, s: []const u8) Allocator.Error!Doc {
         return b.node(.{ .line_suffix = s });
+    }
+
+    pub fn ifBreak(b: Builder, brk: Doc, flat: Doc) Allocator.Error!Doc {
+        return b.node(.{ .if_break = .{ .brk = brk, .flat = flat } });
+    }
+
+    pub fn alt(b: Builder, hugged: Doc, expanded: Doc) Allocator.Error!Doc {
+        return b.node(.{ .alt = .{ .hugged = hugged, .expanded = expanded } });
     }
 
     /// `items` separated by `sep`.
@@ -270,6 +285,8 @@ const Printer = struct {
                     }
                 },
                 .indent, .group => |d| try p.scratch.append(p.gpa, .{ .indent = c.indent, .mode = c.mode, .doc = d }),
+                .if_break => |ib| try p.scratch.append(p.gpa, .{ .indent = c.indent, .mode = c.mode, .doc = if (c.mode == .brk) ib.brk else ib.flat }),
+                .alt => |a| try p.scratch.append(p.gpa, .{ .indent = c.indent, .mode = c.mode, .doc = a.hugged }),
                 .hug => |d| try p.scratch.append(p.gpa, .{ .indent = c.indent, .mode = .brk, .doc = d }),
                 .fill => |items| {
                     if (items.len == 0) continue;
@@ -311,6 +328,12 @@ const Printer = struct {
                 .concat => |kids| try p.pushChildren(c, kids),
                 .indent => |d| try p.push(.{ .indent = c.indent + p.opts.indent, .mode = c.mode, .doc = d }),
                 .hug => |d| try p.push(.{ .indent = c.indent, .mode = .brk, .doc = d }),
+                .if_break => |ib| try p.push(.{ .indent = c.indent, .mode = c.mode, .doc = if (c.mode == .brk) ib.brk else ib.flat }),
+                .alt => |a| {
+                    const hugged = c.mode == .flat or
+                        try p.fits(p.remaining(), .{ .indent = c.indent, .mode = .flat, .doc = a.hugged }, p.stack.items);
+                    try p.push(.{ .indent = c.indent, .mode = if (hugged) .flat else c.mode, .doc = if (hugged) a.hugged else a.expanded });
+                },
                 .group => |d| {
                     const mode: Mode = switch (c.mode) {
                         .flat => .flat,
@@ -481,6 +504,37 @@ test "format_doc: a hug whose head does not fit makes the enclosing group break"
     // The head "f(long_first_argument, function()" is 33 columns.
     try expectPrint(33, d, "f(long_first_argument, function()\n        x\n    end)");
     try expectPrint(32, d, "f(\n    long_first_argument,\n    function()\n        x\n    end\n)");
+}
+
+test "format_doc: if_break picks by the group's mode" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const b: Builder = .{ .a = arena.allocator() };
+    const d = try b.group(try b.cat(&.{
+        try b.text("{"),
+        try b.indent(try b.cat(&.{ line, try b.text("a = 1"), try b.ifBreak(try b.text(","), empty) })),
+        line,
+        try b.text("}"),
+    }));
+    try expectPrint(100, d, "{ a = 1 }");
+    try expectPrint(6, d, "{\n    a = 1,\n}");
+}
+
+test "format_doc: alt takes the hugged layout when its first line fits, else the expanded one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const b: Builder = .{ .a = arena.allocator() };
+    const body = try b.cat(&.{ try b.text("function()"), try b.indent(try b.cat(&.{ hardline, try b.text("x") })), hardline, try b.text("end") });
+    const hugged = try b.cat(&.{ try b.text("f(aaaa, "), try b.hug(body), try b.text(")") });
+    const expanded = try b.group(try b.cat(&.{
+        try b.text("f("),
+        try b.indent(try b.cat(&.{ softline, try b.text("aaaa,"), line, body })),
+        softline,
+        try b.text(")"),
+    }));
+    const d = try b.alt(hugged, expanded);
+    try expectPrint(100, d, "f(aaaa, function()\n    x\nend)");
+    try expectPrint(17, d, "f(\n    aaaa,\n    function()\n        x\n    end\n)");
 }
 
 test "format_doc: a trailing comment is written at the newline, after the code's comma" {

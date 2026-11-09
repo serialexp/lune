@@ -35,6 +35,8 @@ pub const coroutine = @import("coroutine.zig");
 pub const native_act = @import("native_act.zig");
 /// The source formatter's document algebra and printer (doc 83 §4.3).
 pub const format_doc = @import("format_doc.zig");
+/// Which comments go with which code, for the formatter (doc 83 §5).
+pub const format_comments = @import("format_comments.zig");
 
 /// Diagnostic / CLI I/O — the single wrapper around the churny `std.Io` writer
 /// API and `Value` text rendering.
@@ -190,6 +192,7 @@ test {
     _ = @import("coroutine.zig");
     _ = native_act;
     _ = format_doc;
+    _ = format_comments;
     _ = @import("stack_mem.zig");
     _ = datetime;
     _ = tzif;

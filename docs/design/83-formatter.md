@@ -1,6 +1,6 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 (the printer) and 0b (tokens) landed; phases 1–7 outstanding. Every style decision made by Bart
+Status: partial — phases 0 (printer), 0b (tokens) and 1 (comments) landed; phases 2–7 outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
@@ -40,7 +40,7 @@ land; move whole phases to Done once everything inside them is checked.
 
 - [x] **Phase 0 — the printing core.** `src/format_doc.zig`: the document
   algebra (text, raw, line, softline, hardline, break_parent, group, indent,
-  fill, hug, lineSuffix) and the fitting printer; 13 unit tests print
+  fill, hug, lineSuffix, ifBreak, alt) and the fitting printer; 15 unit tests print
   hand-built documents, including the hug, trailing-comment, fill and
   bounded-lookahead cases (`Stats.fits_steps` is asserted, Rule #22). Done
   2026-11-10.
@@ -50,11 +50,17 @@ land; move whole phases to Done once everything inside them is checked.
   trivia and diagnostics already come through the sinks callers pass. The only
   edit to the parser; no AST node changed. Done 2026-11-10.
 
+- [x] **Phase 1 — comment attachment.** `src/format_comments.zig`: a
+  `Comments` index over the lexer's trivia that the builder queries in source
+  order: `takeLeading` (own-line and inline comments before an item, with
+  blank-line flags), `takeTrailing` (same-line comments after code),
+  `gapHasBlank`, `pendingBefore`. Implemented as lazy consumption by the
+  builder rather than a separate attachment pass, so no position arithmetic is
+  repeated; a comment the builder never reaches makes the formatter refuse
+  (never lose, never move across a symbol). 7 tests. Done 2026-11-10.
+
 ### Outstanding
 
-- [ ] **Phase 1 — comment attachment.** `src/format_comments.zig`: the §5 rule
-  over the lexer's trivia, producing leading / trailing / dangling comments per
-  node and the free-standing ones between statements.
 - [ ] **Phase 2 — statements and expressions.** `src/format.zig`: every
   statement and expression form of `ast.zig` (including templates, attributes,
   `global`, `async`/`await`, type annotations) built into documents; the
