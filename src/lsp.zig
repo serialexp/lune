@@ -8,6 +8,7 @@ pub const documents = @import("lsp/documents.zig");
 pub const analysis = @import("lsp/analysis.zig");
 pub const navigation = @import("lsp/navigation.zig");
 pub const syntax = @import("lsp/syntax.zig");
+pub const formatting = @import("lsp/formatting.zig");
 pub const tokens = @import("lsp/tokens.zig");
 pub const completion = @import("lsp/completion.zig");
 pub const stdlib_db = @import("lsp/stdlib_db.zig");
@@ -31,6 +32,7 @@ test {
     _ = analysis;
     _ = navigation;
     _ = syntax;
+    _ = formatting;
     _ = tokens;
     _ = completion;
     _ = stdlib_db;

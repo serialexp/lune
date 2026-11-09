@@ -21,6 +21,9 @@ const ast = @import("../ast.zig");
 const resolve = @import("../resolve.zig");
 const navigation = @import("navigation.zig");
 const syntax = @import("syntax.zig");
+const formatting = @import("formatting.zig");
+const format = @import("../format.zig");
+const diag = @import("../diag.zig");
 const tokens = @import("tokens.zig");
 const completion = @import("completion.zig");
 const library = @import("library.zig");
@@ -248,6 +251,8 @@ pub const Server = struct {
         if (std.mem.eql(u8, method, "textDocument/signatureHelp")) return self.signatureHelp(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/semanticTokens/full")) return self.semanticTokens(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/documentSymbol")) return self.documentSymbols(a, id, params, out);
+        if (std.mem.eql(u8, method, "textDocument/formatting")) return self.formatDocument(a, id, params, out, false);
+        if (std.mem.eql(u8, method, "textDocument/rangeFormatting")) return self.formatDocument(a, id, params, out, true);
         if (std.mem.eql(u8, method, "textDocument/foldingRange")) return self.foldingRanges(a, id, params, out);
         if (std.mem.eql(u8, method, "textDocument/selectionRange")) return self.selectionRanges(a, id, params, out);
         if (std.mem.eql(u8, method, "workspace/symbol")) return self.workspaceSymbols(a, id, params, out);
@@ -892,6 +897,36 @@ pub const Server = struct {
             .range = index.toRange(text, s.range.start, s.range.end, self.encoding),
             .selectionRange = index.toRange(text, s.selection.start, s.selection.end, self.encoding),
         };
+    }
+
+    /// Doc 83 §8.2: format the whole document, answer with the changed
+    /// lines as edits (only those touching the range for a range request).
+    /// A document the formatter refuses (syntax errors, a comment it will not
+    /// move) gets no edits.
+    fn formatDocument(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox, ranged: bool) Error!void {
+        const uri: []const u8, const range: ?position.Range = blk: {
+            if (ranged) {
+                const p = jsonrpc.decodeParams(protocol.DocumentRangeFormattingParams, a, params) catch |e| return self.badParams(id, e, out);
+                break :blk .{ p.textDocument.uri, p.range };
+            }
+            const p = jsonrpc.decodeParams(protocol.DocumentFormattingParams, a, params) catch |e| return self.badParams(id, e, out);
+            break :blk .{ p.textDocument.uri, null };
+        };
+        const doc = self.docs.get(uri) orelse return out.fail(id, .invalid_params, "the document is not open");
+        const text = doc.text.items;
+        var diags = diag.Diagnostics.init(a);
+        defer diags.deinit();
+        const formatted = format.format(a, text, &diags) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.SyntaxError, error.UnplacedComment => return out.result(id, &[_]protocol.TextEdit{}),
+        };
+        const index = doc.lineIndex(self.gpa) catch return error.OutOfMemory;
+        const span: ?formatting.Span = if (range) |r| .{
+            .start = index.toOffset(text, r.start, self.encoding),
+            .end = index.toOffset(text, r.end, self.encoding),
+        } else null;
+        const list = try formatting.edits(a, index, text, formatted, self.encoding, span, formatting.max_edit_steps);
+        try out.result(id, list);
     }
 
     fn foldingRanges(self: *Server, a: std.mem.Allocator, id: jsonrpc.Id, params: ?jsonrpc.Value, out: *Outbox) Error!void {
@@ -1992,6 +2027,8 @@ test "requests: an unopened document is invalid params; initialize advertises th
     try testing.expect(caps.get("renameProvider").?.object.get("prepareProvider").?.bool);
     try testing.expect(caps.get("semanticTokensProvider").?.object.get("full").?.bool);
     try testing.expect(caps.get("foldingRangeProvider").?.bool);
+    try testing.expect(caps.get("documentFormattingProvider").?.bool);
+    try testing.expect(caps.get("documentRangeFormattingProvider").?.bool);
     try testing.expect(caps.get("hoverProvider").?.bool);
     try testing.expectEqualStrings("(", caps.get("signatureHelpProvider").?.object.get("triggerCharacters").?.array.items[0].string);
     try testing.expectEqualStrings(".", caps.get("completionProvider").?.object.get("triggerCharacters").?.array.items[0].string);
@@ -2173,6 +2210,35 @@ test "document symbols: the outline nests functions and table fields" {
     try testing.expectEqual(@as(i64, 2), sel.get("character").?.integer);
     try testing.expect(top[1].object.get("children") != null);
     try testing.expectEqualStrings("y", top[1].object.get("children").?.array.items[0].object.get("name").?.string);
+}
+
+test "formatting: whole document edits, range subset, and no edits for a refused file" {
+    var h = Harness.init(.{});
+    defer h.deinit();
+    try h.open();
+    const text = "local a=1\nlocal b = 2\nlocal c=3\n";
+    const r = try askWith(&h, text, "textDocument/formatting", "");
+    const edits = r.object.get("result").?.array.items;
+    try testing.expectEqual(@as(usize, 2), edits.len);
+    try testing.expectEqualStrings("local a = 1\n", edits[0].object.get("newText").?.string);
+    try testing.expectEqual(@as(i64, 0), edits[0].object.get("range").?.object.get("start").?.object.get("line").?.integer);
+    try testing.expectEqual(@as(i64, 1), edits[0].object.get("range").?.object.get("end").?.object.get("line").?.integer);
+
+    var h2 = Harness.init(.{});
+    defer h2.deinit();
+    try h2.open();
+    const ranged = try askWith(&h2, text, "textDocument/rangeFormatting",
+        \\,"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":3}}
+    );
+    const only = ranged.object.get("result").?.array.items;
+    try testing.expectEqual(@as(usize, 1), only.len);
+    try testing.expectEqualStrings("local c = 3\n", only[0].object.get("newText").?.string);
+
+    var h3 = Harness.init(.{});
+    defer h3.deinit();
+    try h3.open();
+    const bad = try askWith(&h3, "local = =\n", "textDocument/formatting", "");
+    try testing.expectEqual(@as(usize, 0), bad.object.get("result").?.array.items.len);
 }
 
 test "selection ranges: the chain from the name outwards, each range containing the last" {

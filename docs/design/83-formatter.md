@@ -1,10 +1,10 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder), 3 (corpus gate) and 4 (CLI) landed; phases 5–7 outstanding. Every style decision made by Bart
+Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder), 3 (corpus gate) and 4 (CLI) and 5 (language server) landed; phases 6–7 outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
-Last updated: 2026-11-10 (phase 4)
+Last updated: 2026-11-10 (phase 5)
 
 ## Implementation status
 
@@ -79,14 +79,20 @@ land; move whole phases to Done once everything inside them is checked.
   rewrite keeping the mode, size+mtime re-check before the rename; exit 1 on
   refusal, failure, or a changed file in `--check`. Done 2026-11-10.
 
+- [x] **Phase 5 — language server.** `textDocument/formatting` and
+  `rangeFormatting` with both provider capabilities. `src/lsp/formatting.zig`
+  diffs the formatter's output against the document by lines (Myers, bounded
+  at 1000 edit steps, falling back to one edit over the differing middle) so
+  untouched lines keep cursors and undo; a range request formats the whole
+  file and returns the hunks that touch the range. Syntax errors and refused
+  comments return no edits. Done 2026-11-10.
+
 ### Outstanding
 
 - [ ] **Method-chain breaking and name-list wrapping** (§6): not built in
   phase 2; long chains and name lists currently stay on one line.
 - [ ] **Comments inside expressions** (§5): refused in v1; place them or keep
   refusing, decided once real code hits it.
-- [ ] **Phase 5 — language server.** `textDocument/formatting` and
-  `rangeFormatting`; the `documentFormattingProvider` capability (§8.2).
 - [ ] **Phase 6 — wasm, C API, viz editor.** `mahina_format` export, the
   capi function, a Format command in the viz editor (§8.3).
 - [ ] **Phase 7 — format the repo, add the gate.** One commit that reformats

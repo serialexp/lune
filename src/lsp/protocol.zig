@@ -162,6 +162,8 @@ pub const ServerCapabilities = struct {
     signatureHelpProvider: ?SignatureHelpOptions = .{},
     semanticTokensProvider: ?SemanticTokensOptions = null,
     documentSymbolProvider: bool = true,
+    documentFormattingProvider: bool = true,
+    documentRangeFormattingProvider: bool = true,
     foldingRangeProvider: bool = true,
     selectionRangeProvider: bool = true,
     workspaceSymbolProvider: bool = true,
@@ -378,6 +380,17 @@ pub const SymbolInformation = struct {
     kind: u8,
     location: Location,
     containerName: ?[]const u8 = null,
+};
+
+/// `textDocument/formatting`. The client's `options` are not read: there is
+/// one standard style (doc 83 D1).
+pub const DocumentFormattingParams = struct {
+    textDocument: TextDocumentIdentifier,
+};
+
+pub const DocumentRangeFormattingParams = struct {
+    textDocument: TextDocumentIdentifier,
+    range: Range,
 };
 
 pub const FoldingRangeParams = struct {
