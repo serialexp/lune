@@ -1,7 +1,7 @@
 # 81 — `load` honours its env: chunk environments — Design
 
-Status: draft, not yet implemented. Strictness decided, Phase 0 measured
-(§6, §7); the environment model still open
+Status: draft, not yet implemented. Strictness, opt-out and the access
+model decided (§6); Phase 0 measured (§7); E2's design still to write
 Owner: Bart
 Last updated: 2026-11-09
 
@@ -19,15 +19,22 @@ land; move whole phases to Done once everything inside them is checked.
   positives".
 - [x] **Phase 0 — baselines** (§7): measured before choosing the model.
   Bart: "Measure first".
+- [x] **Q3 — cells bound at load time (E2)** (§6.2): decided 2026-11-09,
+  with §7's numbers in hand. Bart: "I suggest we go E2". E2 needs its own
+  design (stable cells in the environment; `rawset`, `pairs`, `_G[name]`,
+  late-created globals, keyframes).
+- [x] **Q4 — opt-out by extension** (§6.1): decided 2026-11-09. A `.lua`
+  file keeps implicit globals; a `.mah` file is strict, and may write
+  `global *` to opt out. Bart: "decide by extension, but allow specifying
+  global * in mah files".
 
 ### Outstanding
 
-- [ ] **Q3 — where a declared global lives** (§6.2, §7): today's hinted
-  table slot, read through the closure's environment (B), or a cell bound
-  at load time (E2). Decide with §7's numbers in hand.
-- [ ] **Q4 — how Lua code opts out** (§6.1): the bench corpus and other
-  Lua sources use implicit globals. A CLI flag, a `global *` the file
-  writes, or a file extension rule.
+- [ ] **E2's design** (§6.2): the cell layout, how a table environment
+  keeps stable cells, and what a `.lua` chunk's implicit globals bind to.
+- [ ] **`set_global` recorded by the JIT** (§7): first, by Bart's order
+  (2026-11-09). Its recorded store changes shape under E2 (a cell store);
+  the recording machinery around it carries over.
 
 - [ ] **Q1 — the environment model** (§3): (A) Lua 5.4 lexical `_ENV`
   everywhere, (B) a per-closure environment, inherited at closure creation,
