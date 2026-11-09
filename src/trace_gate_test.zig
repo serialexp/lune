@@ -251,6 +251,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     try state.region_policy.arrival_entry_regions.put(gpa, 9, try gpa.dupe(RegionId, &.{rid}));
     state.penalty.clearRetainingCapacity();
     state.gate.clearRetainingCapacity();
+    state.noteGatesChanged();
 
     // (5a) CONSUMED — exit 0 is classified into the live region and carries nonzero
     // work, so the region window owns the verdict and the member anchor is untouched
@@ -1141,6 +1142,7 @@ test "doc 31: a pending continuation/replay-side request gated after creation is
     // Same for the replay-side path, with a RECORD gate this time — both
     // maps bar recording starts.
     _ = state.gate.remove(key);
+    state.noteGatesChanged();
     state.setPendingReplayAnchor(key);
     state.gateRecordAnchor(key, .record_abort);
     state.maybeStartReplaySide(&proto, 4);
@@ -1150,6 +1152,7 @@ test "doc 31: a pending continuation/replay-side request gated after creation is
     // Control: with both gates clear the same request DOES start a recording
     // — the decline above was the gate, not the plumbing.
     _ = state.record_gate.remove(key);
+    state.noteGatesChanged();
     state.setPendingExitAnchor(key);
     state.maybeStartContinuation(&proto, 4);
     try testing.expect(state.isRecording());
@@ -1168,4 +1171,70 @@ test "doc 31 D1: clearCache drops the record gate (epoch boundary, leak-checked)
     try testing.expectEqual(@as(usize, 0), state.record_gate.count());
     // `deinit` under std.testing.allocator leak-checks the map allocation
     // itself (doc 31 §6 test 9).
+}
+
+/// Entries of `state.bar_cache` that memoize `key` (0 or 1).
+fn barEntriesFor(state: *const TraceState, key: AnchorKey) usize {
+    const tab = state.bar_cache orelse return 0;
+    var n: usize = 0;
+    for (tab) |e| {
+        if (e.proto == key.proto and e.pc == key.pc) n += 1;
+    }
+    return n;
+}
+
+test "bar memo: a barred continuation is remembered, and expiry or a gate change lets counting resume" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.enabled = true;
+
+    const code = [_]Instr{ Instr.op0(.halt), Instr.op0(.halt), Instr.op0(.ret) };
+    const proto = Proto{ .code = &code, .name = "t", .num_registers = 2 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = trace.CONT_PC_BIT | 1, .proto_id = proto.id };
+
+    // Barred, no trace: the return is refused and memoized, not counted.
+    state.gateRecordAnchor(key, .record_abort);
+    state.onRetResume(&proto, 1, 0, 0, &code);
+    try testing.expectEqual(@as(usize, 1), barEntriesFor(&state, key));
+    try testing.expectEqual(@as(?u32, null), state.counters.get(key));
+    // A memo hit refuses the same way (safe builds assert it against the maps).
+    state.onRetResume(&proto, 1, 0, 0, &code);
+    try testing.expectEqual(@as(?u32, null), state.counters.get(key));
+
+    // The cooldown elapses: the memo no longer applies and the return counts.
+    state.tick = state.record_gate.get(key).?.retry_at;
+    state.onRetResume(&proto, 1, 0, 0, &code);
+    try testing.expectEqual(@as(?u32, 1), state.counters.get(key));
+
+    // Barred again and memoized; then the gate goes away early. The
+    // generation retires the memo, so the next return counts at once.
+    state.gateRecordAnchor(key, .record_abort);
+    state.onRetResume(&proto, 1, 0, 0, &code);
+    try testing.expectEqual(@as(?u32, 1), state.counters.get(key));
+    _ = state.record_gate.remove(key);
+    state.noteGatesChanged();
+    state.onRetResume(&proto, 1, 0, 0, &code);
+    try testing.expectEqual(@as(?u32, 2), state.counters.get(key));
+}
+
+test "bar memo: an abandoned head stays refused without counting" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.enabled = true;
+
+    const code = [_]Instr{ Instr.op0(.halt), Instr.op0(.ret) };
+    const proto = Proto{ .code = &code, .name = "h", .num_registers = 1 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC, .proto_id = proto.id };
+
+    var i: u32 = 0;
+    while (i < state.config.max_strikes) : (i += 1) state.gateRecordAnchor(key, .record_abort);
+    try testing.expect(state.recordingAbandoned(key));
+    state.onCallEntry(&proto, 0, 0, &code);
+    try testing.expectEqual(@as(usize, 1), barEntriesFor(&state, key));
+    // Abandoned is forever: far past every window, calls are still refused.
+    state.tick = std.math.maxInt(u64) / 2;
+    state.onCallEntry(&proto, 0, 0, &code);
+    try testing.expectEqual(@as(?u32, null), state.counters.get(key));
 }

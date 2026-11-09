@@ -3081,6 +3081,7 @@ pub fn clearCache(self: *TraceState) void {
     @memset(&self.hotcount, 0);
     self.gate.clearRetainingCapacity();
     self.record_gate.clearRetainingCapacity();
+    self.noteGatesChanged();
     self.lleave_count.clearRetainingCapacity();
     self.unroll_fail.clearRetainingCapacity();
     self.penalty.clearRetainingCapacity();

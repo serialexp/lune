@@ -81,6 +81,7 @@ pub const InputKind = trace_code.InputKind;
 pub const InputSeed = trace_code.InputSeed;
 pub const UPVALUE_CELL_ANCHOR = trace_code.UPVALUE_CELL_ANCHOR;
 pub const FUNC_HEAD_PC = trace_code.FUNC_HEAD_PC;
+pub const CONT_PC_BIT = trace_code.CONT_PC_BIT;
 
 /// Doc 44: a hot function head waiting for the dispatch prologue to arm a
 /// `.head` recording at the callee's pc 0. See `TraceState.onCallEntry` /
@@ -717,6 +718,37 @@ pub const TraceConfig = struct {
     coverage: bool = false,
 };
 
+/// Exact memo of barred call/continuation anchors (`BarEntry`, `barCached`).
+/// 2^8 = 256 entries, allocated on first fill: only a VM that traces and meets
+/// a barred head or continuation anchor pays for it.
+const BAR_CACHE_BITS = 8;
+const BAR_CACHE_SIZE = 1 << BAR_CACHE_BITS;
+
+/// One `bar_cache` entry: "`(proto, pc)` has no trace and its recording is
+/// barred until `tick` reaches `until`", true while both generations still
+/// match. `gate_gen` moves on every gate-map mutation and the registry's
+/// `cache_gen` on every trace attach/detach, so an entry can only be stale in
+/// the direction of a slow-path re-check, never answer differently from it.
+/// `proto` and `proto_id` both compare: the maps key on the pointer, and the
+/// id makes a reused address a miss rather than a hit.
+const BarEntry = struct {
+    proto: ?*const Proto = null,
+    proto_id: u32 = 0,
+    pc: u32 = 0,
+    gate_gen: u32 = 0,
+    cache_gen: u32 = 0,
+    until: u64 = 0,
+};
+
+/// `bar_cache` slot for an anchor, keyed on `proto.id` like `hotIndex` (the
+/// same on every run). A collision only evicts, so it costs a slow-path visit.
+inline fn barIndex(proto_id: u32, pc: u32) usize {
+    var h: u64 = proto_id;
+    h ^= @as(u64, pc) *% 0x9E3779B97F4A7C15;
+    h ^= h >> 31;
+    return @intCast(h & (BAR_CACHE_SIZE - 1));
+}
+
 /// Direct-mapped hot-count table size (a power of two). A back-edge hashes its
 /// `(proto, pc)` into this many `u16` slots; the table is a cheap pre-filter that
 /// lets a *gated* anchor skip the per-back-edge hashmap bookkeeping in
@@ -990,6 +1022,16 @@ pub const TraceState = struct {
     /// to `GATE_SKIP` when an anchor is found gated, so a dead loop's millions of
     /// back-edges cost an array decrement instead of three hashmap probes apiece.
     hotcount: [HOTCOUNT_SIZE]u16 = @splat(0),
+    /// Exact memo of barred call/continuation anchors (see `BarEntry`). A
+    /// return into a caller whose continuation is barred, or a call of an
+    /// unpatched head that is, would otherwise pay `hasTrace` plus both gate
+    /// lookups (three hashes, ~150 instructions) every time. Null until the
+    /// first fill; an allocation failure just leaves it null.
+    bar_cache: ?*[BAR_CACHE_SIZE]BarEntry = null,
+    /// Moves on every mutation of `gate` or `record_gate`; `bar_cache` entries
+    /// from an older generation are misses. Every mutation site bumps it
+    /// (`noteGatesChanged`); safe builds assert each hit against the maps.
+    gate_gen: u32 = 0,
     /// Part B-2b: persistent hotexit-provenance relations. Edges are expected to
     /// be few, so lifecycle operations deliberately use linear scans.
     provenance_edges: std.ArrayListUnmanaged(ProvenanceEdge) = .empty,
@@ -2274,6 +2316,7 @@ pub const TraceState = struct {
         self.counters.deinit(self.gpa);
         self.gate.deinit(self.gpa);
         self.record_gate.deinit(self.gpa);
+        if (self.bar_cache) |tab| self.gpa.destroy(tab);
         self.lleave_count.deinit(self.gpa);
         self.unroll_fail.deinit(self.gpa);
         self.upvalue_mutable_memo.deinit(self.gpa);
@@ -2852,6 +2895,7 @@ pub const TraceState = struct {
         // two-op form was a measured ~2% of a scimark-lu run.
         const e = self.gate.getEntry(anchor) orelse return;
         self.gate.removeByPtr(e.key_ptr);
+        self.noteGatesChanged();
     }
 
     // Region-ops: accounting, bridges, provenance, observer cache — moved to trace_regionops.zig (file-split pass);
@@ -3330,6 +3374,57 @@ pub const TraceState = struct {
         return self.isGated(anchor) or self.isRecordGated(anchor);
     }
 
+    /// Every `gate`/`record_gate` mutation calls this: it retires every
+    /// `bar_cache` entry at once.
+    pub inline fn noteGatesChanged(self: *TraceState) void {
+        self.gate_gen +%= 1;
+    }
+
+    /// The tick a gate entry bars recording until (`isGated`'s arithmetic):
+    /// forever once abandoned, else `retry_at`; 0 for no gate.
+    fn gateBarUntil(self: *const TraceState, g: ?Gate) u64 {
+        const gate = g orelse return 0;
+        if (gate.strikes >= self.config.max_strikes) return std.math.maxInt(u64);
+        return gate.retry_at;
+    }
+
+    /// The call/return hooks' fast reject: `anchor` has no trace and its
+    /// recording is barred, by an entry `recordingBarredMemo` filled. Exact:
+    /// a hit is what `!hasTrace(anchor) and recordingBarred(anchor)` would
+    /// answer, which safe builds assert.
+    inline fn barCached(self: *const TraceState, anchor: AnchorKey) bool {
+        const tab = self.bar_cache orelse return false;
+        const e = &tab[barIndex(anchor.proto_id, anchor.pc)];
+        const hit = e.proto == anchor.proto and e.pc == anchor.pc and e.proto_id == anchor.proto_id and
+            e.gate_gen == self.gate_gen and e.cache_gen == self.registry.cache_gen and self.tick < e.until;
+        if (std.debug.runtime_safety and hit) {
+            std.debug.assert(!self.hasTrace(anchor) and self.recordingBarred(anchor));
+        }
+        return hit;
+    }
+
+    /// `recordingBarred` for an anchor the caller found without a trace,
+    /// remembering a barred answer in `bar_cache` for `barCached`.
+    fn recordingBarredMemo(self: *TraceState, anchor: AnchorKey) bool {
+        const until = @max(self.gateBarUntil(self.gate.get(anchor)), self.gateBarUntil(self.record_gate.get(anchor)));
+        if (self.tick >= until) return false;
+        const tab = self.bar_cache orelse blk: {
+            const t = self.gpa.create([BAR_CACHE_SIZE]BarEntry) catch return true;
+            t.* = @splat(.{});
+            self.bar_cache = t;
+            break :blk t;
+        };
+        tab[barIndex(anchor.proto_id, anchor.pc)] = .{
+            .proto = anchor.proto,
+            .proto_id = anchor.proto_id,
+            .pc = anchor.pc,
+            .gate_gen = self.gate_gen,
+            .cache_gen = self.registry.cache_gen,
+            .until = until,
+        };
+        return true;
+    }
+
     /// A1' (task 27): PERMANENT-only variant of `recordingBarred` — true only
     /// once either gate has abandoned the anchor for good (`strikes >=
     /// max_strikes`), never during a transient cooldown window. The
@@ -3353,6 +3448,7 @@ pub const TraceState = struct {
     /// back-edge tick. Returns null on OOM (gate simply not escalated).
     fn bumpGateEntry(self: *TraceState, map: *AnchorMap(Gate), anchor: AnchorKey, reason: GateReason) ?*Gate {
         const gop = map.getOrPut(self.gpa, anchor) catch return null;
+        self.noteGatesChanged();
         if (!gop.found_existing) {
             gop.value_ptr.* = .{ .retry_at = 0, .window = self.config.backoff_base, .strikes = 0, .reason = reason };
         }
@@ -3708,19 +3804,36 @@ pub const TraceState = struct {
         self.onCallEntryTraced(proto, base, call_seq, img);
     }
 
-    fn onCallEntryTraced(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64, img: []const Instr) void {
+    /// The steady-state refusals (a patched head, a barred one) in a small
+    /// function of their own, so they don't pay `onCallEntrySlow`'s frame.
+    /// `noinline`: inlined into `opCall` (by hand, or by LLVM once it is
+    /// this small) it costs every tier-0 call ~9 instructions through the
+    /// handler's codegen, tracing off (recursive-fib +0.6%, callgrind).
+    noinline fn onCallEntryTraced(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64, img: []const Instr) void {
+        if (self.callEntryRefused(proto, img)) return;
+        @call(.never_inline, onCallEntrySlow, .{ self, proto, base, call_seq, img });
+    }
+
+    /// `onCallEntry`'s cheap refusals, in their original order.
+    inline fn callEntryRefused(self: *const TraceState, proto: *const Proto, img: []const Instr) bool {
         // A recording owns the stream; don't compete. Suspended (doc 63
         // §5.9): no repatch (it drains) and no pending call anchor. Both
         // conditions are `fast_block` bits: one load and test.
-        if ((self.fast_block & (FastBit.recording | FastBit.jit_suspended)) != 0) return;
-        if (proto.is_vararg) return;
+        if ((self.fast_block & (FastBit.recording | FastBit.jit_suspended)) != 0) return true;
+        if (proto.is_vararg) return true;
         // Doc 44 D9 (S1): the caller passes the callee's freshly-reloaded
         // image, so the patched steady state is one bounds-checked opcode
         // compare — entry is the patch's job (`maybeRepatchHead` returned on
         // this exact check via its own `codeFor` hash; the D8-era per-call
         // `hasTrace` + `codeFor` hashes both fall away here). The unpatched
         // path below keeps `hasTrace` so D8 repatch recovery stays live.
-        if (img.len != 0 and img[0].op == .jfunc_head) return;
+        if (img.len != 0 and img[0].op == .jfunc_head) return true;
+        // A barred head with no trace: one memo probe, not three hashes.
+        return self.barCached(.{ .proto = proto, .pc = FUNC_HEAD_PC, .proto_id = proto.id });
+    }
+
+    /// The rest of `onCallEntry`, once `callEntryRefused` let it through.
+    fn onCallEntrySlow(self: *TraceState, proto: *const Proto, base: usize, call_seq: u64, img: []const Instr) void {
         const key = AnchorKey{ .proto = proto, .pc = FUNC_HEAD_PC, .proto_id = proto.id };
         if (self.hasTrace(key)) {
             // Doc 44 D8 (review round 2 blocker 4): entry is the patch's job —
@@ -3736,7 +3849,7 @@ pub const TraceState = struct {
             self.maybeRepatchHead(proto, key, img);
             return;
         }
-        if (self.recordingBarred(key)) return;
+        if (self.recordingBarredMemo(key)) return;
         const gop = self.counters.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
@@ -3779,8 +3892,11 @@ pub const TraceState = struct {
     /// - the boundary return never reaches this funnel (`opRet`'s
     ///   `stop_depth` path exits `execImpl` before it).
     /// `opRet` calls it only with tracing enabled.
-    pub fn onRetResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
-        self.noteResume(proto, resume_pc, base, call_seq, img, null);
+    pub noinline fn onRetResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
+        // Most returns stop at the refusals, without `noteResume`'s frame
+        // (`onCallEntryTraced`'s split, and `noinline` for the same reason).
+        if (self.resumeRefused(proto, resume_pc, img)) return;
+        @call(.never_inline, noteResume, .{ self, proto, resume_pc, base, call_seq, img, null });
     }
 
     /// Trace stitching (doc 44): a `call_interp` terminal exited at the host
@@ -3795,26 +3911,34 @@ pub const TraceState = struct {
         // recursion's base case) has no continuation worth a trace; refuse
         // before the counter, which would otherwise be hashed per exit.
         if (call_pc + 1 < proto.code.len and proto.code[call_pc + 1].op == .ret) return;
+        if (self.resumeRefused(proto, call_pc + 1, img)) return;
         self.noteResume(proto, call_pc + 1, base, call_seq, img, call_pc);
     }
 
-    fn noteResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr, host_call_pc: ?u32) void {
+    /// The continuation hooks' cheap refusals, in their original order.
+    inline fn resumeRefused(self: *const TraceState, proto: *const Proto, resume_pc: u32, img: []const Instr) bool {
         std.debug.assert(self.config.enabled);
         // A recording owns the stream; don't compete. Suspended (doc 63
         // §5.9): as `onCallEntry`, one `fast_block` test for both.
-        if ((self.fast_block & (FastBit.recording | FastBit.jit_suspended)) != 0) return;
-        if (proto.is_vararg) return;
+        if ((self.fast_block & (FastBit.recording | FastBit.jit_suspended)) != 0) return true;
+        if (proto.is_vararg) return true;
         // A system proto (a resumable native's activation, doc 68 §5.1) has
         // no instruction a recording could take: its continuation would
         // abort on `native_act` and only cost every comparison a probe.
-        if (proto.system) return;
-        if (resume_pc >= img.len) return; // resume at end-of-code (no instruction to anchor)
+        if (proto.system) return true;
+        if (resume_pc >= img.len) return true; // resume at end-of-code (no instruction to anchor)
         // Patched steady state: one bounds-checked opcode compare (D9 S1).
         const resumed_op = img[resume_pc].op;
-        if (resumed_op == .jcont) return;
+        if (resumed_op == .jcont) return true;
         // Collision rule: the pc hosts (or could host) a different patch kind.
-        if (resumed_op == .jfor_loop or resumed_op == .jloop or resumed_op == .jfunc_head) return;
-        if (trace_entry_registry.EntryRegistry.patchedEntryOp(proto.code[resume_pc].op) != null) return;
+        if (resumed_op == .jfor_loop or resumed_op == .jloop or resumed_op == .jfunc_head) return true;
+        if (trace_entry_registry.EntryRegistry.patchedEntryOp(proto.code[resume_pc].op) != null) return true;
+        // A barred continuation with no trace: one memo probe, not three hashes.
+        return self.barCached(.{ .proto = proto, .pc = contAnchorPc(resume_pc), .proto_id = proto.id });
+    }
+
+    /// The rest of a continuation hook, once `resumeRefused` let it through.
+    fn noteResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr, host_call_pc: ?u32) void {
         const key = AnchorKey{ .proto = proto, .pc = contAnchorPc(resume_pc), .proto_id = proto.id };
         if (self.hasTrace(key)) {
             // D8 recovery, cont flavour: traces exist but the pc is unpatched
@@ -3823,7 +3947,7 @@ pub const TraceState = struct {
             self.maybeRepatchCont(proto, key, img);
             return;
         }
-        if (self.recordingBarred(key)) return;
+        if (self.recordingBarredMemo(key)) return;
         const gop = self.counters.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;

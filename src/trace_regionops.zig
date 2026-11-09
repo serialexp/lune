@@ -1479,6 +1479,7 @@ pub fn clearMemberAnchorState(self: *TraceState, rid: RegionId) void {
         while (git.next()) |e| {
             if (self.regionMemberPoint(rid, e.key_ptr.proto.id, e.key_ptr.pc)) {
                 _ = self.gate.remove(e.key_ptr.*);
+                self.noteGatesChanged();
                 continue :gates;
             }
         }

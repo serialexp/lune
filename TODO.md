@@ -55,6 +55,12 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       activation now hands off at its calls (`enterCallee`'s
       `.native_call` arm). The general fix needs a handoff point on the
       call or return path that costs `.fast` nothing.
+      **Partly cut (2026-11-10, (B) step 1):** `recordingBarred`'s two
+      hash lookups per call and per return are now an exact direct-mapped
+      memo (`TraceState.bar_cache`, invalidated by `gate_gen` and the
+      registry's `cache_gen`). The pure-head probe below went from 931 M to
+      877 M; the `__index` probe went from 757 M to 688 M (tier 0 581 M). The
+      rest of the gap is the `.full` stickiness above.
 - [ ] **A `table.sort` comparison costs ~100 instructions more as a
       frame** (doc 68 §12: `sort_cmp` +14.9% tier-0, +16.2% JIT, over
       §10's 10%). Per comparison: ~210 in `opNativeAct` with the call
@@ -869,6 +875,16 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       `headEpisodeQuiet` and `opJFuncHead`, then the exit stub, because
       the trace leaves at the `ret` and tier 0 runs it. The trace is 3.4 KB
       of x86-64 for four bytecodes.
+      **Step 1 landed (2026-11-10):** the call and return hooks no longer
+      hash a barred anchor twice per call. They read a memo with 256 slots,
+      checked against the maps in Safe builds (`barCached` /
+      `recordingBarredMemo`; every gate mutation calls `noteGatesChanged`).
+      JIT board: co_pingpong -4.6%, globals_script -3.8%, tostring_meta
+      -3.7%, binary-trees -1.5%, spectral-norm -1.4%; tier 0 is flat (the
+      hooks stay `noinline`: inlining them added ~9 instructions per
+      `opCall`). Pure-head probe 931 M -> 877 M. **Step 2, next:** a design
+      doc for a lean head-trace entry lane (callgrind per call: ~400 in the
+      entry wrapper, ~109 in the body, ~150 in `noteResume`).
 - [ ] **(C) Record through `pcall`.** LuaJIT's `recff_pcall` records the
       call as a frame tag on the trace, so a hot loop that calls `pcall`
       stays one trace. Mahina's recorder aborts at the native today.
