@@ -546,22 +546,37 @@ In order, the first that applies wins:
    adding a word later is a breaking change.
 3. **A bound head word is Lua.** If the line's first word is a bound local,
    upvalue or global, the line is Lua.
-4. **An unbound head word is a command.** Otherwise the line is a command
-   line and the word is looked up on `PATH` (a host input; the REPL is never
-   recorded). So `git status` and a lone `ls` run programs, while a
-   misspelled variable that is not a program stays an error.
-5. Anything else is Lua.
+4. **An unbound head word that is a program is a command.** The head word is
+   the first whitespace-delimited token, taken whole. If it is unbound and
+   names a program on `PATH` (a host input; the REPL is never recorded), the
+   line is a command line. So `git status` and a lone `ls` run programs.
+   `git.status` and `ls(x)` are not program names (unless such a binary
+   exists), so they are Lua.
+5. Anything else is Lua. If that Lua then fails because the head word is
+   unbound, the error says the line was read as Lua, for example
+   `interpreted as Lua: attempt to call a nil value (global 'foo')`. There is
+   no separate "command not found" message. A misspelled variable that is not
+   a program is therefore an error and runs nothing.
 
 Consequences: a bound name always hides a program of the same name (Lua's own
 `type`, `select`, `load` hide `type`, `select`, `load`); `!` is the way past
 it. A forgotten variable named like a program (`file`, `test`, `time`) runs
 that program.
 
-Not decided yet (open questions, below): what may follow an unbound head word
-(`git.status`, `ls(x)`), the error text when a head word is neither bound nor
-on `PATH`, and the word grammar of a command line (quoting, `$NAME`, globbing,
-pipes, redirection). The restriction that holds for all of them: only syntax
-that cannot be read two ways; no Bash free-form.
+The word grammar of a command line is restricted to syntax that cannot be read
+two ways; no Bash free-form:
+
+- **Globbing is explicit only.** `*`, `?` and `[..]` are never expanded
+  implicitly; the file list comes from an explicit call or marked form (its
+  spelling is open, Q17).
+- **Pipes are always `proc.pipe`.** A pipe means the VM's own `proc.pipe`
+  (§3.6), never a shell's.
+- **No redirection syntax.** There is no `>` or `<` sugar: sugar of that kind
+  is where shell scripts break. Capture the result into a variable and use it
+  (`proc.run` already returns the output; `stdin` and file writes cover the
+  rest).
+
+Still open: quoting and `$NAME` in a command line (Q17).
 
 ## 7. Portability and the host seam
 
@@ -607,15 +622,15 @@ output, to show the pump and ring buffer stay linear and bounded.
 
 Q14b in the checklist above, and for §6.1:
 
-- **Q15 — what may follow an unbound head word.** `git status` and `ls -la`
-  are plain words; `git.status` and `ls(x)` could stay a Lua error or run as a
-  command.
-- **Q16 — not found.** The text when the head word is neither bound nor on
-  `PATH`: `ls: command not found`, or Lua's `attempt to call a nil value
-  (global 'foo')` for lines that also parse as Lua.
-- **Q17 — the word grammar.** Quoting, `$NAME`, globbing (explicit only?),
-  pipes and redirection (map to `proc.pipe` and `stdin`/`stdout`, not new
-  operators?).
+- [x] **Q15 — what may follow an unbound head word.** Decided 2026-11-09: the
+  head word is the whole first token; it is a command only if that token is
+  a program on `PATH`. `git.status` and `ls(x)` are Lua.
+- [x] **Q16 — not found.** Decided 2026-11-09: no "command not found". A line
+  that is not a command is Lua, and its error says it was interpreted as Lua.
+- [ ] **Q17 — the word grammar.** Decided: globbing explicit only, pipes
+  always `proc.pipe`, no redirection syntax. Open: the spelling of explicit
+  globs, quoting and `$NAME`, and whether a command line has a `|` spelling at
+  all or pipes are only written as `proc.pipe`.
 
 ## References
 
