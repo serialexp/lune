@@ -42,6 +42,21 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnostics) 
 
 /// `parse`, recording the comments it skips in `trivia` when one is given.
 pub fn parseTrivia(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnostics, trivia: ?*lexer.Trivia) Error!ast.Ast {
+    return (try parseFormat(gpa, source, diags, trivia)).ast;
+}
+
+/// A parse and the token stream it was made from (doc 83 §4.2).
+pub const Parsed = struct {
+    ast: ast.Ast,
+    /// Every token, ending in `.eof`. Allocated in `ast`'s arena: valid
+    /// until `ast.deinit()`.
+    tokens: []const Token,
+};
+
+/// `parseTrivia`, also returning the tokens. The formatter finds the syntax
+/// the AST does not keep (semicolons, `then`/`do`/`end`, attribute placement,
+/// a template's hole boundaries) by scanning the tokens inside a node's span.
+pub fn parseFormat(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnostics, trivia: ?*lexer.Trivia) Error!Parsed {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -56,7 +71,10 @@ pub fn parseTrivia(gpa: std.mem.Allocator, source: [:0]const u8, diags: *Diagnos
     };
     const root = try p.parseChunk();
 
-    return .{ .arena = arena, .source = source, .root = root };
+    return .{
+        .ast = .{ .arena = arena, .source = source, .root = root },
+        .tokens = tokens,
+    };
 }
 
 const Parser = struct {
@@ -1078,6 +1096,19 @@ fn parseOk(src: [:0]const u8) !ast.Ast {
     }
     try testing.expect(!diags.hasErrors());
     return tree;
+}
+
+test "parseFormat: the token stream comes back with the tree, semicolons included" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var parsed = try parseFormat(testing.allocator, "local x = 1; f()", &diags, null);
+    defer parsed.ast.deinit();
+    try testing.expect(!diags.hasErrors());
+    try testing.expectEqual(@as(usize, 2), parsed.ast.root.len);
+    // local x = 1 ; f ( ) <eof>: the `;` the AST drops is still a token.
+    const tags = [_]Tag{ .keyword_local, .identifier, .assign, .int_literal, .semicolon, .identifier, .lparen, .rparen, .eof };
+    try testing.expectEqual(tags.len, parsed.tokens.len);
+    for (tags, parsed.tokens) |want, got| try testing.expectEqual(want, got.tag);
 }
 
 test "local declaration with int value" {

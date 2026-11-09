@@ -1,6 +1,6 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phase 0 (the printer) landed; phases 0b–7 outstanding. Every style decision made by Bart
+Status: partial — phases 0 (the printer) and 0b (tokens) landed; phases 1–7 outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
@@ -45,12 +45,13 @@ land; move whole phases to Done once everything inside them is checked.
   bounded-lookahead cases (`Stats.fits_steps` is asserted, Rule #22). Done
   2026-11-10.
 
+- [x] **Phase 0b — expose the token stream.** `parser.parseFormat` (next to
+  `parseTrivia`) returns the AST and its token slice (in the AST's arena); the
+  trivia and diagnostics already come through the sinks callers pass. The only
+  edit to the parser; no AST node changed. Done 2026-11-10.
+
 ### Outstanding
 
-- [ ] **Phase 0b — expose the token stream.** `parser.parseFormat` (next to
-  `parseTrivia`) returns the AST, the token list, the trivia and the
-  diagnostics together (§4.2). The only edit to the parser; the AST does not
-  change.
 - [ ] **Phase 1 — comment attachment.** `src/format_comments.zig`: the §5 rule
   over the lexer's trivia, producing leading / trailing / dangling comments per
   node and the free-standing ones between statements.
