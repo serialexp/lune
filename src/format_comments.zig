@@ -103,6 +103,12 @@ pub const Comments = struct {
         return c.start < pos;
     }
 
+    /// Drop the comments that start before `end`: they sit inside source the
+    /// formatter prints verbatim (a template), so they travel with it.
+    pub fn skipTo(self: *Comments, end: u32) void {
+        while (self.next < self.list.len and self.list[self.next].start < end) self.next += 1;
+    }
+
     pub fn exhausted(self: *const Comments) bool {
         return self.next >= self.list.len;
     }
@@ -142,25 +148,44 @@ pub const Comments = struct {
         return std.mem.indexOfScalar(u8, self.source[from..to], '\n') != null;
     }
 
-    /// Consume the comments after code that ends at `after`, on the same
-    /// line, and return them joined by single spaces (with the leading space
-    /// the printer's `lineSuffix` wants), or null. A block comment that
-    /// code follows on its line is not trailing (it is the next item's
-    /// leading comment, inline).
-    pub fn takeTrailing(self: *Comments, a: Allocator, after: u32) Allocator.Error!?[]const u8 {
+    pub const Trailing = struct {
+        /// The comments joined by single spaces, with the leading space the
+        /// printer's `lineSuffix` wants.
+        text: []const u8,
+        /// Where the last one ends.
+        end: u32,
+    };
+
+    /// Consume the comments after code that ends at `after`: on the same
+    /// line, with nothing but whitespace (and `;`) between the code and the
+    /// comment, so `a = 1; b = 2 -- c` gives `-- c` to `b = 2`. A block
+    /// comment that code follows on its line is not trailing (it is the next
+    /// item's leading comment, inline).
+    pub fn takeTrailing(self: *Comments, a: Allocator, after: u32) Allocator.Error!?Trailing {
         var buf: std.ArrayList(u8) = .empty;
         const line = self.lineOf(after);
+        var cursor = after;
+        var end = after;
         while (self.next < self.list.len) {
             const c = self.list[self.next];
-            if (c.start < after or self.lineOf(c.start) != line) break;
-            if (c.block and !self.endsLine(c.end)) break;
-            try buf.append(a, ' ');
-            try buf.appendSlice(a, self.text(c));
-            self.next += 1;
-            if (!c.block) break;
+            if (c.start < cursor or self.lineOf(c.start) != line) break;
+            for (self.source[cursor..c.start]) |ch| switch (ch) {
+                ' ', '\t', '\r', ';' => {},
+                else => break,
+            } else {
+                if (c.block and !self.endsLine(c.end)) break;
+                try buf.append(a, ' ');
+                try buf.appendSlice(a, self.text(c));
+                self.next += 1;
+                cursor = c.end;
+                end = c.end;
+                if (!c.block) break;
+                continue;
+            }
+            break;
         }
         if (buf.items.len == 0) return null;
-        return try buf.toOwnedSlice(a);
+        return .{ .text = try buf.toOwnedSlice(a), .end = end };
     }
 
     /// Only whitespace, then a newline, end of file, or another comment, follows `pos`.
@@ -216,7 +241,8 @@ test "comments: a trailing comment is on the code's line, and consumed once" {
     var f = try Fixture.init(src);
     defer f.deinit();
     const t = (try f.comments.takeTrailing(f.a.allocator(), offsetOf(src, " --"))).?;
-    try testing.expectEqualStrings(" -- one", t);
+    try testing.expectEqualStrings(" -- one", t.text);
+    try testing.expectEqual(offsetOf(src, "\n"), t.end);
     // The next line's comment is not trailing.
     try testing.expect((try f.comments.takeTrailing(f.a.allocator(), offsetOf(src, " --"))) == null);
     const run = try f.comments.takeLeading(f.a.allocator(), offsetOf(src, "\n"), offsetOf(src, "y"));
@@ -243,6 +269,15 @@ test "comments: a run followed by a blank line is free-standing" {
     const run = try f.comments.takeLeading(f.a.allocator(), offsetOf(src, "\n"), offsetOf(src, "b"));
     try testing.expectEqual(@as(usize, 1), run.items.len);
     try testing.expect(run.blank_after);
+}
+
+test "comments: a comment after other code on its line is not the first statement's trailing comment" {
+    const src = "a = 1; b = 2 -- c\n";
+    var f = try Fixture.init(src);
+    defer f.deinit();
+    try testing.expect((try f.comments.takeTrailing(f.a.allocator(), offsetOf(src, ";") + 1)) == null);
+    const t = (try f.comments.takeTrailing(f.a.allocator(), offsetOf(src, " -- c"))).?;
+    try testing.expectEqualStrings(" -- c", t.text);
 }
 
 test "comments: a block comment with code after it on its line is inline, and not trailing" {

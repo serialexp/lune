@@ -37,6 +37,8 @@ pub const native_act = @import("native_act.zig");
 pub const format_doc = @import("format_doc.zig");
 /// Which comments go with which code, for the formatter (doc 83 §5).
 pub const format_comments = @import("format_comments.zig");
+/// The source formatter (doc 83).
+pub const format = @import("format.zig");
 
 /// Diagnostic / CLI I/O — the single wrapper around the churny `std.Io` writer
 /// API and `Value` text rendering.
@@ -193,6 +195,8 @@ test {
     _ = native_act;
     _ = format_doc;
     _ = format_comments;
+    _ = format;
+    _ = @import("format_gate_test.zig");
     _ = @import("stack_mem.zig");
     _ = datetime;
     _ = tzif;

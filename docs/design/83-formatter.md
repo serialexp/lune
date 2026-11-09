@@ -1,10 +1,10 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 (printer), 0b (tokens) and 1 (comments) landed; phases 2–7 outstanding. Every style decision made by Bart
+Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder) and 3 (corpus gate) landed; phases 4–7 outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
-Last updated: 2026-11-10 (phase 0)
+Last updated: 2026-11-10 (phases 2 and 3)
 
 ## Implementation status
 
@@ -59,14 +59,26 @@ land; move whole phases to Done once everything inside them is checked.
   repeated; a comment the builder never reaches makes the formatter refuse
   (never lose, never move across a symbol). 7 tests. Done 2026-11-10.
 
+- [x] **Phase 2 — statements and expressions.** `src/format.zig`: every
+  statement and expression form of `ast.zig` built into documents (templates
+  verbatim, with comments inside a hole travelling with it); the
+  semicolon-before-`(` rule; the redundant-paren rule. Deviations from the
+  plan, to revisit: name lists are not wrapped; blank lines between expanded
+  table entries are preserved; a comment inside an expression other than in a
+  list or between statements makes the formatter refuse (`UnplacedComment`).
+  Done 2026-11-10.
+- [x] **Phase 3 — correctness gates.** `src/format_gate_test.zig` runs the
+  formatter over `bench`, `tests`, `viz/fixtures` and `src/stdlib` (70 files):
+  each must format, be a fixed point, and compile to the same program
+  (recursive proto signature, no line info). All 70 pass. The benchmark
+  (Q2) is still outstanding. Done 2026-11-10.
+
 ### Outstanding
 
-- [ ] **Phase 2 — statements and expressions.** `src/format.zig`: every
-  statement and expression form of `ast.zig` (including templates, attributes,
-  `global`, `async`/`await`, type annotations) built into documents; the
-  semicolon-before-`(` rule; the redundant-paren rule.
-- [ ] **Phase 3 — correctness gates.** Idempotence, bytecode equivalence,
-  comment preservation, corpus run (§7). Lands with phase 2, not after it.
+- [ ] **Method-chain breaking and name-list wrapping** (§6): not built in
+  phase 2; long chains and name lists currently stay on one line.
+- [ ] **Comments inside expressions** (§5): refused in v1; place them or keep
+  refusing, decided once real code hits it.
 - [ ] **Phase 4 — CLI.** `mahina fmt [--check] [--stdin] <paths>` (§8.1).
 - [ ] **Phase 5 — language server.** `textDocument/formatting` and
   `rangeFormatting`; the `documentFormattingProvider` capability (§8.2).
