@@ -16,6 +16,8 @@ interface MahinaExports {
   mahina_free_result(resPtr: number): void;
   mahina_check(srcPtr: number, srcLen: number): number;
   mahina_free_check_result(resPtr: number): void;
+  mahina_format(srcPtr: number, srcLen: number): number;
+  mahina_free_format_result(resPtr: number): void;
   mahina_replay(srcPtr: number, srcLen: number, effPtr: number, effLen: number, argsPtr: number, argsLen: number, stopAfter: number): number;
   mahina_free_replay_result(resPtr: number): void;
   mahina_dispatch_smoke(iterations: number): number;
@@ -234,6 +236,15 @@ export interface MahinaDiagnostic {
   message: string;
 }
 
+/** What `format` answers (the source formatter, doc 83): the formatted text, or
+ *  why the source was left alone. `diagnostics` are `check`-shaped (byte spans);
+ *  a `comment` refusal has none (the formatter will not move a comment it has
+ *  no place for). */
+export type MahinaFormatResult =
+  | { status: "ok"; text: string }
+  | { status: "syntax"; diagnostics: MahinaDiagnostic[] }
+  | { status: "comment" };
+
 /** A ready-to-use VM instance. */
 /** The language server (doc 74) in this module instance: message bodies in,
  *  message bodies out, no framing. The caller owns the debounce timer — it
@@ -262,6 +273,8 @@ export interface MahinaModule {
   /** Parse + compile a source chunk and return its diagnostics WITHOUT running
    *  it — the editor's live linter. An empty array means a clean compile. */
   check(src: string): MahinaDiagnostic[];
+  /** Format `src` in the one standard style. Pure: nothing runs. */
+  format(src: string): MahinaFormatResult;
   /** Replay `src` forward to instruction-boundary safepoint `stopAfter`, feeding
    *  the recorded `effects` blob (from a prior `runSource`) back deterministically,
    *  and return the VM state there. Re-running to the same `stopAfter` yields
@@ -296,6 +309,8 @@ const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4 + 4 + 8;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
+/** `FormatResult`: u32 status, {ptr,len} text, {ptr,len} diags. */
+const FORMAT_RESULT_BYTES = 4 + 8 + 8;
 // Diag record layout: u32 severity, start, end, line; { u32 ptr; u32 len } msg.
 const DIAG_BYTES = 4 * 4 + 8;
 
@@ -658,6 +673,58 @@ function wrap(exports: MahinaExports): MahinaModule {
     };
   };
 
+  /** Read `count` `Diag` records at `diagsPtr` (the layout `mahina_check` and
+   *  `mahina_format` share). Call with the owning result still alive. */
+  const readDiags = (diagsPtr: number, count: number): MahinaDiagnostic[] => {
+    const out: MahinaDiagnostic[] = [];
+    for (let i = 0; i < count; i++) {
+      const off = diagsPtr + i * DIAG_BYTES;
+      const dv = new DataView(exports.memory.buffer, off, DIAG_BYTES);
+      const severity = dv.getUint32(0, true);
+      const start = dv.getUint32(4, true);
+      const end = dv.getUint32(8, true);
+      const line = dv.getUint32(12, true);
+      const msg = readBuf(exports.memory, dv, 16);
+      out.push({
+        severity: severity === 0 ? "error" : "warning",
+        start,
+        end,
+        line,
+        message: decoder.decode(msg),
+      });
+    }
+    return out;
+  };
+
+  const format = (src: string): MahinaFormatResult => {
+    const bytes = encoder.encode(src);
+    const srcPtr = bytes.length === 0 ? 0 : exports.mahina_alloc(bytes.length);
+    if (bytes.length !== 0) {
+      new Uint8Array(exports.memory.buffer, srcPtr, bytes.length).set(bytes);
+    }
+    const resPtr = exports.mahina_format(srcPtr, bytes.length);
+    if (srcPtr !== 0) exports.mahina_free(srcPtr, bytes.length);
+    if (resPtr === 0) {
+      throw new Error("mahina_format returned null (wasm allocation failure)");
+    }
+    // Re-acquire views after the call — memory may have grown.
+    const head = new DataView(exports.memory.buffer, resPtr, FORMAT_RESULT_BYTES);
+    const status = head.getUint32(0, true);
+    let result: MahinaFormatResult;
+    if (status === 0) {
+      result = { status: "ok", text: decoder.decode(readBuf(exports.memory, head, 4)) };
+    } else if (status === 1) {
+      result = { status: "syntax", diagnostics: readDiags(head.getUint32(12, true), head.getUint32(16, true)) };
+    } else if (status === 2) {
+      result = { status: "comment" };
+    } else {
+      exports.mahina_free_format_result(resPtr);
+      throw new Error("mahina_format: wasm allocation failure");
+    }
+    exports.mahina_free_format_result(resPtr);
+    return result;
+  };
+
   const check = (src: string): MahinaDiagnostic[] => {
     const bytes = encoder.encode(src);
     const srcPtr = bytes.length === 0 ? 0 : exports.mahina_alloc(bytes.length);
@@ -676,24 +743,7 @@ function wrap(exports: MahinaExports): MahinaModule {
     const diagsPtr = head.getUint32(4, true);
     const count = head.getUint32(8, true);
 
-    const out: MahinaDiagnostic[] = [];
-    for (let i = 0; i < count; i++) {
-      const off = diagsPtr + i * DIAG_BYTES;
-      const dv = new DataView(exports.memory.buffer, off, DIAG_BYTES);
-      const severity = dv.getUint32(0, true);
-      const start = dv.getUint32(4, true);
-      const end = dv.getUint32(8, true);
-      const line = dv.getUint32(12, true);
-      const msg = readBuf(exports.memory, dv, 16);
-      out.push({
-        severity: severity === 0 ? "error" : "warning",
-        start,
-        end,
-        line,
-        message: decoder.decode(msg),
-      });
-    }
-
+    const out = readDiags(diagsPtr, count);
     exports.mahina_free_check_result(resPtr);
     return out;
   };
@@ -735,6 +785,7 @@ function wrap(exports: MahinaExports): MahinaModule {
     lsp,
     runSource: guarded("run", runSource),
     check: guarded("check", check),
+    format: guarded("format", format),
     replay: guarded("replay", replay),
     dispatchSmoke: guarded("dispatch smoke", (iterations: number) => exports.mahina_dispatch_smoke(iterations)),
   };

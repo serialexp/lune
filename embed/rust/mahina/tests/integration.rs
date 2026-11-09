@@ -14,6 +14,15 @@ fn eval_scalars() {
 }
 
 #[test]
+fn format_normalizes_source_and_reports_syntax_errors() {
+    assert_eq!(mahina::format("local x=1;").unwrap(), "local x = 1\n");
+    match mahina::format("local = =") {
+        Err(Error::Compile(m)) => assert!(m.contains("line 1"), "{m}"),
+        other => panic!("expected a compile error, got {other:?}"),
+    }
+}
+
+#[test]
 fn eval_multiple_results() {
     let vm = Vm::new().unwrap();
     let out = vm.eval("return 1, 'two', 3.0", "t").unwrap();

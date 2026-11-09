@@ -400,6 +400,29 @@ export function setFileText(path: string, text: string): void {
   if (i >= 0 && state.files[i].text !== text) setState("files", i, "text", text);
 }
 
+/** Format the active workspace file with the built-in formatter (doc 83). A
+ *  file the formatter leaves alone (syntax errors, a comment it will not move)
+ *  says so in the output area instead. */
+export async function formatActive(): Promise<void> {
+  const path = state.activePath;
+  const text = fileText(path);
+  if (text === undefined || activeReadOnly()) return;
+  try {
+    const r = await mahinaWorker().format(text);
+    if (r.status === "ok") {
+      setFileText(path, r.text);
+      setState({ runError: null, runErrorSpan: null });
+    } else if (r.status === "syntax") {
+      const d = r.diagnostics[0];
+      setState({ runError: `format: not formatted, the file has syntax errors${d ? ` (line ${d.line}: ${d.message})` : ""}`, runErrorSpan: null });
+    } else {
+      setState({ runError: "format: not formatted, a comment sits where the formatter cannot place it", runErrorSpan: null });
+    }
+  } catch (e) {
+    setState({ runError: runFailureText(e) });
+  }
+}
+
 /** Show the tab at `path` in the editor. */
 export function setActivePath(path: string): void {
   if (fileText(path) !== undefined && state.activePath !== path) setState("activePath", path);

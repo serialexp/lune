@@ -94,6 +94,17 @@ int main(void) {
     assert(mh_ref_free(vm, fref) == MH_OK);
     assert(mh_ref_get(vm, fref, &f) == MH_ERR_API); /* stale ref detected */
 
+    /* source formatter (no VM) */
+    mh_str fmt_out, fmt_err;
+    assert(mh_format(MH_STR("local x=1;"), &fmt_out, &fmt_err) == MH_OK);
+    assert(fmt_out.len == 12 && memcmp(fmt_out.ptr, "local x = 1\n", 12) == 0 && fmt_err.len == 0);
+    mh_str_free(fmt_out);
+    mh_str_free(fmt_err);
+    assert(mh_format(MH_STR("local = ="), &fmt_out, &fmt_err) == MH_ERR_COMPILE);
+    assert(fmt_out.len == 0 && fmt_err.len > 0);
+    mh_str_free(fmt_out);
+    mh_str_free(fmt_err);
+
     /* tables + iteration */
     mh_value t;
     assert(mh_table_new(vm, &t) == MH_OK);

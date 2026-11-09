@@ -862,6 +862,53 @@ pub export fn mh_run(vm: ?*VmBox, script: ?*ScriptBox, results: ?[*]mh_value, ma
     return runImage(box, sb.image, resultsSlice(results, max_results), nres);
 }
 
+/// Doc 83 §8.3: the source formatter, no VM needed. `.ok` with the formatted
+/// text in `out`; `.err_compile` with the diagnostics (one `line N: error: msg`
+/// per line) in `errors` when the source has syntax errors or a comment the
+/// formatter will not move. Both strings are library-allocated: release each
+/// with `mh_str_free`.
+pub export fn mh_format(src: mh_str, out: ?*mh_str, errors: ?*mh_str) mh_status {
+    const o = out orelse return .err_api;
+    const e = errors orelse return .err_api;
+    o.* = .{};
+    e.* = .{};
+    const bytes = strSlice(src) orelse return .err_api;
+    var diags = mahina.diag.Diagnostics.init(c_gpa);
+    defer diags.deinit();
+    const text = mahina.format.format(c_gpa, bytes, &diags) catch |err| switch (err) {
+        error.OutOfMemory => return .err_oom,
+        error.SyntaxError => {
+            var msg: std.ArrayList(u8) = .empty;
+            for (diags.list.items) |d| {
+                msg.print(c_gpa, "line {d}: {s}: {s}\n", .{ d.line, @tagName(d.severity), d.message }) catch {
+                    msg.deinit(c_gpa);
+                    return .err_oom;
+                };
+            }
+            const owned = msg.toOwnedSlice(c_gpa) catch {
+                msg.deinit(c_gpa);
+                return .err_oom;
+            };
+            e.* = asStr(owned);
+            return .err_compile;
+        },
+        error.UnplacedComment => {
+            const owned = c_gpa.dupe(u8, "a comment sits where the formatter cannot place it\n") catch return .err_oom;
+            e.* = asStr(owned);
+            return .err_compile;
+        },
+    };
+    o.* = asStr(text);
+    return .ok;
+}
+
+/// Release a string `mh_format` returned. An empty one is a no-op.
+pub export fn mh_str_free(s: mh_str) void {
+    const p = s.ptr orelse return;
+    if (s.len == 0) return;
+    c_gpa.free(@constCast(p)[0..s.len]);
+}
+
 pub export fn mh_eval(vm: ?*VmBox, src: mh_str, name: mh_str, results: ?[*]mh_value, max_results: usize, nresults: ?*usize) mh_status {
     const box = vm orelse return .err_api;
     bumpEpoch(box);

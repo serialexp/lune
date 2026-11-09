@@ -1,10 +1,10 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder), 3 (corpus gate) and 4 (CLI) and 5 (language server) landed; phases 6–7 outstanding. Every style decision made by Bart
+Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder), 3 (corpus gate) and 4 (CLI) and 5 (language server) and 6 (wasm, C API, viz) landed; phase 7 outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
-Last updated: 2026-11-10 (phase 5)
+Last updated: 2026-11-10 (phase 6)
 
 ## Implementation status
 
@@ -87,14 +87,23 @@ land; move whole phases to Done once everything inside them is checked.
   file and returns the hunks that touch the range. Syntax errors and refused
   comments return no edits. Done 2026-11-10.
 
+- [x] **Phase 6 — wasm, C API, viz editor.** `mahina_format` /
+  `mahina_free_format_result` in `src/wasm_entry.zig` (status 0 ok, 1 syntax
+  errors with `check`-shaped diagnostics, 2 unplaceable comment, 3 out of
+  memory); `mh_format` / `mh_str_free` in `src/capi.zig` and `include/mahina.h`
+  with a smoke-test case, the `mahina-sys` extern pair and a safe
+  `mahina::format` in the Rust crate (tested); `MahinaModule.format`, the
+  worker/client plumbing, a Format button and Alt+Shift+F in the viz editor
+  replacing the active file's text, and `viz/test/format.test.ts` (formats a
+  sample, re-runs it for the same output, fixed point, refusal, empty,
+  non-ASCII). Done 2026-11-10.
+
 ### Outstanding
 
 - [ ] **Method-chain breaking and name-list wrapping** (§6): not built in
   phase 2; long chains and name lists currently stay on one line.
 - [ ] **Comments inside expressions** (§5): refused in v1; place them or keep
   refusing, decided once real code hits it.
-- [ ] **Phase 6 — wasm, C API, viz editor.** `mahina_format` export, the
-  capi function, a Format command in the viz editor (§8.3).
 - [ ] **Phase 7 — format the repo, add the gate.** One commit that reformats
   every `.lua`/`.mah` file in the tree, then `just fmt-check` in CI (§9).
 - [ ] **Q1 — where the table thresholds sit** (§6.5): settled by running the

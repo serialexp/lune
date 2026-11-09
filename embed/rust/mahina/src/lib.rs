@@ -102,6 +102,28 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Format mahina source in the one standard style (doc 83). No VM needed.
+/// Source with syntax errors, or a comment the formatter will not move,
+/// is `Error::Compile` with the diagnostics.
+pub fn format(src: &str) -> Result<String> {
+    let mut out = sys::mh_str::empty();
+    let mut errors = sys::mh_str::empty();
+    let st = unsafe { sys::mh_format(sys::mh_str::from_slice(src.as_bytes()), &mut out, &mut errors) };
+    let take = |s: sys::mh_str| -> String {
+        let text = String::from_utf8_lossy(unsafe { s.as_slice() }).into_owned();
+        unsafe { sys::mh_str_free(s) };
+        text
+    };
+    let formatted = take(out);
+    let diagnostics = take(errors);
+    match st {
+        sys::MH_OK => Ok(formatted),
+        sys::MH_ERR_COMPILE => Err(Error::Compile(diagnostics)),
+        sys::MH_ERR_OOM => Err(Error::Oom),
+        _ => Err(Error::Api("mh_format failed".into())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VM internals
 // ---------------------------------------------------------------------------

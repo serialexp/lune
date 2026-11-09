@@ -12,6 +12,8 @@ import {
   loadProjectFromUrl,
   setScriptArgs,
   stopRun,
+  formatActive,
+  activeReadOnly,
   coverageStripesShown,
   locLabel,
   frameLabel,
@@ -65,7 +67,11 @@ export default function App() {
   // included; Escape stops a running program. Capture phase, so it wins over
   // CodeMirror's own Mod-Enter (insert blank line).
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+    if ((e.key === "F" || e.key === "f") && e.shiftKey && e.altKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      void formatActive();
+    } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       e.stopPropagation();
       if (!state.running) void (e.shiftKey ? runBoth() : runWasm());
@@ -159,6 +165,15 @@ export default function App() {
                 Stop
               </button>
             </Show>
+            <button
+              type="button"
+              class="secondary"
+              disabled={state.running || activeReadOnly()}
+              title="Format this file in the one standard style (Alt+Shift+F)"
+              onClick={() => void formatActive()}
+            >
+              Format
+            </button>
             <button
               type="button"
               class="secondary"

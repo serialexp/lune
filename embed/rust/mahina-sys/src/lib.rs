@@ -150,6 +150,9 @@ extern "C" {
     pub fn mh_mem_stats_get(vm: *mut mh_vm, out: *mut mh_mem_stats) -> mh_status;
     pub fn mh_collect(vm: *mut mh_vm) -> mh_status;
 
+    pub fn mh_format(src: mh_str, out: *mut mh_str, errors: *mut mh_str) -> mh_status;
+    pub fn mh_str_free(s: mh_str);
+
     pub fn mh_compile(vm: *mut mh_vm, src: mh_str, name: mh_str, out: *mut *mut mh_script) -> mh_status;
     pub fn mh_script_free(script: *mut mh_script);
     pub fn mh_run(

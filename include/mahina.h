@@ -173,6 +173,15 @@ void mh_script_free(mh_script *script);
 mh_status mh_run(mh_vm *vm, mh_script *script, mh_value *results, size_t max_results, size_t *nresults);
 mh_status mh_eval(mh_vm *vm, mh_str src, mh_str name, mh_value *results, size_t max_results, size_t *nresults);
 
+/* ---- source formatter (doc 83) ------------------------------------------ */
+/* Format `src` in the one standard style; no VM needed. MH_OK: the formatted
+ * text is in *out. MH_ERR_COMPILE: syntax errors (or a comment the formatter
+ * will not move); the diagnostics, one "line N: error: msg" per line, are in
+ * *errors. Both strings are library-allocated: release each with
+ * mh_str_free (an empty one is a no-op). */
+mh_status mh_format(mh_str src, mh_str *out, mh_str *errors);
+void mh_str_free(mh_str s);
+
 /* ---- calling guest functions ------------------------------------------- */
 /* Surplus results are truncated to max_results; results[*nresults..] are
  * UNDEFINED (read only the reported prefix). args and results must not

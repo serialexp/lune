@@ -23,6 +23,8 @@
 //!   export  mahina_free_result(*Result)      — free a Result and all its buffers
 //!   export  mahina_check(src_ptr, src_len) -> *CheckResult
 //!   export  mahina_free_check_result(*CheckResult)
+//!   export  mahina_format(src_ptr, src_len) -> *FormatResult
+//!   export  mahina_free_format_result(*FormatResult)
 //!   export  mahina_replay(src_ptr, src_len, eff_ptr, eff_len, stop_after) -> *ReplayResult
 //!   export  mahina_free_replay_result(*ReplayResult)
 //!   export  mahina_panic_message_ptr() -> ptr, mahina_panic_message_len() -> len
@@ -66,6 +68,12 @@
 //! Diag (extern struct, 24 bytes): { u32 severity (0=error,1=warning), u32 start,
 //!   u32 end, u32 line (1-based), {u32 ptr,u32 len} msg (owned utf8) }. `start`/
 //!   `end` are byte offsets [start,end) into the source the editor passed in.
+//!
+//! FormatResult layout (the source formatter, doc 83; pure, runs nothing):
+//!   u32 status        0 = formatted, 1 = syntax errors (see `diags`),
+//!                     2 = a comment the formatter will not move, 3 = out of memory
+//!   {u32 ptr,u32 len} text       the formatted source (utf8); empty unless status 0
+//!   {u32 ptr,u32 len} diags      as in CheckResult (record count in `len`); status 1
 //!
 //! Each non-empty buffer is an independent `wasm_allocator` allocation; the
 //! Result/CheckResult struct is one too. `mahina_free_result` /
@@ -214,6 +222,13 @@ const Diag = extern struct {
 /// `diags.len` is the *record count*, not a byte length.
 const CheckResult = extern struct {
     status: u32 = 0,
+    diags: Buf = .{},
+};
+
+/// The result of `mahina_format` (see the file header).
+const FormatResult = extern struct {
+    status: u32 = 0,
+    text: Buf = .{},
     diags: Buf = .{},
 };
 
@@ -399,6 +414,50 @@ export fn mahina_free_check_result(res: ?*CheckResult) void {
         const diags = base[0..@as(usize, r.diags.len)];
         for (diags) |d| freeBuf(d.msg);
         gpa.free(diags);
+    }
+    gpa.destroy(r);
+}
+
+/// Format `source` in the one standard style (doc 83). The editor's Format
+/// command. Pure: nothing runs. Returns 0 only on a catastrophic allocation
+/// failure before a FormatResult exists. The source bytes are read, not freed.
+export fn mahina_format(src_ptr: u32, src_len: u32) ?*FormatResult {
+    const res = gpa.create(FormatResult) catch return null;
+    res.* = .{};
+    const src: []const u8 = blk: {
+        if (src_len == 0) break :blk &[_]u8{};
+        const p: [*]const u8 = @ptrFromInt(@as(usize, src_ptr));
+        break :blk p[0..@as(usize, src_len)];
+    };
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    const text = mahina.format.format(gpa, src, &diags) catch |e| {
+        switch (e) {
+            error.OutOfMemory => res.status = 3,
+            error.UnplacedComment => res.status = 2,
+            error.SyntaxError => {
+                res.status = 1;
+                res.diags = collectDiags(diags.list.items) catch {
+                    res.status = 3;
+                    return res;
+                };
+            },
+        }
+        return res;
+    };
+    res.text = bufFromSlice(text);
+    return res;
+}
+
+/// Free a `FormatResult`, its text, and its diagnostics.
+export fn mahina_free_format_result(res: ?*FormatResult) void {
+    const r = res orelse return;
+    freeBuf(r.text);
+    if (r.diags.len != 0) {
+        const base: [*]Diag = @ptrFromInt(@as(usize, r.diags.ptr));
+        const items = base[0..@as(usize, r.diags.len)];
+        for (items) |d| freeBuf(d.msg);
+        gpa.free(items);
     }
     gpa.destroy(r);
 }

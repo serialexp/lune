@@ -17,7 +17,8 @@ import { loadMahina, MahinaTrapError, type MahinaModule, type MahinaRunResult, t
 type Req =
   | { id: number; method: "init"; url: string }
   | { id: number; method: "run"; src: string; argv: string[]; files: SourceFile[] }
-  | { id: number; method: "replay"; src: string; effects: Uint8Array; stopAfter: number; argv: string[] };
+  | { id: number; method: "replay"; src: string; effects: Uint8Array; stopAfter: number; argv: string[] }
+  | { id: number; method: "format"; src: string };
 
 type Res =
   | { id: number; ok: true; result: unknown }
@@ -68,6 +69,10 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case "run": {
         const result = mod.runSource(req.src, req.argv, req.files);
         post({ id: req.id, ok: true, result }, runTransferables(result));
+        return;
+      }
+      case "format": {
+        post({ id: req.id, ok: true, result: mod.format(req.src) });
         return;
       }
       case "replay": {
