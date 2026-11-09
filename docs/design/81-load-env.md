@@ -1,8 +1,9 @@
 # 81 — `load` honours its env: chunk environments — Design
 
-Status: draft, not yet implemented (options for Bart; nothing built)
+Status: draft, not yet implemented. Strictness decided, Phase 0 measured
+(§6, §7); the environment model still open
 Owner: Bart
-Last updated: 2026-11-02
+Last updated: 2026-11-09
 
 ## Implementation status
 
@@ -11,9 +12,22 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Done
 
-_(nothing yet)_
+- [x] **Q0 — globals are declared** (§6): decided 2026-11-09. Every chunk
+  is strict: a free name that no `local` and no `global` declares is a
+  compile error. The names the host installs (`print`, `string`, …) count
+  as declared. Bart: "less footguns and cheaper global access are both
+  positives".
+- [x] **Phase 0 — baselines** (§7): measured before choosing the model.
+  Bart: "Measure first".
 
 ### Outstanding
+
+- [ ] **Q3 — where a declared global lives** (§6.2, §7): today's hinted
+  table slot, read through the closure's environment (B), or a cell bound
+  at load time (E2). Decide with §7's numbers in hand.
+- [ ] **Q4 — how Lua code opts out** (§6.1): the bench corpus and other
+  Lua sources use implicit globals. A CLI flag, a `global *` the file
+  writes, or a file extension rule.
 
 - [ ] **Q1 — the environment model** (§3): (A) Lua 5.4 lexical `_ENV`
   everywhere, (B) a per-closure environment, inherited at closure creation,
@@ -21,9 +35,6 @@ _(nothing yet)_
 - [ ] **Q2 — metatables on the environment** (§5): does `get_global` honour
   `__index`/`__newindex` on `_G` and on a `load` env (strict.lua), in the
   same unit or a later one?
-- [ ] **Phase 0 — baselines.** `get_global`/`set_global` instruction counts
-  (tier-0 and native) on a globals-heavy loop and the bench suite, so the
-  chosen model's cost is measured against today.
 - [ ] **Phase 1 — the model** (per Q1): compiler, resolver, `load`'s env
   argument, `closure` creation.
 - [ ] **Phase 2 — JIT**: the recorder's global inputs keyed by the
@@ -115,6 +126,70 @@ depend on it. The fast path can stay as it is: a miss already leaves for
 the slow handler, which is where an `__index` lookup belongs. A
 `__newindex` check on `set_global` costs one metatable test per store.
 This can land with Phase 1 or separately.
+
+## 6. Explicit globals (2026-11-09)
+
+Bart: "Maybe we should just make globals explicit? I feel like resolving g
+to _ENV.g is a bit icky if we have to do it every single time we use a
+variable." Doc 76 already has Lua 5.5's declarations and its strict scope
+(`global x`; inside its scope an undeclared name is a compile error). Two
+points shaped the choice:
+
+- No model resolves a name per use. The compiler decides once that `g` is
+  a global and which table it reads; what runs per use is loads.
+- A declared global still lives in some table, so declaring globals does
+  not answer which table `load`'s `env` replaces. That stays Q1/Q3.
+
+### 6.1 Strictness (Q0, decided)
+
+Every chunk is strict, as if it opened with doc 76's declarations. The
+names the host installs at VM creation count as declared, so `print` needs
+no `global print`; a program's own globals do. This is stricter than 5.5,
+whose chunks start with an implicit `global *`. Lua sources that rely on
+implicit globals need a way to opt out (Q4).
+
+### 6.2 Cheaper access (Q3)
+
+- **Hinted slot, through the closure's env (B).** Today's fast path with
+  `closure.env` in place of `vm.globals`: about one more load.
+- **Cells bound at load time (E2).** Declarations give the compiler the set
+  of globals a chunk uses. At load, each is bound to a cell in its
+  environment, and a use loads the cell. The environment must then keep
+  each value in a stable cell: `env.x = 1` from outside, `rawset`, `pairs`,
+  `_G[name]`, a global first created after the load, and keyframes all have
+  to see the same cell. A design doc of its own.
+
+## 7. Phase 0: what globals cost today (2026-11-09)
+
+ReleaseFast at f91022e, instruction counts (`perf stat instructions:u`).
+
+**Microbenchmarks**, 20M iterations; each row's delta is against the same
+loop on locals:
+
+| loop | tier 0 | `--trace --jit-native` |
+|---|---|---|
+| `acc = acc + g1 + g2 + g3 + g4` | +54 instructions per read | ±0 (the reads are trace inputs) |
+| `g1 = i` | +92 per store | the loop never traces (below) |
+
+A read's tier-0 fast path (`opGetGlobal`) is ~50 instructions. About 28
+are the hinted lookup: the hint array's bounds, the constant's tag,
+`vm.globals`, the node's bounds, tag and key, the value's nil test. The
+rest is the dispatch every op pays. A cell would replace the lookup with
+about three dependent loads, so E2 could save roughly 20 of the ~50, at
+tier 0 only. (B) adds about one load.
+
+**Stores don't trace.** `set_global` is NYI in the recorder (`nyi_opcode`,
+TODO.md "`set_upval` on an OPEN upvalue"), so `g1 = i` in a loop runs at
+tier 0 under the JIT, and the `--trace` run costs 18% more than tier 0
+alone (4007M against 3400M). This is independent of Q3.
+
+**The suite** (55 benches, perf samples in the global handlers): under 3%
+in every bench but `str_long_keys` (6.5% tier 0, 5.9% JIT), where its one
+read per iteration is `tostring`. Instruction counts put that read at 2.0%
+(a `local tostring` copy saves 9.6M of 473M), so the sampled shares
+overstate: the bench suite is written with locals and spends little on
+globals. Code written with globals pays the per-read cost above at
+tier 0, and nothing on traced reads.
 
 ## References
 
