@@ -501,21 +501,13 @@ const F = struct {
                 return f.cat(&.{ try f.t(op), if (same) try f.t(" ") else fd.empty, operand });
             },
             .binary => return f.binary(e),
-            .field => |fl| return f.cat(&.{ try f.expr(fl.obj), try f.t("."), try f.t(fl.name) }),
-            .index => |ix| return f.cat(&.{ try f.expr(ix.obj), try f.t("["), try f.whole(ix.key), try f.t("]") }),
+            .field, .index, .method_call => return f.chain(e),
             .call => |c| {
                 if (c.callee.data == .intrinsic) {
                     // `await e`.
                     return f.cat(&.{ try f.t("await "), try f.expr(c.args[0]) });
                 }
-                const callee = try f.expr(c.callee);
-                const arglist = try f.argList(c.args, c.callee.span.end, e.span.end);
-                return f.cat(&.{ callee, arglist });
-            },
-            .method_call => |m| {
-                const obj = try f.expr(m.obj);
-                const arglist = try f.argList(m.args, m.name_span.end, e.span.end);
-                return f.cat(&.{ obj, try f.t(":"), try f.t(m.name), arglist });
+                return f.chain(e);
             },
             .function => |fb| {
                 const head = try f.t(if (fb.is_async) "async function" else "function");
@@ -525,6 +517,92 @@ const F = struct {
             .table => |fields| return f.table(fields, e.span),
             .err => return error.SyntaxError,
         }
+    }
+
+    /// A postfix chain (`a.b[c](d):e(f)`): its root and every link after it,
+    /// built in one pass so a long chain is not re-walked per link. A chain of
+    /// more than two calls that does not fit breaks before every `.` or `:`
+    /// that follows the first call (§6.4), each link indented once.
+    fn chain(f: *F, e: *const Expr) Error!Doc {
+        var rev: std.ArrayList(*const Expr) = .empty;
+        var root = e;
+        walk: while (true) {
+            switch (root.data) {
+                .field => |fl| {
+                    try rev.append(f.a, root);
+                    root = fl.obj;
+                },
+                .index => |ix| {
+                    try rev.append(f.a, root);
+                    root = ix.obj;
+                },
+                .method_call => |m| {
+                    try rev.append(f.a, root);
+                    root = m.obj;
+                },
+                .call => |c| {
+                    if (c.callee.data == .intrinsic) break :walk;
+                    try rev.append(f.a, root);
+                    root = c.callee;
+                },
+                else => break :walk,
+            }
+        }
+        std.mem.reverse(*const Expr, rev.items);
+        var links: std.ArrayList(Doc) = .empty;
+        var calls: usize = 0;
+        // Where each link begins a line when the chain breaks: the `.`/`:`
+        // links after the first call.
+        var breaks: std.ArrayList(bool) = .empty;
+        var seen_call = false;
+        for (rev.items) |node| {
+            switch (node.data) {
+                .field => |fl| {
+                    try breaks.append(f.a, seen_call);
+                    try links.append(f.a, try f.cat(&.{ try f.t("."), try f.t(fl.name) }));
+                },
+                .index => |ix| {
+                    try breaks.append(f.a, false);
+                    try links.append(f.a, try f.cat(&.{ try f.t("["), try f.whole(ix.key), try f.t("]") }));
+                },
+                .call => |c| {
+                    try breaks.append(f.a, false);
+                    try links.append(f.a, try f.argList(c.args, c.callee.span.end, node.span.end));
+                    calls += 1;
+                    seen_call = true;
+                },
+                .method_call => |m| {
+                    try breaks.append(f.a, seen_call);
+                    const arglist = try f.argList(m.args, m.name_span.end, node.span.end);
+                    try links.append(f.a, try f.cat(&.{ try f.t(":"), try f.t(m.name), arglist }));
+                    calls += 1;
+                    seen_call = true;
+                },
+                else => unreachable,
+            }
+        }
+        const root_doc = try f.expr(root);
+        var parts: std.ArrayList(Doc) = .empty;
+        try parts.append(f.a, root_doc);
+        var any_break = false;
+        if (calls > 2) for (breaks.items) |b| {
+            if (b) any_break = true;
+        };
+        if (!any_break) {
+            for (links.items) |l| try parts.append(f.a, l);
+            return f.cat(parts.items);
+        }
+        // The head runs to the first link that starts a line; the rest hang
+        // from it, one `.`/`:` link (with what follows it) per line.
+        var i: usize = 0;
+        while (!breaks.items[i]) : (i += 1) try parts.append(f.a, links.items[i]);
+        var rest: std.ArrayList(Doc) = .empty;
+        while (i < links.items.len) : (i += 1) {
+            if (breaks.items[i]) try rest.append(f.a, fd.softline);
+            try rest.append(f.a, links.items[i]);
+        }
+        try parts.append(f.a, try f.b.indent(try f.cat(rest.items)));
+        return f.b.group(try f.cat(parts.items));
     }
 
     fn binary(f: *F, e: *const Expr) Error!Doc {
@@ -1132,6 +1210,19 @@ test "format: line breaks inside long strings, templates and block comments come
     try expectFmt("local y = `t\r\nu`\r\n", "local y = `t\nu`\n");
     try expectFmt("--[[ a\r\n b ]]\r\nlocal z = 1\r\n", "--[[ a\n b ]]\nlocal z = 1\n");
     try expectFmt("local x = [[a\rb\n\rc]]\n", "local x = [[a\nb\nc]]\n");
+}
+
+test "format: a long method chain breaks before each link after the first call" {
+    try expectFmt("a:b():c():d()", "a:b():c():d()\n");
+    try expectFmt(
+        "local result = builder:set_name(\"some long name here\"):set_age(1234567):set_email(\"x@example.com\"):build()",
+        "local result = builder:set_name(\"some long name here\")\n    :set_age(1234567)\n    :set_email(\"x@example.com\")\n    :build()\n",
+    );
+    // Two calls stay on one line however long.
+    try expectFmt(
+        "local result = builder:set_name(\"some long name here that is long\", \"and another string here to fill the width\", 1)",
+        "local result = builder:set_name(\n    \"some long name here that is long\",\n    \"and another string here to fill the width\",\n    1\n)\n",
+    );
 }
 
 test "format: comments stay with their code" {
