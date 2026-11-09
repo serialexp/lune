@@ -3586,7 +3586,14 @@ nothing at all.
       cells record as `ustore`). The same goes for `set_global`. Both
       stop whole loops from tracing (`u = u + i` in a nested function
       whose parent is still running; `G = G + i`). It blocks some
-      exit-side recordings too.
+      exit-side recordings too. `bench/globals_script.lua` (2026-11-09)
+      is the script-shaped case: `set_global` aborts in five of its
+      functions, and it runs 15.5% native.
+- [ ] **`set_global` costs twice a read at tier 0** (doc 81 §7: 114
+      instructions against `gget`'s 54; LuaJIT `-joff` 38). `opSetGlobal`
+      has no inline hinted fast path: it checks `readonly`, calls
+      `Table.setHinted` out of line (key normalization included), then the
+      write barrier. Measure with `bench/opprobe/globals.lua gset grmw`.
 - [ ] **Two iteration credits can't be seen yet.** Tier-1a call B's and
       `replayLedger`'s `enclosing_iteration` credits don't change any
       test when removed: `linked_completed` is already ≥ 1 there, and the

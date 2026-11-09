@@ -28,6 +28,10 @@ instructions, against LuaJIT `-joff`. These are not `@bench` programs, so
 - `upvalues.lua`: doc 71's probes: an upvalue read from a closed cell
   (`ugetc`) and an open one (`ugeto`), and a write to a closed cell from a
   local (`usetc`). LuaJIT-compatible.
+- `globals.lua`: doc 81's probes, one global operation per iteration: a
+  read (`gget`), a store (`gset`), `G = G + 1` (`grmw`), a call through a
+  global name (`gcall`), `math.abs` through the global `math` (`gfield`)
+  and a builtin by its global name (`gbuiltin`). LuaJIT-compatible.
 
 Usage, from the repo root, with a ReleaseFast build (`just release`):
 

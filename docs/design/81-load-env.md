@@ -191,6 +191,32 @@ overstate: the bench suite is written with locals and spends little on
 globals. Code written with globals pays the per-read cost above at
 tier 0, and nothing on traced reads.
 
+**A bench and probes for code written with globals.** The suite had none,
+so two were added:
+
+- `bench/globals_script.lua`: a game tick written the way scripts are,
+  with config, state, counters, functions and the RNG seed all globals and
+  the stdlib reached through global `math`. LuaJIT-compatible. At f91022e:
+  tier 0 240 ms, JIT 140 ms, LuaJIT 14 ms (16.7× and 9.7×), 15.5% of
+  loop iterations native. Its aborts are mostly `set_global` NYI, in
+  `rand`, `move`, `tick`, `bounce` and `collide`.
+- `bench/opprobe/globals.lua`: one global operation per iteration.
+  Marginal instructions at tier 0 against LuaJIT `-joff`:
+
+| probe | mahina | LuaJIT `-joff` | ratio |
+|---|---|---|---|
+| `gget` (read) | 54 | 25 | 2.2× |
+| `gset` (store) | 114 | 38 | 3.0× |
+| `grmw` (`G = G + 1`) | 207 | 58 | 3.6× |
+| `gcall` (call a global function) | 361 | 86 | 4.2× |
+| `gfield` (`math.abs`) | 237 | 110 | 2.2× |
+| `gbuiltin` (`type`) | 166 | 81 | 2.0× |
+
+A store costs twice a read: `opSetGlobal` checks `readonly`, calls
+`Table.setHinted` out of line (which normalizes the key), then runs the
+write barrier. A call's cost is the call's: `call1` from a local is 361
+too.
+
 ## References
 
 - `src/compiler.zig` `loadName`/`storeName`; `src/resolve.zig` (`_G`).
