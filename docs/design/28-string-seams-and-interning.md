@@ -2,8 +2,9 @@
 
 Status: reviewed (codex gpt-5.6-sol: approve-with-must-fixes — all folded in
 below and marked **[MF]**); L1/L2/L4 landed 2026-08-28; L3 landed 2026-11-02,
-widened and with a second chain trigger (§5.1)
-Last updated: 2026-11-02
+widened and with a second chain trigger (§5.1), counted on hits since
+2026-11-09
+Last updated: 2026-11-09
 Arc: Bart 2026-08-28 — "Lets do the strings first. Everyone will run into
 those at some point."
 
@@ -323,6 +324,24 @@ stays dense and marks its bucket again, which is always valid. The guard,
 the chain rehash and the resize read the bit instead of recomputing the
 sparse hash. os_date −1.3%, co_garbage −0.9% (instructions, both tiers):
 os_date is now −0.45% against full Wyhash.
+
+**The trigger counts hits, not misses (2026-11-09).** What os_date still
+paid was the trigger firing on misses: 33k of its 303k misses promoted a
+group of dates that died at the next collection, and paid a chain rehash
+and dense hashes until then. The cost the trigger exists for is a *hit*
+that compares bytes along a group, so a hit now does the counting: one that
+byte-compared `strtab_max_ident` (4) strings sharing its sparse hash and
+length before its own rehashes their chain (`strtabHitGuard`). It allocates
+nothing and moves no string, so the pointer it returns stays good.
+`internedLookup` and the recorder's probe stay read-only. A miss keeps only
+the weighted long-chain guard, so an unmarked group can now reach 17
+strings (`strtab_max_coll / 2 + 1`) before its next hit promotes it; the
+rebuild and the sweep still group only the dense strings, since a group
+never promoted is simply waiting for a hit. Against the miss trigger (instructions): os_date
+−1.76%, scalar −1.1% (JIT; tier 0 −0.25%), scimark −0.66%, io_lines −0.3%,
+nothing worse. os_date is now −2.2% against full Wyhash. The hit-heavy
+shapes of the table above stay where the miss trigger put them, within
+0.25%.
 
 ## 6. L4 — intern with a known cp_len
 

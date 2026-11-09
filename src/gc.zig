@@ -149,9 +149,9 @@ pub const Heap = struct {
     ///
     /// The hash is LuaJIT's, widened (doc 28 §5): `string.sparseHash` reads
     /// six words, so strings that differ only between them collide. A miss
-    /// whose walk costs more than `strtab_max_coll`, or that byte-compares
-    /// `strtab_max_ident` strings sharing its hash and length, rehashes that
-    /// chain with `string.denseHash` (`strtabRehashChain`,
+    /// whose walk costs more than `strtab_max_coll`, or a hit that first
+    /// byte-compares `strtab_max_ident` strings sharing its hash and length,
+    /// rehashes that chain with `string.denseHash` (`strtabRehashChain`,
     /// `lj_str_rehash_chain`). The invariant: a string's `hash` is its dense
     /// hash (`string.isDense`) exactly when the bucket its sparse hash names
     /// is marked in `strtab_dense`. Each sweep decides the marks afresh from
@@ -530,11 +530,16 @@ pub const Heap = struct {
     /// compared counts twice, as in `lj_str_new`.
     const strtab_max_coll: usize = 32;
 
-    /// A miss that byte-compared this many strings sharing its sparse hash
-    /// and length rehashes their chain densely, so no more than this many
-    /// strings ever share a sparse hash in an unmarked bucket. They are
-    /// strings the samples cannot tell apart, and every hit on one compares
-    /// bytes along the group; LuaJIT waits for `strtab_max_coll`.
+    /// A hit that byte-compared this many strings sharing its sparse hash
+    /// and length before its own rehashes their chain densely (doc 28 §5.1).
+    /// They are strings the samples cannot tell apart, and every hit on one
+    /// compares bytes along the group; LuaJIT waits for `strtab_max_coll`.
+    /// A miss does not count them: short-lived strings that collide (a day's
+    /// dates differing only in the hour) are seldom looked up again, and
+    /// promoting their groups costs more than it saves. Misses keep the
+    /// long-chain guard, so an unmarked group holds at most
+    /// `strtab_max_coll / 2 + 1` strings: a miss that compared that many
+    /// counts past `strtab_max_coll`.
     const strtab_max_ident: usize = 4;
 
     /// The hash `content` is stored and found under (doc 28 §5): its sparse
@@ -561,12 +566,13 @@ pub const Heap = struct {
         s: ?*String,
         /// Strings passed, counting twice each whose bytes were compared.
         coll: usize,
-        /// Strings passed that share the hash and length.
+        /// Strings passed that share the hash and length, on a hit too.
         ident: usize,
     };
 
     /// Look up `content`, stored under `hash`, in the intern chains: the
-    /// unique live `String` or null, and on a miss what the walk cost.
+    /// unique live `String` or null, and what the walk cost (`coll` only on
+    /// a miss).
     /// A hit costs one hash + on average ≤1 chain hop (grow keeps load ≤ ~100%).
     inline fn strtabFind(self: *const Heap, content: []const u8, hash: u64) Found {
         if (self.strtab.len == 0) return .{ .s = null, .coll = 0, .ident = 0 };
@@ -575,7 +581,7 @@ pub const Heap = struct {
         var ident: usize = 0;
         while (s) |cur| : (s = cur.next_intern) {
             if (cur.hash == hash and cur.len == content.len) {
-                if (bytes.eql(cur.bytes(), content)) return .{ .s = cur, .coll = 0, .ident = 0 };
+                if (bytes.eql(cur.bytes(), content)) return .{ .s = cur, .coll = 0, .ident = ident };
                 ident += 1;
             }
             passed += 1;
@@ -588,18 +594,31 @@ pub const Heap = struct {
     }
 
     /// The miss path's chain guard: when the walk for a sparse-hashed
-    /// `content` cost more than `strtab_max_coll`, or met `strtab_max_ident`
-    /// strings it could not tell apart by hash, rehash that chain densely and
-    /// return the hash `content` now goes under; else `hash`. Infallible (the
-    /// marks were allocated with the table).
+    /// `content` cost more than `strtab_max_coll`, rehash that chain densely
+    /// and return the hash `content` now goes under; else `hash`. Infallible
+    /// (the marks were allocated with the table).
     inline fn strtabGuard(self: *Heap, content: []const u8, hash: u64, found: Found) u64 {
-        if (found.coll <= strtab_max_coll and found.ident < strtab_max_ident) return hash;
+        if (found.coll <= strtab_max_coll) return hash;
         // A dense lookup's chain has nothing left to rehash.
         if (string.isDense(hash)) return hash;
         const idx = @as(usize, @truncate(hash)) & (self.strtab.len - 1);
         if (self.bucketDense(self.strtab_dense, idx)) return hash;
         self.strtabRehashChain(idx);
         return string.denseHash(content);
+    }
+
+    /// The hit path's guard: a hit found under sparse `hash` after
+    /// byte-comparing `strtab_max_ident` look-alikes rehashes their chain.
+    /// No allocation, no collection, and no string moves, so the caller's
+    /// pointer stays good; only the chain geometry changes. Read-only probes
+    /// (`internedLookup`, the recorder's) never come here.
+    inline fn strtabHitGuard(self: *Heap, hash: u64, found: Found) void {
+        if (found.ident >= strtab_max_ident) {
+            @branchHint(.unlikely);
+            // A dense lookup's bucket is not the group's.
+            if (string.isDense(hash)) return;
+            self.strtabRehashChain(@as(usize, @truncate(hash)) & (self.strtab.len - 1));
+        }
     }
 
     /// Mark bucket `idx` dense and move its sparse-hashed strings to their
@@ -728,10 +747,10 @@ pub const Heap = struct {
     /// Mark in `marks` the buckets of a `mask + 1`-bucket table that hash
     /// densely (`lj_str_resize`, widened): those more than `strtab_max_coll`
     /// strings name by their sparse hash, and those holding more than
-    /// `strtab_max_ident` strings of one sparse hash and length, the groups
-    /// the miss guard promotes. Whether any is marked. Only a marked bucket
-    /// can hold such a group: the guard marks it as it forms, every geometry
-    /// keeps a group in one bucket, and a sweep only shrinks it. So only the
+    /// `strtab_max_ident` dense strings of one sparse hash and length, the
+    /// groups the hit guard promoted that are still that large. Whether any is
+    /// marked. A group not yet promoted stays sparse and waits for its next
+    /// expensive hit; every geometry keeps a group in one bucket. So only the
     /// dense strings are grouped, sorted in scratch freed here.
     fn strtabDecideMarks(self: *const Heap, marks: []u64, mask: usize) std.mem.Allocator.Error!bool {
         const counts = try self.gpa.alloc(u32, mask + 1);
@@ -893,6 +912,7 @@ pub const Heap = struct {
             // Hit-path contract check (doc 28 §6 [MF]).
             if (known.cp_len) |n| std.debug.assert(n == existing.cp_len);
             if (known.ascii) |a| std.debug.assert(a == existing.isAscii());
+            self.strtabHitGuard(h0, found);
             return existing;
         }
         // The chain guard may re-chain before anything fallible: geometry is
@@ -914,6 +934,7 @@ pub const Heap = struct {
         const found = self.strtabFind(s.bytes(), h0);
         if (found.s) |existing| {
             s.destroy(self.gpa);
+            self.strtabHitGuard(h0, found);
             return existing;
         }
         s.hash = self.strtabGuard(s.bytes(), h0, found);
@@ -1654,15 +1675,15 @@ fn strtabCheckIntegrity(heap: *Heap) !void {
                 }
             }
             try testing.expect(on_list);
-            // An unmarked bucket holds no group the miss guard would have
-            // promoted (`strtabDecideMarks` relies on it).
+            // An unmarked bucket holds no group the long-chain guard would
+            // have promoted (`strtab_max_ident`'s bound).
             if (heap.strtab_any_dense and heap.bucketDense(heap.strtab_dense, idx)) continue;
             var twins: usize = 0;
             var t = head;
             while (t) |o| : (t = o.next_intern) {
                 if (o.hash == cur.hash and o.len == cur.len) twins += 1;
             }
-            try testing.expect(twins <= Heap.strtab_max_ident);
+            try testing.expect(twins <= Heap.strtab_max_coll / 2 + 1);
         }
     }
     try testing.expectEqual(heap.strtab_count, chained);
@@ -1785,19 +1806,58 @@ test "doc 28 §5: a miss counts twice a string whose bytes it compared, as lj_st
     try strtabCheckIntegrity(&heap);
 }
 
-test "doc 28 §5: the fifth string the samples cannot tell apart rehashes their chain" {
+/// Intern the colliders `0..n` again. The one last in their chain compares
+/// the others first, so with more than `strtab_max_ident` of them a hit
+/// promotes the group.
+fn hitColliders(heap: *Heap, buf: *[64]u8, n: usize) !void {
+    for (0..n) |i| _ = try heap.intern(sparseColliders(buf, i));
+}
+
+test "doc 28 §5.1: a hit that compares four look-alikes first rehashes their chain" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var buf: [64]u8 = undefined;
+    var group: [Heap.strtab_max_ident + 1]*String = undefined;
+    for (&group, 0..) |*g, i| g.* = try heap.intern(sparseColliders(&buf, i));
+    // Misses do not count look-alikes.
+    try testing.expect(!heap.strtab_any_dense);
+    try strtabCheckIntegrity(&heap);
+    // The newest is first in the chain: its hit compares nothing.
+    try testing.expectEqual(group[group.len - 1], try heap.intern(sparseColliders(&buf, group.len - 1)));
+    try testing.expect(!heap.strtab_any_dense);
+    // A read-only probe never promotes.
+    try testing.expectEqual(@as(?*String, group[0]), heap.internedLookup(sparseColliders(&buf, 0)));
+    try testing.expect(!heap.strtab_any_dense);
+    // The oldest is last: its hit compares the other four, and promotes.
+    try testing.expectEqual(group[0], try heap.intern(sparseColliders(&buf, 0)));
+    try testing.expect(heap.strtab_any_dense);
+    for (group) |g| try testing.expect(string.isDense(g.hash));
+    try strtabCheckIntegrity(&heap);
+    for (group, 0..) |g, i| try testing.expectEqual(g, try heap.intern(sparseColliders(&buf, i)));
+}
+
+test "doc 28 §5.1: misses alone let a group grow to strtab_max_coll / 2 + 1" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var buf: [64]u8 = undefined;
+    const bound = Heap.strtab_max_coll / 2 + 1;
+    for (0..bound) |i| _ = try heap.intern(sparseColliders(&buf, i));
+    try testing.expect(!heap.strtab_any_dense);
+    try strtabCheckIntegrity(&heap);
+    const next = try heap.intern(sparseColliders(&buf, bound));
+    try testing.expect(heap.strtab_any_dense);
+    try testing.expect(string.isDense(next.hash));
+    try strtabCheckIntegrity(&heap);
+}
+
+test "doc 28 §5.1: a group of four never promotes" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     var buf: [64]u8 = undefined;
     for (0..Heap.strtab_max_ident) |i| _ = try heap.intern(sparseColliders(&buf, i));
+    try hitColliders(&heap, &buf, Heap.strtab_max_ident);
+    try hitColliders(&heap, &buf, Heap.strtab_max_ident);
     try testing.expect(!heap.strtab_any_dense);
-    try strtabCheckIntegrity(&heap);
-    const fifth = try heap.intern(sparseColliders(&buf, Heap.strtab_max_ident));
-    try testing.expect(heap.strtab_any_dense);
-    try testing.expect(string.isDense(fifth.hash));
-    try strtabCheckIntegrity(&heap);
-    // A hit finds it under the dense hash it now has.
-    try testing.expectEqual(fifth, try heap.intern(sparseColliders(&buf, Heap.strtab_max_ident)));
 }
 
 test "doc 28 §5: a rebuild keeps a same-hash group dense while it is larger than strtab_max_ident" {
@@ -1806,6 +1866,7 @@ test "doc 28 §5: a rebuild keeps a same-hash group dense while it is larger tha
     var buf: [64]u8 = undefined;
     var group: [Heap.strtab_max_ident + 1]*String = undefined;
     for (&group, 0..) |*g, i| g.* = try heap.intern(sparseColliders(&buf, i));
+    try hitColliders(&heap, &buf, group.len);
     try testing.expect(heap.strtab_any_dense);
 
     // A grow: five strings, far under strtab_max_coll, yet still dense.
@@ -1824,13 +1885,15 @@ test "doc 28 §5: a rebuild keeps a same-hash group dense while it is larger tha
     try testing.expect(heap.strtab_any_dense);
     try strtabCheckIntegrity(&heap);
 
-    // Four survive, so the sweep hashes them sparsely again; then the fifth
-    // promotes them once more.
+    // Four survive, so the sweep hashes them sparsely again; with a fifth,
+    // hits promote them once more.
     try collectWithRoots(&heap, roots[0..Heap.strtab_max_ident]);
     try testing.expect(!heap.strtab_any_dense);
     try strtabCheckIntegrity(&heap);
     for (group[0..Heap.strtab_max_ident], 0..) |g, i| try testing.expectEqual(@as(?*String, g), heap.internedLookup(sparseColliders(&buf, i)));
     _ = try heap.intern(sparseColliders(&buf, Heap.strtab_max_ident));
+    try testing.expect(!heap.strtab_any_dense);
+    try hitColliders(&heap, &buf, group.len);
     try testing.expect(heap.strtab_any_dense);
     try strtabCheckIntegrity(&heap);
 }
@@ -1843,6 +1906,7 @@ test "doc 28 §5.1: the sweep keeps a crowd's mark and drops a dead group's, wit
     // whose sparse hashes differ but name one bucket.
     var group: [Heap.strtab_max_ident + 1]*String = undefined;
     for (&group, 0..) |*g, i| g.* = try heap.intern(sparseColliders(&buf, i));
+    try hitColliders(&heap, &buf, group.len);
     const mask = heap.strtab.len - 1;
     const bucket = string.sparseHash("c0") & mask;
     // The 34th walks past 33: the guard marks the bucket.
@@ -1886,6 +1950,7 @@ test "doc 28 §5.1: without scratch, the sweep keeps the dense survivors dense" 
     var group: [Heap.strtab_max_ident]*String = undefined;
     for (&group, 0..) |*g, i| g.* = try heap.intern(sparseColliders(&buf, i));
     _ = try heap.intern(sparseColliders(&buf, Heap.strtab_max_ident));
+    try hitColliders(&heap, &buf, Heap.strtab_max_ident + 1);
     try testing.expect(heap.strtab_any_dense);
 
     // Four of the five survive, too few to need the mark, but the sweep

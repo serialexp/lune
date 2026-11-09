@@ -4,7 +4,7 @@ Status: partial — U1 (large-block cache), U2 (single-copy concat), U3
 (byte-charged GC pacing) and U4 (long strings: the sparse intern hash) built;
 the follow-ups below outstanding
 Owner: Bart
-Last updated: 2026-11-02
+Last updated: 2026-11-09
 
 ## Implementation status
 
@@ -37,6 +37,10 @@ land; move whole units to Done once everything inside them is checked.
 - [x] **The sweep re-decides the dense marks** (doc 28 §5.1). os_date's
   +7.7% came from marks that outlived the strings that made them, in a
   table that never grew: every bucket ended up marked.
+- [x] **The trigger counts hits, not misses** (doc 28 §5.1, §5.4). It
+  replaced the byte-budget idea below: short same-hash groups that die
+  young are seldom hit, so counting look-alikes on hits stopped promoting
+  them. os_date −1.76% more, −2.2% against full Wyhash.
 
 ### Outstanding
 
@@ -46,10 +50,6 @@ land; move whole units to Done once everything inside them is checked.
 - [ ] **n-ary concat** (§4.2): `a .. b .. c .. d` is three binary concats
   with two intermediate strings; Lua's `OP_CONCAT` joins a register range
   once. A bytecode change; not started.
-- [ ] **The trigger counts compares, not their cost** (§5.4). Short
-  same-hash groups that die young still get promoted: os_date pays +0.9%
-  where a build without the trigger pays −1.9%. A budget of compared bytes
-  might promote only groups whose compares are expensive. Not measured.
 - [ ] **Embedders** (§2.3): document `LargeBlockCache` in the embedding
   guide; the C API does not install it today.
 
@@ -353,6 +353,13 @@ The 80k `s = s .. "x"` loop takes 0.07 s (U1–U3: 0.15 s; lua5.4 0.09 s).
 Every intern still pays a sparse hash, and a promoted bucket pays the
 dense one as well. os_date's +7.7% came from marks that outlived their
 strings; the sweep now re-decides them (doc 28 §5.1), which leaves +0.9%.
+
+Follow-up (2026-11-09): the sweep decides from the dense survivors alone,
+and the identical-hash trigger moved from misses to hits
+(`strtabHitGuard`): a hit that byte-compared four look-alikes before its
+own rehashes their chain, and a miss keeps only the weighted guard. Groups
+of dates that die young were promoted on miss and seldom hit. os_date is
+now −2.2% against full Wyhash.
 
 ## References
 
