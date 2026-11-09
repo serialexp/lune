@@ -130,7 +130,9 @@ test "format: the repo's own programs format to a fixed point and compile to the
             }
         }
     }
-    std.debug.print("format gate: {d} files, {d} formatted to a fixed point with identical bytecode\n", .{ total, checked });
+    // Printed only on failure: a test step that writes to stderr is reported
+    // by `zig build` as a failed command even when it passes.
+    if (bad != 0) std.debug.print("format gate: {d} files, {d} formatted to a fixed point with identical bytecode\n", .{ total, checked });
     try testing.expect(total > 0);
     try testing.expectEqual(@as(usize, 0), bad);
 }
