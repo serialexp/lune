@@ -566,17 +566,21 @@ that program.
 The word grammar of a command line is restricted to syntax that cannot be read
 two ways; no Bash free-form:
 
-- **Globbing is explicit only.** `*`, `?` and `[..]` are never expanded
-  implicitly; the file list comes from an explicit call or marked form (its
-  spelling is open, Q17).
-- **Pipes are always `proc.pipe`.** A pipe means the VM's own `proc.pipe`
-  (§3.6), never a shell's.
+- **Globbing is a function.** `*`, `?` and `[..]` are never expanded
+  implicitly; the file list comes from an explicit `glob(...)` call (decided
+  2026-11-09; which library and group it lives in is an implementation
+  detail of the phase that adds it).
+- **No pipe sugar.** There is no `|` in a command line. A pipe is written as
+  `proc.pipe` (§3.6), exactly as in a script.
 - **No redirection syntax.** There is no `>` or `<` sugar: sugar of that kind
   is where shell scripts break. Capture the result into a variable and use it
   (`proc.run` already returns the output; `stdin` and file writes cover the
   rest).
 
-Still open: quoting and `$NAME` in a command line (Q17).
+`$NAME` and quoting: mahina has no string interpolation today. A command
+line gets variables from a generic interpolation feature in the language (its
+own design doc), not from a shell-only `$NAME`; until that exists a command
+line takes plain words and quoted strings (Q17).
 
 ## 7. Portability and the host seam
 
@@ -627,10 +631,10 @@ Q14b in the checklist above, and for §6.1:
   a program on `PATH`. `git.status` and `ls(x)` are Lua.
 - [x] **Q16 — not found.** Decided 2026-11-09: no "command not found". A line
   that is not a command is Lua, and its error says it was interpreted as Lua.
-- [ ] **Q17 — the word grammar.** Decided: globbing explicit only, pipes
-  always `proc.pipe`, no redirection syntax. Open: the spelling of explicit
-  globs, quoting and `$NAME`, and whether a command line has a `|` spelling at
-  all or pipes are only written as `proc.pipe`.
+- [ ] **Q17 — the word grammar.** Decided 2026-11-09: globbing is the
+  `glob(...)` function, no pipe sugar, no redirection syntax. Open: variables
+  and quoting in command-line words, which wait on a generic string
+  interpolation design (not written yet).
 
 ## References
 
