@@ -236,6 +236,8 @@ result, drift found.
   `--lua-io-errors`, `--effect-log-limit`) plus one pty test for
   line-buffering on a terminal (REQ-80.1). Drift: doc 65 §6 says output is
   flushed before a stdin read, which the criteria had not stated; REQ-80.3
-  was added for it. Not converted: performance budgets (§9, benchmarks) and
-  the deferred items (reopen flag, `__close` on handles), which are open
-  questions on REQ-53.
+  was added for it. Doc 65 is stale on `__close`: its "Outstanding" list and
+  Phase 3 text say mahina has no to-be-closed variables, but doc 76's `<close>`
+  landed and REQ-65 proves files close with their scope (doc 65 not yet
+  edited). Not converted: performance budgets (§9, benchmarks) and the
+  reopen flag (open question on REQ-53).
