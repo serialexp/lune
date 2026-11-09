@@ -45,11 +45,12 @@ pub const Breakdown = struct {
     parse_arena: usize = 0,
     /// The token array alone (inside `parse_arena`).
     tokens: usize = 0,
-    /// The comment list.
+    /// The comment list and the line table that places comments.
     trivia: usize = 0,
-    /// The formatter's arena: the document and the strings it builds.
-    doc_arena: usize = 0,
-    /// The printer's working memory and its output buffer.
+    /// The document at its largest (one top-level statement's), and the
+    /// formatter's own scratch.
+    doc: usize = 0,
+    /// The printer's working memory.
     printer: fd.Stats = .{},
     output: usize = 0,
 };
@@ -60,6 +61,10 @@ pub fn format(gpa: Allocator, source: []const u8, diags: *diag.Diagnostics) Erro
 }
 
 /// `format`, reporting where its memory went in `breakdown`.
+///
+/// The file is printed one top-level statement at a time: each is built,
+/// printed, and its document released before the next is built (doc 83 §10),
+/// so the document never holds more than the largest top-level statement.
 pub fn formatMeasured(gpa: Allocator, source: []const u8, diags: *diag.Diagnostics, breakdown: ?*Breakdown) Error![]u8 {
     const src = try gpa.dupeSentinel(u8, source, 0);
     defer gpa.free(src);
@@ -75,25 +80,31 @@ pub fn formatMeasured(gpa: Allocator, source: []const u8, diags: *diag.Diagnosti
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const a = arena.allocator();
     var f: F = .{
-        .a = a,
-        .b = .{ .a = a },
+        .gpa = gpa,
+        .arena = &arena,
+        .a = arena.allocator(),
+        .b = try .init(gpa, src),
         .src = src,
         .toks = parsed.tokens,
-        .cm = try fc.Comments.init(a, src, trivia.comments.items),
+        .cm = undefined,
     };
-    const body = try f.blockBody(parsed.ast.root, 0, @intCast(src.len), true);
+    defer f.deinit();
+    f.cm = try fc.Comments.init(gpa, src, trivia.comments.items);
+    f.base = f.b.mark();
+    var printer: fd.Printer = .init(gpa, &f.b, .{ .width = width });
+    defer printer.deinit();
+    f.sink = &printer;
+    _ = try f.blockBody(parsed.ast.root, 0, @intCast(src.len), true);
     if (!f.cm.exhausted()) return error.UnplacedComment;
-    var pstats: fd.Stats = .{};
-    const text = try fd.print(gpa, body, .{ .width = width }, &pstats);
+    const text = try printer.finish();
     errdefer gpa.free(text);
     if (breakdown) |bd| bd.* = .{
         .parse_arena = parsed.ast.arena.queryCapacity(),
         .tokens = parsed.tokens.len * @sizeOf(Token),
-        .trivia = trivia.comments.capacity * @sizeOf(lexer.Comment),
-        .doc_arena = arena.queryCapacity(),
-        .printer = pstats,
+        .trivia = trivia.comments.capacity * @sizeOf(lexer.Comment) + f.cm.line_starts.len * @sizeOf(u32),
+        .doc = f.b.capacityBytes() + arena.queryCapacity() + f.scratchBytes(),
+        .printer = printer.stats,
         .output = text.len,
     };
     if (text.len == 0) return text;
@@ -104,31 +115,71 @@ pub fn formatMeasured(gpa: Allocator, source: []const u8, diags: *diag.Diagnosti
 }
 
 /// `s` with every line break (`\r`, `\n`, `\r\n`, `\n\r`) as one `\n`, the
-/// breaks the lexer counts (`Lexer.newline`).
-fn lfOnly(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.ensureTotalCapacity(a, s.len);
+/// breaks the lexer counts (`Lexer.newline`), in `buf`.
+fn lfOnly(gpa: Allocator, buf: *std.ArrayList(u8), s: []const u8) Allocator.Error![]const u8 {
+    buf.clearRetainingCapacity();
+    try buf.ensureTotalCapacity(gpa, s.len);
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         const c = s[i];
         if (c != '\r' and c != '\n') {
-            out.appendAssumeCapacity(c);
+            buf.appendAssumeCapacity(c);
             continue;
         }
-        out.appendAssumeCapacity('\n');
+        buf.appendAssumeCapacity('\n');
         if (i + 1 < s.len and (s[i + 1] == '\r' or s[i + 1] == '\n') and s[i + 1] != c) i += 1;
     }
-    return out.items;
+    return buf.items;
 }
 
 // -- the builder ---------------------------------------------------------
 
 const F = struct {
+    gpa: Allocator,
+    /// Comment runs; reset after each top-level statement is printed.
+    arena: *std.heap.ArenaAllocator,
     a: Allocator,
     b: fd.Builder,
     src: []const u8,
     toks: []const Token,
     cm: fc.Comments,
+    /// The top-level statements are printed here as they are built.
+    sink: ?*fd.Printer = null,
+    /// What the builder holds before the first statement (its fixed nodes).
+    base: fd.Builder.Mark = undefined,
+    /// A top-level piece has been printed (the next one is preceded by a newline).
+    printed_any: bool = false,
+
+    // The stacks the formatter's lists are built on, in `gpa`. Lists nest,
+    // innermost on top; a list is read by index while nested lists are
+    // built, because a push may move the stack.
+    pieces: std.ArrayList(Piece) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
+    exprs: std.ArrayList(*const Expr) = .empty,
+    ops: std.ArrayList(ast.BinaryOp) = .empty,
+    flags: std.ArrayList(bool) = .empty,
+    /// Text being assembled (a name list, a normalized string), copied into
+    /// the builder as soon as it is done.
+    sbuf: std.ArrayList(u8) = .empty,
+    lfbuf: std.ArrayList(u8) = .empty,
+
+    fn deinit(f: *F) void {
+        f.cm.deinit(f.gpa);
+        f.b.deinit();
+        f.pieces.deinit(f.gpa);
+        f.entries.deinit(f.gpa);
+        f.exprs.deinit(f.gpa);
+        f.ops.deinit(f.gpa);
+        f.flags.deinit(f.gpa);
+        f.sbuf.deinit(f.gpa);
+        f.lfbuf.deinit(f.gpa);
+    }
+
+    fn scratchBytes(f: *const F) usize {
+        return f.pieces.capacity * @sizeOf(Piece) + f.entries.capacity * @sizeOf(Entry) +
+            f.exprs.capacity * @sizeOf(*const Expr) + f.ops.capacity * @sizeOf(ast.BinaryOp) +
+            f.flags.capacity + f.sbuf.capacity + f.lfbuf.capacity;
+    }
 
     // ---- tokens and text ----
 
@@ -169,7 +220,7 @@ const F = struct {
     /// reads every `\r`, `\n`, `\r\n` and `\n\r` there as one `\n` already
     /// (doc 83 Q3), so the output is LF throughout and means the same.
     fn lit(f: *F, s: []const u8) Error!Doc {
-        const text = if (std.mem.indexOfScalar(u8, s, '\r') != null) try lfOnly(f.a, s) else s;
+        const text = if (std.mem.indexOfScalar(u8, s, '\r') != null) try lfOnly(f.gpa, &f.lfbuf, s) else s;
         if (std.mem.indexOfScalar(u8, text, '\n') != null) return f.b.raw(text);
         return f.b.text(text);
     }
@@ -197,14 +248,14 @@ const F = struct {
     /// had one.
     fn runDoc(f: *F, run: fc.LeadingRun) Error!?Doc {
         if (run.items.len == 0) return null;
-        var parts: std.ArrayList(Doc) = .empty;
+        const top = f.b.top();
         for (run.items, 0..) |it, i| {
-            if (i > 0 and it.blank_before) try parts.append(f.a, fd.hardline);
-            try parts.append(f.a, try f.commentDoc(it.comment));
-            try parts.append(f.a, if (it.inline_) try f.t(" ") else fd.hardline);
+            if (i > 0 and it.blank_before) try f.b.push(fd.hardline);
+            try f.b.push(try f.commentDoc(it.comment));
+            try f.b.push(if (it.inline_) try f.t(" ") else fd.hardline);
         }
-        if (run.blank_after) try parts.append(f.a, fd.hardline);
-        return try f.cat(parts.items);
+        if (run.blank_after) try f.b.push(fd.hardline);
+        return try f.b.catFrom(top);
     }
 
     // ---- statement blocks ----
@@ -214,8 +265,10 @@ const F = struct {
     /// Statements one per line with their comments, from `start` (where the
     /// block's header ended) to `limit` (where its closing token starts).
     /// No leading or trailing newline; `empty` if there is nothing to print.
+    /// The top level (`top`) is printed to `sink` as it goes, and returns
+    /// `empty`.
     fn blockBody(f: *F, stmts: ast.Block, start: u32, limit: u32, top: bool) Error!Doc {
-        var pieces: std.ArrayList(Piece) = .empty;
+        const ptop = f.pieces.items.len;
         var prev_end = start;
         var after_fn = false;
         for (stmts, 0..) |s, i| {
@@ -233,11 +286,11 @@ const F = struct {
                 }
             }
             var force_blank_at: ?usize = null;
-            if (is_fn and attached_from == run.items.len) force_blank_at = pieces.items.len;
+            if (is_fn and attached_from == run.items.len) force_blank_at = f.pieces.items.len;
             var carry: ?Doc = null;
             var first_piece = true;
             for (run.items, 0..) |it, j| {
-                if (j == attached_from and is_fn) force_blank_at = pieces.items.len;
+                if (j == attached_from and is_fn) force_blank_at = f.pieces.items.len;
                 var d = try f.commentDoc(it.comment);
                 if (carry) |c| d = try f.cat(&.{ c, d });
                 if (it.inline_) {
@@ -248,7 +301,7 @@ const F = struct {
                 var blank = it.blank_before;
                 if (first_piece and after_fn) blank = true;
                 first_piece = false;
-                try pieces.append(f.a, .{ .doc = d, .blank_before = blank });
+                try f.pieces.append(f.gpa, .{ .doc = d, .blank_before = blank });
             }
             var sd = try f.stmt(s);
             try f.checkClean(s.span.end);
@@ -267,33 +320,57 @@ const F = struct {
             var blank = if (run.items.len > 0) run.blank_after else f.cm.gapHasBlank(prev_end, s.span.start);
             if (first_piece and after_fn) blank = true;
             if (force_blank_at) |at| {
-                if (at == pieces.items.len) blank = true else pieces.items[at].blank_before = true;
+                if (at == f.pieces.items.len) blank = true else f.pieces.items[at].blank_before = true;
             }
-            try pieces.append(f.a, .{ .doc = sd, .blank_before = blank });
+            try f.pieces.append(f.gpa, .{ .doc = sd, .blank_before = blank });
             prev_end = end_pos;
             after_fn = is_fn;
+            if (top) try f.flush(ptop);
         }
         // Comments after the last statement, before the closing token.
         const tail = try f.cm.takeLeading(f.a, prev_end, limit);
         for (tail.items, 0..) |it, j| {
             const d = try f.commentDoc(it.comment);
             const blank = it.blank_before or (j == 0 and after_fn);
-            try pieces.append(f.a, .{ .doc = d, .blank_before = blank });
+            try f.pieces.append(f.gpa, .{ .doc = d, .blank_before = blank });
         }
-        return f.assemble(pieces.items);
+        if (top) {
+            try f.flush(ptop);
+            return fd.empty;
+        }
+        const d = try f.assemble(f.pieces.items[ptop..]);
+        f.pieces.shrinkRetainingCapacity(ptop);
+        return d;
+    }
+
+    /// Prints the top-level pieces from `ptop` on, then releases everything
+    /// built for them.
+    fn flush(f: *F, ptop: usize) Error!void {
+        const sink = f.sink.?;
+        for (f.pieces.items[ptop..]) |p| {
+            if (f.printed_any) {
+                try sink.feed(fd.hardline);
+                if (p.blank_before) try sink.feed(fd.hardline);
+            }
+            try sink.feed(p.doc);
+            f.printed_any = true;
+        }
+        f.pieces.shrinkRetainingCapacity(ptop);
+        f.b.release(f.base);
+        _ = f.arena.reset(.retain_capacity);
     }
 
     fn assemble(f: *F, pieces: []const Piece) Error!Doc {
         if (pieces.len == 0) return fd.empty;
-        var parts: std.ArrayList(Doc) = .empty;
+        const top = f.b.top();
         for (pieces, 0..) |p, i| {
             if (i > 0) {
-                try parts.append(f.a, fd.hardline);
-                if (p.blank_before) try parts.append(f.a, fd.hardline);
+                try f.b.push(fd.hardline);
+                if (p.blank_before) try f.b.push(fd.hardline);
             }
-            try parts.append(f.a, p.doc);
+            try f.b.push(p.doc);
         }
-        return f.cat(parts.items);
+        return f.b.catFrom(top);
     }
 
     /// The end of a statement and the `;` that may follow it.
@@ -337,26 +414,27 @@ const F = struct {
             .local_function => |lf| return f.functionStmt(s, "local ", lf.name, lf.body),
             .global_function => |gf| return f.functionStmt(s, "global ", gf.name, gf.body),
             .function_decl => |fdc| {
-                var name: std.ArrayList(u8) = .empty;
+                f.sbuf.clearRetainingCapacity();
                 for (fdc.name.path, 0..) |p, i| {
-                    if (i > 0) try name.append(f.a, '.');
-                    try name.appendSlice(f.a, p.text);
+                    if (i > 0) try f.sbuf.append(f.gpa, '.');
+                    try f.sbuf.appendSlice(f.gpa, p.text);
                 }
                 if (fdc.name.method) |m| {
-                    try name.append(f.a, ':');
-                    try name.appendSlice(f.a, m.text);
+                    try f.sbuf.append(f.gpa, ':');
+                    try f.sbuf.appendSlice(f.gpa, m.text);
                 }
-                const head = try f.cat(&.{ try f.t(if (fdc.body.is_async) "async function " else "function "), try f.t(name.items) });
+                const head = try f.cat(&.{ try f.t(if (fdc.body.is_async) "async function " else "function "), try f.t(f.sbuf.items) });
                 return f.cat(&.{ head, try f.funcBody(fdc.body, fdc.name.method != null) });
             },
             .assign => |a| {
-                var targets: std.ArrayList(Doc) = .empty;
-                for (a.targets) |e| try targets.append(f.a, try f.expr(e));
-                return f.cat(&.{
-                    try f.b.join(try f.t(", "), targets.items),
-                    try f.t(" = "),
-                    try f.exprList(a.values),
-                });
+                const top = f.b.top();
+                for (a.targets, 0..) |e, i| {
+                    const d = try f.expr(e);
+                    if (i > 0) try f.b.push(try f.t(", "));
+                    try f.b.push(d);
+                }
+                const targets = try f.b.catFrom(top);
+                return f.cat(&.{ targets, try f.t(" = "), try f.exprList(a.values) });
             },
             .compound_assign => |c| {
                 const target = try f.expr(c.target);
@@ -384,38 +462,39 @@ const F = struct {
             },
             .if_ => |i| return f.ifStmt(s, i),
             .numeric_for => |n| {
-                var parts: std.ArrayList(Doc) = .empty;
-                try parts.append(f.a, try f.t("for "));
-                try parts.append(f.a, try f.t(n.name));
-                try parts.append(f.a, try f.t(" = "));
-                try parts.append(f.a, try f.whole(n.start));
-                try parts.append(f.a, try f.t(", "));
-                try parts.append(f.a, try f.whole(n.stop));
+                const top = f.b.top();
+                try f.b.push(try f.t("for "));
+                try f.b.push(try f.t(n.name));
+                try f.b.push(try f.t(" = "));
+                try f.b.push(try f.whole(n.start));
+                try f.b.push(try f.t(", "));
+                try f.b.push(try f.whole(n.stop));
                 var last_end = n.stop.span.end;
                 if (n.step) |st| {
-                    try parts.append(f.a, try f.t(", "));
-                    try parts.append(f.a, try f.whole(st));
+                    try f.b.push(try f.t(", "));
+                    try f.b.push(try f.whole(st));
                     last_end = st.span.end;
                 }
                 const do_tok = f.findTok(.keyword_do, last_end) orelse return error.SyntaxError;
                 try f.checkClean(do_tok.start);
-                try parts.append(f.a, try f.t(" do"));
-                try parts.append(f.a, try f.indentedBody(n.body, do_tok.end, f.tokEndingAt(s.span.end).start));
-                try parts.append(f.a, fd.hardline);
-                try parts.append(f.a, try f.t("end"));
-                return f.cat(parts.items);
+                try f.b.push(try f.t(" do"));
+                try f.b.push(try f.indentedBody(n.body, do_tok.end, f.tokEndingAt(s.span.end).start));
+                try f.b.push(fd.hardline);
+                try f.b.push(try f.t("end"));
+                return f.b.catFrom(top);
             },
             .generic_for => |g| {
-                var names: std.ArrayList(u8) = .empty;
+                f.sbuf.clearRetainingCapacity();
                 for (g.names, 0..) |n, k| {
-                    if (k > 0) try names.appendSlice(f.a, ", ");
-                    try names.appendSlice(f.a, n.text);
+                    if (k > 0) try f.sbuf.appendSlice(f.gpa, ", ");
+                    try f.sbuf.appendSlice(f.gpa, n.text);
                 }
+                const names = try f.t(f.sbuf.items);
                 const exprs = try f.exprList(g.exprs);
                 const do_tok = f.findTok(.keyword_do, g.exprs[g.exprs.len - 1].span.end) orelse return error.SyntaxError;
                 try f.checkClean(do_tok.start);
                 const inner = try f.indentedBody(g.body, do_tok.end, f.tokEndingAt(s.span.end).start);
-                return f.cat(&.{ try f.t("for "), try f.t(names.items), try f.t(" in "), exprs, try f.t(" do"), inner, fd.hardline, try f.t("end") });
+                return f.cat(&.{ try f.t("for "), names, try f.t(" in "), exprs, try f.t(" do"), inner, fd.hardline, try f.t("end") });
             },
             .return_ => |values| {
                 if (values.len == 0) return f.t("return");
@@ -427,27 +506,27 @@ const F = struct {
     }
 
     fn ifStmt(f: *F, s: Stmt, i: anytype) Error!Doc {
-        var parts: std.ArrayList(Doc) = .empty;
+        const top = f.b.top();
         const end_tok = f.tokEndingAt(s.span.end);
         for (i.branches, 0..) |br, k| {
-            if (k > 0) try parts.append(f.a, fd.hardline);
+            if (k > 0) try f.b.push(fd.hardline);
             const cond = try f.whole(br.cond);
             const then_tok = f.findTok(.keyword_then, br.cond.span.end) orelse return error.SyntaxError;
             try f.checkClean(then_tok.start);
             const limit: u32 = if (k + 1 < i.branches.len) i.branches[k + 1].kw_start else if (i.else_body != null) i.else_start else end_tok.start;
-            try parts.append(f.a, try f.t(if (k == 0) "if " else "elseif "));
-            try parts.append(f.a, cond);
-            try parts.append(f.a, try f.t(" then"));
-            try parts.append(f.a, try f.indentedBody(br.body, then_tok.end, limit));
+            try f.b.push(try f.t(if (k == 0) "if " else "elseif "));
+            try f.b.push(cond);
+            try f.b.push(try f.t(" then"));
+            try f.b.push(try f.indentedBody(br.body, then_tok.end, limit));
         }
         if (i.else_body) |eb| {
-            try parts.append(f.a, fd.hardline);
-            try parts.append(f.a, try f.t("else"));
-            try parts.append(f.a, try f.indentedBody(eb, i.else_start + 4, end_tok.start));
+            try f.b.push(fd.hardline);
+            try f.b.push(try f.t("else"));
+            try f.b.push(try f.indentedBody(eb, i.else_start + 4, end_tok.start));
         }
-        try parts.append(f.a, fd.hardline);
-        try parts.append(f.a, try f.t("end"));
-        return f.cat(parts.items);
+        try f.b.push(fd.hardline);
+        try f.b.push(try f.t("end"));
+        return f.b.catFrom(top);
     }
 
     fn functionStmt(f: *F, s: Stmt, prefix: []const u8, name: []const u8, body: *ast.FunctionBody) Error!Doc {
@@ -465,24 +544,28 @@ const F = struct {
     /// A list too long for the line is filled: as many names per line as
     /// fit, the continuation lines indented once.
     fn declHead(f: *F, span: ast.Span) Error!Doc {
-        var parts: std.ArrayList(Doc) = .empty;
-        var buf: std.ArrayList(u8) = .empty;
+        const top = f.b.top();
+        f.sbuf.clearRetainingCapacity();
         var prev: ?Tag = null;
         var i = f.tokIdx(span.start);
         while (i < f.toks.len and f.toks[i].start < span.end and f.toks[i].tag != .assign) : (i += 1) {
             const tk = f.toks[i];
-            if (prev) |p| if (spaceBetween(p, tk.tag)) try buf.append(f.a, ' ');
-            try buf.appendSlice(f.a, f.lexeme(tk));
+            if (prev) |p| if (spaceBetween(p, tk.tag)) try f.sbuf.append(f.gpa, ' ');
+            try f.sbuf.appendSlice(f.gpa, f.lexeme(tk));
             prev = tk.tag;
             if (tk.tag == .comma) {
-                try parts.append(f.a, try f.t(buf.items));
-                buf = .empty;
+                try f.b.push(try f.t(f.sbuf.items));
+                f.sbuf.clearRetainingCapacity();
                 prev = null;
             }
         }
-        try parts.append(f.a, try f.t(buf.items));
-        if (parts.items.len == 1) return parts.items[0];
-        return f.b.indent(try f.b.fill(parts.items));
+        try f.b.push(try f.t(f.sbuf.items));
+        if (f.b.parts(top).len == 1) {
+            const only = f.b.parts(top)[0];
+            f.b.popTo(top);
+            return only;
+        }
+        return f.b.indent(try f.b.fillFrom(top));
     }
 
     // ---- expressions ----
@@ -507,13 +590,15 @@ const F = struct {
         if (values.len == 0) return fd.empty;
         const first = try f.whole(values[0]);
         if (values.len == 1) return first;
-        var rest: std.ArrayList(Doc) = .empty;
+        const top = f.b.top();
         for (values[1..]) |v| {
-            try rest.append(f.a, try f.t(","));
-            try rest.append(f.a, fd.line);
-            try rest.append(f.a, try f.whole(v));
+            try f.b.push(try f.t(","));
+            try f.b.push(fd.line);
+            const d = try f.whole(v);
+            try f.b.push(d);
         }
-        return f.b.group(try f.cat(&.{ first, try f.b.indent(try f.cat(rest.items)) }));
+        const rest = try f.b.catFrom(top);
+        return f.b.group(try f.cat(&.{ first, try f.b.indent(rest) }));
     }
 
     fn expr(f: *F, e: *const Expr) Error!Doc {
@@ -563,85 +648,99 @@ const F = struct {
     /// more than two calls that does not fit breaks before every `.` or `:`
     /// that follows the first call (§6.4), each link indented once.
     fn chain(f: *F, e: *const Expr) Error!Doc {
-        var rev: std.ArrayList(*const Expr) = .empty;
+        // The links, outermost first, on the expression stack.
+        const xtop = f.exprs.items.len;
         var root = e;
         walk: while (true) {
             switch (root.data) {
                 .field => |fl| {
-                    try rev.append(f.a, root);
+                    try f.exprs.append(f.gpa, root);
                     root = fl.obj;
                 },
                 .index => |ix| {
-                    try rev.append(f.a, root);
+                    try f.exprs.append(f.gpa, root);
                     root = ix.obj;
                 },
                 .method_call => |m| {
-                    try rev.append(f.a, root);
+                    try f.exprs.append(f.gpa, root);
                     root = m.obj;
                 },
                 .call => |c| {
                     if (c.callee.data == .intrinsic) break :walk;
-                    try rev.append(f.a, root);
+                    try f.exprs.append(f.gpa, root);
                     root = c.callee;
                 },
                 else => break :walk,
             }
         }
-        std.mem.reverse(*const Expr, rev.items);
-        var links: std.ArrayList(Doc) = .empty;
+        std.mem.reverse(*const Expr, f.exprs.items[xtop..]);
+        const n = f.exprs.items.len - xtop;
+        // Each link's doc on the builder's stack; where each link begins a
+        // line when the chain breaks (the `.`/`:` links after the first
+        // call) on the flag stack.
+        const ltop = f.b.top();
+        const btop = f.flags.items.len;
         var calls: usize = 0;
-        // Where each link begins a line when the chain breaks: the `.`/`:`
-        // links after the first call.
-        var breaks: std.ArrayList(bool) = .empty;
         var seen_call = false;
-        for (rev.items) |node| {
+        for (0..n) |k| {
+            const node = f.exprs.items[xtop + k];
             switch (node.data) {
                 .field => |fl| {
-                    try breaks.append(f.a, seen_call);
-                    try links.append(f.a, try f.cat(&.{ try f.t("."), try f.t(fl.name) }));
+                    try f.flags.append(f.gpa, seen_call);
+                    try f.b.push(try f.cat(&.{ try f.t("."), try f.t(fl.name) }));
                 },
                 .index => |ix| {
-                    try breaks.append(f.a, false);
-                    try links.append(f.a, try f.cat(&.{ try f.t("["), try f.whole(ix.key), try f.t("]") }));
+                    try f.flags.append(f.gpa, false);
+                    const link = try f.cat(&.{ try f.t("["), try f.whole(ix.key), try f.t("]") });
+                    try f.b.push(link);
                 },
                 .call => |c| {
-                    try breaks.append(f.a, false);
-                    try links.append(f.a, try f.argList(c.args, c.callee.span.end, node.span.end));
+                    try f.flags.append(f.gpa, false);
+                    const link = try f.argList(c.args, c.callee.span.end, node.span.end);
+                    try f.b.push(link);
                     calls += 1;
                     seen_call = true;
                 },
                 .method_call => |m| {
-                    try breaks.append(f.a, seen_call);
+                    try f.flags.append(f.gpa, seen_call);
                     const arglist = try f.argList(m.args, m.name_span.end, node.span.end);
-                    try links.append(f.a, try f.cat(&.{ try f.t(":"), try f.t(m.name), arglist }));
+                    try f.b.push(try f.cat(&.{ try f.t(":"), try f.t(m.name), arglist }));
                     calls += 1;
                     seen_call = true;
                 },
                 else => unreachable,
             }
         }
+        f.exprs.shrinkRetainingCapacity(xtop);
         const root_doc = try f.expr(root);
-        var parts: std.ArrayList(Doc) = .empty;
-        try parts.append(f.a, root_doc);
         var any_break = false;
-        if (calls > 2) for (breaks.items) |b| {
+        if (calls > 2) for (f.flags.items[btop..]) |b| {
             if (b) any_break = true;
         };
         if (!any_break) {
-            for (links.items) |l| try parts.append(f.a, l);
-            return f.cat(parts.items);
+            f.flags.shrinkRetainingCapacity(btop);
+            // The root, then the links.
+            const links = try f.b.catFrom(ltop);
+            return f.cat(&.{ root_doc, links });
         }
         // The head runs to the first link that starts a line; the rest hang
         // from it, one `.`/`:` link (with what follows it) per line.
-        var i: usize = 0;
-        while (!breaks.items[i]) : (i += 1) try parts.append(f.a, links.items[i]);
-        var rest: std.ArrayList(Doc) = .empty;
-        while (i < links.items.len) : (i += 1) {
-            if (breaks.items[i]) try rest.append(f.a, fd.softline);
-            try rest.append(f.a, links.items[i]);
+        var first_break: usize = 0;
+        while (!f.flags.items[btop + first_break]) first_break += 1;
+        const rtop = f.b.top();
+        for (first_break..n) |k| {
+            if (f.flags.items[btop + k]) try f.b.push(fd.softline);
+            try f.b.push(f.b.parts(ltop)[k]);
         }
-        try parts.append(f.a, try f.b.indent(try f.cat(rest.items)));
-        return f.b.group(try f.cat(parts.items));
+        const rest = try f.b.catFrom(rtop);
+        const htop = f.b.top();
+        try f.b.push(root_doc);
+        for (0..first_break) |k| try f.b.push(f.b.parts(ltop)[k]);
+        try f.b.push(try f.b.indent(rest));
+        const whole_chain = try f.b.group(try f.b.catFrom(htop));
+        f.b.popTo(ltop);
+        f.flags.shrinkRetainingCapacity(btop);
+        return whole_chain;
     }
 
     fn binary(f: *F, e: *const Expr) Error!Doc {
@@ -649,72 +748,90 @@ const F = struct {
         const level = opLevel(op);
         // The chain of this precedence level, flattened along its
         // associativity, so `a + b - c` is one group.
-        var operands: std.ArrayList(*const Expr) = .empty;
-        var ops: std.ArrayList(ast.BinaryOp) = .empty;
+        // Operands in source order on the expression stack, the operators
+        // between them on the operator stack.
+        const xtop = f.exprs.items.len;
+        const otop = f.ops.items.len;
         if (rightAssoc(op)) {
             var cur = e;
             while (true) {
                 const bn = cur.data.binary;
-                try operands.append(f.a, bn.lhs);
-                try ops.append(f.a, bn.op);
+                try f.exprs.append(f.gpa, bn.lhs);
+                try f.ops.append(f.gpa, bn.op);
                 if (bn.rhs.data == .binary and opLevel(bn.rhs.data.binary.op) == level) {
                     cur = bn.rhs;
                 } else {
-                    try operands.append(f.a, bn.rhs);
+                    try f.exprs.append(f.gpa, bn.rhs);
                     break;
                 }
             }
         } else {
-            var stack: std.ArrayList(*const Expr) = .empty;
+            // Walked from the right: right operands outermost first, then
+            // the leftmost operand; reversed into source order.
             var cur = e;
             while (true) {
                 const bn = cur.data.binary;
-                try stack.append(f.a, bn.rhs);
-                try ops.append(f.a, bn.op);
+                try f.exprs.append(f.gpa, bn.rhs);
+                try f.ops.append(f.gpa, bn.op);
                 if (bn.lhs.data == .binary and opLevel(bn.lhs.data.binary.op) == level) {
                     cur = bn.lhs;
                 } else {
-                    try operands.append(f.a, bn.lhs);
+                    try f.exprs.append(f.gpa, bn.lhs);
                     break;
                 }
             }
-            std.mem.reverse(ast.BinaryOp, ops.items);
-            var i = stack.items.len;
-            while (i > 0) {
-                i -= 1;
-                try operands.append(f.a, stack.items[i]);
-            }
+            std.mem.reverse(*const Expr, f.exprs.items[xtop..]);
+            std.mem.reverse(ast.BinaryOp, f.ops.items[otop..]);
         }
-        const first = try f.expr(operands.items[0]);
-        var rest: std.ArrayList(Doc) = .empty;
-        for (ops.items, operands.items[1..]) |o, operand| {
-            try rest.append(f.a, fd.line);
-            try rest.append(f.a, try f.t(opText(o)));
-            try rest.append(f.a, try f.t(" "));
-            try rest.append(f.a, try f.expr(operand));
+        const n_ops = f.ops.items.len - otop;
+        const first = try f.expr(f.exprs.items[xtop]);
+        const top = f.b.top();
+        for (0..n_ops) |k| {
+            try f.b.push(fd.line);
+            try f.b.push(try f.t(opText(f.ops.items[otop + k])));
+            try f.b.push(try f.t(" "));
+            const d = try f.expr(f.exprs.items[xtop + 1 + k]);
+            try f.b.push(d);
         }
-        return f.b.group(try f.cat(&.{ first, try f.b.indent(try f.cat(rest.items)) }));
+        f.exprs.shrinkRetainingCapacity(xtop);
+        f.ops.shrinkRetainingCapacity(otop);
+        const rest = try f.b.catFrom(top);
+        return f.b.group(try f.cat(&.{ first, try f.b.indent(rest) }));
     }
 
     // ---- lists: arguments, parameters, table entries ----
 
-    const Item = struct { start: u32, end: u32 };
+    /// One item of a bracketed list: its doc, whether a blank line was
+    /// before it, and the comment after it on its line (`empty` if none).
+    const Entry = struct { doc: Doc, blank: bool, suffix: Doc };
 
     /// Builds the parts of a bracketed list while the caller builds each
-    /// item, in order, so comments between items are consumed in order.
+    /// item, in order, so comments between items are consumed in order. The
+    /// items are on `F.entries` from `top` on; `release` pops them.
     const ListBuilder = struct {
         f: *F,
         prev: u32,
-        docs: std.ArrayList(Doc) = .empty,
-        blanks: std.ArrayList(bool) = .empty,
-        suffixes: std.ArrayList(?Doc) = .empty,
+        top: usize,
         /// A comment on the opening bracket's line.
         open_suffix: ?Doc = null,
         any_comment: bool = false,
         pending_lead: ?Doc = null,
+        pending_blank: bool = false,
+
+        fn release(lb: *const ListBuilder) void {
+            lb.f.entries.shrinkRetainingCapacity(lb.top);
+        }
+
+        fn count(lb: *const ListBuilder) usize {
+            return lb.f.entries.items.len - lb.top;
+        }
+
+        fn entry(lb: *const ListBuilder, i: usize) Entry {
+            return lb.f.entries.items[lb.top + i];
+        }
 
         fn init(f: *F, open_end: u32) Error!ListBuilder {
-            var lb: ListBuilder = .{ .f = f, .prev = open_end };
+            var lb: ListBuilder = .{ .f = f, .prev = open_end, .top = f.entries.items.len };
             if (try f.cm.takeTrailing(f.a, open_end)) |tr| {
                 lb.open_suffix = try f.b.lineSuffix(tr.text);
                 lb.prev = tr.end;
@@ -728,8 +845,7 @@ const F = struct {
         fn begin(lb: *ListBuilder, start: u32) Error!void {
             const f = lb.f;
             const run = try f.cm.takeLeading(f.a, lb.prev, start);
-            const blank = if (run.items.len > 0) run.items[0].blank_before else f.cm.gapHasBlank(lb.prev, start);
-            try lb.blanks.append(f.a, blank);
+            lb.pending_blank = if (run.items.len > 0) run.items[0].blank_before else f.cm.gapHasBlank(lb.prev, start);
             if (try f.runDoc(run)) |d| {
                 lb.any_comment = true;
                 lb.pending_lead = d;
@@ -745,15 +861,14 @@ const F = struct {
             var d = doc;
             if (lb.pending_lead) |lead| d = try f.cat(&.{ lead, d });
             lb.pending_lead = null;
-            var suffix: ?Doc = null;
+            var suffix: Doc = fd.empty;
             lb.prev = sep_end;
             if (try f.cm.takeTrailing(f.a, sep_end)) |tr| {
                 suffix = try f.b.lineSuffix(tr.text);
                 lb.prev = tr.end;
                 lb.any_comment = true;
             }
-            try lb.docs.append(f.a, d);
-            try lb.suffixes.append(f.a, suffix);
+            try f.entries.append(f.gpa, .{ .doc = d, .blank = lb.pending_blank, .suffix = suffix });
         }
 
         /// Own-line comments before the closing bracket.
@@ -762,36 +877,37 @@ const F = struct {
             const run = try f.cm.takeLeading(f.a, lb.prev, close_start);
             if (run.items.len == 0) return null;
             lb.any_comment = true;
-            var parts: std.ArrayList(Doc) = .empty;
+            const top = f.b.top();
             for (run.items, 0..) |it, i| {
                 if (i > 0) {
-                    try parts.append(f.a, fd.hardline);
-                    if (it.blank_before) try parts.append(f.a, fd.hardline);
+                    try f.b.push(fd.hardline);
+                    if (it.blank_before) try f.b.push(fd.hardline);
                 }
-                try parts.append(f.a, try f.commentDoc(it.comment));
+                try f.b.push(try f.commentDoc(it.comment));
             }
-            return try f.cat(parts.items);
+            return try f.b.catFrom(top);
         }
 
         /// The items separated by commas; `sep` follows each comma (a `line`
         /// or a `hardline`). A trailing comment forces the group to break.
         fn joined(lb: *ListBuilder, sep: Doc, trailing_comma: Doc, keep_blank: bool) Error!Doc {
             const f = lb.f;
-            var parts: std.ArrayList(Doc) = .empty;
-            const n = lb.docs.items.len;
-            for (lb.docs.items, 0..) |d, i| {
+            const top = f.b.top();
+            const n = lb.count();
+            for (0..n) |i| {
+                const it = lb.entry(i);
                 if (i > 0) {
-                    try parts.append(f.a, sep);
-                    if (keep_blank and lb.blanks.items[i]) try parts.append(f.a, fd.hardline);
+                    try f.b.push(sep);
+                    if (keep_blank and it.blank) try f.b.push(fd.hardline);
                 }
-                try parts.append(f.a, d);
-                try parts.append(f.a, if (i + 1 < n) try f.t(",") else trailing_comma);
-                if (lb.suffixes.items[i]) |sfx| {
-                    try parts.append(f.a, sfx);
-                    try parts.append(f.a, fd.break_parent);
+                try f.b.push(it.doc);
+                try f.b.push(if (i + 1 < n) try f.t(",") else trailing_comma);
+                if (it.suffix != fd.empty) {
+                    try f.b.push(it.suffix);
+                    try f.b.push(fd.break_parent);
                 }
             }
-            return f.cat(parts.items);
+            return f.b.catFrom(top);
         }
     };
 
@@ -800,9 +916,11 @@ const F = struct {
         const open = f.toks[f.tokIdx(callee_end)];
         const close = f.tokEndingAt(call_end);
         var lb = try ListBuilder.init(f, open.end);
+        defer lb.release();
         for (list) |e| {
             try lb.begin(e.span.start);
-            try lb.end(e.span.end, try f.whole(e));
+            const d = try f.whole(e);
+            try lb.end(e.span.end, d);
         }
         const dangling = try lb.finish(close.start);
         if (list.len == 0 and !lb.any_comment) return f.t("()");
@@ -818,15 +936,15 @@ const F = struct {
         }));
         // A last argument that is a function or a table hugs the call (§6.2).
         if (!lb.any_comment and list.len > 0 and hugs(list[list.len - 1]) and !anyHuggable(list[0 .. list.len - 1])) {
-            var parts: std.ArrayList(Doc) = .empty;
-            try parts.append(f.a, open_doc);
-            for (lb.docs.items[0 .. list.len - 1]) |d| {
-                try parts.append(f.a, d);
-                try parts.append(f.a, try f.t(", "));
+            const top = f.b.top();
+            try f.b.push(open_doc);
+            for (0..list.len - 1) |i| {
+                try f.b.push(lb.entry(i).doc);
+                try f.b.push(try f.t(", "));
             }
-            try parts.append(f.a, try f.b.hug(lb.docs.items[list.len - 1]));
-            try parts.append(f.a, close_doc);
-            return f.b.alt(try f.cat(parts.items), expanded);
+            try f.b.push(try f.b.hug(lb.entry(list.len - 1).doc));
+            try f.b.push(close_doc);
+            return f.b.alt(try f.b.catFrom(top), expanded);
         }
         return expanded;
     }
@@ -857,6 +975,7 @@ const F = struct {
         };
         const close = f.toks[close_idx];
         var lb = try ListBuilder.init(f, open.end);
+        defer lb.release();
         for (params) |p| {
             const end = if (p.type) |ty| ty.span.end else p.name_span.end;
             try lb.begin(p.name_span.start);
@@ -897,23 +1016,25 @@ const F = struct {
     }
 
     fn typeText(f: *F, ty: *const ast.TypeExpr) Error![]const u8 {
-        var buf: std.ArrayList(u8) = .empty;
+        f.sbuf.clearRetainingCapacity();
         for (ty.path, 0..) |seg, i| {
-            if (i > 0) try buf.append(f.a, '.');
-            try buf.appendSlice(f.a, seg);
+            if (i > 0) try f.sbuf.append(f.gpa, '.');
+            try f.sbuf.appendSlice(f.gpa, seg);
         }
-        if (ty.optional) try buf.append(f.a, '?');
-        return buf.items;
+        if (ty.optional) try f.sbuf.append(f.gpa, '?');
+        return f.sbuf.items;
     }
 
     // ---- tables ----
 
     fn table(f: *F, fields: []const ast.TableField, span: ast.Span) Error!Doc {
         var lb = try ListBuilder.init(f, span.start + 1);
+        defer lb.release();
         for (fields) |fl| {
             const sp = f.fieldSpan(fl);
             try lb.begin(sp.start);
-            try lb.end(sp.end, try f.fieldDoc(fl));
+            const d = try f.fieldDoc(fl);
+            try lb.end(sp.end, d);
         }
         const dangling = try lb.finish(span.end - 1);
         if (fields.len == 0 and !lb.any_comment) return f.t("{}");
@@ -952,13 +1073,16 @@ const F = struct {
         }
         const trailing = try f.b.ifBreak(comma, fd.empty);
         if (fill_ok and fields.len > 1) {
-            var items: std.ArrayList(Doc) = .empty;
-            for (lb.docs.items, 0..) |d, i| {
-                try items.append(f.a, if (i + 1 < lb.docs.items.len) try f.cat(&.{ d, comma }) else d);
+            const top = f.b.top();
+            const n = lb.count();
+            for (0..n) |i| {
+                const d = lb.entry(i).doc;
+                try f.b.push(if (i + 1 < n) try f.cat(&.{ d, comma }) else d);
             }
+            const items = try f.b.fillFrom(top);
             return f.b.group(try f.cat(&.{
                 open_doc,
-                try f.b.indent(try f.cat(&.{ fd.line, try f.b.fill(items.items) })),
+                try f.b.indent(try f.cat(&.{ fd.line, items })),
                 trailing,
                 fd.line,
                 close_doc,
@@ -1031,8 +1155,9 @@ const F = struct {
         }
         const new: u8 = if (dq > sq) '\'' else '"';
         if (new == old) return lexeme_;
-        var out: std.ArrayList(u8) = .empty;
-        try out.append(f.a, new);
+        const out = &f.sbuf;
+        out.clearRetainingCapacity();
+        try out.append(f.gpa, new);
         i = 0;
         while (i < content.len) : (i += 1) {
             const c = content[i];
@@ -1042,18 +1167,18 @@ const F = struct {
                 if (n == '"' or n == '\'') {
                     // The old delimiter's escape is no longer needed; the new
                     // delimiter's is never present (it was the other quote).
-                    if (n == new) try out.append(f.a, '\\');
-                    try out.append(f.a, n);
+                    if (n == new) try out.append(f.gpa, '\\');
+                    try out.append(f.gpa, n);
                 } else {
-                    try out.append(f.a, '\\');
-                    try out.append(f.a, n);
+                    try out.append(f.gpa, '\\');
+                    try out.append(f.gpa, n);
                 }
             } else if (c == new) {
-                try out.append(f.a, '\\');
-                try out.append(f.a, c);
-            } else try out.append(f.a, c);
+                try out.append(f.gpa, '\\');
+                try out.append(f.gpa, c);
+            } else try out.append(f.gpa, c);
         }
-        try out.append(f.a, new);
+        try out.append(f.gpa, new);
         return out.items;
     }
 };

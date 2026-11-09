@@ -175,7 +175,7 @@ fn report(gpa: std.mem.Allocator, io: std.Io, name: []const u8, text: []const u8
         x(m.bd.parse_arena, in),
         x(m.bd.tokens, in),
         x(m.bd.trivia, in),
-        x(m.bd.doc_arena, in),
+        x(m.bd.doc, in),
         x(m.bd.printer.work_bytes, in),
         x(m.bd.output, in),
     });
