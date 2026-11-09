@@ -546,7 +546,7 @@ pub const Heap = struct {
     /// hash, or its dense one when the sparse hash's bucket is marked.
     inline fn strtabHash(self: *const Heap, content: []const u8) u64 {
         const h = string.sparseHash(content);
-        if (self.strtab_any_dense and self.bucketDense(self.strtab_dense, h & (self.strtab.len - 1))) {
+        if (self.strtab_any_dense and self.bucketDense(self.strtab_dense, @as(usize, @truncate(h)) & (self.strtab.len - 1))) {
             @branchHint(.unlikely);
             return string.denseHash(content);
         }
@@ -715,7 +715,7 @@ pub const Heap = struct {
                 if (self.strtab_any_dense) {
                     const was_dense = string.isDense(cur.hash);
                     const sparse = if (was_dense) string.sparseHash(cur.bytes()) else cur.hash;
-                    if (!self.bucketDense(marks, sparse & mask)) {
+                    if (!self.bucketDense(marks, @as(usize, @truncate(sparse)) & mask)) {
                         cur.hash = sparse;
                     } else if (!was_dense) {
                         cur.hash = string.denseHash(cur.bytes());
@@ -762,7 +762,7 @@ pub const Heap = struct {
             while (s) |cur| : (s = cur.next_intern) {
                 const dense = string.isDense(cur.hash);
                 const sparse = if (dense) string.sparseHash(cur.bytes()) else cur.hash;
-                counts[sparse & mask] +|= 1;
+                counts[@as(usize, @truncate(sparse)) & mask] +|= 1;
                 if (dense) grouped += 1;
             }
         }
@@ -830,7 +830,7 @@ pub const Heap = struct {
             var s = dense;
             while (s) |cur| {
                 const next = cur.next_intern; // save before relinking
-                self.markDense(self.strtab_dense, string.sparseHash(cur.bytes()) & mask);
+                self.markDense(self.strtab_dense, @as(usize, @truncate(string.sparseHash(cur.bytes()))) & mask);
                 self.strtabLink(cur);
                 s = next;
             }
@@ -848,9 +848,9 @@ pub const Heap = struct {
         // Each bucket's run of settlers, and inside it each group's run.
         i = 0;
         while (i < n) {
-            const bucket = settlers[i].sparse & mask;
+            const bucket = @as(usize, @truncate(settlers[i].sparse)) & mask;
             var end = i + 1;
-            while (end < n and settlers[end].sparse & mask == bucket) end += 1;
+            while (end < n and @as(usize, @truncate(settlers[end].sparse)) & mask == bucket) end += 1;
             var marked = end - i > strtab_max_coll;
             var g = i;
             while (!marked and g < end) {
