@@ -387,6 +387,25 @@ pub fn build(b: *std.Build) void {
     const bench_lsp_step = b.step("bench-lsp", "Run the doc 74 language-server benchmark (ReleaseFast)");
     bench_lsp_step.dependOn(&run_bench_lsp.step);
 
+    // `zig build bench-fmt` — doc 83 §10: the source formatter over realistic
+    // and adversarial files. ReleaseFast, informational, not a test (global
+    // Rule #22).
+    const bench_fmt_exe = b.addExecutable(.{
+        .name = "bench-fmt",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_fmt.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{
+                .{ .name = "mahina", .module = mod },
+            },
+        }),
+    });
+    bench_fmt_exe.use_llvm = true;
+    const run_bench_fmt = b.addRunArtifact(bench_fmt_exe);
+    const bench_fmt_step = b.step("bench-fmt", "Run the doc 83 source-formatter benchmark (ReleaseFast)");
+    bench_fmt_step.dependOn(&run_bench_fmt.step);
+
     // `zig build bench-facts` — doc 67 §5.3: building a page's slab fact
     // tables, and one arm-time `proves`, at the trace size limits.
     // ReleaseFast, informational, not a test (global Rule #22).

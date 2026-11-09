@@ -1,6 +1,6 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder), 3 (corpus gate) and 4 (CLI) and 5 (language server), 6 (wasm, C API, viz) and 7 (the repo formatted, gate added) landed; the benchmark (Q2), Q3, method-chain breaking and name-list wrapping outstanding. Every style decision made by Bart
+Status: partial — phases 0 to 7 landed (printer, tokens, comments, builder, corpus gate, CLI, language server, wasm/C API/viz, the repo formatted with its gate) and the benchmark (Q2) is in; Q3, method-chain breaking, name-list wrapping and the peak-memory footprint outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
@@ -113,14 +113,27 @@ land; move whole phases to Done once everything inside them is checked.
   bug found and fixed on the way (an empty `{}` before the last argument
   blocked hugging it, `setmetatable({}, {...})`). Settled 2026-11-10.
 
+- [x] **Q2 — the printer stays linear, and the benchmark exists** (§10):
+  `zig build bench-fmt` (`src/bench_fmt.zig`, ReleaseFast, informational per
+  Rule #22) runs the §10 corpus. Measured 2026-11-10 (machine at load ~7):
+  realistic 5,000 lines 5 ms (budget 100 ms); 50,000 realistic lines 82 ms;
+  50,000 lines of 40-argument calls (26 MB) 555 ms; 50,000 lines of 40-term
+  chains (20 MB) 581 ms; dense comments 14 ms; one 1 MB line 38 ms; nesting
+  to depth 190 (the parser stops at `max_depth` 200) 0.11 ms for tables and
+  0.17 ms for calls, time proportional to output size (which grows with the
+  indentation). No per-line or per-level growth. Peak memory is 40–80× the
+  input (the document arena), see Outstanding.
+
 ### Outstanding
+
+- [ ] **Peak memory** (§10): 12 MB for a 165 KB file, 1.1 GB for the 26 MB
+  adversarial one, i.e. 40–80× the input. Linear, so within the editor use,
+  but the document nodes are the place to look if it ever matters.
 
 - [ ] **Method-chain breaking and name-list wrapping** (§6): not built in
   phase 2; long chains and name lists currently stay on one line.
 - [ ] **Comments inside expressions** (§5): refused in v1; place them or keep
   refusing, decided once real code hits it.
-- [ ] **Q2 — does the printer stay linear on pathological nesting** (§10):
-  settled by a benchmark over a deeply nested generated file.
 - [ ] **Q3 — newlines inside long strings and templates** (§3, §7.2): whether
   the lexer already folds `\r\n` to `\n` inside long-bracket strings (as Lua
   does); settled by reading and testing the lexer in phase 2. If it does not,
