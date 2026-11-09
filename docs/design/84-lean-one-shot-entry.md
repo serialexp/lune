@@ -18,6 +18,9 @@ land; move whole phases to Done once everything inside them is checked.
   return on an anchor that has no trace and is barred from recording. The
   pure probe (§2.1) went from +662 to +573 instructions per call. This doc
   is step 2.
+- [x] **Phase 0a — the probe is a board row.** `bench/call_small_fn.lua`
+  is §2.1's program at 10⁶ calls, with its hashgate rows (all three modes
+  and LuaJIT agree).
 - [x] **Q1 — per-anchor knowledge: (b), two membership bits** (§4.1).
 - [x] **Q2 — admission: (a), a blocker word of its own** (§4.2).
 - [x] **Q3 — completion counters: (a), in the runtime** (§4.3).
@@ -31,9 +34,8 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Phase 0 — probes on the board.** Commit the pure-callee probe
-  (§2.1) as a `@bench` program, so the per-call entry cost has a row of
-  its own. Record the §2 baselines on the pinned pool.
+- [ ] **Phase 0b — baselines on the pinned pool.** Record §2's rows there
+  (needs a push, so it waits until Bart asks for one).
 - [ ] **Phase 1 — a per-anchor quiet predicate** (§4.1). Today a single
   penalty or gate entry anywhere sends every one-shot entry in the program
   down the full path (§3.1). Pick from Q1.
