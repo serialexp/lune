@@ -1,10 +1,10 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: draft, not yet implemented. Every style decision made by Bart
+Status: partial — phase 0 (the printer) landed; phases 0b–7 outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
-Last updated: 2026-11-10
+Last updated: 2026-11-10 (phase 0)
 
 ## Implementation status
 
@@ -38,12 +38,15 @@ land; move whole phases to Done once everything inside them is checked.
   findings are applied or rejected with reasons below; two points concern
   Bart's own decisions (call sugar does not exist, §3; template holes, §6.8).
 
+- [x] **Phase 0 — the printing core.** `src/format_doc.zig`: the document
+  algebra (text, raw, line, softline, hardline, break_parent, group, indent,
+  fill, hug, lineSuffix) and the fitting printer; 13 unit tests print
+  hand-built documents, including the hug, trailing-comment, fill and
+  bounded-lookahead cases (`Stats.fits_steps` is asserted, Rule #22). Done
+  2026-11-10.
+
 ### Outstanding
 
-- [ ] **Phase 0 — the printing core.** `src/format_doc.zig`: the document
-  algebra (text, line, softline, hardline, group, indent, fill, trailing
-  comment slot) and the fitting printer, with its own unit tests. No language
-  knowledge.
 - [ ] **Phase 0b — expose the token stream.** `parser.parseFormat` (next to
   `parseTrivia`) returns the AST, the token list, the trivia and the
   diagnostics together (§4.2). The only edit to the parser; the AST does not
