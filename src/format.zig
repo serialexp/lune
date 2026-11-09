@@ -700,7 +700,7 @@ const F = struct {
     }
 
     fn anyHuggable(list: []const *Expr) bool {
-        for (list) |e| if (e.data == .function or e.data == .table) return true;
+        for (list) |e| if (hugs(e)) return true;
         return false;
     }
 
@@ -1097,6 +1097,11 @@ test "format: a last function argument hugs the call" {
     try expectFmt("f({a=1,b=2})", "f({ a = 1, b = 2 })\n");
     try expectFmt("x:method(1, 2)", "x:method(1, 2)\n");
     try expectFmt("await task", "await task\n");
+    // An empty table before the hugged one does not block the hug.
+    try expectFmt(
+        "setmetatable({}, {__tostring = function() return 'T' end})",
+        "setmetatable({}, {\n    __tostring = function()\n        return \"T\"\n    end,\n})\n",
+    );
 }
 
 test "format: comments stay with their code" {
