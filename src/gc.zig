@@ -153,8 +153,9 @@ pub const Heap = struct {
     /// `strtab_max_ident` strings sharing its hash and length, rehashes that
     /// chain with `string.denseHash` (`strtabRehashChain`,
     /// `lj_str_rehash_chain`). The invariant: a string's `hash` is its dense
-    /// hash exactly when the bucket its sparse hash names is marked in
-    /// `strtab_dense`. Both seeds are fixed (LuaJIT draws them at random), so
+    /// hash (`string.isDense`) exactly when the bucket its sparse hash names
+    /// is marked in `strtab_dense`. Each sweep decides the marks afresh from
+    /// the dense survivors (`strtabResettle`). Both seeds are fixed (LuaJIT draws them at random), so
     /// the geometry stays a function of the program; this answers accidental
     /// collisions, not a hostile flood.
     strtab: []?*String = &.{},
@@ -594,7 +595,7 @@ pub const Heap = struct {
     inline fn strtabGuard(self: *Heap, content: []const u8, hash: u64, found: Found) u64 {
         if (found.coll <= strtab_max_coll and found.ident < strtab_max_ident) return hash;
         // A dense lookup's chain has nothing left to rehash.
-        if (hash != string.sparseHash(content)) return hash;
+        if (string.isDense(hash)) return hash;
         const idx = @as(usize, @truncate(hash)) & (self.strtab.len - 1);
         if (self.bucketDense(self.strtab_dense, idx)) return hash;
         self.strtabRehashChain(idx);
@@ -603,9 +604,7 @@ pub const Heap = struct {
 
     /// Mark bucket `idx` dense and move its sparse-hashed strings to their
     /// dense buckets (`lj_str_rehash_chain`). Strings already dense stay
-    /// where their dense hash puts them, which may be `idx` again. A string
-    /// in an unmarked chain is sparse exactly when its own sparse bucket is
-    /// unmarked; `idx` is unmarked until the walk is done.
+    /// where their dense hash puts them, which may be `idx` again.
     noinline fn strtabRehashChain(self: *Heap, idx: usize) void {
         const mask = self.strtab.len - 1;
         var s = self.strtab[idx];
@@ -613,8 +612,7 @@ pub const Heap = struct {
         var moved: ?*String = null; // decided strings, rechained after the walk
         while (s) |cur| {
             const next = cur.next_intern;
-            if (!self.bucketDense(self.strtab_dense, string.sparseHash(cur.bytes()) & mask))
-                cur.hash = string.denseHash(cur.bytes());
+            if (!string.isDense(cur.hash)) cur.hash = string.denseHash(cur.bytes());
             cur.next_intern = moved;
             moved = cur;
             s = next;
@@ -632,11 +630,16 @@ pub const Heap = struct {
 
     /// Push `s` at its bucket's head. Infallible; the caller has ensured capacity.
     fn strtabInsert(self: *Heap, s: *String) void {
+        self.strtabLink(s);
+        self.strtab_count += 1;
+    }
+
+    /// `strtabInsert` for a string already counted.
+    inline fn strtabLink(self: *Heap, s: *String) void {
         std.debug.assert(self.strtab.len != 0);
         const idx = @as(usize, @truncate(s.hash)) & (self.strtab.len - 1);
         s.next_intern = self.strtab[idx];
         self.strtab[idx] = s;
-        self.strtab_count += 1;
     }
 
     /// Make room for one more entry: lazy-allocate the minimum table, or grow ×2
@@ -686,14 +689,13 @@ pub const Heap = struct {
         @memset(marks, 0);
         const mask = new_len - 1;
         const any_dense = self.strtab_any_dense and try self.strtabDecideMarks(marks, mask);
-        const old_mask = self.strtab.len - 1;
         for (self.strtab) |head| {
             var s = head;
             while (s) |cur| {
                 const next = cur.next_intern; // save before overwriting the link
                 if (self.strtab_any_dense) {
-                    const sparse = string.sparseHash(cur.bytes());
-                    const was_dense = self.bucketDense(self.strtab_dense, sparse & old_mask);
+                    const was_dense = string.isDense(cur.hash);
+                    const sparse = if (was_dense) string.sparseHash(cur.bytes()) else cur.hash;
                     if (!self.bucketDense(marks, sparse & mask)) {
                         cur.hash = sparse;
                     } else if (!was_dense) {
@@ -730,19 +732,19 @@ pub const Heap = struct {
     /// the miss guard promotes. Whether any is marked. Only a marked bucket
     /// can hold such a group: the guard marks it as it forms, every geometry
     /// keeps a group in one bucket, and a sweep only shrinks it. So only the
-    /// strings of marked buckets are grouped, sorted in scratch freed here.
+    /// dense strings are grouped, sorted in scratch freed here.
     fn strtabDecideMarks(self: *const Heap, marks: []u64, mask: usize) std.mem.Allocator.Error!bool {
         const counts = try self.gpa.alloc(u32, mask + 1);
         defer self.gpa.free(counts);
         @memset(counts, 0);
-        const old_mask = self.strtab.len - 1;
         var grouped: usize = 0;
         for (self.strtab) |head| {
             var s = head;
             while (s) |cur| : (s = cur.next_intern) {
-                const sparse = string.sparseHash(cur.bytes());
+                const dense = string.isDense(cur.hash);
+                const sparse = if (dense) string.sparseHash(cur.bytes()) else cur.hash;
                 counts[sparse & mask] +|= 1;
-                if (self.bucketDense(self.strtab_dense, sparse & old_mask)) grouped += 1;
+                if (dense) grouped += 1;
             }
         }
         const twins = try self.gpa.alloc(Twin, grouped);
@@ -751,9 +753,8 @@ pub const Heap = struct {
         for (self.strtab) |head| {
             var s = head;
             while (s) |cur| : (s = cur.next_intern) {
-                const sparse = string.sparseHash(cur.bytes());
-                if (!self.bucketDense(self.strtab_dense, sparse & old_mask)) continue;
-                twins[n] = .{ .hash = sparse, .len = cur.len };
+                if (!string.isDense(cur.hash)) continue;
+                twins[n] = .{ .hash = string.sparseHash(cur.bytes()), .len = cur.len };
                 n += 1;
             }
         }
@@ -774,6 +775,81 @@ pub const Heap = struct {
             i = j;
         }
         return any;
+    }
+
+    /// A dense survivor `strtabResettle` decides: its sparse hash, and it.
+    const Settler = struct {
+        sparse: u64,
+        s: *String,
+
+        /// By sparse bucket, then sparse hash, then length.
+        fn lessThan(mask: usize, a: Settler, b: Settler) bool {
+            if (a.sparse & mask != b.sparse & mask) return a.sparse & mask < b.sparse & mask;
+            if (a.sparse != b.sparse) return a.sparse < b.sparse;
+            return a.s.len < b.s.len;
+        }
+    };
+
+    /// The sweep's `strtabDecideMarks` (doc 28 §5.1): clear every mark and
+    /// decide afresh from the `n` dense survivors in `dense` (linked through
+    /// `next_intern`, not yet chained), so a mark lasts only as long as the
+    /// group or crowd that needs it. Without this, short-lived strings that
+    /// collide (a day's dates differing only in the hour) mark bucket after
+    /// bucket of a table that never grows, and every later string in them
+    /// pays both hashes. The sparse survivors are chained already, and no
+    /// sparse string's bucket was marked, so a marked bucket's strings are
+    /// all in `dense` and they alone decide it, by `strtabDecideMarks`'s
+    /// rules. Costs a sparse hash per dense survivor and a sort of them,
+    /// nothing per sparse one. Without the scratch, every dense survivor
+    /// stays dense and marks its bucket again, which is always valid.
+    fn strtabResettle(self: *Heap, dense: ?*String, n: usize) void {
+        @memset(self.strtab_dense, 0);
+        self.strtab_any_dense = false;
+        if (n == 0) return;
+        const mask = self.strtab.len - 1;
+        const settlers = self.gpa.alloc(Settler, n) catch {
+            var s = dense;
+            while (s) |cur| {
+                const next = cur.next_intern; // save before relinking
+                self.markDense(self.strtab_dense, string.sparseHash(cur.bytes()) & mask);
+                self.strtabLink(cur);
+                s = next;
+            }
+            self.strtab_any_dense = true;
+            return;
+        };
+        defer self.gpa.free(settlers);
+        var i: usize = 0;
+        var s = dense;
+        while (s) |cur| : (s = cur.next_intern) {
+            settlers[i] = .{ .sparse = string.sparseHash(cur.bytes()), .s = cur };
+            i += 1;
+        }
+        std.mem.sortUnstable(Settler, settlers, mask, Settler.lessThan);
+        // Each bucket's run of settlers, and inside it each group's run.
+        i = 0;
+        while (i < n) {
+            const bucket = settlers[i].sparse & mask;
+            var end = i + 1;
+            while (end < n and settlers[end].sparse & mask == bucket) end += 1;
+            var marked = end - i > strtab_max_coll;
+            var g = i;
+            while (!marked and g < end) {
+                var h = g + 1;
+                while (h < end and settlers[h].sparse == settlers[g].sparse and settlers[h].s.len == settlers[g].s.len) h += 1;
+                marked = h - g > strtab_max_ident;
+                g = h;
+            }
+            if (marked) {
+                self.markDense(self.strtab_dense, bucket);
+                self.strtab_any_dense = true;
+            }
+            for (settlers[i..end]) |st| {
+                if (!marked) st.s.hash = st.sparse;
+                self.strtabLink(st.s);
+            }
+            i = end;
+        }
     }
 
     /// Intern `content`: return the existing object for these bytes, or allocate,
@@ -1256,6 +1332,10 @@ pub const Heap = struct {
     pub fn sweep(self: *Heap) void {
         @memset(self.strtab, null);
         var live_str: usize = 0;
+        // Dense survivors wait for `strtabResettle`, linked through
+        // `next_intern`; sparse ones re-chain as they are met.
+        var dense: ?*String = null;
+        var dense_n: usize = 0;
         var slot: *?*GcHeader = &self.objects;
         var live: usize = 0;
         var live_threads: usize = 0;
@@ -1271,15 +1351,20 @@ pub const Heap = struct {
                 live += 1;
                 if (h.type == .thread) live_threads += 1;
                 if (h.type == .string) {
-                    self.strtabInsert(String.fromHeader(h));
+                    const s = String.fromHeader(h);
+                    if (string.isDense(s.hash)) {
+                        s.next_intern = dense;
+                        dense = s;
+                        dense_n += 1;
+                    } else self.strtabLink(s);
                     live_str += 1;
                 }
                 slot = &h.next;
             }
         }
-        // `strtabInsert` recounted the survivors; overwrite rather than trusting
-        // the pre-sweep figure.
+        // Count the survivors rather than trusting the pre-sweep figure.
         self.strtab_count = live_str;
+        if (self.strtab_any_dense) self.strtabResettle(dense, dense_n) else std.debug.assert(dense_n == 0);
         self.object_count = live;
         self.thread_count = live_threads;
         self.collections += 1;
@@ -1287,28 +1372,22 @@ pub const Heap = struct {
         // destroyed strings their bytes, so the debt is what the survivors
         // hold.
         self.setGcTarget(@max(initial_gc_threshold, (live +| self.debt()) *| heap_growth));
-        self.strtabAfterSweep();
+        self.strtabMaybeShrink();
         // Doc 73: stacks pooled since the last collection hand their pages
         // back, so an idle pool holds no committed stack memory.
         self.stack_pool.trim();
     }
 
-    /// Post-sweep maintenance. Halve the bucket array when live entries fall
-    /// below a quarter of it (hysteresis against grow's 100%-load trigger: a
-    /// shrink needs the population to halve twice, a re-grow needs it to
-    /// double twice — sawtooth populations near a boundary do not thrash). One
-    /// halving per sweep. And with dense buckets about, rebuild at the same
-    /// size so the marks follow the survivors (doc 28 §5.1): the groups that
-    /// made them are mostly garbage by now, and a mark that outlives them
-    /// makes every later string in its bucket pay both hashes. Short-lived
-    /// strings that collide (a day's dates differing only in the hour) would
-    /// otherwise mark every bucket of a table that never grows. OOM keeps the
-    /// current table and marks — geometry is runtime-private, so this costs
-    /// memory or time, never correctness or determinism of output.
-    fn strtabAfterSweep(self: *Heap) void {
-        const shrink = self.strtab.len > strtab_min_size and self.strtab_count < self.strtab.len / 4;
-        if (!shrink and !self.strtab_any_dense) return;
-        const new_len = if (shrink) @max(strtab_min_size, self.strtab.len / 2) else self.strtab.len;
+    /// Optional post-sweep maintenance: halve the bucket array when live entries
+    /// fall below a quarter of it (hysteresis against grow's 100%-load trigger:
+    /// a shrink needs the population to halve twice, a re-grow needs it to double
+    /// twice — sawtooth populations near a boundary do not thrash). One halving
+    /// per sweep. OOM keeps the current (larger) table — geometry is runtime-
+    /// private, so this costs memory, never correctness or determinism of output.
+    fn strtabMaybeShrink(self: *Heap) void {
+        if (self.strtab.len <= strtab_min_size) return;
+        if (self.strtab_count >= self.strtab.len / 4) return;
+        const new_len = @max(strtab_min_size, self.strtab.len / 2);
         // strtabRebuild re-chains without touching strtab_count, which the sweep
         // walk above has just recounted.
         self.strtabRebuild(new_len) catch return;
@@ -1715,7 +1794,7 @@ test "doc 28 §5: the fifth string the samples cannot tell apart rehashes their 
     try strtabCheckIntegrity(&heap);
     const fifth = try heap.intern(sparseColliders(&buf, Heap.strtab_max_ident));
     try testing.expect(heap.strtab_any_dense);
-    try testing.expect(fifth.hash != string.sparseHash(fifth.bytes()));
+    try testing.expect(string.isDense(fifth.hash));
     try strtabCheckIntegrity(&heap);
     // A hit finds it under the dense hash it now has.
     try testing.expectEqual(fifth, try heap.intern(sparseColliders(&buf, Heap.strtab_max_ident)));
@@ -1735,7 +1814,7 @@ test "doc 28 §5: a rebuild keeps a same-hash group dense while it is larger tha
     for (&keep, 0..) |*k, i| k.* = try heap.intern(std.fmt.bufPrint(&name, "g{d}", .{i}) catch unreachable);
     try testing.expect(heap.strtab.len > Heap.strtab_min_size);
     try testing.expect(heap.strtab_any_dense);
-    for (group) |g| try testing.expect(g.hash != string.sparseHash(g.bytes()));
+    for (group) |g| try testing.expect(string.isDense(g.hash));
     try strtabCheckIntegrity(&heap);
 
     // Five survive a collection: the sweep's rebuild keeps them dense.
@@ -1753,6 +1832,80 @@ test "doc 28 §5: a rebuild keeps a same-hash group dense while it is larger tha
     for (group[0..Heap.strtab_max_ident], 0..) |g, i| try testing.expectEqual(@as(?*String, g), heap.internedLookup(sparseColliders(&buf, i)));
     _ = try heap.intern(sparseColliders(&buf, Heap.strtab_max_ident));
     try testing.expect(heap.strtab_any_dense);
+    try strtabCheckIntegrity(&heap);
+}
+
+test "doc 28 §5.1: the sweep keeps a crowd's mark and drops a dead group's, without resizing" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var buf: [64]u8 = undefined;
+    // A group of five, then a crowd of more than strtab_max_coll strings
+    // whose sparse hashes differ but name one bucket.
+    var group: [Heap.strtab_max_ident + 1]*String = undefined;
+    for (&group, 0..) |*g, i| g.* = try heap.intern(sparseColliders(&buf, i));
+    const mask = heap.strtab.len - 1;
+    const bucket = string.sparseHash("c0") & mask;
+    // The 34th walks past 33: the guard marks the bucket.
+    var crowd: [Heap.strtab_max_coll + 2]*String = undefined;
+    var name: [16]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (n < crowd.len) : (i += 1) {
+        const c = std.fmt.bufPrint(&name, "c{d}", .{i}) catch unreachable;
+        if (string.sparseHash(c) & mask != bucket) continue;
+        crowd[n] = try heap.intern(c);
+        n += 1;
+    }
+    try testing.expect(string.isDense(crowd[crowd.len - 1].hash));
+    try testing.expect(string.isDense(group[0].hash));
+    const len = heap.strtab.len;
+
+    // The group dies, the crowd lives: only the crowd's bucket stays marked.
+    var roots: [crowd.len]*GcHeader = undefined;
+    for (&roots, crowd) |*r, c| r.* = &c.header;
+    try collectWithRoots(&heap, &roots);
+    try testing.expectEqual(len, heap.strtab.len);
+    try testing.expect(heap.strtab_any_dense);
+    try testing.expect(heap.bucketDense(heap.strtab_dense, bucket));
+    try testing.expect(!heap.bucketDense(heap.strtab_dense, string.sparseHash(sparseColliders(&buf, 0)) & mask));
+    for (crowd) |c| try testing.expect(string.isDense(c.hash));
+    try strtabCheckIntegrity(&heap);
+
+    // Half the crowd dies: what is left hashes sparsely again.
+    try collectWithRoots(&heap, roots[0 .. crowd.len / 2]);
+    try testing.expect(!heap.strtab_any_dense);
+    for (crowd[0 .. crowd.len / 2]) |c| try testing.expect(!string.isDense(c.hash));
+    try strtabCheckIntegrity(&heap);
+}
+
+test "doc 28 §5.1: without scratch, the sweep keeps the dense survivors dense" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var heap = Heap.init(failing.allocator());
+    defer heap.deinit();
+    var buf: [64]u8 = undefined;
+    var group: [Heap.strtab_max_ident]*String = undefined;
+    for (&group, 0..) |*g, i| g.* = try heap.intern(sparseColliders(&buf, i));
+    _ = try heap.intern(sparseColliders(&buf, Heap.strtab_max_ident));
+    try testing.expect(heap.strtab_any_dense);
+
+    // Four of the five survive, too few to need the mark, but the sweep
+    // cannot allocate its scratch: they stay dense, still valid.
+    var roots: [group.len]*GcHeader = undefined;
+    for (&roots, group) |*r, g| r.* = &g.header;
+    try heap.beginCollect();
+    for (roots) |r| heap.markHeader(r);
+    heap.traceAll();
+    failing.fail_index = failing.alloc_index;
+    heap.sweep();
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expect(heap.strtab_any_dense);
+    for (group) |g| try testing.expect(string.isDense(g.hash));
+    try strtabCheckIntegrity(&heap);
+    for (group, 0..) |g, k| try testing.expectEqual(@as(?*String, g), heap.internedLookup(sparseColliders(&buf, k)));
+
+    // The next sweep has its scratch and drops the mark.
+    try collectWithRoots(&heap, &roots);
+    try testing.expect(!heap.strtab_any_dense);
     try strtabCheckIntegrity(&heap);
 }
 

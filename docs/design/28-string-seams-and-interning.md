@@ -309,6 +309,21 @@ counts, JIT tier):
 | 6 of 425 B | +4.2% | +1.2% |
 | 64 of 75 B (the guard promotes at 17 anyway) | +1.9% | +1.9% |
 
+**The sweep decides from the dense survivors alone (2026-11-09).** The
+same-size rebuild walked every live string, three times, at every
+collection while any bucket was marked. Every dense hash now carries bit 32
+(`string.dense_bit`), so a stored hash says which hash it is. The sweep
+re-chains the sparse survivors as it meets them and sets the dense ones
+aside. `strtabResettle` clears the marks and decides afresh from the dense
+ones alone: no sparse string's bucket was marked, so a marked bucket's
+strings are all dense, and its population and groups are theirs. That
+costs a sparse hash per dense survivor and a sort of them, nothing per
+sparse survivor. If the scratch allocation fails, every dense survivor
+stays dense and marks its bucket again, which is always valid. The guard,
+the chain rehash and the resize read the bit instead of recomputing the
+sparse hash. os_date −1.3%, co_garbage −0.9% (instructions, both tiers):
+os_date is now −0.45% against full Wyhash.
+
 ## 6. L4 — intern with a known cp_len
 
 `Heap.intern` recounts code points on every miss (`createWithHash` →

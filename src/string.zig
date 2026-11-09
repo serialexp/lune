@@ -63,9 +63,19 @@ pub fn sparseHash(content: []const u8) u64 {
 }
 
 /// The hash of a chain `sparseHash` overloaded (doc 28 §5): every byte,
-/// keyed differently from the sparse one.
+/// keyed differently from the sparse one. It carries `dense_bit`, which no
+/// sparse hash has (they are 32-bit), so a stored hash says which one it is
+/// (`isDense`); the low 32 bits are Wyhash's.
 pub fn denseHash(content: []const u8) u64 {
-    return std.hash.Wyhash.hash(dense_seed, content);
+    return (std.hash.Wyhash.hash(dense_seed, content) & 0xffff_ffff) | dense_bit;
+}
+
+/// Set in every `denseHash`, clear in every `sparseHash`.
+pub const dense_bit: u64 = 1 << 32;
+
+/// Whether `hash` is a `denseHash`.
+pub inline fn isDense(hash: u64) bool {
+    return hash & dense_bit != 0;
 }
 
 const sparse_seed: u32 = 0x9e37_79b9;
@@ -370,6 +380,13 @@ test "sparseHash is LuaJIT's hash_sparse, widened, with our fixed seed" {
     inline for (cases) |c| try testing.expectEqual(@as(u64, c[1]), sparseHash(c[0]));
     // It samples: "ab" and "abc" collide, which the intern table resolves by
     // comparing bytes.
+}
+
+test "a dense hash carries dense_bit and a sparse one never does" {
+    for ([_][]const u8{ "", "a", "hello world", "0123456789abcdefghijklmnopqrstuvwxyz0123456789" }) |c| {
+        try testing.expect(isDense(denseHash(c)));
+        try testing.expect(!isDense(sparseHash(c)));
+    }
 }
 
 test "sparseHash reads every one of the first and last eight bytes" {
