@@ -882,9 +882,18 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       JIT board: co_pingpong -4.6%, globals_script -3.8%, tostring_meta
       -3.7%, binary-trees -1.5%, spectral-norm -1.4%; tier 0 is flat (the
       hooks stay `noinline`: inlining them added ~9 instructions per
-      `opCall`). Pure-head probe 931 M -> 877 M. **Step 2, next:** a design
-      doc for a lean head-trace entry lane (callgrind per call: ~400 in the
-      entry wrapper, ~109 in the body, ~150 in `noteResume`).
+      `opCall`). Pure-head probe 931 M -> 877 M. **Step 2:** the design
+      is doc 84 (`docs/design/84-lean-one-shot-entry.md`), drafted
+      2026-11-10 with Q1-Q4 open for Bart. It also found that one penalty
+      or dispatch gate anywhere disables the quiet path for every one-shot
+      entry: binary-trees takes the full path on 402k of 402k entries
+      (six `legacy_thrash` gates) and runs +91% instructions over tier 0.
+- [ ] **A loop that never traces pays ~37 instructions per back-edge in
+      `gatedBackEdgeHandler`** (seen 2026-11-10, doc 84 §2.1: the pure
+      probe's caller loop, which can't trace because of `if a ~= b` on two
+      tables). `skipGatedBackEdge` answers the same "gated, skip" every
+      iteration. Tier 0 pays nothing there. Same shape as the bar memo
+      (4a8c8e6): a settled answer that should cost one load.
 - [ ] **(C) Record through `pcall`.** LuaJIT's `recff_pcall` records the
       call as a frame tag on the trace, so a hot loop that calls `pcall`
       stays one trace. Mahina's recorder aborts at the native today.
