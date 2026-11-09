@@ -1,6 +1,6 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 to 7 landed (printer, tokens, comments, builder, corpus gate, CLI, language server, wasm/C API/viz, the repo formatted with its gate) and the benchmark (Q2) is in; Q3, method-chain breaking, name-list wrapping and the peak-memory footprint outstanding. Every style decision made by Bart
+Status: partial — phases 0 to 7 landed (printer, tokens, comments, builder, corpus gate, CLI, language server, wasm/C API/viz, the repo formatted with its gate) and the benchmark (Q2) and the CRLF rule (Q3) are settled; method-chain breaking, name-list wrapping and the peak-memory footprint outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
@@ -124,6 +124,12 @@ land; move whole phases to Done once everything inside them is checked.
   indentation). No per-line or per-level growth. Peak memory is 40–80× the
   input (the document arena), see Outstanding.
 
+- [x] **Q3 — newlines inside long strings and templates** (§3, §7.2): the
+  lexer folds every `\r`, `\n`, `\r\n` and `\n\r` inside long strings,
+  templates, quoted-string line continuations and block comments to one
+  `\n` (`#[[a<CRLF>b]]` is 3), so the formatter writes them as `\n` and the
+  output is LF throughout with no exemption in the gate. Done 2026-11-10.
+
 ### Outstanding
 
 - [ ] **Peak memory** (§10): 12 MB for a 165 KB file, 1.1 GB for the 26 MB
@@ -134,10 +140,6 @@ land; move whole phases to Done once everything inside them is checked.
   phase 2; long chains and name lists currently stay on one line.
 - [ ] **Comments inside expressions** (§5): refused in v1; place them or keep
   refusing, decided once real code hits it.
-- [ ] **Q3 — newlines inside long strings and templates** (§3, §7.2): whether
-  the lexer already folds `\r\n` to `\n` inside long-bracket strings (as Lua
-  does); settled by reading and testing the lexer in phase 2. If it does not,
-  CRLF inside those regions is preserved and the LF-only gate exempts them.
 
 ## Why this exists
 

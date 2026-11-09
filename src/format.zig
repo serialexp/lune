@@ -74,6 +74,24 @@ pub fn format(gpa: Allocator, source: []const u8, diags: *diag.Diagnostics) Erro
     return out;
 }
 
+/// `s` with every line break (`\r`, `\n`, `\r\n`, `\n\r`) as one `\n`, the
+/// breaks the lexer counts (`Lexer.newline`).
+fn lfOnly(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(a, s.len);
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c != '\r' and c != '\n') {
+            out.appendAssumeCapacity(c);
+            continue;
+        }
+        out.appendAssumeCapacity('\n');
+        if (i + 1 < s.len and (s[i + 1] == '\r' or s[i + 1] == '\n') and s[i + 1] != c) i += 1;
+    }
+    return out.items;
+}
+
 // -- the builder ---------------------------------------------------------
 
 const F = struct {
@@ -117,9 +135,14 @@ const F = struct {
         return f.toks[i];
     }
 
+    /// Verbatim source text. Line breaks inside it (a long string, a template,
+    /// a block comment, a backslash-newline) are written as `\n`: the lexer
+    /// reads every `\r`, `\n`, `\r\n` and `\n\r` there as one `\n` already
+    /// (doc 83 Q3), so the output is LF throughout and means the same.
     fn lit(f: *F, s: []const u8) Error!Doc {
-        if (std.mem.indexOfScalar(u8, s, '\n') != null) return f.b.raw(s);
-        return f.b.text(s);
+        const text = if (std.mem.indexOfScalar(u8, s, '\r') != null) try lfOnly(f.a, s) else s;
+        if (std.mem.indexOfScalar(u8, text, '\n') != null) return f.b.raw(text);
+        return f.b.text(text);
     }
 
     fn t(f: *F, s: []const u8) Error!Doc {
@@ -1102,6 +1125,13 @@ test "format: a last function argument hugs the call" {
         "setmetatable({}, {__tostring = function() return 'T' end})",
         "setmetatable({}, {\n    __tostring = function()\n        return \"T\"\n    end,\n})\n",
     );
+}
+
+test "format: line breaks inside long strings, templates and block comments come out as LF" {
+    try expectFmt("local x = [[a\r\nb]]\r\n", "local x = [[a\nb]]\n");
+    try expectFmt("local y = `t\r\nu`\r\n", "local y = `t\nu`\n");
+    try expectFmt("--[[ a\r\n b ]]\r\nlocal z = 1\r\n", "--[[ a\n b ]]\nlocal z = 1\n");
+    try expectFmt("local x = [[a\rb\n\rc]]\n", "local x = [[a\nb\nc]]\n");
 }
 
 test "format: comments stay with their code" {
