@@ -101,7 +101,7 @@ fn recordReplay(gpa: std.mem.Allocator, host: *FakeHost, opts: RunOpts, source: 
     return rec;
 }
 
-test "io: read formats cross host buffers (3-byte fills)" {
+test "[REQ-60.1] [REQ-60.2] io: read formats cross host buffers (3-byte fills)" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try host.put("in.txt", "hello wörld\n42 3.5 0x10 -7e1\nñandú\nlast");
@@ -118,7 +118,7 @@ test "io: read formats cross host buffers (3-byte fills)" {
     , "hello wörld\n42\t3.5\t16\t-70\n\n\nñan\n\ndú\nlast\nnil\tnil\t\n");
 }
 
-test "io: a count reads code points, a binary count reads bytes into a byte array" {
+test "[REQ-61.1] [REQ-61.2] [REQ-61.3] io: a count reads code points, a binary count reads bytes into a byte array" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try host.put("u.txt", "äöü€x");
@@ -134,7 +134,7 @@ test "io: a count reads code points, a binary count reads bytes into a byte arra
     , "äöü€\tx\n3\t195\t164\t195\nfalse\tbad argument #2 to '?' (format not allowed on a binary file)\n");
 }
 
-test "io: write, seek, append and io.lines against the host" {
+test "[REQ-63.1] [REQ-63.2] [REQ-63.3] [REQ-63.4] io: write, seek, append and io.lines against the host" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try expectOut(&host,
@@ -154,7 +154,7 @@ test "io: write, seek, append and io.lines against the host" {
     try testing.expectEqualStrings("one\n2\n3.5\nfour\n", host.contentOf("o.txt").?);
 }
 
-test "io: a file to-be-closed is closed with its scope, by an io.lines loop's break too (doc 76 §6)" {
+test "[REQ-65.1] [REQ-65.2] [REQ-65.3] io: a file to-be-closed is closed with its scope, by an io.lines loop's break too (doc 76 §6)" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try host.put("o.txt", "one\ntwo\n");
@@ -170,7 +170,7 @@ test "io: a file to-be-closed is closed with its scope, by an io.lines loop's br
     try testing.expectEqual(@as(usize, 0), host.handles.count());
 }
 
-test "io: binary writes take byte arrays" {
+test "[REQ-64.1] [REQ-64.2] io: binary writes take byte arrays" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try expectOut(&host,
@@ -182,7 +182,22 @@ test "io: binary writes take byte arrays" {
     try testing.expectEqualStrings("ABC", host.contentOf("b.bin").?);
 }
 
-test "io: failures raise by default and return nil, msg, code in Lua mode" {
+test "[REQ-62.1] [REQ-62.2] io: a text read of invalid UTF-8 raises, and the same bytes read as binary arrive intact" {
+    var host = FakeHost.init(testing.allocator);
+    defer host.deinit();
+    try host.put("bad.txt", "ok\xff\xfe!");
+    try expectOut(&host,
+        \\local f = io.open("bad.txt")
+        \\print(pcall(f.read, f, "a"))
+        \\f:close()
+        \\local b = io.open("bad.txt", "rb")
+        \\local a = b:read(5)
+        \\print(#a, a[3], a[4])
+        \\b:close()
+    , "false\tcannot read 'bad.txt': not valid UTF-8\n5\t255\t254\n");
+}
+
+test "[REQ-69.1] [REQ-69.2] [REQ-70.1] [REQ-70.2] io: failures raise by default and return nil, msg, code in Lua mode" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.denied = &.{"secret"};
@@ -207,7 +222,7 @@ test "io: failures raise by default and return nil, msg, code in Lua mode" {
     }
 }
 
-test "io: closed and wrong-direction handles are refused without asking the host" {
+test "[REQ-66.1] [REQ-66.2] [REQ-66.3] [REQ-66.4] io: closed and wrong-direction handles are refused without asking the host" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try host.put("r.txt", "x");
@@ -230,7 +245,7 @@ test "io: closed and wrong-direction handles are refused without asking the host
         "false\tcannot seek stdout: not seekable\n");
 }
 
-test "io: stdout and stderr go to the VM's seams and are not logged" {
+test "[REQ-74.1] [REQ-74.2] io: stdout and stderr go to the VM's seams and are not logged" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     const r = try recordReplay(testing.allocator, &host, .{},
@@ -245,7 +260,7 @@ test "io: stdout and stderr go to the VM's seams and are not logged" {
     try testing.expectEqual(@as(usize, 0), host.calls);
 }
 
-test "io: stdin reads and io.read take the default input" {
+test "[REQ-67.1] io: stdin reads and io.read take the default input" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.stdin = "first line\n12 rest\n";
@@ -258,7 +273,7 @@ test "io: stdin reads and io.read take the default input" {
     try testing.expectEqualStrings("first line\n12\t rest\n\nnil\n", r.out);
 }
 
-test "io: every host operation records and replays with no host" {
+test "[REQ-73.1] [REQ-73.3] [REQ-73.4] [REQ-63.5] io: every host operation records and replays with no host" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try host.put("data.txt", "alpha\nbeta\n");
@@ -294,7 +309,7 @@ test "io: every host operation records and replays with no host" {
         try testing.expect(seen.contains(k));
 }
 
-test "io: Lua-mode failures replay in Lua mode" {
+test "[REQ-71.4] io: Lua-mode failures replay in Lua mode" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     const r = try recordReplay(testing.allocator, &host, .{ .io_errors = .lua },
@@ -304,7 +319,7 @@ test "io: Lua-mode failures replay in Lua mode" {
     try testing.expectEqualStrings("nil\tcannot open 'nope': not found\t1\n", r.out);
 }
 
-test "io: a replay in the other error mode is refused" {
+test "[REQ-71.2] io: a replay in the other error mode is refused" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     const source = "print(pcall(io.open, 'nope'))";
@@ -313,7 +328,7 @@ test "io: a replay in the other error mode is refused" {
     try testing.expectError(error.IoErrorModeMismatch, run(testing.allocator, .{ .mode = .replay, .log = rec.log }, source));
 }
 
-test "io: without the files group io.open is absent; io.write is always there" {
+test "[REQ-55.2] io: without the files group io.open is absent; io.write is always there" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
     var out_buf: [256]u8 = undefined;
@@ -326,7 +341,7 @@ test "io: without the files group io.open is absent; io.write is always there" {
     try testing.expectEqualStrings("nil\tnil\tnil\tnil\nok\n", out.buffered());
 }
 
-test "io: a restored handle is detached until reopenFiles, which resumes at the captured position" {
+test "[REQ-92.1] [REQ-92.2] [REQ-92.3] io: a restored handle is detached until reopenFiles, which resumes at the captured position" {
     const gpa = testing.allocator;
     var host = FakeHost.init(gpa);
     defer host.deinit();

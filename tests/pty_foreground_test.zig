@@ -183,3 +183,26 @@ test "[REQ-52.3] the terminal's Ctrl-C reaches the child that holds it, and mahi
     try testing.expectEqual(at_int.pgrp, at_int.tpgid);
     try testing.expectEqualStrings("9", try lineAfter(out.items, "code\t"));
 }
+
+test "[REQ-80.1] on a terminal each line is written as soon as it is printed" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const pty = try Pty.open();
+    defer pty.close();
+    // The program blocks on the terminal after printing, so a line that is
+    // still in a buffer would never reach us before we answer.
+    const code = "print('first') io.read() print('second')\x00";
+    const pid = try launch(pty, @ptrCast(code.ptr));
+    var killed = false;
+    defer if (!killed) {
+        _ = linux.kill(pid, .KILL);
+        _ = finish(pid) catch {};
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try readUntil(gpa, pty.master, &out, "first");
+    try typeInto(pty.master, "go\n");
+    try readUntil(gpa, pty.master, &out, "second");
+    killed = true;
+    try testing.expectEqual(@as(u8, 0), try finish(pid));
+}

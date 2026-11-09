@@ -650,7 +650,7 @@ fn hostCallExiting(vm: ?*capi.VmBox, userdata: ?*anyopaque, args: ?[*]const mh_v
     return .ok;
 }
 
-test "os.exit: MH_EXIT with the status, the VM restored and reusable, and an exit inside a callback ends its caller" {
+test "[REQ-83.7] [REQ-83.8] [REQ-57.3] os.exit: MH_EXIT with the status, the VM restored and reusable, and an exit inside a callback ends its caller" {
     const env: c_uint = @as(u8, @bitCast(mahina.system.Groups{ .env = true }));
     const box = try capi.createVm(testing.allocator, .{ .system = env });
     defer freeVm(box);

@@ -226,6 +226,19 @@ pub fn build(b: *std.Build) void {
     junitReport(run_pty_tests, test_junit);
     test_step.dependOn(&run_pty_tests.step);
 
+    // The CLI's streams, status and host flags seen from outside the process
+    // (tests/cli_stdio_test.zig), run the same way.
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("tests/cli_stdio_test.zig"),
+        .target = target,
+    });
+    runner.addImports(cli_mod);
+    const cli_tests = b.addTest(.{ .root_module = cli_mod, .filters = test_filters, .test_runner = runner.config() });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    run_cli_tests.setCwd(exe.getEmittedBin().dirname());
+    junitReport(run_cli_tests, test_junit);
+    test_step.dependOn(&run_cli_tests.step);
+
     // --- embedding C ABI (doc 59) -------------------------------------------
     //
     // `zig build lib` — `libmahina.a` + `include/mahina.h`: the C-ABI embedding

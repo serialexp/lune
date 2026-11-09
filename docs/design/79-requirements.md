@@ -218,3 +218,24 @@ result, drift found.
   which runs the real CLI (`./mahina`, from the directory it was built
   into) as session leader of a pseudo-terminal; with the handover
   disabled both tests fail. Not covered: portability (§7).
+- **Doc 65 — the `io` and `os` host library** (2026-11-09): epic REQ-53 *The
+  io and os host library* under REQ-1, features REQ-54 system interfaces,
+  REQ-59 files and io, REQ-68 error modes, REQ-72 recording and replay,
+  REQ-77 standard output, REQ-82 `os.exit`, REQ-84 time and dates, REQ-91
+  file handles across a keyframe, REQ-93 files on disk, REQ-96 environment.
+  46 nodes, 103 criteria, 14 notes (10 on REQ-53), all `draft`. Trace pass:
+  every criterion verified by `gt requirement verify --strict` against a
+  local report (194 units in scope, none uncited). Tests added for what
+  criteria claim: a text read of invalid UTF-8 raises while the same bytes
+  read as `rb` arrive intact; the `io` half of "a group that is off installs
+  none of its functions". The CLI half, which no unit test can see, is
+  `tests/cli_stdio_test.zig` (real `./mahina` with raw `fork`/`execve`: the
+  order and non-overwriting of stdout and stderr in one regular file, flush
+  at exit, at `os.exit` and before the error report, held back on a pipe,
+  flushed before a stdin read, the low 8 bits of the exit status, `--system`,
+  `--lua-io-errors`, `--effect-log-limit`) plus one pty test for
+  line-buffering on a terminal (REQ-80.1). Drift: doc 65 §6 says output is
+  flushed before a stdin read, which the criteria had not stated; REQ-80.3
+  was added for it. Not converted: performance budgets (§9, benchmarks) and
+  the deferred items (reopen flag, `__close` on handles), which are open
+  questions on REQ-53.

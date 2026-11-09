@@ -309,7 +309,7 @@ fn utcAt(y: i64, m: i64, d: i64, h: i64) i64 {
     return datetime.secondsOf(.{ .year = y, .month = m, .day = d, .hour = h, .min = 0, .sec = 0 });
 }
 
-test "POSIX TZ: a northern-hemisphere rule switches at the right instants" {
+test "[REQ-90.1] POSIX TZ: a northern-hemisphere rule switches at the right instants" {
     const tz = Posix.parse("CET-1CEST,M3.5.0,M10.5.0/3").?;
     // 2024: summer time from 2024-03-31 01:00 UTC to 2024-10-27 01:00 UTC.
     const start = utcAt(2024, 3, 31, 1);
@@ -321,7 +321,7 @@ test "POSIX TZ: a northern-hemisphere rule switches at the right instants" {
     try expectZone(cet, tz.lookup(utcAt(2024, 1, 1, 0)));
 }
 
-test "POSIX TZ: a southern-hemisphere rule wraps the year" {
+test "[REQ-90.1] POSIX TZ: a southern-hemisphere rule wraps the year" {
     const tz = Posix.parse("AEST-10AEDT,M10.1.0,M4.1.0/3").?;
     try expectZone(.{ .offset = 11 * 3600, .dst = true, .abbr = "AEDT" }, tz.lookup(utcAt(2024, 1, 15, 0)));
     try expectZone(.{ .offset = 10 * 3600, .dst = false, .abbr = "AEST" }, tz.lookup(utcAt(2024, 7, 15, 0)));
@@ -331,7 +331,7 @@ test "POSIX TZ: a southern-hemisphere rule wraps the year" {
     try testing.expect(!tz.lookup(end).dst);
 }
 
-test "POSIX TZ: forms without daylight saving, quoted names, defaults" {
+test "[REQ-90.2] POSIX TZ: forms without daylight saving, quoted names, defaults" {
     try expectZone(.{ .offset = 0, .dst = false, .abbr = "UTC" }, Posix.parse("UTC0").?.lookup(0));
     try expectZone(.{ .offset = 5 * 3600 + 1800, .dst = false, .abbr = "+0530" }, Posix.parse("<+0530>-5:30").?.lookup(0));
     try expectZone(.{ .offset = -(3 * 3600), .dst = false, .abbr = "-03" }, Posix.parse("<-03>3").?.lookup(0));
@@ -396,7 +396,7 @@ fn buildTzif(gpa: std.mem.Allocator, times: []const i64, idx: []const u8, types:
     return out.toOwnedSlice(gpa);
 }
 
-test "TZif: transitions, the time before the first, and the footer after the last" {
+test "[REQ-90.3] TZif: transitions, the time before the first, and the footer after the last" {
     const gpa = testing.allocator;
     // LMT until 1900, then CET, CEST and CET again in 2000, then the footer.
     const t1900 = utcAt(1900, 1, 1, 0);
@@ -420,7 +420,7 @@ test "TZif: transitions, the time before the first, and the footer after the las
     try expectZone(cet, tz.lookup(utcAt(2024, 12, 1, 0)));
 }
 
-test "TZif: malformed files are refused, never read past their end" {
+test "[REQ-90.4] TZif: malformed files are refused, never read past their end" {
     const gpa = testing.allocator;
     const good = try buildTzif(gpa, &.{0}, &.{0}, &.{.{ .off = 0, .dst = false, .abbr = "UTC" }}, "UTC0");
     defer gpa.free(good);

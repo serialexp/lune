@@ -197,7 +197,7 @@ test "F2d: replaying a recorded effect log reproduces the recorded output" {
     try testing.expect(!std.mem.eql(u8, rec.out, rec2.out));
 }
 
-test "F2d: replay with a too-short log reports EffectLogExhausted (no silent divergence)" {
+test "[REQ-75.3] F2d: replay with a too-short log reports EffectLogExhausted (no silent divergence)" {
     const gpa = testing.allocator;
     const source =
         \\print(os.clock()); print(os.clock())
@@ -395,7 +395,7 @@ test "F2e: replay with no seed in the log reports EffectLogExhausted" {
     try testing.expectError(error.EffectLogExhausted, effectRun(gpa, "print(math.random())", .replay, &.{}, null, null));
 }
 
-test "doc 65 Q4: math.random() with no injected source starts from the fixed default seed" {
+test "[REQ-58.1] [REQ-58.3] doc 65 Q4: math.random() with no injected source starts from the fixed default seed" {
     const gpa = testing.allocator;
     // No entropy source: the VM is deterministic. The default seed is still
     // logged, so a replay needs no source either.
@@ -549,7 +549,7 @@ test "F2e: math.randomseed() entropy form records and replays the seed" {
     try testing.expectEqualStrings(rec.out, rep.out);
 }
 
-test "doc 65 Q4: math.randomseed() with no injected source uses the default seed" {
+test "[REQ-58.2] doc 65 Q4: math.randomseed() with no injected source uses the default seed" {
     const gpa = testing.allocator;
     // The no-arg entropy form draws like a lazy random(): the default seed.
     const r = try effectRun(gpa, "print(math.randomseed())", .record, &.{}, null, null);
@@ -567,7 +567,7 @@ test "doc 65 Q4: math.randomseed() with no injected source uses the default seed
 // effect-log blob sidesteps cross-heap string lifetimes.
 // ---------------------------------------------------------------------------
 
-test "env: os.getenv reads set/unset/empty (record)" {
+test "[REQ-97.1] [REQ-97.2] [REQ-97.3] env: os.getenv reads set/unset/empty (record)" {
     const gpa = testing.allocator;
     var fenv = FakeEnv{};
     var vm = try Vm.init(gpa);
@@ -595,7 +595,7 @@ test "env: os.getenv reads set/unset/empty (record)" {
     for (vm.effect_log.entries.items) |it| try testing.expectEqual(EffectKind.getenv, it.kind);
 }
 
-test "doc 65 Q5: without the env group, os.getenv is absent and nothing is unavailable" {
+test "[REQ-55.3] doc 65 Q5: without the env group, os.getenv is absent and nothing is unavailable" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -616,7 +616,7 @@ test "doc 65 Q5: without the env group, os.getenv is absent and nothing is unava
     );
 }
 
-test "env: a recorded string result survives a GC collection while parked in the log" {
+test "[REQ-97.5] env: a recorded string result survives a GC collection while parked in the log" {
     const gpa = testing.allocator;
     var fenv = FakeEnv{};
     var vm = try Vm.init(gpa);
@@ -637,7 +637,7 @@ test "env: a recorded string result survives a GC collection while parked in the
     try testing.expectEqualStrings("/home/bart", string.String.fromHeader(res.asHeap()).bytes());
 }
 
-test "env: replay feeds back a logged string result without calling the native" {
+test "[REQ-97.3] env: replay feeds back a logged string result without calling the native" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -656,7 +656,7 @@ test "env: replay feeds back a logged string result without calling the native" 
     try testing.expectEqualStrings("REPLAYED\n", sink.buffered());
 }
 
-test "S-B: getenv of non-UTF-8 host bytes raises a catchable error" {
+test "[REQ-97.4] S-B: getenv of non-UTF-8 host bytes raises a catchable error" {
     const gpa = testing.allocator;
     var fenv = FakeEnv{};
     var vm = try Vm.init(gpa);
@@ -676,7 +676,7 @@ test "S-B: getenv of non-UTF-8 host bytes raises a catchable error" {
     try testing.expectEqualStrings("/home/bart\nfalse\tstring\n", sink.buffered());
 }
 
-test "S-B: a recorded non-UTF-8 getenv replays byte-identically (validate-after-log)" {
+test "[REQ-97.4] S-B: a recorded non-UTF-8 getenv replays byte-identically (validate-after-log)" {
     const gpa = testing.allocator;
     const src =
         \\local ok, e = pcall(os.getenv, "BADUTF8")
@@ -919,7 +919,7 @@ test "S-C: a wrong-version pin is not self-erasing — the rejected entry stays 
     try testing.expect(!vm.unicode_version_pinned);
 }
 
-test "replay: a kind-diverged log entry is not consumed — the cursor stays put on EffectKindMismatch" {
+test "[REQ-75.2] replay: a kind-diverged log entry is not consumed — the cursor stays put on EffectKindMismatch" {
     // The same cursor-truthfulness contract at the generic `nextLoggedEffect`
     // level: the log's next entry is a .unicode_version but the program's next
     // effect is a clock read. The divergence raises, and the unconsumed entry
@@ -1288,7 +1288,7 @@ test "multi-file: fault, frames and safepoint lines name the chunk their line is
 // Doc 65 Phase 2 — the effect log for host operations: the recording cap, the
 // pinned io error mode, and fail/bytes results through record and replay.
 
-test "doc 65 §4.5: a recording past the effect-log limit is fatal, uncatchable, and names the limit" {
+test "[REQ-76.1] doc 65 §4.5: a recording past the effect-log limit is fatal, uncatchable, and names the limit" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -1317,7 +1317,7 @@ test "doc 65 §4.5: a recording past the effect-log limit is fatal, uncatchable,
     try testing.expect(std.mem.indexOf(u8, fault.message, "--effect-log-limit") != null);
 }
 
-test "doc 65 §4.5: the cap counts what encodeFile writes, and 0 or off mode means none" {
+test "[REQ-76.2] doc 65 §4.5: the cap counts what encodeFile writes, and 0 or off mode means none" {
     const gpa = testing.allocator;
     const src =
         \\for i = 1, 50 do os.getenv("HOME") end
@@ -1348,7 +1348,7 @@ test "doc 65 §4.5: the cap counts what encodeFile writes, and 0 or off mode mea
     }
 }
 
-test "doc 65 §4.4: the io error mode is pinned once per session in record" {
+test "[REQ-71.1] doc 65 §4.4: the io error mode is pinned once per session in record" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -1363,7 +1363,7 @@ test "doc 65 §4.4: the io error mode is pinned once per session in record" {
     try testing.expectEqual(@as(u64, 1), vm.committed_effect_seq);
 }
 
-test "doc 65 §4.4: a replay under the other io error mode refuses, and the entry stays at the cursor" {
+test "[REQ-71.2] doc 65 §4.4: a replay under the other io error mode refuses, and the entry stays at the cursor" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -1383,7 +1383,7 @@ test "doc 65 §4.4: a replay under the other io error mode refuses, and the entr
     try testing.expect(vm.io_errors_pinned);
 }
 
-test "doc 65 §4.4: a resumed replay does not consume a second io error mode pin" {
+test "[REQ-71.3] doc 65 §4.4: a resumed replay does not consume a second io error mode pin" {
     // The keyframe carries no pinned flag: after a restore the pin before the
     // cut is found behind the cursor, as for `unicode_version`.
     const gpa = testing.allocator;
@@ -1398,7 +1398,7 @@ test "doc 65 §4.4: a resumed replay does not consume a second io error mode pin
     try testing.expectEqual(@as(i64, 9), (try interp.replayHost(&vm, .file_seek)).value.asInt());
 }
 
-test "doc 65 §4.2: host results — values, failures and bytes — record, encode and replay" {
+test "[REQ-75.1] doc 65 §4.2: host results — values, failures and bytes — record, encode and replay" {
     const gpa = testing.allocator;
     var log_bytes: []u8 = undefined;
     {
@@ -1435,7 +1435,7 @@ test "doc 65 §4.2: host results — values, failures and bytes — record, enco
     try testing.expectError(error.EffectLogExhausted, interp.replayHost(&vm, .file_write));
 }
 
-test "doc 65 §4.5: a bytes result past the cap is refused and leaves the log as it was" {
+test "[REQ-76.3] doc 65 §4.5: a bytes result past the cap is refused and leaves the log as it was" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();

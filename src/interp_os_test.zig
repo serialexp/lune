@@ -104,7 +104,7 @@ fn recordReplay(gpa: std.mem.Allocator, host: *FakeHost, opts: RunOpts, source: 
     return rec;
 }
 
-test "os: os.time and os.date read the host clock and zone" {
+test "[REQ-85.1] [REQ-85.2] [REQ-85.3] os: os.time and os.date read the host clock and zone" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.now = 1_700_000_000;
@@ -124,7 +124,7 @@ test "os: os.time and os.date read the host clock and zone" {
         "Tue Nov 14 23:13:20 2023\n");
 }
 
-test "os: os.time(t) reads local wall time like mktime and normalizes the table" {
+test "[REQ-86.1] [REQ-86.2] [REQ-86.3] os: os.time(t) reads local wall time like mktime and normalizes the table" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.tz = tzif.Posix.parse(cet).?;
@@ -141,7 +141,7 @@ test "os: os.time(t) reads local wall time like mktime and normalizes the table"
         "1719828000\n1711848600\n1729992600\n1719831600\n1704103200\n-2208992400\n");
 }
 
-test "os: a UTC host needs no zone, and an abbreviation is any UTF-8" {
+test "[REQ-85.4] os: a UTC host needs no zone, and an abbreviation is any UTF-8" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.tz = tzif.Posix.parse("<+0530>-5:30").?;
@@ -151,7 +151,7 @@ test "os: a UTC host needs no zone, and an abbreviation is any UTF-8" {
     , "05:30 +0530 +0530\n0\n");
 }
 
-test "os: date tables and formats are checked as Lua checks them" {
+test "[REQ-87.1] os: date tables and formats are checked as Lua checks them" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try expectOut(&host,
@@ -179,7 +179,7 @@ test "os: date tables and formats are checked as Lua checks them" {
         "946684800\n");
 }
 
-test "os: remove, rename and tmpname, failures in both error modes" {
+test "[REQ-94.1] [REQ-94.3] [REQ-95.1] [REQ-69.3] [REQ-70.1] os: remove, rename and tmpname, failures in both error modes" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     try host.put("a.txt", "A");
@@ -207,7 +207,7 @@ test "os: remove, rename and tmpname, failures in both error modes" {
     try testing.expectEqualStrings("nil\tcannot remove 'nope': not found\t1\nnil\tcannot rename 'nope': not found\t1\n", r.out);
 }
 
-test "os: every host input records and replays with no host" {
+test "[REQ-73.2] [REQ-73.3] [REQ-83.5] os: every host input records and replays with no host" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     host.now = 1_700_000_000;
@@ -231,7 +231,7 @@ test "os: every host input records and replays with no host" {
         try testing.expect(seen.contains(k));
 }
 
-test "os: os.exit ends the run with its status, and pcall cannot stop it" {
+test "[REQ-83.1] [REQ-83.2] [REQ-83.3] os: os.exit ends the run with its status, and pcall cannot stop it" {
     var host = FakeHost.init(testing.allocator);
     defer host.deinit();
     const cases = [_]struct { src: [:0]const u8, status: i32 }{
@@ -265,7 +265,7 @@ fn enableEnv(vm: *Vm) anyerror!void {
     try vm.enableSystem(.{ .env = true });
 }
 
-test "os: os.exit from a hot loop ends the run in every trace mode" {
+test "[REQ-83.4] os: os.exit from a hot loop ends the run in every trace mode" {
     const source =
         \\local function f(i) if i == 300 then os.exit(9) end return i end
         \\local s = 0
@@ -280,7 +280,7 @@ test "os: os.exit from a hot loop ends the run in every trace mode" {
     }
 }
 
-test "os: calling a member of a group that is off says which interface it needs" {
+test "[REQ-56.1] [REQ-56.2] os: calling a member of a group that is off says which interface it needs" {
     const r = try run(testing.allocator, .{ .groups = .{ .clock = true } },
         \\print(pcall(function() io.open("x") end))
         \\print(pcall(function() return os.date() end))
@@ -306,7 +306,7 @@ test "os: calling a member of a group that is off says which interface it needs"
     try testing.expectEqualStrings("false\tmain:1: attempt to call a nil value (field 'open')\n", removed.out);
 }
 
-test "os: the interface hint is the same from a hot loop in every trace mode" {
+test "[REQ-56.3] os: the interface hint is the same from a hot loop in every trace mode" {
     const source =
         \\local function f(i) if i == 300 then return os.time() end return i end
         \\local s = 0
@@ -323,12 +323,13 @@ test "os: the interface hint is the same from a hot loop in every trace mode" {
     }
 }
 
-test "os: a group that is off installs none of its functions" {
+test "[REQ-55.1] os: a group that is off installs none of its functions" {
     const r = try run(testing.allocator, .{ .groups = .{ .clock = true } },
         \\print(os.time, os.date, os.remove, os.rename, os.tmpname, os.exit, os.difftime ~= nil)
+        \\print(io.open, io.tmpfile, io.read, io.stdin)
     );
     defer r.deinit(testing.allocator);
-    try testing.expectEqualStrings("nil\tnil\tnil\tnil\tnil\tnil\ttrue\n", r.out);
+    try testing.expectEqualStrings("nil\tnil\tnil\tnil\tnil\tnil\ttrue\nnil\tnil\tnil\tnil\n", r.out);
 }
 
 test "[REQ-26.1] os: os.environ lists the host environment, sorted, as a fresh table each call" {

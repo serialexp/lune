@@ -259,7 +259,7 @@ fn expectFormat(fmt: []const u8, t: i64, zone: Zone, expected: []const u8) !void
     try testing.expectEqualStrings(expected, out.items);
 }
 
-test "civil dates round-trip over four centuries and the epoch's neighbours" {
+test "[REQ-89.1] civil dates round-trip over four centuries and the epoch's neighbours" {
     var z: i64 = daysFromCivil(1600, 1, 1);
     while (z < daysFromCivil(2001, 1, 1)) : (z += 1) {
         const c = civilFromDays(z);
@@ -271,13 +271,13 @@ test "civil dates round-trip over four centuries and the epoch's neighbours" {
     try testing.expectEqual(Civil{ .year = -1, .month = 12, .day = 31 }, civilFromDays(daysFromCivil(0, 1, 1) - 1));
 }
 
-test "breakDown matches gmtime" {
+test "[REQ-89.2] breakDown matches gmtime" {
     // date -u -d @1700000000: Tue Nov 14 22:13:20 UTC 2023, day 318 of the year.
     try testing.expectEqual(Tm{ .year = 2023, .month = 11, .day = 14, .hour = 22, .min = 13, .sec = 20, .wday = 2, .yday = 317 }, breakDown(1700000000));
     try testing.expectEqual(Tm{ .year = 1969, .month = 12, .day = 31, .hour = 23, .min = 59, .sec = 59, .wday = 3, .yday = 364 }, breakDown(-1));
 }
 
-test "secondsOf normalizes like mktime" {
+test "[REQ-89.2] secondsOf normalizes like mktime" {
     const base = secondsOf(.{ .year = 2024, .month = 1, .day = 1, .hour = 0, .min = 0, .sec = 0 });
     try testing.expectEqual(@as(i64, 1704067200), base);
     // Month 13 is next January; day 0 is the last day of the month before.
@@ -287,7 +287,7 @@ test "secondsOf normalizes like mktime" {
     try testing.expectEqual(secondsOf(.{ .year = 2023, .month = 11, .day = 1, .hour = 0, .min = 0, .sec = 0 }), secondsOf(.{ .year = 2024, .month = -1, .day = 1, .hour = 0, .min = 0, .sec = 0 }));
 }
 
-test "strftime conversions in the C locale" {
+test "[REQ-88.1] strftime conversions in the C locale" {
     // 2023-11-14 22:13:20 UTC, a Tuesday.
     const t = 1700000000;
     const z = Zone.utc;
@@ -306,7 +306,7 @@ test "strftime conversions in the C locale" {
     try expectFormat("%z", t, .{ .offset = -(9 * 3600 + 30 * 60), .dst = false, .abbr = "-0930" }, "-0930");
 }
 
-test "ISO weeks at year boundaries" {
+test "[REQ-88.2] ISO weeks at year boundaries" {
     // 2021-01-03 (Sunday) is in 2020-W53; 2024-12-30 (Monday) is in 2025-W01.
     try expectFormat("%G-W%V-%u", secondsOf(.{ .year = 2021, .month = 1, .day = 3, .hour = 0, .min = 0, .sec = 0 }), Zone.utc, "2020-W53-7");
     try expectFormat("%G-W%V-%u", secondsOf(.{ .year = 2024, .month = 12, .day = 30, .hour = 0, .min = 0, .sec = 0 }), Zone.utc, "2025-W01-1");
@@ -315,13 +315,13 @@ test "ISO weeks at year boundaries" {
     try expectFormat("%U %W", secondsOf(.{ .year = 2023, .month = 1, .day = 1, .hour = 0, .min = 0, .sec = 0 }), Zone.utc, "01 00");
 }
 
-test "years far from now format as glibc does" {
+test "[REQ-88.3] years far from now format as glibc does" {
     try expectFormat("%Y %C %y", secondsOf(.{ .year = 12345, .month = 6, .day = 1, .hour = 0, .min = 0, .sec = 0 }), Zone.utc, "12345 123 45");
     try expectFormat("%Y %C %y", secondsOf(.{ .year = 5, .month = 6, .day = 1, .hour = 0, .min = 0, .sec = 0 }), Zone.utc, "5 0 05");
     try expectFormat("%Y %C %y %G %g", secondsOf(.{ .year = -123, .month = 6, .day = 1, .hour = 0, .min = 0, .sec = 0 }), Zone.utc, "-123 -2 77 -123 77");
 }
 
-test "checkSpec follows LUA_STRFTIMEOPTIONS" {
+test "[REQ-88.1] checkSpec follows LUA_STRFTIMEOPTIONS" {
     try testing.expectEqual(@as(?usize, 1), checkSpec("Y-%m"));
     try testing.expectEqual(@as(?usize, 2), checkSpec("Ec"));
     try testing.expectEqual(@as(?usize, 2), checkSpec("Oy"));

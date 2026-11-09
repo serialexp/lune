@@ -760,7 +760,7 @@ fn scratchPath(buf: []u8, tmp: *const testing.TmpDir, name: []const u8) []const 
     return std.fmt.bufPrint(buf, ".zig-cache{c}tmp{c}{s}{c}{s}", .{ std.fs.path.sep, std.fs.path.sep, &tmp.sub_path, std.fs.path.sep, name }) catch unreachable;
 }
 
-test "remove, rename and tmpname on the real file system" {
+test "[REQ-94.2] [REQ-94.3] [REQ-95.1] remove, rename and tmpname on the real file system" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var sys = RealSystem.init(testing.allocator, mio.hostIo(), null);
@@ -803,7 +803,7 @@ fn zoneUnder(env: *std.process.Environ.Map, utc: i64, abbr_buf: []u8) !seam.Loca
     return z;
 }
 
-test "the local zone follows TZ: a POSIX rule, a zoneinfo name, empty for UTC" {
+test "[REQ-90.5] the local zone follows TZ: a POSIX rule, a zoneinfo name, empty for UTC" {
     if (builtin.os.tag == .windows) return error.SkipZigTest; // the system zone
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();

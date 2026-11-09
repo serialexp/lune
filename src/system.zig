@@ -109,7 +109,7 @@ pub const Groups = packed struct(u8) {
     }
 };
 
-test "Groups.parse" {
+test "[REQ-57.1] Groups.parse" {
     try std.testing.expectEqual(Groups.all, Groups.parse("all").?);
     try std.testing.expectEqual(Groups.none, Groups.parse("none").?);
     const g = Groups.parse("clock,random").?;
