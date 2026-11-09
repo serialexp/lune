@@ -520,6 +520,49 @@ with Phase 4 and shares its design with Phase 5's command sugar. Neither
 function is recordable in the REPL, which is never recorded; in a recorded
 script each returns its result through the log like `fs_mutate`.
 
+### 6.1 Command lines in the REPL (Phase 5, decided 2026-11-09)
+
+The REPL reads a line as a command line or as Lua by one fixed rule, so
+nothing about a line is a guess. Scripts are never affected: the rule exists
+only for what is typed at the prompt.
+
+In order, the first that applies wins:
+
+1. **`!` prefix.** A line whose first non-space character is `!` is a
+   command line; the first word after it is a program looked up on `PATH`.
+   This is the deliberate break-out of Lua syntax, and the way to run a
+   program whose name is also a variable (`!type ls`, `!git status`). It is
+   decided lexically before the line is parsed. `!` is `not` in mahina, so
+   `!x` at line start no longer prints `not x` in the REPL; write `(!x)`,
+   `print(!x)` or `not x`. `!` anywhere else on a line is unchanged.
+2. **Reserved shell words.** `cd`, `export`, `unset` and `exit` at line
+   start are command lines (the shortcuts of Phase 4 translate to
+   `os.chdir`/`os.setenv`). They are reserved in the **language**, not only
+   in the REPL: a global of that name (assignment, `global` declaration or
+   `_G` write) is a compile error that says the name is reserved for the
+   shell. Locals, parameters and fields named so stay legal. This replaces
+   the Phase 4 rule "only while no global of that name exists" and its
+   "rest must not start with `= ( [ : ,`" test. The set is small and fixed;
+   adding a word later is a breaking change.
+3. **A bound head word is Lua.** If the line's first word is a bound local,
+   upvalue or global, the line is Lua.
+4. **An unbound head word is a command.** Otherwise the line is a command
+   line and the word is looked up on `PATH` (a host input; the REPL is never
+   recorded). So `git status` and a lone `ls` run programs, while a
+   misspelled variable that is not a program stays an error.
+5. Anything else is Lua.
+
+Consequences: a bound name always hides a program of the same name (Lua's own
+`type`, `select`, `load` hide `type`, `select`, `load`); `!` is the way past
+it. A forgotten variable named like a program (`file`, `test`, `time`) runs
+that program.
+
+Not decided yet (open questions, below): what may follow an unbound head word
+(`git.status`, `ls(x)`), the error text when a head word is neither bound nor
+on `PATH`, and the word grammar of a command line (quoting, `$NAME`, globbing,
+pipes, redirection). The restriction that holds for all of them: only syntax
+that cannot be read two ways; no Bash free-form.
+
 ## 7. Portability and the host seam
 
 Spawning goes through the `HostSystem` vtable (doc 65 §5.1) like every other
@@ -562,7 +605,17 @@ output, to show the pump and ring buffer stay linear and bounded.
 
 ## Open questions for review
 
-Q14b in the checklist above.
+Q14b in the checklist above, and for §6.1:
+
+- **Q15 — what may follow an unbound head word.** `git status` and `ls -la`
+  are plain words; `git.status` and `ls(x)` could stay a Lua error or run as a
+  command.
+- **Q16 — not found.** The text when the head word is neither bound nor on
+  `PATH`: `ls: command not found`, or Lua's `attempt to call a nil value
+  (global 'foo')` for lines that also parse as Lua.
+- **Q17 — the word grammar.** Quoting, `$NAME`, globbing (explicit only?),
+  pipes and redirection (map to `proc.pipe` and `stdin`/`stdout`, not new
+  operators?).
 
 ## References
 
