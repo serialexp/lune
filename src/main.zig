@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const mahina = @import("mahina");
 const viz_assets = @import("viz_assets");
 const viz_server = @import("viz_server.zig");
+const fmt_cli = @import("fmt_cli.zig");
 
 /// std's `SelfInfo` with JIT code kept out of its unwinder: in Debug and
 /// ReleaseSafe `init.gpa` traces every allocation (see `src/jit_unwind.zig`).
@@ -281,6 +282,7 @@ pub fn main(init: std.process.Init) u8 {
     var pending = it.next();
     if (pending) |arg| if (std.mem.eql(u8, arg, "viz")) return vizMain(init, &it);
     if (pending) |arg| if (std.mem.eql(u8, arg, "lsp")) return lspMain(init, &it);
+    if (pending) |arg| if (std.mem.eql(u8, arg, "fmt")) return fmtMain(init, &it);
 
     // Leading options precede the script / `-e`; the first non-option argument
     // ends flag parsing.
@@ -521,6 +523,44 @@ const lsp_usage =
     \\  -h, --help   show this help
     \\
 ;
+
+/// `mahina fmt`: format files, a tree, or stdin (doc 83 §8.1).
+fn fmtMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
+    var check = false;
+    var stdin = false;
+    var paths: std.ArrayList([]const u8) = .empty;
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            mahina.io.print("{s}", .{fmt_cli.usage});
+            return 0;
+        } else if (std.mem.eql(u8, arg, "--check")) {
+            check = true;
+        } else if (std.mem.eql(u8, arg, "--stdin")) {
+            stdin = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            mahina.io.eprint("mahina fmt: error: unknown option '{s}'\n{s}", .{ arg, fmt_cli.usage });
+            return 2;
+        } else {
+            paths.append(init.arena.allocator(), arg) catch {
+                mahina.io.eprint("mahina fmt: out of memory\n", .{});
+                return 1;
+            };
+        }
+    }
+    if (stdin) {
+        if (check or paths.items.len > 0) {
+            mahina.io.eprint("mahina fmt: error: --stdin takes no paths and no --check\n{s}", .{fmt_cli.usage});
+            return 2;
+        }
+        return fmt_cli.formatStdin(init.gpa, init.io);
+    }
+    if (paths.items.len == 0) {
+        mahina.io.eprint("mahina fmt: error: no paths given\n{s}", .{fmt_cli.usage});
+        return 2;
+    }
+    const summary = fmt_cli.run(init.gpa, init.io, std.Io.Dir.cwd(), paths.items, check);
+    return summary.exitCode(check);
+}
 
 /// `mahina lsp`: serve the language server over stdio.
 fn lspMain(init: std.process.Init, it: *std.process.Args.Iterator) u8 {
@@ -1010,4 +1050,5 @@ test "cli smoke" {
 
 test {
     _ = viz_server;
+    _ = fmt_cli;
 }

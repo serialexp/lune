@@ -1,10 +1,10 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder) and 3 (corpus gate) landed; phases 4–7 outstanding. Every style decision made by Bart
+Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder), 3 (corpus gate) and 4 (CLI) landed; phases 5–7 outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
-Last updated: 2026-11-10 (phases 2 and 3)
+Last updated: 2026-11-10 (phase 4)
 
 ## Implementation status
 
@@ -73,13 +73,18 @@ land; move whole phases to Done once everything inside them is checked.
   (recursive proto signature, no line info). All 70 pass. The benchmark
   (Q2) is still outstanding. Done 2026-11-10.
 
+- [x] **Phase 4 — CLI.** `mahina fmt [--check] [--stdin] <paths>` (§8.1):
+  `src/fmt_cli.zig` (logic and tests) behind a `fmtMain` in `main.zig`. Sorted
+  walk, fixed skip list, symlinks skipped and reported, atomic same-directory
+  rewrite keeping the mode, size+mtime re-check before the rename; exit 1 on
+  refusal, failure, or a changed file in `--check`. Done 2026-11-10.
+
 ### Outstanding
 
 - [ ] **Method-chain breaking and name-list wrapping** (§6): not built in
   phase 2; long chains and name lists currently stay on one line.
 - [ ] **Comments inside expressions** (§5): refused in v1; place them or keep
   refusing, decided once real code hits it.
-- [ ] **Phase 4 — CLI.** `mahina fmt [--check] [--stdin] <paths>` (§8.1).
 - [ ] **Phase 5 — language server.** `textDocument/formatting` and
   `rangeFormatting`; the `documentFormattingProvider` capability (§8.2).
 - [ ] **Phase 6 — wasm, C API, viz editor.** `mahina_format` export, the
