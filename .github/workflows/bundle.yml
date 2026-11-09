@@ -17,54 +17,17 @@ name: vendor bundle and CLI
 #     and serves its UI and POST /run (tools/cli-smoke.sh), and that UI works
 #     when driven in headless Chrome (viz/e2e/browser-smoke.ts).
 #
-# Releases: pushing a tag `vX.Y.Z` runs the same builds + proofs and then
-# publishes both as one GitHub Release (`release` job below). The tag must
-# equal the version of both Rust crates (embed/rust/*/Cargo.toml), so a
-# release, the crates inside it and a downstream lock file all name one
-# version. Downstream projects pin a release's tarball by URL + sha256.
+# Manual dispatch only. Nothing runs on a push, tag or PR: gothab.io is
+# where lune is pushed, and this GitHub mirror is not where its CI lives.
+#
+# Releases: dispatching this workflow on a tag `vX.Y.Z` (Run workflow → pick
+# the tag) runs the same builds + proofs and then publishes both as one GitHub
+# Release (`release` job below). The tag must equal the version of both Rust
+# crates (embed/rust/*/Cargo.toml), so a release, the crates inside it and a
+# downstream lock file all name one version. Downstream projects pin a
+# release's tarball by URL + sha256.
 
 on:
-  push:
-    branches: [master]
-    # Tag pushes ignore the paths filter: every version tag builds.
-    tags: ['v*']
-    paths:
-      - src/**
-      - include/**
-      - embed/**
-      - viz/**
-      - build.zig
-      - build.zig.zon
-      - .zig-version
-      - tools/mahina-bundle.sh
-      - tools/bundle-smoke.sh
-      - tools/mahina-cli.sh
-      - tools/cli-smoke.sh
-      - tools/embed_assets.zig
-      - tools/install-smoke.sh
-      - install.sh
-      - tests/bundle_smoke/**
-      - .github/workflows/bundle.yml
-      - .github/actions/install-zig/**
-  pull_request:
-    paths:
-      - src/**
-      - include/**
-      - embed/**
-      - viz/**
-      - build.zig
-      - build.zig.zon
-      - .zig-version
-      - tools/mahina-bundle.sh
-      - tools/bundle-smoke.sh
-      - tools/mahina-cli.sh
-      - tools/cli-smoke.sh
-      - tools/embed_assets.zig
-      - tools/install-smoke.sh
-      - install.sh
-      - tests/bundle_smoke/**
-      - .github/workflows/bundle.yml
-      - .github/actions/install-zig/**
   workflow_dispatch:
 
 concurrency:
