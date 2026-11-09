@@ -124,7 +124,7 @@ fn nestedCalls(gpa: std.mem.Allocator, depth: usize) ![]u8 {
 
 // ---- measuring --------------------------------------------------------------
 
-const Measure = struct { best_ns: u64, out_bytes: usize, peak: usize };
+const Measure = struct { best_ns: u64, out_bytes: usize, peak: usize, bd: format.Breakdown };
 
 fn measure(gpa: std.mem.Allocator, io: std.Io, text: []const u8, reps: usize) !Measure {
     var best: u64 = std.math.maxInt(u64);
@@ -142,9 +142,10 @@ fn measure(gpa: std.mem.Allocator, io: std.Io, text: []const u8, reps: usize) !M
     var tracker = mahina.mem.TrackingAllocator.init(gpa);
     var diags = mahina.diag.Diagnostics.init(tracker.allocator());
     defer diags.deinit();
-    const out = try format.format(tracker.allocator(), text, &diags);
+    var bd: format.Breakdown = .{};
+    const out = try format.formatMeasured(tracker.allocator(), text, &diags, &bd);
     tracker.allocator().free(out);
-    return .{ .best_ns = best, .out_bytes = out_bytes, .peak = tracker.stats.peak_bytes };
+    return .{ .best_ns = best, .out_bytes = out_bytes, .peak = tracker.stats.peak_bytes, .bd = bd };
 }
 
 fn lineCount(text: []const u8) usize {
@@ -160,6 +161,23 @@ fn report(gpa: std.mem.Allocator, io: std.Io, name: []const u8, text: []const u8
         ms(m.best_ns),
         m.out_bytes,
         @as(f64, @floatFromInt(m.peak)) / (1024.0 * 1024.0),
+    });
+    // Each phase as a multiple of the input size.
+    const in: f64 = @floatFromInt(@max(text.len, 1));
+    const x = struct {
+        fn f(n: usize, d: f64) f64 {
+            return @as(f64, @floatFromInt(n)) / d;
+        }
+    }.f;
+    mahina.io.print("{s:<34} peak {d:.1}x = parse {d:.1}x (tokens {d:.1}x) + trivia {d:.1}x + doc {d:.1}x + printer {d:.1}x + out {d:.1}x\n", .{
+        "",
+        x(m.peak, in),
+        x(m.bd.parse_arena, in),
+        x(m.bd.tokens, in),
+        x(m.bd.trivia, in),
+        x(m.bd.doc_arena, in),
+        x(m.bd.printer.work_bytes, in),
+        x(m.bd.output, in),
     });
 }
 

@@ -39,8 +39,28 @@ pub const Error = error{
     UnplacedComment,
 };
 
+/// Where `format`'s memory goes, by phase (`zig build bench-fmt`).
+pub const Breakdown = struct {
+    /// The parser's arena: the token array and the syntax tree.
+    parse_arena: usize = 0,
+    /// The token array alone (inside `parse_arena`).
+    tokens: usize = 0,
+    /// The comment list.
+    trivia: usize = 0,
+    /// The formatter's arena: the document and the strings it builds.
+    doc_arena: usize = 0,
+    /// The printer's working memory and its output buffer.
+    printer: fd.Stats = .{},
+    output: usize = 0,
+};
+
 /// The formatted form of `source`. The result is owned by `gpa`.
 pub fn format(gpa: Allocator, source: []const u8, diags: *diag.Diagnostics) Error![]u8 {
+    return formatMeasured(gpa, source, diags, null);
+}
+
+/// `format`, reporting where its memory went in `breakdown`.
+pub fn formatMeasured(gpa: Allocator, source: []const u8, diags: *diag.Diagnostics, breakdown: ?*Breakdown) Error![]u8 {
     const src = try gpa.dupeSentinel(u8, source, 0);
     defer gpa.free(src);
     var trivia = lexer.Trivia.init(gpa);
@@ -65,8 +85,17 @@ pub fn format(gpa: Allocator, source: []const u8, diags: *diag.Diagnostics) Erro
     };
     const body = try f.blockBody(parsed.ast.root, 0, @intCast(src.len), true);
     if (!f.cm.exhausted()) return error.UnplacedComment;
-    const text = try fd.print(gpa, body, .{ .width = width }, null);
+    var pstats: fd.Stats = .{};
+    const text = try fd.print(gpa, body, .{ .width = width }, &pstats);
     errdefer gpa.free(text);
+    if (breakdown) |bd| bd.* = .{
+        .parse_arena = parsed.ast.arena.queryCapacity(),
+        .tokens = parsed.tokens.len * @sizeOf(Token),
+        .trivia = trivia.comments.capacity * @sizeOf(lexer.Comment),
+        .doc_arena = arena.queryCapacity(),
+        .printer = pstats,
+        .output = text.len,
+    };
     if (text.len == 0) return text;
     // One final newline.
     const out = try gpa.realloc(text, text.len + 1);

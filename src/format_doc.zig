@@ -149,6 +149,9 @@ pub const Options = struct {
 pub const Stats = struct {
     /// Nodes the lookahead visited, over all groups.
     fits_steps: u64 = 0,
+    /// Bytes of the printer's working memory at its largest (command stack,
+    /// lookahead stack, queued suffixes; the output not included).
+    work_bytes: usize = 0,
 };
 
 const Mode = enum { flat, brk };
@@ -377,7 +380,11 @@ pub fn print(gpa: Allocator, doc: Doc, opts: Options, stats: ?*Stats) Allocator.
     var p: Printer = .{ .gpa = gpa, .opts = opts };
     defer p.deinit();
     try p.run(doc);
-    if (stats) |s| s.* = p.stats;
+    if (stats) |s| {
+        s.* = p.stats;
+        s.work_bytes = p.stack.capacity * @sizeOf(Cmd) + p.scratch.capacity * @sizeOf(Cmd) +
+            p.suffixes.capacity * @sizeOf([]const u8);
+    }
     return p.out.toOwnedSlice(gpa);
 }
 
