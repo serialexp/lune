@@ -6139,9 +6139,12 @@ pub const Vm = struct {
         if (ts.pending_ret_cont_arm != null or ts.pending_call_head_arm != null) return null;
         // `accountRegionProfit` returns false ⇒ legacy receipt.
         if (!ts.region_policy.receiptsInert()) return null;
-        // The legacy productive removals no-op on empty maps; head gate READS
-        // (want transfer, repatch) stay correct because non-empty forces full.
-        if (ts.penalty.count() != 0 or ts.gate.count() != 0) return null;
+        // The legacy productive receipt's two removals are keyed on THIS
+        // anchor, so they no-op exactly when the anchor is in neither map
+        // (doc 84 §4.1: per anchor, not "both maps empty" program-wide).
+        // A dispatch-gated anchor takes the full path, which owns its gate.
+        ts.assertAnchorMarks(ct);
+        if (ct.anchor_penalty or ct.anchor_gate) return null;
         // Coverage runs want the tsc stamps (`--jit-stats` attribution).
         if (ts.config.coverage) return null;
         return nt;

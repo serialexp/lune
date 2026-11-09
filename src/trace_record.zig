@@ -103,6 +103,24 @@ pub const TraceRecord = struct {
     /// Owned by the registry; null while unpublished.
     anchor_prev: ?*TraceRecord = null,
     anchor_next: ?*TraceRecord = null,
+    /// Doc 84 §4.1: may this trace's anchor have an entry in
+    /// `TraceState.penalty` / `TraceState.gate` (the dispatch gate)? A FALSE
+    /// mark is exact: the anchor is in neither map. True means "in the map,
+    /// or unknown". Unpublished and detached traces carry true (the
+    /// registry sets it on link and unlink), so a receipt on a trace retired
+    /// mid-entry takes the exact hash path. For a published trace, the
+    /// publish site sets both marks from the maps, and the maps' funnels
+    /// (`penaltyEntry`, `removePenalty`, `bumpGateEntry`,
+    /// `clearDispatchGate`) keep every published trace at the anchor exact.
+    /// The productive receipt and the quiet one-shot path read them with one
+    /// load instead of a hash or a whole-map emptiness test.
+    /// `TraceState.assertAnchorMarks` checks the false case in Safe builds.
+    anchor_penalty: bool = true,
+    anchor_gate: bool = true,
+    /// On its anchor's list (`anchor_prev`/`anchor_next` valid). Set and
+    /// cleared by the registry's link/unlink. Lets the map funnels walk an
+    /// anchor's traces from one of them without hashing the anchor.
+    anchor_linked: bool = false,
 
     /// Memo for `TraceState.hasNativeLoopDoneLink` — a pure function of this
     /// trace's instrs (fixed after commit), its dispatch proto (fixed: the

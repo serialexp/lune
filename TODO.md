@@ -884,10 +884,12 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       hooks stay `noinline`: inlining them added ~9 instructions per
       `opCall`). Pure-head probe 931 M -> 877 M. **Step 2:** the design
       is doc 84 (`docs/design/84-lean-one-shot-entry.md`), drafted
-      2026-11-10 with Q1-Q4 open for Bart. It also found that one penalty
+      2026-11-10, Q1-Q4 settled the same day. It also found that one penalty
       or dispatch gate anywhere disables the quiet path for every one-shot
       entry: binary-trees takes the full path on 402k of 402k entries
       (six `legacy_thrash` gates) and runs +91% instructions over tier 0.
+      Doc 84 Phase 1 (per-anchor bits) fixed that: binary-trees -16.5%,
+      spectral-norm -7.2%. Phases 2-6 remain (see the doc's checklist).
 - [ ] **A loop that never traces pays ~37 instructions per back-edge in
       `gatedBackEdgeHandler`** (seen 2026-11-10, doc 84 §2.1: the pure
       probe's caller loop, which can't trace because of `if a ~= b` on two

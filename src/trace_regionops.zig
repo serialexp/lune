@@ -118,11 +118,13 @@ pub inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize
     // gate — with Option-A headroom for shape-guard exits so the side-trace
     // machinery wins the race while capacity remains.
     if (completed > 0) {
-        // Doc 44 D9 (S2): skip the two hash probes when the maps are empty —
-        // the steady state of every healthy workload (removing a missing key
-        // is a no-op, so this is behavior-identical, just without the wyhash).
-        if (self.penalty.count() != 0) _ = self.penalty.remove(key);
-        if (self.gate.count() != 0) self.clearDispatchGate(key);
+        // Doc 84 §4.1: skip the hash probes unless THIS anchor is in a map
+        // (removing a missing key is a no-op, so this is behavior-identical).
+        // Doc 44 D9's S2 skipped them only while both maps were empty
+        // program-wide, which one thrashing loop elsewhere ends for good.
+        self.assertAnchorMarks(t);
+        if (t.anchor_penalty) self.removePenaltyAt(t);
+        if (t.anchor_gate) self.clearDispatchGate(key);
         return;
     }
     // A zero-COMPLETION receipt that ended at the loop's OWN test is a loop
@@ -151,9 +153,8 @@ pub inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize
         if (isMarkerLoopTest(t, exit_instr) and exitSideServes(self, t, exit_instr)) return;
     }
     if (exitSideWaiting(self, t, exit_instr)) return;
-    const gop = self.penalty.getOrPut(self.gpa, key) catch return;
-    if (!gop.found_existing) gop.value_ptr.* = 0;
-    gop.value_ptr.* +|= 1;
+    const pen = self.penaltyEntryAt(t) orelse return;
+    pen.* +|= 1;
     // Option A: give a real side-exit counter enough deterministic headroom to
     // reach `hotexit`, but retain the finite legacy gate. Without direct
     // native exit-branch stitching, permanently exempting zero-progress guard
@@ -166,8 +167,8 @@ pub inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize
         self.config.max_penalty +| self.config.hotexit
     else
         self.config.max_penalty;
-    if (gop.value_ptr.* >= limit) {
-        self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d} -> gate", .{ key.pc, completed, gop.value_ptr.* });
+    if (pen.* >= limit) {
+        self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d} -> gate", .{ key.pc, completed, pen.* });
         // Doc 38 unroll-first policy: thrash-gating an anchor whose trace
         // unrolled an inner while is runtime proof that sibling coverage
         // cannot absorb the trip variance — the second evidence source for
@@ -182,7 +183,7 @@ pub inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize
         }
         self.gateAnchor(key, .legacy_thrash);
     } else {
-        self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d}/{d}", .{ key.pc, completed, gop.value_ptr.*, limit });
+        self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d}/{d}", .{ key.pc, completed, pen.*, limit });
     }
 }
 
@@ -315,7 +316,7 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
     const owner = switch (decision) {
         .none => return,
         .recover => |owner| {
-            _ = self.penalty.remove(owner);
+            self.removePenalty(owner);
             self.clearDispatchGate(owner);
             return;
         },
@@ -336,17 +337,16 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
                 d.instability +|= 1;
                 if (d.instability >= self.config.region_instability_tombstone) {
                     self.dbg("region: instability tombstone rid={d} owner pc={d} work={d}", .{ @intFromEnum(key.region_id), owner.pc, work });
-                    _ = self.penalty.remove(owner);
+                    self.removePenalty(owner);
                     self.invalidateRegion(key.region_id);
                     return;
                 }
             }
         }
     }
-    const gop = self.penalty.getOrPut(self.gpa, owner) catch return;
-    if (!gop.found_existing) gop.value_ptr.* = 0;
-    gop.value_ptr.* +|= 1;
-    if (gop.value_ptr.* >= self.config.max_penalty) {
+    const pen = self.penaltyEntry(owner) orelse return;
+    pen.* +|= 1;
+    if (pen.* >= self.config.max_penalty) {
         // Doc 47 Increment B: a FALLBACK-elected owner (closed-SCC tier) that
         // strikes out is tombstoned — one-shot `invalidateRegion`, returning
         // that region to its pre-Increment-B unarmable status quo — instead of
@@ -360,7 +360,7 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
         if (self.region_policy.region_defs.get(key.region_id)) |def| {
             if (def.fallback_owner) {
                 self.dbg("region: fallback owner strike-out — tombstone rid={d} owner pc={d} work={d}", .{ @intFromEnum(key.region_id), owner.pc, work });
-                _ = self.penalty.remove(owner);
+                self.removePenalty(owner);
                 if (!def.tombstoned) self.invalidateRegion(key.region_id);
                 return;
             }
@@ -373,7 +373,7 @@ fn applyWindowDecision(self: *TraceState, key: RegionKey, work: u64, decision: @
         // Doc 64 §15 (1d): the region's own links, not the registry.
         self.disarmRegionLinks(key.region_id, owner);
     } else {
-        self.dbg("window-strike: owner pc={d} work={d} penalty={d}/{d}", .{ owner.pc, work, gop.value_ptr.*, self.config.max_penalty });
+        self.dbg("window-strike: owner pc={d} work={d} penalty={d}/{d}", .{ owner.pc, work, pen.*, self.config.max_penalty });
     }
 }
 
@@ -1467,7 +1467,7 @@ pub fn clearMemberAnchorState(self: *TraceState, rid: RegionId) void {
         while (pit.next()) |k| {
             if (self.regionMemberPoint(rid, k.proto.id, k.pc)) {
                 const victim = k.*;
-                _ = self.penalty.remove(victim);
+                self.removePenalty(victim);
                 self.clearDispatchGate(victim);
                 continue :outer;
             }
@@ -1478,8 +1478,7 @@ pub fn clearMemberAnchorState(self: *TraceState, rid: RegionId) void {
         var git = self.gate.iterator();
         while (git.next()) |e| {
             if (self.regionMemberPoint(rid, e.key_ptr.proto.id, e.key_ptr.pc)) {
-                _ = self.gate.remove(e.key_ptr.*);
-                self.noteGatesChanged();
+                self.clearDispatchGate(e.key_ptr.*);
                 continue :gates;
             }
         }

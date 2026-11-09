@@ -136,6 +136,12 @@ pub const TraceRegistry = struct {
         self.changed();
     }
     fn linkAnchor(self: *TraceRegistry, t: *Trace) void {
+        // Doc 84 §4.1: the registry can't see the penalty/gate maps, so a
+        // newly linked trace's marks start at the conservative "unknown";
+        // `TraceState`'s publish site makes them exact.
+        t.anchor_penalty = true;
+        t.anchor_gate = true;
+        t.anchor_linked = true;
         const gop = self.by_anchor.getOrPutAssumeCapacity(t.code.anchor);
         const root: u32 = @intFromBool(isInnerRootShape(t));
         t.anchor_next = null;
@@ -166,6 +172,12 @@ pub const TraceRegistry = struct {
         }
         t.anchor_prev = null;
         t.anchor_next = null;
+        // Doc 84 §4.1: the map funnels reach only linked traces, so an
+        // unlinked one (retired mid-entry, still receiving its receipt)
+        // goes back to "unknown" and takes the exact path.
+        t.anchor_penalty = true;
+        t.anchor_gate = true;
+        t.anchor_linked = false;
     }
     /// The traces anchored at `anchor`, in cache order.
     pub fn tracesAt(self: *const TraceRegistry, anchor: AnchorKey) AnchorIter {

@@ -363,8 +363,7 @@ test "doc 20 triggers: anchor gate and side-arm want both mark the patch pending
     // Side-arm trigger: with the gate cleared, `wants_side_trace` crossing
     // hotguard marks pending. (The counter kept saturating while barred, so
     // one more failure is enough — doc 31 §3: hotness is not lost.)
-    _ = state.gate.remove(anchor);
-    state.noteGatesChanged();
+    state.clearDispatchGate(anchor);
     state.countGuardFailure(anchor, 4);
     try testing.expect(state.wants_side_trace != null);
     const p = state.registry.entry_registry.entry_patches.items[t.entry_slot.?];

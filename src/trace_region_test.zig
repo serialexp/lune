@@ -2257,7 +2257,7 @@ test "inc-B strike-out policy: fallback-elected owner tombstones (one-shot); pri
         .root_call_seq = key.activation,
         .useful_window_seen = true,
     });
-    try state.penalty.put(gpa, owner, state.config.max_penalty - 1);
+    state.penaltyEntry(owner).?.* = state.config.max_penalty - 1;
 
     // work=1 < min_useful → strike; penalty saturates → the fallback path.
     state.flushRegionWindow(key, 1);
@@ -2271,7 +2271,7 @@ test "inc-B strike-out policy: fallback-elected owner tombstones (one-shot); pri
 
     // Re-saturating the penalty later re-takes the same path without
     // re-invalidating (tombstone is sticky) and still never gates.
-    try state.penalty.put(gpa, owner, state.config.max_penalty - 1);
+    state.penaltyEntry(owner).?.* = state.config.max_penalty - 1;
     try state.region_policy.region_profit.put(gpa, key, .{
         .root_frame_depth = 0,
         .root_call_seq = key.activation,
@@ -2299,7 +2299,7 @@ test "inc-B strike-out policy: fallback-elected owner tombstones (one-shot); pri
         .root_call_seq = key2.activation,
         .useful_window_seen = true,
     });
-    try state.penalty.put(gpa, owner2, state.config.max_penalty - 1);
+    state.penaltyEntry(owner2).?.* = state.config.max_penalty - 1;
     state.flushRegionWindow(key2, 1);
     {
         const def = state.region_policy.region_defs.get(rid2).?;

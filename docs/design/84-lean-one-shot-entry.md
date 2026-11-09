@@ -1,6 +1,6 @@
 # 84 — The lean one-shot entry lane — Design
 
-Status: designed, not yet implemented. Evidence measured (§2); Q1-Q4
+Status: partial — Phase 1 landed; Phases 2-6 and 0b outstanding. Q1-Q4
 settled (§7) after reviews by Codex and Antigravity
 Owner: Bart
 Last updated: 2026-11-10
@@ -25,6 +25,20 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Q2 — admission: (a), a blocker word of its own** (§4.2).
 - [x] **Q3 — completion counters: (a), in the runtime** (§4.3).
 - [x] **Q4 — heads and continuations together** (§5).
+- [x] **Phase 1 prerequisite — one funnel for penalty mutations** (§4.1).
+  `penaltyEntry`/`removePenalty` (by anchor) and
+  `penaltyEntryAt`/`removePenaltyAt` (from a trace) are the penalty map's
+  only inserts and removals outside the bulk clears. The gate already had
+  `bumpGateEntry`/`clearDispatchGate`; the member-amnesty loop now goes
+  through the latter too.
+- [x] **Phase 1 — a per-anchor quiet predicate** (§4.1). Every trace
+  carries `anchor_penalty` and `anchor_gate`. `headEpisodeQuiet` and the
+  productive legacy receipt read them instead of the program-wide
+  `count() != 0` terms. JIT board (instructions, against the parent
+  commit): binary-trees −16.5%, spectral-norm −7.2%, globals_script
+  −1.2%, pcall_faults −0.3%; euler14-bit +0.4% and nsieve +0.03% (see
+  the §4.1 follow-up). call_small_fn is unchanged; its one anchor never
+  had a penalty. The tier-0 board is flat.
 
   Settled 2026-11-10. Bart asked for second opinions from Codex and
   Antigravity and for the tiebreak to be settled here. Both reviewers
@@ -36,9 +50,6 @@ land; move whole phases to Done once everything inside them is checked.
 
 - [ ] **Phase 0b — baselines on the pinned pool.** Record §2's rows there
   (needs a push, so it waits until Bart asks for one).
-- [ ] **Phase 1 — a per-anchor quiet predicate** (§4.1). Today a single
-  penalty or gate entry anywhere sends every one-shot entry in the program
-  down the full path (§3.1). Pick from Q1.
 - [ ] **Phase 2 — one admission test** (§4.2). The `jfunc_head`/`jcont`
   bypass set, the quiet predicate and `enterPatchedTrace`'s per-call
   prelude collapse into one compare on the patch. Safe builds assert it
@@ -54,8 +65,6 @@ land; move whole phases to Done once everything inside them is checked.
   (§4.6). A `.global` seed is a hash lookup per entry in `nativeSeedFn`.
   Doc 81's load-time cells make it a load. This doc does no seed work of
   its own until E2 lands.
-- [ ] **Phase 1 prerequisite — one funnel for penalty mutations** (§4.1).
-  Penalty entries are inserted and removed in at least four places today.
 - [ ] **Check: `opJFuncHead`'s bypass set omits `pending_ret_anchor`**,
   which `opJCont`'s includes (`interp.zig` ~9551 against ~9662). Find out
   whether that is deliberate before Phase 2 merges both into one word.
@@ -319,6 +328,48 @@ changes, which a productive receipt never touches. What (b) needs:
 - **A new or reused patch is initialised from the maps** before its
   opcode is published (`installEntryPatch`, `trace_entry_registry.zig`
   ~167-198).
+
+**Implemented, 2026-11-10.** Two choices differ from the review above:
+
+- **The bits sit on the traces, not on the patch.** Each trace carries
+  `anchor_penalty` and `anchor_gate` (`trace_record.zig`). A funnel that
+  changes an anchor's membership walks the anchor's trace list (the
+  registry's `anchor_prev`/`anchor_next`) and sets them all, so whichever
+  sibling runs reads the same answer. No anchor-to-slot index was needed.
+  The legacy receipt also reads the bits, so the productive path tests
+  this anchor and no longer the whole map.
+- **The bits are conservative, not exact.** FALSE is exact: the anchor
+  is in neither map. TRUE means "in the map, or unknown". A new trace
+  starts TRUE, and the registry's link and unlink set TRUE. The publish
+  site sets both bits from the maps. This matters because receipts also
+  arrive for traces that are not on any list: hand-built traces in tests,
+  and a trace detached while it was running. Those take the exact path
+  instead. `assertAnchorMarks` checks the implication in Safe builds.
+
+A funnel that holds the trace (the legacy receipt) walks the list from
+that trace. One that holds only an anchor (region decisions, member
+amnesty) uses `registry.tracesAt`, which hashes. The walk runs only when
+an anchor enters or leaves a map. The fast paths are inline:
+`removePenalty` and `clearDispatchGate` are called on every region-window
+`.recover`, nearly always for an anchor with no entry. Out of line they
+cost nsieve +0.7%.
+
+Two variants were measured and rejected:
+
+- **Clearing only the receipt's own trace on removal**, leaving siblings
+  TRUE to heal on their own receipts. Siblings do not reliably come back
+  through that receipt: co_pingpong_d20 went +1.8%.
+- **Inlining `penaltyEntryAt`/`removePenaltyAt` into the inline legacy
+  receipt.** euler14-bit went from +0.4% to +1.3%.
+
+**Residual: euler14-bit +0.4%.** One of its anchors flips in and out of
+the penalty map on alternate receipts, about 150k times. Each flip now
+pays two out-of-line calls and a short list walk, about 30 instructions,
+where the old code paid two inline map operations. The flip itself is
+legacy-thrash bookkeeping on an anchor whose receipts alternate between
+a strike and progress. It is not yet known whether that anchor is a
+one-shot trace that Phase 3's lean completion would cover, or a loop
+outside this doc's lane.
 
 ### 4.2 Phase 2 — one admission test
 

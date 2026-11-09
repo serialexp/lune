@@ -1344,7 +1344,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     const oracle_source_hits = source.hit_count;
     const oracle_deopt_accum = state.region_policy.region_profit.get(key).?;
 
-    state.penalty.clearRetainingCapacity();
+    state.clearPenalties();
     source.hit_count = 0;
     ramp.hit_count = 0;
     state.region_policy.region_profit.getPtr(key).?.* = initial_accum;
@@ -1379,7 +1379,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
 
     // Repeat with a hoisted ramp entry failure. The source's silent M1 state
     // must still drive the zero-progress charge and source-anchor resume.
-    state.penalty.clearRetainingCapacity();
+    state.clearPenalties();
     source.hit_count = 0;
     ramp.hit_count = 0;
     state.region_policy.region_profit.getPtr(key).?.* = initial_accum;
@@ -1412,7 +1412,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     const oracle_prologue_hits = source.hit_count;
     const oracle_prologue_accum = state.region_policy.region_profit.get(key).?;
 
-    state.penalty.clearRetainingCapacity();
+    state.clearPenalties();
     source.hit_count = 0;
     ramp.hit_count = 0;
     state.region_policy.region_profit.getPtr(key).?.* = initial_accum;

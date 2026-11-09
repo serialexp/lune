@@ -2888,14 +2888,108 @@ pub const TraceState = struct {
     }
 
     /// Remove `anchor`'s dispatch gate (doc 31 D2 clear-on-productive).
+    /// Inline for the same reason as `removePenalty`: a region window's
+    /// `.recover` calls it per flush, nearly always for an ungated anchor.
     // pub for trace_regionops.zig (file-split pass)
-    pub fn clearDispatchGate(self: *TraceState, anchor: AnchorKey) void {
+    pub inline fn clearDispatchGate(self: *TraceState, anchor: AnchorKey) void {
         // Single-hash form (getEntry + removeByPtr, not getPtr + remove):
         // this runs on every productive receipt, and the extra hash of the
         // two-op form was a measured ~2% of a scimark-lu run.
         const e = self.gate.getEntry(anchor) orelse return;
         self.gate.removeByPtr(e.key_ptr);
         self.noteGatesChanged();
+        self.markAnchorTraces(anchor, .gate, false);
+    }
+
+    /// Doc 84 §4.1: the penalty map's only insert. Returns the anchor's
+    /// count for the caller to update (a new entry starts at 0), or null on
+    /// OOM. A new entry marks the anchor's traces (`anchor_penalty`).
+    pub fn penaltyEntry(self: *TraceState, anchor: AnchorKey) ?*u32 {
+        const gop = self.penalty.getOrPut(self.gpa, anchor) catch return null;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = 0;
+            self.markAnchorTraces(anchor, .penalty, true);
+        }
+        return gop.value_ptr;
+    }
+
+    /// Doc 84 §4.1: the penalty map's only removal. Inline: a region
+    /// window's `.recover` calls this per flush, nearly always for an anchor
+    /// with no penalty, so the miss stays as cheap as the bare `remove` it
+    /// replaced; the marking runs out of line on a real removal.
+    pub inline fn removePenalty(self: *TraceState, anchor: AnchorKey) void {
+        if (self.penalty.remove(anchor)) self.markAnchorTraces(anchor, .penalty, false);
+    }
+
+    /// `penaltyEntry` for `t`'s own anchor, from a receipt that holds `t`:
+    /// the marks are set by walking the anchor list from `t`, without
+    /// hashing the anchor a second time (a loop whose penalty flips on and
+    /// off pays this per flip).
+    pub fn penaltyEntryAt(self: *TraceState, t: *Trace) ?*u32 {
+        const gop = self.penalty.getOrPut(self.gpa, t.code.anchor) catch return null;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = 0;
+            self.markAnchorTracesFrom(t, .penalty, true);
+        }
+        return gop.value_ptr;
+    }
+
+    /// `removePenalty` for `t`'s own anchor (see `penaltyEntryAt`). It
+    /// clears every trace at the anchor, not only `t`: a stale TRUE left on a
+    /// sibling would not reliably heal, since a head refused the quiet path
+    /// need not come back through here (measured: co_pingpong_d20 +1.8%).
+    pub fn removePenaltyAt(self: *TraceState, t: *Trace) void {
+        if (self.penalty.remove(t.code.anchor)) self.markAnchorTracesFrom(t, .penalty, false);
+    }
+
+    /// Drop every penalty, keeping the traces' marks exact. For tests that
+    /// reset the legacy machine wholesale; production clears the map only
+    /// in `clearCache`, after the registry is empty.
+    pub fn clearPenalties(self: *TraceState) void {
+        self.penalty.clearRetainingCapacity();
+        for (self.registry.cache.items) |t| t.anchor_penalty = false;
+    }
+
+    /// `clearPenalties` for the dispatch gate.
+    pub fn clearDispatchGates(self: *TraceState) void {
+        self.gate.clearRetainingCapacity();
+        self.noteGatesChanged();
+        for (self.registry.cache.items) |t| t.anchor_gate = false;
+    }
+
+    const AnchorMark = enum { penalty, gate };
+
+    /// Set one mark on every published trace at `anchor`. Runs only when an
+    /// anchor enters or leaves a map, never per receipt.
+    noinline fn markAnchorTraces(self: *TraceState, anchor: AnchorKey, comptime mark: AnchorMark, on: bool) void {
+        var it = self.registry.tracesAt(anchor);
+        while (it.next()) |t| setAnchorMark(t, mark, on);
+    }
+
+    /// `markAnchorTraces` for `t`'s anchor, walking its list from `t`. An
+    /// unlinked `t` isn't on the list: fall back to the anchor index.
+    fn markAnchorTracesFrom(self: *TraceState, t: *Trace, comptime mark: AnchorMark, on: bool) void {
+        if (!t.anchor_linked) return self.markAnchorTraces(t.code.anchor, mark, on);
+        var cur: ?*Trace = t;
+        while (cur) |c| : (cur = c.anchor_prev) setAnchorMark(c, mark, on);
+        cur = t.anchor_next;
+        while (cur) |c| : (cur = c.anchor_next) setAnchorMark(c, mark, on);
+    }
+
+    inline fn setAnchorMark(t: *Trace, comptime mark: AnchorMark, on: bool) void {
+        switch (mark) {
+            .penalty => t.anchor_penalty = on,
+            .gate => t.anchor_gate = on,
+        }
+    }
+
+    /// Safe builds: a false mark on `t` is exact (its anchor is not in
+    /// that map). A true mark may over-approximate (`Trace.anchor_penalty`).
+    pub inline fn assertAnchorMarks(self: *const TraceState, t: *const Trace) void {
+        if (std.debug.runtime_safety) {
+            std.debug.assert(t.anchor_penalty or !self.penalty.contains(t.code.anchor));
+            std.debug.assert(t.anchor_gate or !self.gate.contains(t.code.anchor));
+        }
     }
 
     // Region-ops: accounting, bridges, provenance, observer cache — moved to trace_regionops.zig (file-split pass);
@@ -3451,6 +3545,7 @@ pub const TraceState = struct {
         self.noteGatesChanged();
         if (!gop.found_existing) {
             gop.value_ptr.* = .{ .retry_at = 0, .window = self.config.backoff_base, .strikes = 0, .reason = reason };
+            if (map == &self.gate) self.markAnchorTraces(anchor, .gate, true);
         }
         const g = gop.value_ptr;
         g.reason = reason;
@@ -4359,6 +4454,10 @@ pub const TraceState = struct {
             self.gpa.free(t.exit_side_entry);
         };
         try self.registry.publish(t);
+        // Doc 84 §4.1: a published trace's marks are exact (linking left
+        // them at the conservative "unknown").
+        t.anchor_penalty = self.penalty.contains(t.code.anchor);
+        t.anchor_gate = self.gate.contains(t.code.anchor);
         if (comptime jitdbg.enabled) if (self.config.debug_log) {
             // Lane pins (guard_lane aux per table guard) identify which array
             // shape a sibling specializes on — the alternating-lane churn

@@ -127,7 +127,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
 
     // Pre-seed a penalty AND an active gate on the owner: the full window must clear BOTH.
-    try state.penalty.put(gpa, owner, 3);
+    state.penaltyEntry(owner).?.* = 3;
     state.gateAnchor(owner, .legacy_thrash);
     try testing.expect(state.isGated(owner));
 
@@ -249,9 +249,8 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     try state.region_policy.dest_entry_regions.put(gpa, 9, try gpa.dupe(RegionId, &.{rid}));
     // Doc 55 §2 invariant: arrival ⊇ dest (the destination step reads arrival).
     try state.region_policy.arrival_entry_regions.put(gpa, 9, try gpa.dupe(RegionId, &.{rid}));
-    state.penalty.clearRetainingCapacity();
-    state.gate.clearRetainingCapacity();
-    state.noteGatesChanged();
+    state.clearPenalties();
+    state.clearDispatchGates();
 
     // (5a) CONSUMED — exit 0 is classified into the live region and carries nonzero
     // work, so the region window owns the verdict and the member anchor is untouched
@@ -1141,8 +1140,7 @@ test "doc 31: a pending continuation/replay-side request gated after creation is
 
     // Same for the replay-side path, with a RECORD gate this time — both
     // maps bar recording starts.
-    _ = state.gate.remove(key);
-    state.noteGatesChanged();
+    state.clearDispatchGate(key);
     state.setPendingReplayAnchor(key);
     state.gateRecordAnchor(key, .record_abort);
     state.maybeStartReplaySide(&proto, 4);
