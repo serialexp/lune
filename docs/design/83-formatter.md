@@ -1,10 +1,10 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 to 7 landed (printer, tokens, comments, builder, corpus gate, CLI, language server, wasm/C API/viz, the repo formatted with its gate) and the benchmark (Q2) and the CRLF rule (Q3) are settled; the peak-memory footprint and expression-interior comments outstanding. Every style decision made by Bart
+Status: partial — phases 0 to 7 landed (printer, tokens, comments, builder, corpus gate, CLI, language server, wasm/C API/viz, the repo formatted with its gate) and the benchmark (Q2) and the CRLF rule (Q3) are settled; the formatter's peak memory is cut to 13–28× the input for whole files (2026-11-10); expression-interior comments and a smaller syntax tree outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
-Last updated: 2026-11-10 (phase 7)
+Last updated: 2026-11-10 (peak memory)
 
 ## Implementation status
 
@@ -123,6 +123,27 @@ land; move whole phases to Done once everything inside them is checked.
   0.17 ms for calls, time proportional to output size (which grows with the
   indentation). No per-line or per-level growth. Peak memory is 40–80× the
   input (the document arena), see Outstanding.
+  *Follow-up:* the peak-memory work below took it to 13–28×.
+
+- [x] **Peak memory** (§10): `bench-fmt` now prints peak memory by phase
+  (`format.formatMeasured`/`Breakdown`). The profile found the parser's
+  arena at 26–49× the input (half of it dead buffers from lists grown inside
+  the arena) and the document at 16–49× (24-byte pointer nodes, plus the
+  builder's own lists grown in its arena and copied again). Three changes,
+  each with byte-identical output (the 67 pre-reformat repo files, a
+  42k-line file, six generated adversarial shapes):
+  the parser builds its lists on reused gpa stacks and copies each once;
+  the document is compact (12-byte nodes indexed by `u32`, children as
+  ranges, text as source spans, punctuation made once, lists built on a
+  LIFO parts stack); and the file is printed one top-level statement at a
+  time, each statement's document released before the next is built. The
+  printer also walks a node's children with a cursor, so its stacks are
+  bounded by nesting depth and `fits` really stops after the width.
+  Measured 2026-11-10 (machine at load ~16–20), peak as a multiple of
+  input: realistic 5k and 50k lines 82–87× → 19× (3.0 MB, 30 MB); 40-argument
+  calls 44× → 13×; 40-term chains 67× → 28×; one 1 MB line 94× → 53×; times
+  fell with it (realistic 50k lines 89 → 49–58 ms, 26 MB calls 575 → 385–424
+  ms). What remains is the parser's arena, see Outstanding.
 
 - [x] **Q3 — newlines inside long strings and templates** (§3, §7.2): the
   lexer folds every `\r`, `\n`, `\r\n` and `\n\r` inside long strings,
@@ -141,9 +162,11 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Peak memory** (§10): 12 MB for a 165 KB file, 1.1 GB for the 26 MB
-  adversarial one, i.e. 40–80× the input. Linear, so within the editor use,
-  but the document nodes are the place to look if it ever matters.
+- [ ] **Defer: a smaller syntax tree** (§10): the parser's arena is now the
+  whole of the formatter's peak (realistic 14×, 40-term chains 23×, a 1 MB
+  literal 40×): `Expr` is 64 bytes and the arena grows its blocks by 1.5×.
+  The tree is the compiler's too, so this is its own design, taken up if
+  memory matters again.
 
 - [ ] **Comments inside expressions** (§5): refused in v1; place them or keep
   refusing, decided once real code hits it.
@@ -596,7 +619,9 @@ width, §4.3). Phase 3 adds a benchmark, not a test (Rule #22): the largest
 corpus file; generated 50,000-line files of each of wide argument lists, long
 operator chains, dense comments and a single 1 MB line; and nesting of depth
 200 of tables and calls. It records time and peak memory and is compared with
-itself over time. Comment attachment, line-table lookups and the LSP diff are
+itself over time. (Follow-up, 2026-11-10: the document is no longer one
+arena but compact `u32`-indexed node arrays in the builder, released after
+each top-level statement is printed; see "Peak memory" in Done.) Comment attachment, line-table lookups and the LSP diff are
 each O(n log n) or better, and the benchmark covers them.
 
 ## 11. Phasing
