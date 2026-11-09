@@ -2546,6 +2546,12 @@ coverage on code that mixes plain and metatable'd tables.
 
 ## `zig build wasm` is broken (wasm32 `usize` overflow in trace.zig hotIndex) — PRE-EXISTING
 
+> **2026-11-09 (coral-marten):** `zig build wasm` compiles at f91022e, so the
+> hotIndex break below is gone. It broke again for days on u64-hash bucket
+> indexes in gc.zig (b8413db) because no gate builds wasm32: `just test` is
+> 64-bit only. Open: add `zig build wasm` to `just test` (or the gate), so a
+> 64-bit-only `usize` assumption fails where it lands.
+
 Discovered during the metatables M0 work (June 2026), unrelated to it. `zig
 build wasm` fails to compile:
 
