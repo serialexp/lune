@@ -1,78 +1,348 @@
 -- Item 4 probes: the cost of the ops the new forms would remove.
 local which, n = arg[1], tonumber(arg[2])
 local P = {}
-P.base = function(n) local s = 0 for i = 1, n do s = s + i end return s end
+P.base = function(n)
+    local s = 0
+    for i = 1, n do
+        s = s + i
+    end
+    return s
+end
 -- One `load_int` (a constant materialised into a register).
-P.kint = function(n) local s = 0 for i = 1, n do local b = 7 s = s + i end return s end
+P.kint = function(n)
+    local s = 0
+    for i = 1, n do
+        local b = 7
+        s = s + i
+    end
+    return s
+end
 -- `load_const` of a string.
-P.kstr = function(n) local s = 0 for i = 1, n do local b = "x" s = s + i end return s end
+P.kstr = function(n)
+    local s = 0
+    for i = 1, n do
+        local b = "x"
+        s = s + i
+    end
+    return s
+end
 -- A local table's field read and write (no upvalue load).
-P.lfget = function(n) local t = { x = 1 } local s = 0 for i = 1, n do local b = t.x s = s + i end return s end
-P.lfset = function(n) local t = { x = 1 } local s = 0 for i = 1, n do t.x = i s = s + i end return s end
+P.lfget = function(n)
+    local t = { x = 1 }
+    local s = 0
+    for i = 1, n do
+        local b = t.x
+        s = s + i
+    end
+    return s
+end
+P.lfset = function(n)
+    local t = { x = 1 }
+    local s = 0
+    for i = 1, n do
+        t.x = i
+        s = s + i
+    end
+    return s
+end
 -- `if i < n` with locals only: compare + branch.
-P.iflv = function(n) local s = 0 for i = 1, n do if i > n then s = 0 end s = s + i end return s end
+P.iflv = function(n)
+    local s = 0
+    for i = 1, n do
+        if i > n then
+            s = 0
+        end
+        s = s + i
+    end
+    return s
+end
 -- `x == nil` / `x == "s"` against constants.
-P.eqnil = function(n) local s, x = 0, 1 for i = 1, n do if x == nil then s = 0 end s = s + i end return s end
+P.eqnil = function(n)
+    local s, x = 0, 1
+    for i = 1, n do
+        if x == nil then
+            s = 0
+        end
+        s = s + i
+    end
+    return s
+end
 -- Doc 66 P3: arithmetic with a constant operand, on either side, over the
 -- int, mixed and float lanes.
-P.ksubr = function(n) local s = 0 for i = 1, n do local b = i - 7 s = s + i end return s end
-P.ksubl = function(n) local s = 0 for i = 1, n do local b = 7 - i s = s + i end return s end
-P.kmix = function(n) local s = 0 for i = 1, n do local b = i * 0.5 s = s + i end return s end
-P.kfadd = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x + 2.5 s = s + i end return s end
-P.kpow = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x ^ 2 s = s + i end return s end
+P.ksubr = function(n)
+    local s = 0
+    for i = 1, n do
+        local b = i - 7
+        s = s + i
+    end
+    return s
+end
+P.ksubl = function(n)
+    local s = 0
+    for i = 1, n do
+        local b = 7 - i
+        s = s + i
+    end
+    return s
+end
+P.kmix = function(n)
+    local s = 0
+    for i = 1, n do
+        local b = i * 0.5
+        s = s + i
+    end
+    return s
+end
+P.kfadd = function(n)
+    local s, x = 0, 1.5
+    for i = 1, n do
+        local b = x + 2.5
+        s = s + i
+    end
+    return s
+end
+P.kpow = function(n)
+    local s, x = 0, 1.5
+    for i = 1, n do
+        local b = x ^ 2
+        s = s + i
+    end
+    return s
+end
 -- `<<` and `&` are not LuaJIT syntax: compile them lazily so the file still
 -- parses there.
-P.kshl = function(n) return load("local n = ... local s = 0 for i = 1, n do local b = i << 3 s = s + i end return s")(n) end
-P.kband = function(n) return load("local n = ... local s = 0 for i = 1, n do local b = i & 7 s = s + i end return s")(n) end
-P.rbnot = function(n) return load("local n = ... local s = 0 for i = 1, n do local b = ~i s = s + i end return s")(n) end
-P.rneg = function(n) local s = 0 for i = 1, n do local b = -i s = s + i end return s end
+P.kshl = function(n)
+    return load(
+        "local n = ... local s = 0 for i = 1, n do local b = i << 3 s = s + i end return s"
+    )(n)
+end
+P.kband = function(n)
+    return load("local n = ... local s = 0 for i = 1, n do local b = i & 7 s = s + i end return s")(
+        n
+    )
+end
+P.rbnot = function(n)
+    return load("local n = ... local s = 0 for i = 1, n do local b = ~i s = s + i end return s")(n)
+end
+P.rneg = function(n)
+    local s = 0
+    for i = 1, n do
+        local b = -i
+        s = s + i
+    end
+    return s
+end
 -- The register forms on floats, which share the constant forms' handlers.
-P.rfmul = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x * x s = s + i end return s end
-P.rfsub = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x - x s = s + i end return s end
-P.rfdiv = function(n) local s, x = 0, 1.5 for i = 1, n do local b = x / x s = s + i end return s end
-P.rimul = function(n) local s = 0 for i = 1, n do local b = i * i s = s + i end return s end
+P.rfmul = function(n)
+    local s, x = 0, 1.5
+    for i = 1, n do
+        local b = x * x
+        s = s + i
+    end
+    return s
+end
+P.rfsub = function(n)
+    local s, x = 0, 1.5
+    for i = 1, n do
+        local b = x - x
+        s = s + i
+    end
+    return s
+end
+P.rfdiv = function(n)
+    local s, x = 0, 1.5
+    for i = 1, n do
+        local b = x / x
+        s = s + i
+    end
+    return s
+end
+P.rimul = function(n)
+    local s = 0
+    for i = 1, n do
+        local b = i * i
+        s = s + i
+    end
+    return s
+end
 -- Doc 66 P5: equality against a constant, as a value and as a condition.
-P.eqvnil = function(n) local s, x = 0, 1 for i = 1, n do local b = x == nil s = s + i end return s end
-P.eqvfalse = function(n) local s, x = 0, 1 for i = 1, n do local b = x ~= false s = s + i end return s end
-P.eqvstr = function(n) local s, x = 0, "y" for i = 1, n do local b = x == "x" s = s + i end return s end
-P.eqvnum = function(n) local s = 0 for i = 1, n do local b = i == 7 s = s + i end return s end
-P.eqvreg = function(n) local s, x, y = 0, 1, 2 for i = 1, n do local b = x == y s = s + i end return s end
-P.eqstr = function(n) local s, x = 0, "y" for i = 1, n do if x == "x" then s = 0 end s = s + i end return s end
+P.eqvnil = function(n)
+    local s, x = 0, 1
+    for i = 1, n do
+        local b = x == nil
+        s = s + i
+    end
+    return s
+end
+P.eqvfalse = function(n)
+    local s, x = 0, 1
+    for i = 1, n do
+        local b = x ~= false
+        s = s + i
+    end
+    return s
+end
+P.eqvstr = function(n)
+    local s, x = 0, "y"
+    for i = 1, n do
+        local b = x == "x"
+        s = s + i
+    end
+    return s
+end
+P.eqvnum = function(n)
+    local s = 0
+    for i = 1, n do
+        local b = i == 7
+        s = s + i
+    end
+    return s
+end
+P.eqvreg = function(n)
+    local s, x, y = 0, 1, 2
+    for i = 1, n do
+        local b = x == y
+        s = s + i
+    end
+    return s
+end
+P.eqstr = function(n)
+    local s, x = 0, "y"
+    for i = 1, n do
+        if x == "x" then
+            s = 0
+        end
+        s = s + i
+    end
+    return s
+end
 -- Doc 66 P4: compare-and-branch against a number constant, on the right
 -- and on the left, in both polarities, over floats, and two registers
 -- for equality.
-P.ifltk = function(n) local s = 0 for i = 1, n do if i < 0 then s = 0 end s = s + i end return s end
-P.ifkge = function(n) local s = 0 for i = 1, n do if 0 >= i then s = 0 end s = s + i end return s end
-P.ifnot = function(n) local s = 0 for i = 1, n do if not (i <= n) then s = 0 end s = s + i end return s end
-P.ifflt = function(n) local s, x, y = 0, 1.5, 0.5 for i = 1, n do if x < y then s = 0 end s = s + i end return s end
-P.ifeq = function(n) local s, x, y = 0, 1, 2 for i = 1, n do if x == y then s = 0 end s = s + i end return s end
+P.ifltk = function(n)
+    local s = 0
+    for i = 1, n do
+        if i < 0 then
+            s = 0
+        end
+        s = s + i
+    end
+    return s
+end
+P.ifkge = function(n)
+    local s = 0
+    for i = 1, n do
+        if 0 >= i then
+            s = 0
+        end
+        s = s + i
+    end
+    return s
+end
+P.ifnot = function(n)
+    local s = 0
+    for i = 1, n do
+        if not (i <= n) then
+            s = 0
+        end
+        s = s + i
+    end
+    return s
+end
+P.ifflt = function(n)
+    local s, x, y = 0, 1.5, 0.5
+    for i = 1, n do
+        if x < y then
+            s = 0
+        end
+        s = s + i
+    end
+    return s
+end
+P.ifeq = function(n)
+    local s, x, y = 0, 1, 2
+    for i = 1, n do
+        if x == y then
+            s = 0
+        end
+        s = s + i
+    end
+    return s
+end
 -- One `pairs` step: an n-key hash traversed once per outer iteration.
 P.pairs = function(n)
-  local t = {}
-  for i = 1, 100 do t["k" .. i] = i end
-  local s = 0
-  for r = 1, math.floor(n / 100) do for k, v in pairs(t) do s = s + v end end
-  return s
+    local t = {}
+    for i = 1, 100 do
+        t["k" .. i] = i
+    end
+    local s = 0
+    for r = 1, math.floor(n / 100) do
+        for k, v in pairs(t) do
+            s = s + v
+        end
+    end
+    return s
 end
 -- The same over an array part (doc 66 P1's call-free lane).
 P.apairs = function(n)
-  local t = {}
-  for i = 1, 100 do t[i] = i end
-  local s = 0
-  for r = 1, math.floor(n / 100) do for k, v in pairs(t) do s = s + v end end
-  return s
+    local t = {}
+    for i = 1, 100 do
+        t[i] = i
+    end
+    local s = 0
+    for r = 1, math.floor(n / 100) do
+        for k, v in pairs(t) do
+            s = s + v
+        end
+    end
+    return s
 end
 -- And `ipairs`, on `itern`'s `inext` lane (doc 66).
 P.ipairs = function(n)
-  local t = {}
-  for i = 1, 100 do t[i] = i end
-  local s = 0
-  for r = 1, math.floor(n / 100) do for k, v in ipairs(t) do s = s + v end end
-  return s
+    local t = {}
+    for i = 1, 100 do
+        t[i] = i
+    end
+    local s = 0
+    for r = 1, math.floor(n / 100) do
+        for k, v in ipairs(t) do
+            s = s + v
+        end
+    end
+    return s
 end
 -- Doc 66: a `repeat` test, one comparison and as `and`/`or`/`not` chains.
-P.rone = function(n) local s, i = 0, 0 repeat i = i + 1 s = s + i until i >= n return s end
-P.rand = function(n) local s, i = 0, 0 repeat i = i + 1 s = s + i until i >= n and s > 0 return s end
-P.ror = function(n) local s, i = 0, 0 repeat i = i + 1 s = s + i until i >= n or s < 0 return s end
-P.rnot = function(n) local s, i, done = 0, 0, false repeat i = i + 1 s = s + i done = i >= n until not (not done) return s end
+P.rone = function(n)
+    local s, i = 0, 0
+    repeat
+        i = i + 1
+        s = s + i
+    until i >= n
+    return s
+end
+P.rand = function(n)
+    local s, i = 0, 0
+    repeat
+        i = i + 1
+        s = s + i
+    until i >= n and s > 0
+    return s
+end
+P.ror = function(n)
+    local s, i = 0, 0
+    repeat
+        i = i + 1
+        s = s + i
+    until i >= n or s < 0
+    return s
+end
+P.rnot = function(n)
+    local s, i, done = 0, 0, false
+    repeat
+        i = i + 1
+        s = s + i
+        done = i >= n
+    until not (not done)
+    return s
+end
 print(P[which](n))

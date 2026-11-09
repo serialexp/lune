@@ -13,11 +13,16 @@
 local live_n = tonumber(arg and arg[1]) or 200000
 local n = tonumber(arg and arg[2]) or 150000
 local live = {}
-for i = 1, live_n do live[i] = {} end
+for i = 1, live_n do
+    live[i] = {}
+end
 local acc = 0
 for i = 1, n do
-  local co = coroutine.create(function(a) local b = coroutine.yield(a + 1) return b end)
-  local _, v = coroutine.resume(co, i)
-  acc = (acc + v) % 1000000007
+    local co = coroutine.create(function(a)
+        local b = coroutine.yield(a + 1)
+        return b
+    end)
+    local _, v = coroutine.resume(co, i)
+    acc = (acc + v) % 1000000007
 end
 print(#live, acc)

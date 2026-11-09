@@ -17,15 +17,15 @@
 -- @bench args="5000000" luajit=compatible
 
 local function leibniz(n)
-  local sum = 0.0
-  local sign = 1.0
-  local k = 0
-  while k < n do
-    sum = sum + sign / (2.0 * k + 1.0) -- addsd, divsd, mulsd, cvtsi2sd(k)
-    sign = sign * -1.0 -- mulsd (sign flip; not a float neg op)
-    k = k + 1 -- int counter
-  end
-  return sum * 4.0
+    local sum = 0.0
+    local sign = 1.0
+    local k = 0
+    while k < n do
+        sum = sum + sign / (2.0 * k + 1.0) -- addsd, divsd, mulsd, cvtsi2sd(k)
+        sign = sign * -1.0 -- mulsd (sign flip; not a float neg op)
+        k = k + 1 -- int counter
+    end
+    return sum * 4.0
 end
 
 local N = tonumber(arg and arg[1]) or 50000000

@@ -15,5 +15,5 @@
 
 local N = tonumber(arg and arg[1]) or 1000000
 for i = 1, N do
-  print(i, i * 3)
+    print(i, i * 3)
 end

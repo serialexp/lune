@@ -3,9 +3,19 @@
 -- (editors/tree-sitter-mahina/test/drift.test.ts) keeps the editor grammar in
 -- step with src/parser.zig. The program prints what each form evaluates to.
 local name, n = "world", 3
-local t = setmetatable({}, { __tostring = function() return "T" end })
-local function f(...) return ... end
-local function g(...) return `{...}` end
+local t = setmetatable({}, {
+    __tostring = function()
+        return "T"
+    end,
+})
+
+local function f(...)
+    return ...
+end
+
+local function g(...)
+    return `{...}`
+end
 
 print(`hello {name}!`)
 print(`{n + 1} {n * n} {#name}`)

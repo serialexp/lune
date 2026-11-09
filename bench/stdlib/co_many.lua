@@ -19,16 +19,18 @@ local n = tonumber(arg and arg[1]) or 5000
 local rounds = tonumber(arg and arg[2]) or 4
 local cos = {}
 for k = 1, n do
-  cos[k] = coroutine.create(function(a)
-    local s = a
-    while true do s = s + coroutine.yield(s) end
-  end)
+    cos[k] = coroutine.create(function(a)
+        local s = a
+        while true do
+            s = s + coroutine.yield(s)
+        end
+    end)
 end
 local acc = 0
 for r = 1, rounds do
-  for k = 1, n do
-    local _, v = coroutine.resume(cos[k], k + r)
-    acc = (acc + v) % 1000000007
-  end
+    for k = 1, n do
+        local _, v = coroutine.resume(cos[k], k + r)
+        acc = (acc + v) % 1000000007
+    end
 end
 print(n, acc)

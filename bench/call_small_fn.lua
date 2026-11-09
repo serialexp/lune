@@ -11,14 +11,16 @@
 -- @bench args="1000000" luajit=compatible
 
 local function f(n)
-  local x = (n * 16807) % 2147483647
-  return x % 7
+    local x = (n * 16807) % 2147483647
+    return x % 7
 end
 
 local a, b = {}, {}
 local acc = 0
 local N = tonumber(arg and arg[1]) or 1000000
 for i = 1, N do
-  if a ~= b then acc = acc + f(i) end
+    if a ~= b then
+        acc = acc + f(i)
+    end
 end
 print(acc)

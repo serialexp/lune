@@ -11,12 +11,12 @@
 local n = tonumber(arg and arg[1]) or 50000
 local acc = 0
 for k = 1, n do
-  local co = coroutine.create(function(a)
-    local b = coroutine.yield(a + 1)
-    return a + b
-  end)
-  local _, x = coroutine.resume(co, k)
-  local _, y = coroutine.resume(co, x)
-  acc = (acc + y) % 1000000007
+    local co = coroutine.create(function(a)
+        local b = coroutine.yield(a + 1)
+        return a + b
+    end)
+    local _, x = coroutine.resume(co, k)
+    local _, y = coroutine.resume(co, x)
+    acc = (acc + y) % 1000000007
 end
 print(n, acc)

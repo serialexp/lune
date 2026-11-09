@@ -15,14 +15,16 @@
 local n = tonumber(arg[1]) or 80000
 
 local function grow(piece, target)
-  local s = ""
-  while #s < target do s = s .. piece end
-  return s
+    local s = ""
+    while #s < target do
+        s = s .. piece
+    end
+    return s
 end
 
 local total = 0
 for _, piece in ipairs({ "x", "abcdefgh", ("0123456789"):rep(10) }) do
-  local s = grow(piece, n)
-  total = total + #s
+    local s = grow(piece, n)
+    total = total + #s
 end
 print(total)

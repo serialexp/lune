@@ -16,11 +16,13 @@ local prefix = "configuration/section/subsection/entry-with-a-rather-long-name/"
 local counts = {}
 local acc = 0
 for i = 1, N do
-  local k = prefix .. tostring(i % 32) .. "/value"
-  counts[k] = (counts[k] or 0) + 1
-  acc = acc + #k
+    local k = prefix .. tostring(i % 32) .. "/value"
+    counts[k] = (counts[k] or 0) + 1
+    acc = acc + #k
 end
 
 local distinct = 0
-for _, c in pairs(counts) do distinct = distinct + c end
+for _, c in pairs(counts) do
+    distinct = distinct + c
+end
 print(acc, distinct)

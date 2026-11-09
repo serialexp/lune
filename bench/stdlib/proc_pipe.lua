@@ -11,9 +11,9 @@ local mib = tonumber(arg and arg[1]) or 64
 local total = mib * 1024 * 1024
 
 local r = proc.pipe({
-  {"/bin/sh", "-c", "head -c " .. total .. " /dev/zero"},
-  {"cat"},
-  {"cat"},
-  {"cat"},
+    { "/bin/sh", "-c", "head -c " .. total .. " /dev/zero" },
+    { "cat" },
+    { "cat" },
+    { "cat" },
 })
 print(#r.stdout, r.truncated, r.ok, #r.stages)

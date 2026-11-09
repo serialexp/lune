@@ -21,17 +21,19 @@ local find, match = string.find, string.match
 local text = "key=value; name=moon; year=2026; lang=zig"
 
 local function run(n)
-  local acc = 0
-  for i = 1, n do
-    local s, e = find(text, "year", 1, true)   -- plain substring search
-    acc = acc + s + e
-    local k, v = match(text, "(%w+)=(%w+)")     -- first key=value, two captures
-    acc = acc + #k + #v
-    local digits = match("item-00420-x", "%d+") -- class quantifier
-    acc = acc + tonumber(digits)
-    if match(text, "^key") then acc = acc + 1 end  -- anchored
-  end
-  return acc
+    local acc = 0
+    for i = 1, n do
+        local s, e = find(text, "year", 1, true) -- plain substring search
+        acc = acc + s + e
+        local k, v = match(text, "(%w+)=(%w+)") -- first key=value, two captures
+        acc = acc + #k + #v
+        local digits = match("item-00420-x", "%d+") -- class quantifier
+        acc = acc + tonumber(digits)
+        if match(text, "^key") then
+            acc = acc + 1
+        end -- anchored
+    end
+    return acc
 end
 
 local N = tonumber(arg and arg[1]) or 100000

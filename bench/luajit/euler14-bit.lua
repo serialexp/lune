@@ -10,14 +10,20 @@
 local N = tonumber(arg and arg[1]) or 10000000
 local cache, m, n = { 1 }, 1, 1
 for i = 2, N do
-  local j = i
-  for len = 1, 1000000000 do
-    -- Branchless Collatz: when j is even, (j&1)-1 == -1 (all ones) selects j>>1;
-    -- when odd, ~((j&1)-1) == -1 selects 3j+1 (== (j<<1)+j+1). One side is 0.
-    j = (((j >> 1) & ((j & 1) - 1)) | (((j << 1) + j + 1) & ~((j & 1) - 1)))
-    local x = cache[j]; if x then j = x + len; break end
-  end
-  cache[i] = j
-  if j > m then m, n = j, i end
+    local j = i
+    for len = 1, 1000000000 do
+        -- Branchless Collatz: when j is even, (j&1)-1 == -1 (all ones) selects j>>1;
+        -- when odd, ~((j&1)-1) == -1 selects 3j+1 (== (j<<1)+j+1). One side is 0.
+        j = ((j >> 1) & ((j & 1) - 1)) | (((j << 1) + j + 1) & ~((j & 1) - 1))
+        local x = cache[j]
+        if x then
+            j = x + len
+            break
+        end
+    end
+    cache[i] = j
+    if j > m then
+        m, n = j, i
+    end
 end
 io.write("Found ", n, " (chain length: ", m, ")\n")

@@ -4,6 +4,7 @@ name: CI
 # the CI twin of a local command; see the justfile and CLAUDE.md):
 #   test        zig build test            (just test; the library tests run as
 #                                          parallel shards, build.zig -Dtest-shards)
+#   fmt         mahina fmt --check        (just fmt-check; doc 83 §9)
 #   jit-debug   zig build test -Djit-debug=true
 #   hashgate    just hashgate             (frozen output, ReleaseFast + Debug legs)
 #   lib-wasm    zig build lib, zig build wasm
@@ -44,6 +45,10 @@ jobs:
               python3 -m unittest discover -s tools -p test_jit_boundaries.py
               python3 tools/check-jit-boundaries.py
               time zig build test -Dtest-shards="$(nproc)" -Dtest-junit="$PWD/test-results" --summary all
+          - name: formatted sources
+            run: |
+              time zig build
+              time ./zig-out/bin/mahina fmt --check bench tests viz src
           - name: unit tests (jit-debug)
             run: time zig build test -Djit-debug=true -Dtest-shards="$(nproc)" --summary all
           - name: frozen-output gate

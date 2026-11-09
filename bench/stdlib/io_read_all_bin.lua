@@ -11,21 +11,25 @@
 -- runs only read. ASCII keeps the output identical to LuaJIT's.
 local N = tonumber(arg and arg[1]) or 1000000
 local path = (arg and arg[2]) or "/tmp/mahina-bench-lines.txt"
+
 local function ensure()
-  -- mahina raises on a missing file, Lua returns nil: pcall covers both.
-  local ok, f = pcall(io.open, path, "rb")
-  if ok and f then
-    local size = f:seek("end")
-    f:close()
-    if size == N * 100 then return end
-  end
-  local w = io.open(path, "w")
-  local pad = string.rep("x", 91)
-  for i = 1, N do
-    w:write(string.format("%07d ", i), pad, "\n")
-  end
-  w:close()
+    -- mahina raises on a missing file, Lua returns nil: pcall covers both.
+    local ok, f = pcall(io.open, path, "rb")
+    if ok and f then
+        local size = f:seek("end")
+        f:close()
+        if size == N * 100 then
+            return
+        end
+    end
+    local w = io.open(path, "w")
+    local pad = string.rep("x", 91)
+    for i = 1, N do
+        w:write(string.format("%07d ", i), pad, "\n")
+    end
+    w:close()
 end
+
 ensure()
 
 local f = io.open(path, "rb")

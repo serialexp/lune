@@ -11,24 +11,28 @@
 -- bitwise ops are strict integer-only — they do not coerce floats).
 
 local function nsieve(p, m)
-  local count = 0
-  for i = 0, (m >> 6) do p[i] = -1 end
-  for i = 2, m do
-    if ((p[i >> 6] >> (i & 63)) & 1) ~= 0 then
-      count = count + 1
-      for j = i + i, m, i do
-        local jx = j >> 6
-        p[jx] = p[jx] & ~(1 << (j & 63))
-      end
+    local count = 0
+    for i = 0, m >> 6 do
+        p[i] = -1
     end
-  end
-  return count
+    for i = 2, m do
+        if ((p[i >> 6] >> (i & 63)) & 1) ~= 0 then
+            count = count + 1
+            for j = i + i, m, i do
+                local jx = j >> 6
+                p[jx] = p[jx] & ~(1 << (j & 63))
+            end
+        end
+    end
+    return count
 end
 
 local N = tonumber(arg and arg[1]) or 1
-if N < 2 then N = 2 end
+if N < 2 then
+    N = 2
+end
 local primes = {}
 for i = 0, 2 do
-  local m = (1 << (N - i)) * 10000
-  io.write(string.format("Primes up to %8d %8d\n", m, nsieve(primes, m)))
+    local m = (1 << (N - i)) * 10000
+    io.write(string.format("Primes up to %8d %8d\n", m, nsieve(primes, m)))
 end

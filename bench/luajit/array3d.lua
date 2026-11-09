@@ -27,62 +27,72 @@
 -- rejected in favour of catching a single wrong element anywhere in the array.
 
 local function array_set(self, x, y, z, p)
-  assert(x >= 0 and x < self.nx, "x outside PA")
-  assert(y >= 0 and y < self.ny, "y outside PA")
-  assert(z >= 0 and z < self.nz, "z outside PA")
-  local pos = (z*self.ny + y)*self.nx + x
-  local image = self.image
-  if self.packed then
-    local maxv = self.max_voltage
-    if p > maxv then self.max_voltage = p*2.0 end
-    local oldp = image[pos] or 0.0 -- Works with uninitialized table, too
-    if oldp > maxv then p = p + maxv*2.0 end
-    image[pos] = p
-  else
-    image[pos] = p
-  end
-  self.changed = true
-  self.changed_recently = true
+    assert(x >= 0 and x < self.nx, "x outside PA")
+    assert(y >= 0 and y < self.ny, "y outside PA")
+    assert(z >= 0 and z < self.nz, "z outside PA")
+    local pos = (z * self.ny + y) * self.nx + x
+    local image = self.image
+    if self.packed then
+        local maxv = self.max_voltage
+        if p > maxv then
+            self.max_voltage = p * 2.0
+        end
+        local oldp = image[pos] or 0.0 -- Works with uninitialized table, too
+        if oldp > maxv then
+            p = p + maxv * 2.0
+        end
+        image[pos] = p
+    else
+        image[pos] = p
+    end
+    self.changed = true
+    self.changed_recently = true
 end
 
 local function array_points(self)
-  local y, z = 0, 0
-  return function(self, x)
-    x = x + 1
-    if x >= self.nx then
-      x = 0
-      y = y + 1
-      if y >= self.ny then
-	y = 0
-	z = z + 1
-	if z >= self.nz then
-	  return nil, nil, nil
-	end
-      end
-    end
-    return x, y, z
-  end, self, 0
+    local y, z = 0, 0
+    return function(self, x)
+        x = x + 1
+        if x >= self.nx then
+            x = 0
+            y = y + 1
+            if y >= self.ny then
+                y = 0
+                z = z + 1
+                if z >= self.nz then
+                    return nil, nil, nil
+                end
+            end
+        end
+        return x, y, z
+    end,
+        self,
+        0
 end
 
 local function array_new(nx, ny, nz, packed)
-  return {
-    nx = nx, ny = ny, nz = nz,
-    packed = packed, max_voltage = 0.0,
-    changed = false, changed_recently = false,
-    image = {}, -- Preferably use a fixed-type, pre-sized array here.
-    set = array_set,
-    points = array_points,
-  }
+    return {
+        nx = nx,
+        ny = ny,
+        nz = nz,
+        packed = packed,
+        max_voltage = 0.0,
+        changed = false,
+        changed_recently = false,
+        image = {}, -- Preferably use a fixed-type, pre-sized array here.
+        set = array_set,
+        points = array_points,
+    }
 end
 
 local dim = tonumber(arg and arg[1]) or 300 -- Array dimension dim^3
-local packed = arg and arg[2] == "packed"   -- Packed image or flat
+local packed = arg and arg[2] == "packed" -- Packed image or flat
 local arr = array_new(dim, dim, dim, packed)
 
-for x,y,z in arr:points() do
-  arr:set(x, y, z, x*x)
+for x, y, z in arr:points() do
+    arr:set(x, y, z, x * x)
 end
-assert(arr.image[dim^3-1] == (dim-1)^2)
+assert(arr.image[dim ^ 3 - 1] == (dim - 1) ^ 2)
 
 -- mahina-added result checksum. Exact integer fold, no float formatting. When
 -- this was written mahina's string.format could not render a double's exact
@@ -103,18 +113,24 @@ assert(arr.image[dim^3-1] == (dim-1)^2)
 local floor = math.floor
 local acc, populated = 0, 0
 local image = arr.image
-for i = 0, dim^3 - 1 do
-  local x = image[i]
-  if x == nil then
-    acc = (acc * 1000003 + 1) % 2147483647
-  else
-    populated = populated + 1
-    local ip = x - (x % 1)
-    local fb = floor((x % 1) * 2^52)
-    acc = (acc * 1000003 + ip) % 2147483647
-    acc = (acc * 1000003 + fb) % 2147483647
-  end
+for i = 0, dim ^ 3 - 1 do
+    local x = image[i]
+    if x == nil then
+        acc = (acc * 1000003 + 1) % 2147483647
+    else
+        populated = populated + 1
+        local ip = x - (x % 1)
+        local fb = floor((x % 1) * 2 ^ 52)
+        acc = (acc * 1000003 + ip) % 2147483647
+        acc = (acc * 1000003 + fb) % 2147483647
+    end
 end
-print(string.format("array3d checksum: %d  populated: %d/%d  max_voltage: %d",
-                    acc, populated, dim^3, arr.max_voltage))
-
+print(
+    string.format(
+        "array3d checksum: %d  populated: %d/%d  max_voltage: %d",
+        acc,
+        populated,
+        dim ^ 3,
+        arr.max_voltage
+    )
+)

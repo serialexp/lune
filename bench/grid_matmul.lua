@@ -34,41 +34,45 @@
 -- made dense (a contiguous int array part) *before* the first fused store so the
 -- inflation scan accepts them (homogeneous-numeric precondition, doc 14).
 local function mat(n, seed)
-  local m = {}
-  for i = 1, n do
-    local r = {}
-    for j = 1, n do r[j] = 0 end   -- dense int row (bare store fills the array part)
-    m[i] = r
-  end
-  for i = 1, n do
-    for j = 1, n do
-      m[i][j] = (i * 31 + j * 17 + seed) % 100   -- first fused store inflates m to a grid
+    local m = {}
+    for i = 1, n do
+        local r = {}
+        for j = 1, n do
+            r[j] = 0
+        end -- dense int row (bare store fills the array part)
+        m[i] = r
     end
-  end
-  return m
+    for i = 1, n do
+        for j = 1, n do
+            m[i][j] = (i * 31 + j * 17 + seed) % 100 -- first fused store inflates m to a grid
+        end
+    end
+    return m
 end
 
 local N = tonumber(arg and arg[1]) or 200
-if N < 1 then N = 1 end
+if N < 1 then
+    N = 1
+end
 
 local A = mat(N, 1)
 local B = mat(N, 2)
 local C = mat(N, 0)
 
 for i = 1, N do
-  for j = 1, N do
-    local s = 0
-    for k = 1, N do
-      s = s + A[i][k] * B[k][j]   -- fused grid reads (get_index2)
+    for j = 1, N do
+        local s = 0
+        for k = 1, N do
+            s = s + A[i][k] * B[k][j] -- fused grid reads (get_index2)
+        end
+        C[i][j] = s -- fused grid write (set_index2)
     end
-    C[i][j] = s                   -- fused grid write (set_index2)
-  end
 end
 
 local sum = 0
 for i = 1, N do
-  for j = 1, N do
-    sum = sum + C[i][j]
-  end
+    for j = 1, N do
+        sum = sum + C[i][j]
+    end
 end
 io.write(string.format("grid_matmul N=%d checksum=%d\n", N, sum))

@@ -11,6 +11,6 @@
 -- asserts its structure — the Zig-encode ↔ TS-decode cross-language proof.
 local n = 0
 for i = 1, 2000 do
-  n = n + i * 2
+    n = n + i * 2
 end
 print(n)

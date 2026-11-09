@@ -16,8 +16,17 @@ release:
 # zig-out/bin/mahina (Debug) — otherwise a test-only run leaves the installed CLI
 # stale and you debug a binary that predates your changes (costs a few seconds,
 # saves a debugging detour).
-test: build check-jit-boundaries
+test: build check-jit-boundaries fmt-check
     zig build test
+
+# The repo's own mahina sources are in the one standard style (doc 83 §9).
+# Fix with `just fmt`.
+fmt-check: build
+    ./zig-out/bin/mahina fmt --check bench tests viz src
+
+# Format the repo's mahina sources in place.
+fmt: build
+    ./zig-out/bin/mahina fmt bench tests viz src
 
 # Enforce the implemented JIT dependency boundaries, including scanner tests.
 check-jit-boundaries:

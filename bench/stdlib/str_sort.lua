@@ -11,19 +11,27 @@
 
 local N = tonumber(arg and arg[1]) or 20000
 
-local dirs = { "assets/textures/terrain/", "assets/textures/characters/",
-  "assets/sounds/ambient/forest/", "src/game/systems/physics/" }
+local dirs = {
+    "assets/textures/terrain/",
+    "assets/textures/characters/",
+    "assets/sounds/ambient/forest/",
+    "src/game/systems/physics/",
+}
 local paths = {}
 for i = 1, N do
-  local k = (i * 7919) % N
-  paths[i] = "/home/user/projects/example/" .. dirs[k % 4 + 1] .. "file-" .. tostring(k) .. ".dat"
+    local k = (i * 7919) % N
+    paths[i] = "/home/user/projects/example/" .. dirs[k % 4 + 1] .. "file-" .. tostring(k) .. ".dat"
 end
 
 local acc = 0
 for round = 1, 3 do
-  local t = {}
-  for i = 1, N do t[i] = paths[(i + round * 4099) % N + 1] end
-  table.sort(t)
-  for i = 1, N, 97 do acc = (acc * 31 + #t[i] + i) % 1000000007 end
+    local t = {}
+    for i = 1, N do
+        t[i] = paths[(i + round * 4099) % N + 1]
+    end
+    table.sort(t)
+    for i = 1, N, 97 do
+        acc = (acc * 31 + #t[i] + i) % 1000000007
+    end
 end
 print(acc)

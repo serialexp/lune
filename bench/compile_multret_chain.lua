@@ -13,23 +13,23 @@ local calls = tonumber(arg and arg[2]) or 2000
 local per_chain = 190
 
 local function chain(depth)
-  return string.rep("f(", depth) .. "1" .. string.rep(")", depth)
+    return string.rep("f(", depth) .. "1" .. string.rep(")", depth)
 end
 
 local parts = { "local function f(...) return ... end\n" }
 local left = calls
 local k = 0
 while left > per_chain do
-  k = k + 1
-  parts[#parts + 1] = "local c" .. k .. " = " .. chain(per_chain) .. "\n"
-  left = left - per_chain
+    k = k + 1
+    parts[#parts + 1] = "local c" .. k .. " = " .. chain(per_chain) .. "\n"
+    left = left - per_chain
 end
 parts[#parts + 1] = "return " .. chain(left)
 local src = table.concat(parts)
 
 local sum = 0
 for _ = 1, n do
-  local chunk = assert(load(src))
-  sum = sum + chunk()
+    local chunk = assert(load(src))
+    sum = sum + chunk()
 end
 print(sum)

@@ -12,9 +12,14 @@
 local N = tonumber(arg and arg[1]) or 300000
 local len, days = 0, 0
 for i = 1, N do
-  local s = os.date("%Y-%m-%d %H:%M:%S %a %b %j", 1700000000 + i * 3607)
-  len = len + #s
-  local t = os.date("*t", os.time({year = 2024, month = 1 + i % 12, day = 1 + i % 40, hour = 12}))
-  days = days + t.day + t.month
+    local s = os.date("%Y-%m-%d %H:%M:%S %a %b %j", 1700000000 + i * 3607)
+    len = len + #s
+    local t = os.date("*t", os.time({
+            year = 2024,
+            month = 1 + i % 12,
+            day = 1 + i % 40,
+            hour = 12,
+        }))
+    days = days + t.day + t.month
 end
 print(len, days)

@@ -11,12 +11,16 @@ local n = tonumber(arg and arg[1]) or 200000
 
 local closed = 0
 local C = {
-  __close = function(o, e) closed = closed + o.w end,
-  __len = function(o) return o.w end,
+    __close = function(o, e)
+        closed = closed + o.w
+    end,
+    __len = function(o)
+        return o.w
+    end,
 }
 local acc = 0
 for i = 1, n do
-  local o <close> = setmetatable({ w = i % 7 }, C)
-  acc = acc + #o
+    local o <close> = setmetatable({ w = i % 7 }, C)
+    acc = acc + #o
 end
 print(acc, closed)

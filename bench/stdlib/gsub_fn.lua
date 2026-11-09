@@ -14,21 +14,32 @@ local gsub = string.gsub
 
 local text = "the cat sat on the mat with the bat and a hat"
 
-local function upper(w) return w:upper() end
-local function pair(a, b) return b .. a end
-local function maybe(w) if #w == 3 then return nil end return w end
+local function upper(w)
+    return w:upper()
+end
+
+local function pair(a, b)
+    return b .. a
+end
+
+local function maybe(w)
+    if #w == 3 then
+        return nil
+    end
+    return w
+end
 
 local function run(n)
-  local acc = 0
-  for i = 1, n do
-    local r1, c1 = gsub(text, "%w+", upper)
-    acc = acc + #r1 + c1
-    local r2, c2 = gsub(text, "(%w)(%w+)", pair)
-    acc = acc + #r2 + c2
-    local r3, c3 = gsub(text, "%w+", maybe)
-    acc = acc + #r3 + c3
-  end
-  return acc
+    local acc = 0
+    for i = 1, n do
+        local r1, c1 = gsub(text, "%w+", upper)
+        acc = acc + #r1 + c1
+        local r2, c2 = gsub(text, "(%w)(%w+)", pair)
+        acc = acc + #r2 + c2
+        local r3, c3 = gsub(text, "%w+", maybe)
+        acc = acc + #r3 + c3
+    end
+    return acc
 end
 
 local n = tonumber(arg and arg[1]) or 20000

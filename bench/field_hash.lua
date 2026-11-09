@@ -27,13 +27,15 @@
 -- cell, `t.y` an invariant field read — both resolve to hoisted value-cell
 -- pointers in the native prologue.
 local function run(t, n)
-  for _ = 1, n do
-    t.x = t.x + t.y
-  end
-  return t.x
+    for _ = 1, n do
+        t.x = t.x + t.y
+    end
+    return t.x
 end
 
 local N = tonumber(arg and arg[1]) or 20000000
-if N < 1 then N = 1 end
+if N < 1 then
+    N = 1
+end
 local t = { x = 0, y = 1 }
 io.write(string.format("field RMW %10d -> %d\n", N, run(t, N)))

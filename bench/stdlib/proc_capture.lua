@@ -11,8 +11,8 @@ local mib = tonumber(arg and arg[1]) or 64
 local total = mib * 1024 * 1024
 local cmd = "head -c " .. total .. " /dev/zero"
 
-local full = proc.run({"/bin/sh", "-c", cmd, max_bytes = total})
+local full = proc.run({ "/bin/sh", "-c", cmd, max_bytes = total })
 print(#full.stdout, full.truncated)
 
-local tail = proc.run({"/bin/sh", "-c", cmd})
+local tail = proc.run({ "/bin/sh", "-c", cmd })
 print(#tail.stdout, tail.truncated)

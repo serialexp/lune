@@ -15,21 +15,29 @@ local type, tostring, tonumber, select = type, tostring, tonumber, select
 local rawequal, rawget, rawset = rawequal, rawget, rawset
 
 local function run(n)
-  local acc = 0
-  local t = { 10, 20, 30 }
-  for i = 1, n do
-    if type(i) == "number" then acc = acc + 1 end
-    if type(t) == "table" then acc = acc + 1 end
-    if type(type) == "function" then acc = acc + 1 end
-    acc = acc + select("#", 1, 2, 3, 4, 5)
-    acc = acc + #tostring(i)
-    acc = acc + (tonumber("0x1F") or 0) % 7   -- 31 % 7 = 3
-    rawset(t, 1, i % 5)
-    acc = acc + rawget(t, 1)
-    if rawequal(t, t) then acc = acc + 1 end
-    acc = acc + #t
-  end
-  return acc
+    local acc = 0
+    local t = { 10, 20, 30 }
+    for i = 1, n do
+        if type(i) == "number" then
+            acc = acc + 1
+        end
+        if type(t) == "table" then
+            acc = acc + 1
+        end
+        if type(type) == "function" then
+            acc = acc + 1
+        end
+        acc = acc + select("#", 1, 2, 3, 4, 5)
+        acc = acc + #tostring(i)
+        acc = acc + (tonumber("0x1F") or 0) % 7 -- 31 % 7 = 3
+        rawset(t, 1, i % 5)
+        acc = acc + rawget(t, 1)
+        if rawequal(t, t) then
+            acc = acc + 1
+        end
+        acc = acc + #t
+    end
+    return acc
 end
 
 local N = tonumber(arg and arg[1]) or 100000

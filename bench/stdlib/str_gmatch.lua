@@ -16,17 +16,17 @@ local gmatch = string.gmatch
 local csv = "alpha,beta,gamma,delta,epsilon,zeta,eta,theta"
 
 local function run(n)
-  local acc = 0
-  local last = ""
-  local count = 0
-  for i = 1, n do
-    for tok in gmatch(csv, "[^,]+") do
-      acc = acc + #tok
-      last = tok
-      count = count + 1
+    local acc = 0
+    local last = ""
+    local count = 0
+    for i = 1, n do
+        for tok in gmatch(csv, "[^,]+") do
+            acc = acc + #tok
+            last = tok
+            count = count + 1
+        end
     end
-  end
-  return acc, last, count
+    return acc, last, count
 end
 
 local N = tonumber(arg and arg[1]) or 80000

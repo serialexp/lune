@@ -15,15 +15,27 @@
 local fmt = string.format
 
 local function run(n)
-  local acc = 0
-  local sample = ""
-  for i = 1, n do
-    local s = fmt("%d|%05x|%o|%+d|% d|%-6s|%8.3f|%g|%c|100%%",
-      i, i, i, i, i, "id", i * 0.25, i / 3, 65 + (i % 26))
-    acc = acc + #s
-    if i == n then sample = s end
-  end
-  return acc, sample
+    local acc = 0
+    local sample = ""
+    for i = 1, n do
+        local s = fmt(
+            "%d|%05x|%o|%+d|% d|%-6s|%8.3f|%g|%c|100%%",
+            i,
+            i,
+            i,
+            i,
+            i,
+            "id",
+            i * 0.25,
+            i / 3,
+            65 + (i % 26)
+        )
+        acc = acc + #s
+        if i == n then
+            sample = s
+        end
+    end
+    return acc, sample
 end
 
 local N = tonumber(arg and arg[1]) or 200000

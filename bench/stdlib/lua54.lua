@@ -15,20 +15,26 @@ local pack, unpack, rawlen = table.pack, table.unpack, rawlen
 local maxint, minint = math.maxinteger, math.mininteger
 
 local function run(n)
-  local acc = 0
-  local t = { 5, 6, 7, 8 }
-  for i = 1, n do
-    if mtype(i) == "integer" then acc = acc + 1 end
-    if mtype(i + 0.5) == "float" then acc = acc + 1 end
-    if mtype("x") == nil then acc = acc + 1 end
-    local p = pack(i, i + 1, i + 2)
-    acc = acc + p.n
-    local a, b, c = unpack(p, 1, 3)
-    acc = acc + a + b + c
-    acc = acc + rawlen(t)
-    acc = acc + (maxint > minint and 1 or 0)
-  end
-  return acc
+    local acc = 0
+    local t = { 5, 6, 7, 8 }
+    for i = 1, n do
+        if mtype(i) == "integer" then
+            acc = acc + 1
+        end
+        if mtype(i + 0.5) == "float" then
+            acc = acc + 1
+        end
+        if mtype("x") == nil then
+            acc = acc + 1
+        end
+        local p = pack(i, i + 1, i + 2)
+        acc = acc + p.n
+        local a, b, c = unpack(p, 1, 3)
+        acc = acc + a + b + c
+        acc = acc + rawlen(t)
+        acc = acc + (maxint > minint and 1 or 0)
+    end
+    return acc
 end
 
 local N = tonumber(arg and arg[1]) or 100000

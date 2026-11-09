@@ -188,6 +188,9 @@ Use the `just` recipes (`justfile`) as the canonical entry points — they wrap
 the `zig build` invocations and, for benchmarks, guarantee the right binary.
 
 - `just build` — build the CLI. (`zig build`)
+- `just fmt` / `just fmt-check` — format the repo's `.lua`/`.mah` sources in
+  place / check that they are formatted (`mahina fmt`, doc 83). `just test`
+  runs the check, so write mahina code through the formatter.
 - `just test` — run all unit tests, the gate. Depends on `build`, so it also
   refreshes `zig-out/bin/mahina` (Debug) — no more debugging a stale CLI after a
   test-only run. (`zig build && zig build test`)

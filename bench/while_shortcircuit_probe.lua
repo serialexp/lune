@@ -23,12 +23,16 @@
 local s = 0
 local n = tonumber(arg and arg[1]) or 120
 for r = 1, n do
-  local b = false
-  local i = 0
-  while i < (r % 9 + 3) and true do
-    b = not b
-    i = i + 1
-    if b then s = s + i else s = s - i end
-  end
+    local b = false
+    local i = 0
+    while i < (r % 9 + 3) and true do
+        b = not b
+        i = i + 1
+        if b then
+            s = s + i
+        else
+            s = s - i
+        end
+    end
 end
 print(s)

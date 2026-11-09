@@ -21,19 +21,19 @@ local byte, char, rep = string.codepoint or string.byte, string.char, string.rep
 local base = "The quick brown Fox jumps over the lazy Dog 0123456789"
 
 local function run(n)
-  local acc = 0
-  for i = 1, n do
-    local lo = (i % 30) + 1
-    local a = sub(base, lo, lo + 9)        -- 10-char window
-    local b = lower(upper(a))
-    local c = reverse(b)
-    acc = acc + len(c) + byte(c, 1) + byte(c, -1)
-    if i % 64 == 0 then
-      local e = rep(char(65 + (i % 26)), 4, "-")  -- "A-A-A-A"
-      acc = acc + len(e)
+    local acc = 0
+    for i = 1, n do
+        local lo = (i % 30) + 1
+        local a = sub(base, lo, lo + 9) -- 10-char window
+        local b = lower(upper(a))
+        local c = reverse(b)
+        acc = acc + len(c) + byte(c, 1) + byte(c, -1)
+        if i % 64 == 0 then
+            local e = rep(char(65 + (i % 26)), 4, "-") -- "A-A-A-A"
+            acc = acc + len(e)
+        end
     end
-  end
-  return acc
+    return acc
 end
 
 local N = tonumber(arg and arg[1]) or 100000

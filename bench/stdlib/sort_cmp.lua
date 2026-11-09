@@ -13,22 +13,40 @@ local N = tonumber(arg and arg[1]) or 20000
 
 -- 7919 is prime and does not divide N, so this is a permutation of 0..N-1.
 local keys = {}
-for i = 1, N do keys[i] = (i * 7919) % N end
-local V = { __lt = function(a, b) return a.k < b.k end }
+for i = 1, N do
+    keys[i] = (i * 7919) % N
+end
+local V = {
+    __lt = function(a, b)
+        return a.k < b.k
+    end,
+}
 local objs = {}
-for i = 1, N do objs[i] = setmetatable({ k = keys[i] }, V) end
+for i = 1, N do
+    objs[i] = setmetatable({ k = keys[i] }, V)
+end
 
-local function desc(a, b) return a > b end
+local function desc(a, b)
+    return a > b
+end
 
 local acc = 0
 for round = 1, 3 do
-  local t = {}
-  for i = 1, N do t[i] = keys[(i + round * 4099) % N + 1] end
-  table.sort(t, desc)
-  for i = 1, N, 97 do acc = (acc * 31 + t[i] + i) % 1000000007 end
-  local u = {}
-  for i = 1, N do u[i] = objs[(i + round * 4099) % N + 1] end
-  table.sort(u)
-  for i = 1, N, 97 do acc = (acc * 31 + u[i].k + i) % 1000000007 end
+    local t = {}
+    for i = 1, N do
+        t[i] = keys[(i + round * 4099) % N + 1]
+    end
+    table.sort(t, desc)
+    for i = 1, N, 97 do
+        acc = (acc * 31 + t[i] + i) % 1000000007
+    end
+    local u = {}
+    for i = 1, N do
+        u[i] = objs[(i + round * 4099) % N + 1]
+    end
+    table.sort(u)
+    for i = 1, N, 97 do
+        acc = (acc * 31 + u[i].k + i) % 1000000007
+    end
 end
 print(acc)

@@ -1,10 +1,10 @@
 # 83 — A source formatter (`mahina fmt`) — Design
 
-Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder), 3 (corpus gate) and 4 (CLI) and 5 (language server) and 6 (wasm, C API, viz) landed; phase 7 outstanding. Every style decision made by Bart
+Status: partial — phases 0 (printer), 0b (tokens), 1 (comments), 2 (builder), 3 (corpus gate) and 4 (CLI) and 5 (language server), 6 (wasm, C API, viz) and 7 (the repo formatted, gate added) landed; the benchmark (Q2), Q3, method-chain breaking and name-list wrapping outstanding. Every style decision made by Bart
 2026-11-10; review round 1 (Codex, Antigravity) folded in 2026-11-10 (see
 "Review"); the engine-level choices not asked about are marked in §12.
 Owner: claude (coral-raven)
-Last updated: 2026-11-10 (phase 6)
+Last updated: 2026-11-10 (phase 7)
 
 ## Implementation status
 
@@ -98,16 +98,27 @@ land; move whole phases to Done once everything inside them is checked.
   sample, re-runs it for the same output, fixed point, refusal, empty,
   non-ASCII). Done 2026-11-10.
 
+- [x] **Phase 7 — format the repo, add the gate.** One commit reformats the
+  67 `.lua` files under `bench/`, `tests/`, `viz/` and `src/` that were not
+  already in the standard. Checked on a pristine copy of HEAD with the files
+  formatted: `zig build test` (2694 passed, 2 skipped) and `just hashgate`
+  (171 digests, both legs) are unchanged, so the formatter kept every
+  program's meaning and no pinned line number moved. `just fmt` /
+  `just fmt-check` (the latter a dependency of `just test`) and a "formatted
+  sources" leg in `.gothab/workflows/ci.yml`. Not run here: the tree-sitter
+  drift test (`editors/tree-sitter-mahina`, needs Node), which parses the
+  reformatted `tests/lang/interpolation.lua`. Done 2026-11-10.
+- [x] **Q1 — where the table thresholds sit** (§6.5): the rule was run over
+  the corpus and the diff read; the thresholds stand as decided. One layout
+  bug found and fixed on the way (an empty `{}` before the last argument
+  blocked hugging it, `setmetatable({}, {...})`). Settled 2026-11-10.
+
 ### Outstanding
 
 - [ ] **Method-chain breaking and name-list wrapping** (§6): not built in
   phase 2; long chains and name lists currently stay on one line.
 - [ ] **Comments inside expressions** (§5): refused in v1; place them or keep
   refusing, decided once real code hits it.
-- [ ] **Phase 7 — format the repo, add the gate.** One commit that reformats
-  every `.lua`/`.mah` file in the tree, then `just fmt-check` in CI (§9).
-- [ ] **Q1 — where the table thresholds sit** (§6.5): settled by running the
-  rule over the corpus and reading the diff.
 - [ ] **Q2 — does the printer stay linear on pathological nesting** (§10):
   settled by a benchmark over a deeply nested generated file.
 - [ ] **Q3 — newlines inside long strings and templates** (§3, §7.2): whether

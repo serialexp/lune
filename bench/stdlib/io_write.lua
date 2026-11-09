@@ -14,5 +14,5 @@
 local N = tonumber(arg and arg[1]) or 25000
 local chunk = string.rep("0123456789abcdef", 255) .. "0123456789abcde\n"
 for _ = 1, N do
-  io.write(chunk)
+    io.write(chunk)
 end
