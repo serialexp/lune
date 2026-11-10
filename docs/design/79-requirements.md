@@ -1,8 +1,8 @@
 # 79 — Requirements on gothab.io for mahina — Design
 
-Status: draft; the model is adopted from Gothab. A prototype of the Zig citation scheme and JUnit report works locally (Q1, Q2); CI upload and a reusable package are not done. No doc is converted yet.
+Status: in use; the model is adopted from Gothab. The Zig citation scheme and JUnit report work locally and in CI, where gothab.io ingests them (Q1, Q2). Bun tests are not in CI and a reusable package is not done. Converted docs are listed under §Conversion progress.
 Owner: Bart
-Last updated: 2026-11-09
+Last updated: 2026-11-11
 
 ## Implementation status
 
@@ -27,9 +27,15 @@ land; move whole sections to Done once everything inside them is checked.
   the runs uncached; `tools/junit-merge.py <dir>` joins the fragments.
   Checked: 2512 cases from the full suite, tags land in the `requirements`
   property. Not checked: that gothab.io ingests it (CI upload only).
-- [ ] **Q2 (CI half).** Add the `-Dtest-junit` run, the merge and an
-  `actions/test-results@v1` upload (`files:` the merged report) to
-  `.gothab/workflows/ci.yml`'s unit-test job.
+- [x] **Q2 (CI half).** `.gothab/workflows/ci.yml`'s unit-test leg runs
+  `-Dtest-junit`, merges the fragments and uploads the report with
+  `actions/test-results@v1` (ea676d7). Checked 2026-11-11: gothab.io ingested
+  the report for a53f3e4 (`gt requirement verification summary`: 1 upload, 0
+  failed; 194 of 239 units verified).
+- [ ] **Bun tests in CI.** No CI leg runs a Bun test (the Tree-sitter drift
+  check, viz), and gothab.io reads keys only from the `requirements`
+  property, which Bun's JUnit reporter does not write. So REQ-113.4 is
+  verified only by a hand-written local fragment.
 - [ ] **A shared package.** The runner code is mahina-specific (Linux
   syscalls, `junit_capacity` shims, our sharding). A reusable `verifies` for
   Zig would extract the shim, the tag parser and the JUnit writer into a
