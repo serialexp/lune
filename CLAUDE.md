@@ -32,6 +32,13 @@ Concretely:
   fields are `.debug`/`.safe`/`.fast`/`.small` (the `.ReleaseFast`-style names
   are deprecated decls that `==` can't compare against; the `-Doptimize=`
   strings are unchanged).
+- `std.debug.assert(expr)` still evaluates `expr` in ReleaseFast. LLVM
+  drops it only when it can prove the call pure; a hash lookup or a scan
+  loop behind it runs on every pass. An unguarded
+  `assert(... countCodepoints(content))` rescanned every new string in
+  release (str_concat_grow 13.8%, io_read_all 22.6%). A Safe-build
+  witness that calls more than a field read is written
+  `if (std.debug.runtime_safety) std.debug.assert(...)`.
 - std's stack unwinder must never see a JIT PC (`src/jit_unwind.zig`: since
   0.17.0 each one costs a full `.eh_frame` re-parse, and `SafeAllocator`
   traces every allocation in Debug). Every root we own installs

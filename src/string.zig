@@ -257,7 +257,7 @@ pub const String = extern struct {
                 .ascii = known.ascii orelse scanned.ascii,
             };
         };
-        std.debug.assert(std.meta.eql(counted, countCodepoints(content)));
+        if (std.debug.runtime_safety) std.debug.assert(std.meta.eql(counted, countCodepoints(content)));
         var header = GcHeader.init(.string);
         header.flags.str_ascii = counted.ascii;
         self.* = .{
@@ -313,7 +313,7 @@ pub const String = extern struct {
             std.debug.assert(@sizeOf(String) + self.len == raw.len);
             self.raw = null;
             const content = raw[@sizeOf(String)..];
-            std.debug.assert(std.meta.eql(Counted{ .cp_len = self.cp_len, .ascii = self.ascii }, countCodepoints(content)));
+            if (std.debug.runtime_safety) std.debug.assert(std.meta.eql(Counted{ .cp_len = self.cp_len, .ascii = self.ascii }, countCodepoints(content)));
             var header = GcHeader.init(.string);
             header.flags.str_ascii = self.ascii;
             const s: *String = @ptrCast(raw.ptr);

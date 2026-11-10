@@ -2735,7 +2735,7 @@ pub fn removeTraces(self: *TraceState, doomed: []const *Trace) void {
     for (doomed) |t| {
         // Every member must be a live, published trace: a batch submitted
         // twice would hand us destroyed records (see `Vm.WalkDead`).
-        std.debug.assert(self.traceById(t.id) == t);
+        if (std.debug.runtime_safety) std.debug.assert(self.traceById(t.id) == t);
         std.debug.assert(!t.doomed);
         t.doomed = true;
         if (comptime jitdbg.enabled) if (self.config.debug_log) {

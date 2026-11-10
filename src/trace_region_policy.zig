@@ -223,7 +223,7 @@ pub const RegionPolicy = struct {
     pub fn openRegion(self: *RegionPolicy, gpa: std.mem.Allocator, id: RegionId, ctx: RegionContext) ?RegionKey {
         const def = self.region_defs.get(id) orelse return null;
         if (!def.armable) return null;
-        std.debug.assert(self.openCollision(id, ctx) == null);
+        if (std.debug.runtime_safety) std.debug.assert(self.openCollision(id, ctx) == null);
         const key: RegionKey = .{ .region_id = id, .activation = ctx.call_seq };
         // getOrPut may grow even for an existing key: borrowed pointers die first.
         self.act_cache_gen = 0;

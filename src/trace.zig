@@ -4058,7 +4058,7 @@ pub const TraceState = struct {
     /// `resumeSettledHolds` is true. It gives the proto an image if it has
     /// none: one copy of its code, once per proto.
     fn settleResume(self: *TraceState, proto: *const Proto, resume_pc: u32) void {
-        std.debug.assert(self.resumeSettledHolds(proto, resume_pc));
+        if (std.debug.runtime_safety) std.debug.assert(self.resumeSettledHolds(proto, resume_pc));
         self.registry.entry_registry.settleResume(proto, resume_pc);
     }
 

@@ -1247,7 +1247,7 @@ fn plainText(buf: *[128]u8, v: Value) []const u8 {
 /// per-field O(len) `cpCount` rescan is gone. Asserted against the rescan in
 /// safe builds.
 fn emitString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, body: []const u8, body_cp: usize, spec: FormatSpec) !void {
-    std.debug.assert(body_cp == cpCount(body));
+    if (std.debug.runtime_safety) std.debug.assert(body_cp == cpCount(body));
     const pad: usize = if (spec.width > body_cp) spec.width - body_cp else 0;
     if (spec.minus) {
         try out.appendSlice(gpa, body);

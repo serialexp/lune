@@ -2283,7 +2283,7 @@ pub fn replayLedgerFrom(
                     // to `e.exit` falsely rejected legitimate fused hops.
                     if (!self.hasArmedSourceBranchLinkAt(owner, e.exit, succ))
                         @panic("replayLedger: fused M1 transition has no armed source-branch link at the exit guard");
-                    std.debug.assert(self.countTracesAt(owner.code.anchor) >= 2);
+                    if (std.debug.runtime_safety) std.debug.assert(self.countTracesAt(owner.code.anchor) >= 2);
                     // The ramp commits ZERO of its OWN iterations, so its `cum`
                     // equals the skip's (`entry_rbx == skip_local`). `local` here is
                     // therefore the skip trace's own committed count, and

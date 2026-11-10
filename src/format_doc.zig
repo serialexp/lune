@@ -201,7 +201,7 @@ pub const Builder = struct {
     }
 
     pub fn text(b: *Builder, s: []const u8) Allocator.Error!Doc {
-        std.debug.assert(std.mem.indexOfScalar(u8, s, '\n') == null);
+        if (std.debug.runtime_safety) std.debug.assert(std.mem.indexOfScalar(u8, s, '\n') == null);
         if (s.len == 0) return empty;
         if (interned_map.get(s)) |i| return @enumFromInt(5 + i);
         return b.span(.text_src, s);
