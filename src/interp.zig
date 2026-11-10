@@ -8464,8 +8464,10 @@ pub const Vm = struct {
     /// entry runs the quiet episode directly. The walk prelude reduces to
     /// its two evidence resets, because admission proved the rest has
     /// nothing to consume. The epilogue reduces to the strike reset when
-    /// the episode completed and left nothing to merge or drain; any other
-    /// outcome falls into the shared walk tail with the incumbent visited.
+    /// the episode completed and left nothing to merge or drain, and to
+    /// nothing when the episode declined and the walk tail has nothing to
+    /// do (`laneDeclineSettled`); any other outcome falls into the shared
+    /// walk tail with the incumbent visited.
     inline fn enterOneShotLane(
         self: *Vm,
         comptime mode: ExecMode,
@@ -8495,7 +8497,59 @@ pub const Vm = struct {
             if (patch.live) patch.strikes = 0;
             return directive;
         }
+        if (directive == .next_candidate and self.laneDeclineSettled(patch, ct, proto, anchor_pc)) {
+            self.assertLaneDeclineSettled(ct, proto, anchor_pc);
+            if (std.debug.runtime_safety) ts.one_shot_lane_lean_declines +%= 1;
+            return .next_candidate;
+        }
         return self.finishOneShotLane(mode, patch, slot, closure, proto, regs, base, pc, ct, anchor_pc, directive);
+    }
+
+    /// Doc 84 §3.6: the lane's incumbent declined (an entry refusal, a seed
+    /// decline or a zero exit) and the walk tail would do nothing, so the
+    /// canonical instruction runs next. Each line is one step of
+    /// `finishPatchedWalk` proven a no-op:
+    /// - The incumbent is the only trace at its exact anchor, so the
+    ///   sibling walk has no candidate. A declined entry ran no guest
+    ///   code, so `ct` and its list links are as they were at entry.
+    /// - With one trace the anchor is below sibling capacity (the config
+    ///   term), so the patch takes no strike (doc 44 D8).
+    /// - No sibling want stands for this anchor (the entry's own receipts
+    ///   may have just raised one; the tail transfers it).
+    /// - No burst owners to merge and no patch work to drain.
+    /// The decline memo is not armed either way: the incumbent was entered.
+    ///
+    /// The patch tests come first because they are what makes `ct` safe to
+    /// read. The entry's lease has been lowered, so a trace retired during
+    /// the entry is destroyed by now. Retiring `ct` marks its entry slot
+    /// pending, which clears `live`, and only an install sets it again; an
+    /// install needs a commit or a repatch, and neither can bind this slot
+    /// to a new record at `ct`'s address within one declined entry. The
+    /// slot's record itself is never freed while the VM runs.
+    ///
+    /// `noinline` on measurement: inlined, the lane's completing entries
+    /// paid two instructions each for it (call_small_fn +0.14%); as a call
+    /// they pay nothing and a decline pays eight.
+    noinline fn laneDeclineSettled(self: *Vm, patch: *const trace.EntryPatch, ct: *const trace.Trace, proto: *const Proto, anchor_pc: u32) bool {
+        const ts = &self.trace;
+        if (!patch.live or patch.trace != ct) return false;
+        if (ts.head_burst_visited_len != 0 or ts.registry.entry_registry.entry_patch_dirty != 0) return false;
+        if (!ct.anchor_linked or ct.anchor_prev != null or ct.anchor_next != null) return false;
+        if (ts.config.max_traces_per_anchor <= 1) return false;
+        if (ts.wants_head_sibling) |wanted| {
+            if (wanted.proto == proto and wanted.pc == anchor_pc) return false;
+        }
+        return true;
+    }
+
+    /// Safe builds: `laneDeclineSettled` against the walk tail's own tests.
+    inline fn assertLaneDeclineSettled(self: *Vm, ct: *trace.Trace, proto: *const Proto, anchor_pc: u32) void {
+        if (!std.debug.runtime_safety) return;
+        const ts = &self.trace;
+        const visited = [_]*trace.Trace{ct};
+        std.debug.assert(ts.nextTraceExcluding(proto, anchor_pc, &visited) == null);
+        std.debug.assert(ts.countTracesAt(.{ .proto = proto, .pc = anchor_pc, .proto_id = proto.id }) < ts.config.max_traces_per_anchor);
+        std.debug.assert(trace.anchorKind(anchor_pc) != .loop);
     }
 
     /// The lane's slow tail: the incumbent zero-exited, or its episode left

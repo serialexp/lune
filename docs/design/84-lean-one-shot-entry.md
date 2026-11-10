@@ -1,10 +1,12 @@
 # 84 — The lean one-shot entry lane — Design
 
-Status: partial — Phases 1 and 2a landed. The refusal want (§3.6) is
+Status: partial — Phases 1 and 2a landed, and the first slice of a cheap
+decline (the lean decline tail, §3.6). The refusal want (§3.6) is
 prototyped and measured: it costs more than it saves until a declined
-entry is cheap, so its order against Phases 3 and 4 is open (Q5, §3.6).
-Phase 2b is parked until Phases 3 and 4 are in. Q1-Q4 settled (§7) after
-reviews by Codex and Antigravity
+entry is cheap. Q5 (its order against Phases 3 and 4) went unanswered on
+2026-11-11; order A is being followed until Bart says otherwise. Phase 2b
+is parked until Phases 3 and 4 are in. Q1-Q4 settled (§7) after reviews
+by Codex and Antigravity
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -78,6 +80,17 @@ land; move whole phases to Done once everything inside them is checked.
   calls each, one of them refused at the head trace's entry checks. Its
   hashgate rows agree in all three modes and with LuaJIT.
 
+- [x] **The lean decline tail** (§3.6, "Landed: the lean decline tail").
+  A lane entry whose incumbent declined returns straight to the
+  canonical instruction when the walk tail has nothing to do: the
+  incumbent is the only trace at its anchor, the anchor is below sibling
+  capacity, no sibling want stands for it, and there is nothing to merge
+  or drain (`laneDeclineSettled`). Safe builds assert the walk tail's own
+  tests on every such decline. A refused call costs 216 instructions
+  less. JIT board (instructions, against the parent's sources):
+  `call_two_shapes` −7.8%, binary-trees −5.9%, the rest flat. The tier-0
+  board is flat.
+
   Q1-Q4 were settled 2026-11-10. Bart asked for second opinions from Codex and
   Antigravity and for the tiebreak to be settled here. Both reviewers
   picked the same four options independently. Their factual corrections
@@ -96,7 +109,10 @@ land; move whole phases to Done once everything inside them is checked.
   two-shape probe, because a declined entry costs about 610 instructions.
   Not landed; waits on Q5.
 - [ ] **Q5 — what makes a declined entry cheap, and in which order**
-  (§3.6, "What would make a sibling pay"). Open, for Bart.
+  (§3.6, "What would make a sibling pay"). Open, for Bart. Asked on
+  2026-11-11 and not answered; order A (Phases 3 and 4 with the refused
+  outcome in scope, then re-measure the want) is being followed
+  meanwhile, because it is his earlier order and lands no regression.
 - [ ] **Defer — Phase 2b, the blocker word** (§4.2, "Parked"). The
   lane's gate still reads its remaining program-wide conditions one by
   one (three in the gate, about fourteen in `headEpisodeQuiet`, ~40
@@ -476,6 +492,43 @@ Orders to choose from:
 - **C.** (iii) now: write its design doc before any more lane work.
 - **D.** Land the want as measured (+2.7% binary-trees, +6.9% on the
   probe) and recover it in later phases.
+
+#### Landed: the lean decline tail, 2026-11-11
+
+The first slice of (i), ahead of Phases 3 and 4 because it needs neither.
+The largest row of the table above was the walk tail: `finishOneShotLane`
+is a call with twelve arguments into the whole of `finishPatchedWalk`,
+and for a refused sole incumbent every step of it does nothing. The lane
+now tests that directly (`Vm.laneDeclineSettled`) and returns
+`.next_candidate` itself:
+
+- the patch is still live and still this trace's (so the trace record is
+  safe to read: the entry's lease has been lowered, and a retirement
+  during the entry marks the slot pending);
+- no burst owners to merge and no patch work to drain;
+- the trace is the only one on its anchor's list (three loads, no hash);
+- `max_traces_per_anchor > 1`, so a sole trace is below capacity and the
+  patch takes no strike (doc 44 D8);
+- no sibling want stands for this anchor.
+
+Anything else takes the walk tail as before. Safe builds run the walk
+tail's own tests (`nextTraceExcluding`, `countTracesAt`) on every lean
+decline and assert they agree.
+
+| Probe (`--jit-native`, instructions) | Before | After |
+|---|---:|---:|
+| a refused call, over tier 0 | +802 | +586 |
+| `call_two_shapes`, per iteration | 2,787 | 2,571 |
+| binary-trees, argument 12 | 4,074.6 M | 3,835.2 M |
+
+The test is a `noinline` function on measurement. Inlined, a decline
+saved 224 and every completing lane entry paid two instructions
+(`call_small_fn` +0.14%); as a call a decline saves 216 and a completion
+pays nothing.
+
+It does not help a decline at an anchor that has siblings, which is what
+the refusal want creates. That case still walks, so the want is not
+re-measured yet.
 
 Two things this note does not solve. `BottomUpTree`'s base case cannot
 be recorded at all: `return { item }` aborts on `set_list` (doc 72 P3),
@@ -864,6 +917,7 @@ Progress, `perf stat` on the board rows (JIT minus tier 0):
 | step 1 (4a8c8e6) | +577 | +91% |
 | Phase 1 | +577 | +59.4% |
 | Phase 2a | +500 | +56.6% |
+| the lean decline tail (§3.6) | +500 | +47.3% |
 
 Phase 0 puts the pure probe on the board. Each phase is measured with
 callgrind on both tiers, on the pure probe and binary-trees, and with a

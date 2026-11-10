@@ -1214,6 +1214,10 @@ pub const TraceState = struct {
     /// read it to prove the lane is taken; a ReleaseFast lane entry pays
     /// nothing for it and leaves it 0.
     one_shot_lane_entries: u64 = 0,
+    /// Doc 84 §3.6: lane entries whose incumbent declined and that took
+    /// the lean tail (`Vm.laneDeclineSettled`) instead of the walk tail.
+    /// Safe builds only, like `one_shot_lane_entries`.
+    one_shot_lane_lean_declines: u64 = 0,
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a
     /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
     /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).

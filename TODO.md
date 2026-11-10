@@ -118,6 +118,31 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       the file `__close` are no longer globals, and the file methods table
       (`@file`) is `Vm.file_methods`.
 
+## `proc.run` hands the terminal over after the child is running (noted 2026-11-11)
+
+- [ ] **A Ctrl-C typed just after `proc.run` starts a terminal-reading
+      child goes to mahina, not the child.** Seen as one failure of
+      `pty_foreground_test` "[REQ-52.3] the terminal's Ctrl-C reaches the
+      child that holds it" in a `zig build test -Djit-debug=true` run on a
+      loaded machine (a board A/B and a ReleaseFast build ran beside it);
+      8 of 8 reruns on a quiet machine pass. `run` (`src/proc_host.zig`)
+      calls `Interrupt.acquire` and `Foreground.take` after `start` has
+      returned, so the child can run before either. The test waits for
+      the child's "ready" and types Ctrl-C; when the child printed first,
+      the terminal delivers the interrupt to mahina's group. Before
+      `acquire` that is SIGINT's default action on mahina; between
+      `acquire` and `take` the flag is set and then, it seems, not
+      forwarded once the child owns the terminal. Which of the two the
+      failed run hit was not established (read from the code, not
+      reproduced): the test failed at `readUntil(..., "finished")` after
+      its 30 s patience, and the child, in its own group and never
+      signalled, was still looping as an orphan six minutes later. Two
+      parts: the window in `run` (shells close it by also giving the
+      child the terminal before it execs, e.g. glibc's
+      `POSIX_SPAWN_TCSETPGROUP` or a `tcsetpgrp` in the forked child), and
+      the test, which kills only mahina on failure and leaves the child's
+      group running.
+
 ## Multret-feeding steps are not stops (noted 2026-11-09)
 
 After doc 68 P4 an activation's instructions take no step number, so the

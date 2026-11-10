@@ -5917,6 +5917,75 @@ test "one-shot lane (doc 84 §4.2): an exec log, coverage and a held .full dispa
     }.tune));
 }
 
+/// Doc 84 §3.6 helper: one function called with two table shapes from a
+/// loop that cannot trace. Its head trace pins the array lane of whichever
+/// shape recorded, so every call with the other shape is refused at entry
+/// and runs on tier 0. Returns how many refused entries took the lane's
+/// lean tail. `tune` adjusts the VM before the run.
+fn laneDeclineProbe(comptime tune: fn (*Vm) void) !u64 {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local function weight(node)
+        \\  if node[2] then return node[1] + 1 end
+        \\  return node[1]
+        \\end
+        \\local inner = { 3, {}, {} }
+        \\local leaf = { 4 }
+        \\local a, b = {}, {}
+        \\local acc = 0
+        \\for i = 1, 400 do
+        \\  if a ~= b then acc = acc + weight(inner) + weight(leaf) end
+        \\end
+        \\print(acc)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    tune(&vm);
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("3200\n", sink.buffered());
+    return vm.trace.one_shot_lane_lean_declines;
+}
+
+test "one-shot lane (doc 84 §3.6): a refused sole incumbent takes the lean tail" {
+    // The lean tail and the walk tail leave the same state (Safe builds
+    // assert the walk tail's own tests on every lean decline), so the
+    // witness is the lean tail's counter: about one refusal per iteration.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const lean = try laneDeclineProbe(struct {
+        fn tune(_: *Vm) void {}
+    }.tune);
+    try testing.expect(lean >= 350);
+}
+
+test "one-shot lane (doc 84 §3.6): an anchor at sibling capacity keeps the walk tail" {
+    // With room for one trace the sole incumbent is at capacity, so a
+    // decline is a retirement strike and the walk tail must run.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    try testing.expectEqual(@as(u64, 0), try laneDeclineProbe(struct {
+        fn tune(vm: *Vm) void {
+            vm.trace.config.max_traces_per_anchor = 1;
+        }
+    }.tune));
+}
+
 test "head handoff evidence symmetry (doc 44 D12a): the base-case-incumbent shape arms BOTH directions" {
     // Which sibling records FIRST is a deterministic function of hot-call
     // timing, and pre-D12a the base-case-incumbent shape (fib(27) in the
