@@ -891,7 +891,8 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       Doc 84 Phase 1 (per-anchor bits) fixed that: binary-trees -16.5%,
       spectral-norm -7.2%. Phase 2a (2026-11-11, the lane at the patch
       site): call_small_fn -5.3%, binary-trees -1.8%; the pure probe is at
-      +500 per call. Phases 2b-6 remain (see the doc's checklist).
+      +500 per call. Phase 2b (the blocker word) is parked by Bart until
+      Phases 3 and 4 are in; Phases 3-6 remain (see the doc's checklist).
 - [ ] **A one-shot trace whose entry checks fail never gets a sibling**
       (seen 2026-11-11, doc 84 §3.6). binary-trees' `ItemCheck` head trace
       was recorded on an inner node; every leaf fails its `guard_bounds` at
@@ -899,12 +900,13 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       sibling want, and a one-shot patch accrues no strikes below sibling
       capacity, so 1.0 M of the program's 2.17 M one-shot entries (46%) pay
       an entry and then run on tier 0. `BottomUpTree` has the same shape at
-      the bottom of its descents. Options are in the doc (refusals raise a
-      sibling want; refusals count against the patch; leave it). Needs
-      Bart's pick. The loop analog is the "SECOND trace for the second
-      lane shape" entry below.
-- [ ] **No gate builds the ReleaseFast library, so the no-safety block of
+      the bottom of its descents. Bart picked 2026-11-11: refusals raise a
+      sibling want (design note in doc 84 §3.6 first, then build). The loop
+      analog is the "SECOND trace for the second lane shape" entry below.
+- [x] **No gate builds the ReleaseFast library, so the no-safety block of
       `src/asm/offsets_x64.inc` goes stale unnoticed** (seen 2026-11-11).
+      Fixed 2026-11-11: `just test` now runs `just check-release-lib`
+      (Bart's pick; CI is unchanged).
       The comptime check verifies only the block of the build's own safety
       mode. `just test`, CI's `lib-wasm` job and `embed/rust` all build the
       Debug library; at 3916181 `zig build lib -Doptimize=ReleaseFast`
@@ -3905,3 +3907,17 @@ test in `src/interp_phaseq_test.zig` and were dodged there, not fixed.
       alignment constants only fit the board (Rule Z-6). Choose the head's pad
       from the emitted loop span so it crosses the fewest 64-byte lines: needs
       the span before binding `loop_top` (emit twice, or reserve and patch).
+- [ ] **Tier-1a `guard_grid` checks neither the type nor the metatable.**
+      `irinterp.zig`'s `guard_grid` arm assumes its operand is a table with
+      a grid lane and relies on the native prologue having checked it. A
+      grid cannot carry a metatable today (doc 77 §10.3), so this is not a
+      live hole, but tier-1a should check what its own guard claims. Found
+      during doc 77 Phase 1.
+- [ ] **`bench/stdlib/tostring_meta.lua` is tagged `luajit=compatible` but
+      LuaJIT fails it.** Its `C.__tostring` returns a number; LuaJIT's
+      `tostring` passes the number through and `#` on it errors ("attempt
+      to get length of a number value", line 37), so the board shows
+      `luajit ERR`. mahina turns the number into the string `"12345"` and
+      prints `1800000`. Lua 5.4 raises
+      "'__tostring' must return a string". Decide which behaviour mahina
+      wants, then fix the tag or the program.

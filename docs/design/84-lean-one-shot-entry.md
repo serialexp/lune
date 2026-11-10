@@ -1,7 +1,8 @@
 # 84 — The lean one-shot entry lane — Design
 
-Status: partial — Phases 1 and 2a landed; Phases 2b-6 and 0b outstanding.
-Q1-Q4 settled (§7) after reviews by Codex and Antigravity
+Status: partial — Phases 1 and 2a landed. Next: entry refusals (§3.6),
+then Phases 3 and 4; Phase 2b is parked until they are in. Q1-Q4 settled
+(§7) after reviews by Codex and Antigravity
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -73,14 +74,15 @@ land; move whole phases to Done once everything inside them is checked.
 
 - [ ] **Phase 0b — baselines on the pinned pool.** Record §2's rows there
   (needs a push, so it waits until Bart asks for one).
-- [ ] **Phase 2b — the blocker word** (§4.2). The lane's gate still
-  reads its remaining program-wide conditions one by one (three in the
-  gate, about fourteen in `headEpisodeQuiet`, ~40 instructions). They
-  move into `one_shot_blockers`, each bit kept at its own mutation
-  funnel, with a Safe assert against the long form in both directions.
-- [ ] **Decide: a one-shot trace whose entry checks fail never gets a
-  sibling** (§3.6). 46% of binary-trees' one-shot entries are refused at
-  the trace's own prologue and run on tier 0 after paying the entry.
+- [ ] **Entry refusals raise a sibling want** (§3.6). 46% of
+  binary-trees' one-shot entries are refused at the trace's own prologue
+  and run on tier 0 after paying the entry. Bart picked option (a) on
+  2026-11-11: design note first, then build.
+- [ ] **Defer — Phase 2b, the blocker word** (§4.2, "Parked"). The
+  lane's gate still reads its remaining program-wide conditions one by
+  one (three in the gate, about fourteen in `headEpisodeQuiet`, ~40
+  instructions). Parked by Bart on 2026-11-11 until Phases 3 and 4 are
+  in.
 - [ ] **Phase 3 — a lean completion** (§4.3). A terminal completion with
   nothing to consume does counters only. Pick from Q3.
 - [ ] **Phase 4 — a thin native call for one-shot pages** (§4.4). A small
@@ -320,7 +322,8 @@ repatch.
 The loop analog is already in TODO.md ("the anchor never records a
 SECOND trace for the second lane shape"). Nothing in this doc's phases
 addresses it: the lane makes a refused entry cheaper, it does not make it
-useful. Options, not yet decided:
+useful. Options (Bart picked (a) on 2026-11-11; its design note goes
+below this list before anything is built):
 
 - **(a) Entry refusals raise a sibling want.** A counter per trace; at a
   threshold the anchor asks for a second trace, recorded on the
@@ -554,6 +557,22 @@ terms. The config terms (`native_codegen`, `coverage`, `record_exec_log`,
 the debug-log sync) have no mutation funnel: about 70 test sites assign
 config fields directly. They stay direct loads unless a funnel is worth a
 sweep of those sites.
+
+**Parked, 2026-11-11 (Phase 2b).** The remaining terms live in three
+structs: `TraceState`, the native physical registry and the region
+policy. The last two are also built standalone in tests, so they cannot
+reach a word on `TraceState` without plumbing. Three shapes were measured
+or bounded on the JIT board (instructions, against Phase 2a):
+
+| Shape | call_small_fn | binary-trees | Needs |
+|---|---:|---:|---|
+| One word for everything, config included (unsound stand-in: an upper bound) | −2.5% | −2.8% | the registry and the policy reach `TraceState`'s word; a funnel for config writes (a sweep of ~70 test sites) |
+| One exact summary per owner struct, config direct (stand-in) | −1.7% | −2.2% | ~25 hook sites, no plumbing, no sweep |
+| No word: the predicate inlined into the handlers, minus the terms `fast_block == 0` implies | +2.0% | +1.0% | nothing; rejected (the handlers spill) |
+
+Bart's pick: stop at 2a, do Phases 3 and 4 first (about 178 instructions
+per call each, of the 500 left on the probe), then revisit. Those phases
+may also change what the admission has to read.
 
 ### 4.3 Phase 3 — a lean completion
 

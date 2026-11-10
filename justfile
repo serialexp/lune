@@ -16,8 +16,16 @@ release:
 # zig-out/bin/mahina (Debug) — otherwise a test-only run leaves the installed CLI
 # stale and you debug a binary that predates your changes (costs a few seconds,
 # saves a debugging detour).
-test: build check-jit-boundaries fmt-check
+test: build check-jit-boundaries fmt-check check-release-lib
     zig build test
+
+# The ReleaseFast library must build. `src/asm/offsets_x64.inc` has a block of
+# offsets per runtime-safety mode and a build checks only its own, so a Debug
+# gate never sees drift in the ReleaseFast block (it sat 24 bytes stale and
+# the release library did not build). Installed under zig-out/release-lib so
+# it never replaces a Debug zig-out/lib.
+check-release-lib:
+    zig build lib -Doptimize=ReleaseFast --prefix zig-out/release-lib
 
 # The repo's own mahina sources are in the one standard style (doc 83 §9).
 # Fix with `just fmt`.
