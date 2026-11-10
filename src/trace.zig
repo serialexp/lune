@@ -1671,6 +1671,8 @@ pub const TraceState = struct {
     /// the sole entry for every sibling); it is consumed on the CURRENT
     /// activation by `enterPatchedTrace` after the whole sibling walk declines
     /// (transfer into `pending_call_anchor`, review round 2's reframe).
+    /// One slot for the whole program: a want that no walk consumed is
+    /// displaced by the next anchor whose exit gets hot (`noteTakenExit`).
     wants_head_sibling: ?AnchorKey = null,
     /// Provenance of `wants_head_sibling` (mirrors `side_want_src`): the
     /// `(trace, exit)` whose hot counter raised it — DONE-latched when a

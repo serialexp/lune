@@ -433,9 +433,25 @@ pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: u
     // SOLE entry for every sibling (no virgin back-edge walk to re-arm
     // through). Consumed on the CURRENT activation by `enterPatchedTrace`
     // after the whole sibling walk declines.
+    //
+    // The want is ONE slot for the whole program, so a standing want blocks
+    // only its own anchor. A want is consumed on a walk at its anchor; one
+    // that is still standing when another anchor's exit gets hot was not
+    // (its anchor got gated and unpatched in the receipt that raised it, or
+    // the failing path never came back), and nothing else would ever clear
+    // it. Left in place it bars every other anchor's sibling for the rest of
+    // the run (binary-trees: `BottomUpTree`'s want, raised and gated in one
+    // receipt, held the slot for the whole program). Displacing it loses
+    // nothing: its source counter stays saturated, so the first zero exit
+    // of a walk that could consume it raises it again. Same rule as
+    // `fileRetContArm`.
     if (trace_mod.anchorKind(t.code.anchor.pc) != .loop) {
-        if (self.wants_head_sibling != null) return;
+        if (self.wants_head_sibling) |standing| {
+            if (standing.proto == t.code.anchor.proto and standing.pc == t.code.anchor.pc) return;
+        }
         if (self.countTracesAt(t.code.anchor) >= self.config.max_traces_per_anchor) return;
+        if (self.wants_head_sibling) |stale|
+            self.dbg("head want displaced: anchor pc={d} (src t={?})", .{ stale.pc, if (self.head_want_src) |s| s.trace_id else null });
         self.dbg("hotexit: trace id={d} exit={d} count={d} -> want HEAD sibling", .{ t.id, exit_instr, c.* });
         self.wants_head_sibling = t.code.anchor;
         self.head_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };

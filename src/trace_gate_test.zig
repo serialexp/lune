@@ -1236,3 +1236,55 @@ test "bar memo: an abandoned head stays refused without counting" {
     state.onCallEntry(&proto, 0, 0, &code);
     try testing.expectEqual(@as(?u32, null), state.counters.get(key));
 }
+
+test "head want: another anchor's hot exit displaces a stale want; the same anchor's does not" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.hotexit = 2;
+
+    const proto_a = Proto{ .code = &.{}, .name = "a", .num_registers = 1 };
+    const proto_b = Proto{ .code = &.{}, .name = "b", .num_registers = 1 };
+    const key_a: AnchorKey = .{ .proto = &proto_a, .pc = trace.FUNC_HEAD_PC, .proto_id = proto_a.id };
+    const key_b: AnchorKey = .{ .proto = &proto_b, .pc = trace.FUNC_HEAD_PC, .proto_id = proto_b.id };
+    var counts_a = [_]u8{ 0, 0, 0 };
+    var counts_a2 = [_]u8{ 0, 0, 0 };
+    var counts_b = [_]u8{ 0, 0, 0 };
+    const empty: trace.TraceCode = .{ .anchor = key_a, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var ta: Trace = .{ .code = empty, .id = 1, .exit_counts = &counts_a };
+    var ta2: Trace = .{ .code = empty, .id = 2, .exit_counts = &counts_a2 };
+    var tb: Trace = .{ .code = empty, .id = 3, .exit_counts = &counts_b };
+    tb.code.anchor = key_b;
+
+    // `a`'s exit 1 gets hot and raises the want.
+    state.noteTakenExit(&ta, 1, 0, .legacy);
+    try testing.expectEqual(@as(?AnchorKey, null), state.wants_head_sibling);
+    state.noteTakenExit(&ta, 1, 0, .legacy);
+    try testing.expectEqual(@as(?AnchorKey, key_a), state.wants_head_sibling);
+    try testing.expectEqual(@as(?ExitKey, .{ .trace_id = 1, .exit_instr = 1 }), state.head_want_src);
+
+    // A second trace at the SAME anchor getting hot keeps the standing
+    // want and its source: one want per anchor, first source wins.
+    state.noteTakenExit(&ta2, 2, 0, .legacy);
+    state.noteTakenExit(&ta2, 2, 0, .legacy);
+    try testing.expectEqual(@as(?ExitKey, .{ .trace_id = 1, .exit_instr = 1 }), state.head_want_src);
+
+    // No walk at `a` consumed it. `b`'s exit gets hot: the stale want must
+    // not bar it. Before the fix it did, for the rest of the run.
+    state.noteTakenExit(&tb, 1, 0, .legacy);
+    try testing.expectEqual(@as(?AnchorKey, key_a), state.wants_head_sibling);
+    state.noteTakenExit(&tb, 1, 0, .legacy);
+    try testing.expectEqual(@as(?AnchorKey, key_b), state.wants_head_sibling);
+    try testing.expectEqual(@as(?ExitKey, .{ .trace_id = 3, .exit_instr = 1 }), state.head_want_src);
+
+    // Nothing is lost: `a`'s counter is saturated, so its next zero exit
+    // takes the slot back.
+    state.noteTakenExit(&ta, 1, 0, .legacy);
+    try testing.expectEqual(@as(?AnchorKey, key_a), state.wants_head_sibling);
+    try testing.expectEqual(@as(?ExitKey, .{ .trace_id = 1, .exit_instr = 1 }), state.head_want_src);
+
+    // A barred anchor raises nothing and displaces nothing (doc 31 D1).
+    state.gateRecordAnchor(key_b, .record_abort);
+    state.noteTakenExit(&tb, 1, 0, .legacy);
+    try testing.expectEqual(@as(?AnchorKey, key_a), state.wants_head_sibling);
+}
