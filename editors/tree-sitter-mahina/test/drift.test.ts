@@ -5,9 +5,10 @@
 // ERROR node. A construct added to src/parser.zig without a grammar change
 // lands here first.
 //
-// Requires `pnpm install` in this directory (it fetches the tree-sitter CLI).
+// Requires `pnpm install` in this directory (it fetches the tree-sitter CLI);
+// run it with `pnpm drift` (Vitest; CI's "viz and grammar tests" leg).
 
-import { expect, test } from "bun:test";
+import { expect, test } from "vitest";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 

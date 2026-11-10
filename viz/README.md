@@ -57,7 +57,7 @@ replay open: Space plays, ←/→ step, Home/End jump, Esc closes.
 ## Stack
 
 Vite + SolidJS, installed with pnpm (the version `package.json`'s
-`packageManager` pins; Node >= 22.13). Bun is the test runner only; never
+`packageManager` pins; Node >= 22.13). Vitest runs the tests. Never
 `bun install` here, which lays a second dependency tree beside pnpm's. The binary
 decoder is **generated** from
 `../schema/trace.json` by binschema and **vendored** under `src/gen/` (committed
@@ -69,7 +69,7 @@ output — no build-time dependency on the binschema repo).
 pnpm install
 pnpm dev           # vite dev server; open the printed URL
 pnpm build         # tsc --noEmit && vite build  → dist/
-pnpm test          # `bun test`: cross-language decode + disasm + store tests
+pnpm test          # Vitest: cross-language decode + disasm + store tests
 pnpm smoke:browser <mahina>   # drive `mahina viz` in headless Chrome (e2e/)
 ```
 
@@ -121,7 +121,8 @@ zig build
   file `./lib/util.mah` is.
 - `fixtures/` — `counting-loop.lua` + the committed `counting-loop.mahinatrace`
   cross-language fixture.
-- `test/` — `bun test` specs.
+- `test/` — Vitest specs (`vitest.config.ts`; `test/setup.ts` turns `[REQ-…]`
+  name tags into the JUnit `requirements` property, doc 79).
 - `e2e/browser-smoke.ts` — the headless-Chrome smoke test (`pnpm smoke:browser`).
 
 ## Regenerating the decoder

@@ -2,7 +2,7 @@
 // which workspace file a program's `require` reads in the browser and under
 // `mahina viz`, so the two must agree.
 
-import { test, expect } from "bun:test";
+import { test, expect } from "vitest";
 import { normalizePath, baseName } from "../src/paths";
 
 test("normalizePath drops `.` and empty segments and resolves `..`", () => {

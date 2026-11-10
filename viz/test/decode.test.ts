@@ -7,7 +7,7 @@
 //   zig build && ./zig-out/bin/mahina --emit-traces \
 //       viz/fixtures/counting-loop.mahinatrace viz/fixtures/counting-loop.lua
 
-import { test, expect } from "bun:test";
+import { test, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { decodeTraceFile } from "../src/decode";

@@ -3,13 +3,14 @@
 // and asserts the two produce byte-identical keyframe + effects + trace. Two
 // different engines agreeing is the strongest determinism check we have.
 //
-// This drives the native binary directly via Bun.spawnSync (the same flag set
+// This drives the native binary directly via spawnSync (the same flag set
 // the dev-server `POST /run` middleware uses), so it needs no Vite server.
 // Requires `zig build` (native) and `zig build wasm` at the repo root.
 
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll } from "vitest";
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { instantiateMahinaFromBytes, type MahinaModule } from "../src/wasm/mahina";
@@ -36,7 +37,7 @@ function runNative(source: string): RunArtifacts {
     // From inside the program's directory, by its relative name, as the viz
     // server runs it: the name is the chunk's in error messages, which the
     // wasm run gets as its `argv[0]` (`runWasm`).
-    const r = Bun.spawnSync([nativePath, "--system", "clock,random", "--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, "p.mahina"], { cwd: dir });
+    const r = spawnSync(nativePath, ["--system", "clock,random", "--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, "p.mahina"], { cwd: dir, maxBuffer: 1 << 30 });
     const read = (p: string): Uint8Array => {
       try {
         return new Uint8Array(readFileSync(p));
@@ -45,7 +46,7 @@ function runNative(source: string): RunArtifacts {
       }
     };
     return {
-      status: r.exitCode === 0 ? 0 : 1,
+      status: r.status === 0 ? 0 : 1,
       stdout: r.stdout.toString(),
       diagnostics: r.stderr.toString(),
       keyframe: read(kf),

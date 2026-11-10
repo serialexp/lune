@@ -5,7 +5,7 @@
 // `aggregateCoverage` turns the top-level counts into a percentage split. Both
 // are pure (no store singleton), so we drive them with hand-built fixtures.
 
-import { test, expect } from "bun:test";
+import { test, expect } from "vitest";
 import { resolveCoverageLines, aggregateCoverage, timeSplitOf } from "../src/store";
 import type { CoverageAnchorOutput, CoverageFileOutput } from "../src/decode";
 import type { ProtoDisasm } from "../src/wasm/mahina";

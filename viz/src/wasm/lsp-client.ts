@@ -1,7 +1,7 @@
 // Main-thread side of the in-browser language server (doc 74): one
 // `LSPClient` (`@codemirror/lsp-client`) talking to `mahina.lsp.worker.ts` over
 // postMessage. The worker is spawned lazily, on the first editor that asks, so
-// the bun suite that imports the store never touches `Worker`.
+// the test suite that imports the store never touches `Worker`.
 
 import { LSPClient, languageServerExtensions, languageServerSupport, type Transport } from "@codemirror/lsp-client";
 import type { Extension } from "@codemirror/state";

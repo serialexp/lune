@@ -12,6 +12,6 @@
     "lib": ["ESNext", "DOM", "DOM.Iterable"],
     "types": ["vite/client", "node"]
   },
-  "// note": "Scoped to src/ — the vendored gen/ is generated (not lint-clean), and test/ is run/checked by `bun test`. strict stays on for sound type checking.",
+  "// note": "Scoped to src/ — the vendored gen/ is generated (not lint-clean), and test/ is run/checked by Vitest. strict stays on for sound type checking.",
   "include": ["src"]
 }

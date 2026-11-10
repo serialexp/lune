@@ -2,7 +2,7 @@
 // squiggles. mahina diagnostics are UTF-8 byte spans; CodeMirror positions are
 // UTF-16 code-unit indices. ASCII is the identity; multibyte text shifts.
 
-import { test, expect } from "bun:test";
+import { test, expect } from "vitest";
 import { byteToUtf16 } from "../src/editor/byteOffsets";
 
 test("ASCII is the identity map", () => {

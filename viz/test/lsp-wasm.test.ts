@@ -1,7 +1,7 @@
 // The language server's wasm exports (doc 74): a message-body API over the
 // sans-IO core. Requires `zig build wasm` at the repo root.
 
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 

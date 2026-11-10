@@ -543,9 +543,9 @@ pub fn build(b: *std.Build) void {
     //      call is a *guarantee*: if `wasm32 + tail_call` couldn't emit a real
     //      tail call, `zig build wasm` would fail right here. So a green wasm
     //      build already proves the capability survives on the browser target.
-    //   2. RUNTIME: a `bun` test (viz/test/) instantiates the module and runs
+    //   2. RUNTIME: a Vitest test (viz/test/) instantiates the module and runs
     //      `mahina_dispatch_smoke(2_000_000)`, proving the engine reuses frames in
-    //      practice (no stack overflow). We run it under bun rather than a Zig
+    //      practice (no stack overflow). We run it under Node rather than a Zig
     //      `addTest` because Zig's test runner needs host I/O to report results,
     //      which `wasm32-freestanding` lacks — there is no in-`zig build` way to
     //      execute freestanding-wasm tests without a WASI shim + runtime.

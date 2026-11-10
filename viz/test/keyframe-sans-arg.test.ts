@@ -8,7 +8,7 @@
 // that keyframeSansArg now distinguishes each of those while still cancelling
 // arg[0]. Keyframes are built with the generated encoder — no VM run needed.
 
-import { test, expect } from "bun:test";
+import { test, expect } from "vitest";
 import {
   SnapshotFileEncoder,
   type SnapValueInput,

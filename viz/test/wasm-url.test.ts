@@ -3,7 +3,7 @@
 // (`/assets/…`), so the client must hand it an absolute URL resolved against
 // the page — a relative `./mahina.wasm` made Run 404 in `mahina viz`.
 
-import { test, expect } from "bun:test";
+import { test, expect } from "vitest";
 import { resolveWasmUrl } from "../src/wasm/mahina-client";
 
 test("the built base `./` resolves next to the page, not the worker script", () => {

@@ -2,12 +2,15 @@
   "name": "tree-sitter-mahina",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.28.6",
   "description": "Tree-sitter grammar for mahina (presentation only: highlighting, brackets, outline, indents). Diagnostics and scoping come from `mahina lsp`.",
   "scripts": {
     "generate": "tree-sitter generate",
-    "test": "tree-sitter test"
+    "test": "tree-sitter test",
+    "drift": "vitest run"
   },
   "devDependencies": {
-    "tree-sitter-cli": "^0.25.0"
+    "tree-sitter-cli": "^0.25.0",
+    "vitest": "^5.1.0"
   }
 }

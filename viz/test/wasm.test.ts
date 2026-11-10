@@ -1,5 +1,5 @@
-// In-browser VM (wasm) test, run under bun's WebAssembly engine (which honours
-// `return_call`, like every major browser since Safari 18.2). Two things are
+// In-browser VM (wasm) test, run under Node's WebAssembly engine (V8, which
+// honours `return_call`, like every major browser since Safari 18.2). Two things are
 // proven here:
 //   1. The guaranteed-tail-call capability gate runs on wasm: a 2M-hop
 //      `@call(.always_tail)` chain completes in O(1) stack (pillar #4).
@@ -10,7 +10,7 @@
 // The .wasm is built by `zig build wasm` at the repo root; this test reads it
 // from zig-out. If it's missing, build it first.
 
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { instantiateMahinaFromBytes, type MahinaModule } from "../src/wasm/mahina";

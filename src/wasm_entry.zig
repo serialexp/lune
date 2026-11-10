@@ -301,8 +301,9 @@ fn freeBuf(b: Buf) void {
 ///      guarantee: if wasm couldn't emit a real tail call, `zig build wasm`
 ///      would fail here rather than silently grow the stack. This is pillar #4
 ///      ("Stay on Zig's bedrock") holding on the browser target.
-///   2. *Runtime gate* — a `bun` test calls this with ~2M iterations; completing
-///      without a stack overflow proves the browser engine honours `return_call`.
+///   2. *Runtime gate* — a Vitest test (viz/test/) calls this with ~2M
+///      iterations; completing without a stack overflow proves the browser
+///      engine honours `return_call`.
 export fn mahina_dispatch_smoke(iterations: u32) u32 {
     return @intCast(mahina.dispatch.run(@as(u64, iterations)));
 }

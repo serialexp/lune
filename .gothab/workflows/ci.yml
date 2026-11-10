@@ -8,6 +8,7 @@ name: CI
 #   jit-debug   zig build test -Djit-debug=true
 #   hashgate    just hashgate             (frozen output, ReleaseFast + Debug legs)
 #   lib-wasm    zig build lib, zig build wasm
+#   vitest      pnpm test in viz/, pnpm drift in editors/tree-sitter-mahina/
 # Locally you run the fast subset; this is the whole gate. The benchmark board
 # is not here: it needs the pinned pool and is dispatched with `gt profile`
 # (profile-bench.yml).
@@ -60,6 +61,22 @@ jobs:
             run: |
               time zig build lib
               time zig build wasm
+          # The viz tests run the native CLI and the wasm VM; the drift test
+          # runs the Tree-sitter grammar over every tracked mahina source.
+          # Vitest's JUnit report carries the `[REQ-…]` tags of test names
+          # (tools/vitest-requirements.ts, doc 79).
+          - name: viz and grammar tests
+            run: |
+              time zig build
+              time zig build wasm
+              out="$PWD/test-results"
+              mkdir -p "$out"
+              cd viz
+              pnpm install --frozen-lockfile
+              time pnpm exec vitest run --reporter=default --reporter=junit --outputFile.junit="$out/viz.xml"
+              cd ../editors/tree-sitter-mahina
+              pnpm install --frozen-lockfile
+              time pnpm exec vitest run --reporter=default --reporter=junit --outputFile.junit="$out/drift.xml"
     steps:
       - uses: actions/checkout@v5
 
@@ -149,8 +166,9 @@ jobs:
           mkdir -p test-results
           python3 tools/junit-merge.py test-results > test-results/junit.xml
 
+      # The unit-test leg's merged report, or the Vitest leg's two reports.
       - name: Upload test results
         uses: actions/test-results@v1
-        if: always() && matrix.name == 'unit tests'
+        if: always() && (matrix.name == 'unit tests' || matrix.name == 'viz and grammar tests')
         with:
-          files: test-results/junit.xml
+          files: test-results/*.xml

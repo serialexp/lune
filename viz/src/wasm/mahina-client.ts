@@ -5,7 +5,7 @@
 // posts back its response.
 //
 // The worker is spawned LAZILY, on the first call, and never at module load: the
-// bun test suite imports `store.ts` (which imports this) and must not touch
+// test suite imports `store.ts` (which imports this) and must not touch
 // `Worker`. Only a real run in the browser stands the worker up.
 
 import type { MahinaRunResult, MahinaReplayResult, MahinaFormatResult, SourceFile } from "./mahina";

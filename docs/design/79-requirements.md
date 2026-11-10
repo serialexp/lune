@@ -1,6 +1,6 @@
 # 79 — Requirements on gothab.io for mahina — Design
 
-Status: in use; the model is adopted from Gothab. The Zig citation scheme and JUnit report work locally and in CI, where gothab.io ingests them (Q1, Q2). Bun tests are not in CI and a reusable package is not done. Converted docs are listed under §Conversion progress.
+Status: in use; the model is adopted from Gothab. The Zig citation scheme and JUnit report work locally and in CI, where gothab.io ingests them (Q1, Q2). The viz and Tree-sitter tests (Vitest) report their keys the same way. A reusable package is not done. Converted docs are listed under §Conversion progress.
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -32,10 +32,18 @@ land; move whole sections to Done once everything inside them is checked.
   `actions/test-results@v1` (ea676d7). Checked 2026-11-11: gothab.io ingested
   the report for a53f3e4 (`gt requirement verification summary`: 1 upload, 0
   failed; 194 of 239 units verified).
-- [ ] **Bun tests in CI.** No CI leg runs a Bun test (the Tree-sitter drift
-  check, viz), and gothab.io reads keys only from the `requirements`
-  property, which Bun's JUnit reporter does not write. So REQ-113.4 is
-  verified only by a hand-written local fragment.
+- [x] **The TypeScript tests in CI** (2026-11-11). No CI leg ran the
+  viz tests or the Tree-sitter drift check, and Bun's JUnit reporter writes
+  no `requirements` property, the only place gothab.io reads keys from. Bart
+  chose to move them from `bun test` to Vitest, whose JUnit reporter writes
+  each test annotation as a property named by its type.
+  `tools/vitest-requirements.ts` annotates every `[REQ-…]` tag in a test's
+  name with type `requirements`, so TypeScript tests cite keys the way Zig
+  tests do; each package's `test/setup.ts` registers it. CI's "viz and
+  grammar tests" leg runs both suites and uploads their reports.
+  gothab's own `packages/vitest-verifies` (keys in `meta.verifies`, a
+  subclassed reporter) was not used: it is private to the gothab repository
+  and keeps keys out of the test name.
 - [ ] **A shared package.** The runner code is mahina-specific (Linux
   syscalls, `junit_capacity` shims, our sharding). A reusable `verifies` for
   Zig would extract the shim, the tag parser and the JUnit writer into a
@@ -261,5 +269,6 @@ result, drift found.
   local report. REQ-113.4 is proved by a Bun test (the Tree-sitter drift
   check), which Bun's JUnit reporter reports without the `requirements`
   property, so its fragment was written by hand for the local run: the CI half
-  of Q2 needs that mapping.
+  of Q2 needs that mapping. (2026-11-11: the drift check runs under Vitest
+  now and its report carries the key; see the Implementation status.)
 

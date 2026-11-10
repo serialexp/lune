@@ -3,7 +3,7 @@
 //
 // Requires `zig build wasm` at the repo root.
 
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { instantiateMahinaFromBytes, type MahinaModule } from "../src/wasm/mahina";

@@ -1,8 +1,8 @@
 // Store-logic test (DOM-free): loading the fixture populates the store and
 // selection behaves. The SolidJS store itself needs no DOM, so this runs under
-// bun. Browser render is verified separately (manual, post-build).
+// Node. Browser render is verified separately (manual, post-build).
 
-import { test, expect } from "bun:test";
+import { test, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
