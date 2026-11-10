@@ -1,9 +1,10 @@
 # 77 — Recording metamethods — Design
 
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
-decided; not yet implemented (Phase 4 waits on doc 68 P2)
+decided; Phase 0 landed (2026-11-11), Phases 1–7 outstanding (doc 68 P2,
+which Phase 4 waits on, has landed)
 Owner: Bart
-Last updated: 2026-11-02
+Last updated: 2026-11-11
 
 ## Implementation status
 
@@ -12,20 +13,34 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Done
 
-_(nothing yet)_
+- [x] **Phase 0 — baselines and the nested-recording probe** (§10,
+  2026-11-11).
+  - [x] bench programs that use metatables: `bench/luajit/ray.lua`
+    (LuaJIT's; its pixels feed a checksum, since `string.char` writes UTF-8
+    here), `bench/meta_ops.lua` (in-place `__add`, `__lt`/`__le`/`__eq`/
+    `__unm` on a field), `bench/meta_proxy.lua` (`__index`/`__newindex`
+    functions over upvalues), `bench/meta_close_reused.lua` (one `<close>`
+    value reused; `bench/stdlib/meta_close.lua` from doc 68 allocates one
+    per iteration), and, beyond the plan, `bench/meta_fields.lua` (present-key
+    reads and overwrites on objects with a class metatable, Phase 1's own
+    target). `bench/stdlib/meta_calls.lua` (doc 68) and
+    `bench/opprobe/fields.lua` are regression cases. Local numbers and
+    aborts in §10.1; hashgate rows added.
+  - [x] the probe. Doc 68 P2 landed after this doc was written: tier 0 now
+    runs a Lua metamethod as a `.finish_op` frame in the same dispatch
+    (`pushMetaFrame`), not through a nested `callValue`, so the mirror sees
+    the handler's instructions as an ordinary frame's. Doc 82 Phase 3
+    records exactly that path for `__tostring`, and its test (`[REQ-115.1]`
+    in `src/interp_template_test.zig`) is the probe: the handler is
+    inlined at inline depth 1 and the trace runs. `pushMetaFrame`'s
+    `bumpHostEpoch` matters to a recording only while a host call's results
+    are pending (`recHostResults`), which a metamethod frame cannot
+    interleave with.
 
 ### Outstanding
 
-- [ ] **Phase 0 — baselines and the nested-recording probe** (§10).
-  - [ ] bench programs that use metatables: `ray` (LuaJIT's, a class
-    hierarchy through `__index = self`), an allocation-free operator
-    program (in-place `__add`-style updates, §2.1), a proxy with an
-    `__index` function, a `<close>` value in a loop, and
-    `bench/opprobe/fields.lua` as a regression case; tier-0, JIT and LuaJIT
-    numbers on the board
-  - [ ] a test that proves the recording mirror sees the instructions a
-    metamethod's nested `callValue` runs, at the right inline depth, and
-    that the host epoch it bumps disturbs nothing in the recording (§6.1)
+- [ ] **Phase 0 numbers on the board** (the pinned pool): needs a push, then
+  `gt profile`.
 - [ ] **Phase 1 — tables that carry a metatable, on their raw paths** (§4, §5).
   - [ ] `guard_table` aux bit `GUARD_TABLE_ANY_META` (Q4: merged with AND,
     the writable bit with OR), in tier-1a, native and tropt
@@ -514,6 +529,26 @@ LuaJIT; the proxy, `<close>` and operator programs native with no
 90% in `--jit-stats`; the existing pool's IR byte-identical and its times
 within noise on the pinned pool. Phase 2 also reports emitted probes and
 callouts per iteration for an invariant receiver.
+
+### 10.1 Phase 0 baseline (2026-11-11)
+
+Local machine (load ~4.6 on 24 cores), `bench/run.py`, best of 5, at the
+`@bench` sizes; `--dump-aborts` from a `--jit-native` run.
+
+| program | t0 ms | jit ms | LuaJIT ms | res% | aborts |
+|---|---|---|---|---|---|
+| ray | 462.4 | 1248.3 | 32.3 | 26.3 | 19 sites: `has_metatable` on `get_field` (`intersect`, `sphere_distance`, main), `for_prep` |
+| meta_fields | 389.1 | 435.4 | 14.4 | 0.0 | `has_metatable` (`get_index` of an element with a metatable, `get_field` in `step`), `len` |
+| meta_ops | 393.0 | 397.2 | 7.0 | 0.0 | `bad_type` on `add` |
+| meta_proxy | 302.8 | 301.2 | 13.3 | 0.0 | `has_metatable` on `get_field` |
+| meta_close_reused | 407.4 | 420.7 | n/a | 0.0 | `nyi_opcode` on `tbc` |
+| meta_calls (doc 68) | 46.8 | 46.9 | 0.9 | 0.0 | `has_metatable` on `get_index` |
+| fields.lua `mlook`/`mcall` | | | | | `has_metatable` on `get_field` |
+
+`ray` is 2.7x slower with the JIT than on tier 0: its leaf functions run as
+one-shot head traces (213-380 cycles a call) around tier-0 callers that
+abort on the class fields. That is doc 84's entry cost plus this doc's
+Phases 1 and 3 (TODO.md).
 
 ## 11. Open questions for review
 

@@ -890,6 +890,16 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       (six `legacy_thrash` gates) and runs +91% instructions over tier 0.
       Doc 84 Phase 1 (per-anchor bits) fixed that: binary-trees -16.5%,
       spectral-norm -7.2%. Phases 2-6 remain (see the doc's checklist).
+- [ ] **`ray` runs 2.7x slower with the JIT than on tier 0** (seen
+      2026-11-11, doc 77 Phase 0: `bench/luajit/ray.lua 6 64`, t0 462 ms,
+      jit 1248 ms, LuaJIT 32 ms). `--jit-stats`: 64% of the run is outside
+      loop bodies, and the one-shot head traces of its leaf functions cost
+      213-380 cycles per call (`dot` 213, `vsub` 380, `vdot` 538, `unitise`
+      672) where tier 0's loops run ~242 cycles an iteration. The classes'
+      field reads (`self.centre`, `self.radius`) and method lookups abort
+      `has_metatable` (doc 77 Phases 1 and 3), so the hot code is many tiny
+      head traces around tier-0 callers. Doc 84 (lean one-shot entry) is the
+      entry-cost half; `ray` is a measure for it.
 - [ ] **A loop that never traces pays ~37 instructions per back-edge in
       `gatedBackEdgeHandler`** (seen 2026-11-10, doc 84 §2.1: the pure
       probe's caller loop, which can't trace because of `if a ~= b` on two
