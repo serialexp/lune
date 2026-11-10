@@ -1,6 +1,6 @@
 # 84 — The lean one-shot entry lane — Design
 
-Status: partial — Phases 1, 2a and 3 landed, with the runtime half of
+Status: partial — Phases 1, 2a, 3 and 5 landed, with the runtime half of
 Phase 4 (the quiet episode reads the raw native result) and the first
 slice of a cheap decline (the lean decline tail, §3.6). Phase 4's other
 parts need a page capability and are sized in §4.4. The refusal want (§3.6) is
@@ -108,6 +108,15 @@ land; move whole phases to Done once everything inside them is checked.
   `call_two_shapes` −6.0%, binary-trees −1.1%, spectral-norm −1.1%, ray
   −0.6%, `globals_script` −0.6%, `meta_fields` −0.3%, array3d −0.3%;
   nothing rose. The tier-0 board is flat.
+- [x] **Phase 5 — a one-load return refusal** (§4.5, "Implemented").
+  One settled bit per pc, in a trailer behind the proto's code image.
+  `opRet` tests it inline, then the live `.jcont`, and calls the long
+  form only when neither answers. A settled return costs 74 instructions
+  less. JIT board (instructions): `call_small_fn` −5.7%,
+  `call_two_shapes` −6.1%, `co_pingpong` −3.0%, binary-trees −2.0%,
+  `globals_script` −1.8%, ray −1.1%, spectral-norm −0.9%; `gsub_fn`
+  +0.135% and `compile_multret_chain` +0.046% (a first image in a program
+  that had none, §4.5). The tier-0 board is flat.
 
   Q1-Q4 were settled 2026-11-10. Bart asked for second opinions from Codex and
   Antigravity and for the tiebreak to be settled here. Both reviewers
@@ -148,8 +157,6 @@ land; move whole phases to Done once everything inside them is checked.
   three need the page to promise that nothing it can reach reads them,
   and a page's armed exits jump into other pages, so the promise has to
   cover what can be armed. Not started; §4.4 has the options.
-- [ ] **Phase 5 — a one-load return refusal** (§4.5). `onRetResume`'s
-  refusal chain becomes one per-pc settled bit.
 - [ ] **Phase 6 — re-measure binary-trees' seed cost after doc 81 E2**
   (§4.6). A `.global` seed is a hash lookup per entry in `nativeSeedFn`.
   Doc 81's load-time cells make it a load. This doc does no seed work of
@@ -1029,6 +1036,98 @@ patches). Anchors that are refused only temporarily keep the chain.
 This helps every return in a program running under `--trace`, not only
 returns from traces.
 
+#### Implemented, 2026-11-11
+
+**Where the bit lives.** Three places were on the table: a trailer on
+the code image, a flag byte in `Instr`, and a faster bar memo. Bart was
+asked and did not answer, so the trailer was chosen here: it is the
+"per-proto bitset indexed by pc" this section describes, it leaves
+`Instr` and the canonical code untouched, and `opRet` already holds the
+image pointer. The bits sit behind the image in the same allocation
+(`imageAllocLen`, one bit per pc, rounded up to whole `Instr`s), so the
+test is one byte load off a pointer already in a register. A proto with
+no image has no bits. Settling a pc gives its proto an image if it has
+none (`ensureImage`): one copy of the code, once per proto, bounded by
+code size. Protos are arena-owned and live as long as the VM, so an
+image never outlives its key.
+
+**What is settled.** Two refusals are permanent until a named event:
+
+- the collision rule: the canonical op at the resume pc is a loop patch
+  site. That never changes.
+- a continuation anchor with no trace whose recording is abandoned
+  (`recordingBarredMemo` returns `.abandoned`, a gate bar until
+  `maxInt`).
+
+A cooling anchor (a bar with an end tick), a vararg or system proto, an
+active recording and a suspended JIT are not settled. They keep the long
+form.
+
+**What clears it.** Every gate mutation (`noteGatesChanged`, the four
+funnels `gate_gen` already has) and every trace attach or detach
+(`TraceRegistry.changed()`, with `cache_gen`) clears all settled bits,
+and `dropEntryPatchState` drops them with the images. The clear walks a
+list of the set bits (`settled_sites`), so it costs what was set, and
+nothing when nothing was. Clearing all bits is coarser than the bar
+memo's per-entry generations: a gate move anywhere makes every settled
+pc take the long form once more, which settles it again. A per-anchor
+clear is a possible refinement. It has not been needed: gates move at
+recording decisions, not per call.
+
+**The hook.** `onRetResume` is inline at its call site in `opRet`:
+
+1. `img.ptr != proto.code.ptr` (the caller has an image), else the long
+   form;
+2. the settled bit, return;
+3. `img[resume_pc].op == .jcont`, return (entry is the patch's job);
+4. the long form (`onRetResumeUnsettled`, out of line), which settles
+   what it proves.
+
+Safe builds assert every inline hit against the long form's own answer
+(`resumeSettledHolds` reads the canonical code and the maps;
+the `.jcont` hit re-runs `resumeRefused`). The hashgate runs that assert
+over every board row in Debug.
+
+**Shapes measured.** JIT board, instructions, against 5eef689:
+
+| Shape | `call_small_fn` | binary-trees | ray | Rose |
+|---|---:|---:|---:|---|
+| the bit inline, `.jcont` in the call | −5.69% | −1.12% | −0.26% | |
+| the bit tested out of line | 18 more per settled return | | | |
+| **the bit and `.jcont` inline (landed)** | −5.69% | −2.05% | −1.12% | |
+| the same, collision rule not settled | −5.69% | −2.05% | −1.12% | `meta_fields` +0.16% (−0.31% when settled) |
+| collision rule tested inline from the canonical op | −4.30% | −1.92% | −1.30% | `tostring_meta` +1.17%, `compile_multret_chain` +0.40% |
+| a narrower inline collision test | −5.30% | −1.80% | −0.86% | `tostring_meta` +0.27%, `compile_multret_chain` +0.25% |
+
+An inline test costs every return that it does not settle, so only the
+two tests that answer most returns stay inline, and the collision rule
+goes through the bit.
+
+**Result.** JIT board: `call_two_shapes` −6.10%, `call_small_fn` −5.69%
+(1,297.96 M → 1,224.18 M, 74 per return), `co_pingpong` −2.96%,
+binary-trees −2.05% (3,792.57 M → 3,714.87 M), `globals_script` −1.84%,
+ray −1.12%, `co_pingpong_d20` −0.90%, spectral-norm −0.89%,
+`meta_fields` −0.31%, array3d −0.23%, `co_pingpong_d150` −0.17%. The
+`--trace` board: `call_small_fn` −2.99%, `co_pingpong` −2.96%,
+`call_two_shapes` −2.34%, binary-trees −1.01%, `globals_script` −0.95%,
+`co_pingpong_d20` −0.91%, `co_pingpong_d150` −0.87%, ray −0.56%,
+recursive-fib −0.44%, spectral-norm −0.29%. The tier-0 board is flat.
+
+**Two rows rise, in both traced modes:** `gsub_fn` +0.135% and
+`compile_multret_chain` +0.046%. Neither had an image before, and a
+settle gives them their first. Once any image exists, `closureCode`
+stops answering "the canonical code" on a count test and reads the
+closure's memo instead, and a closure made fresh pays the image hash
+once to fill it. `gsub_fn` makes one such closure per `string.gsub`
+call (the native's activation, doc 68 §5.1). Callgrind at the bench's
+size: the settle saves 3.3 M instructions and the first image costs
+5.3 M (the image hash 1.24 M, the memo path in `opNativeAct` 2.69 M and
+`opEntry` 0.92 M). Any program that already has one patched trace pays
+this today, so it is the existing price of images, moved earlier for
+these two rows. The activation's part of it is removable, since an
+activation's proto can never have an image. That is taken as its own
+change.
+
 ### 4.6 Phase 6 — seeds, after doc 81 E2
 
 Per entry, binary-trees pays ~218 instructions in `nativeSeedFn`. Its
@@ -1086,6 +1185,7 @@ Progress, `perf stat` on the board rows (JIT minus tier 0):
 | Phase 2a | +500 | +56.6% |
 | the lean decline tail (§3.6) | +500 | +47.3% |
 | Phase 3 and Phase 4's runtime half | +413 | +45.7% |
+| Phase 5 | +339 | +42.7% |
 
 Phase 0 puts the pure probe on the board. Each phase is measured with
 callgrind on both tiers, on the pure probe and binary-trees, and with a

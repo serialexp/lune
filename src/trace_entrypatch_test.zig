@@ -442,3 +442,106 @@ test "doc 31 D1 amendment: record-gated anchor arms GATE_SKIP only when no trace
     state.afterBackEdge(&proto2, 2);
     try testing.expect(!state.skipBackEdge(&proto2, 2));
 }
+
+// ---- doc 84 §4.5: settled return refusals ------------------------------------
+
+const EntryRegistry = trace.trace_entry_registry.EntryRegistry;
+
+test "doc 84 §4.5: an abandoned continuation settles its resume pc; a gate move clears it" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.enabled = true;
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+    const cont = AnchorKey{ .proto = &proto, .pc = trace.contAnchorPc(3), .proto_id = proto.id };
+    const sites = &state.registry.entry_registry.settled_sites;
+
+    // Cooling (five of six strikes): refused, but not for good, so the
+    // return keeps the long form.
+    for (0..state.config.max_strikes - 1) |_| state.gateRecordAnchor(cont, .record_abort);
+    state.onRetResume(&proto, 3, 0, 0, state.codeFor(&proto));
+    try testing.expectEqual(@as(usize, 0), sites.items.len);
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 3));
+
+    // Abandoned: the next return through the long form settles the pc.
+    state.gateRecordAnchor(cont, .record_abort);
+    try testing.expect(state.recordingAbandoned(cont));
+    state.onRetResume(&proto, 3, 0, 0, state.codeFor(&proto));
+    try testing.expect(EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 3));
+    try testing.expectEqual(@as(usize, 1), sites.items.len);
+    // A settled return adds nothing, and its neighbours are not settled.
+    state.onRetResume(&proto, 3, 0, 0, state.codeFor(&proto));
+    try testing.expectEqual(@as(usize, 1), sites.items.len);
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 2));
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 4));
+
+    // Any gate mutation clears every bit (here: an unrelated anchor's gate).
+    state.gateRecordAnchor(.{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .record_abort);
+    try testing.expectEqual(@as(usize, 0), sites.items.len);
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 3));
+    // Still abandoned, so the next return settles it again.
+    state.onRetResume(&proto, 3, 0, 0, state.codeFor(&proto));
+    try testing.expect(EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 3));
+
+    // An epoch boundary lifts the gates and drops the images: the pc is
+    // unsettled for good and the return counts again.
+    state.clearCache();
+    try testing.expectEqual(@as(usize, 0), sites.items.len);
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 3));
+    state.onRetResume(&proto, 3, 0, 0, state.codeFor(&proto));
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 3));
+    try testing.expectEqual(@as(?u32, 1), state.counters.get(cont));
+}
+
+test "doc 84 §4.5: the collision rule settles its pc; a live .jcont refuses at the call site" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.enabled = true;
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+    const sites = &state.registry.entry_registry.settled_sites;
+
+    // pc 5 is a `for_loop`: a loop patch site, so no continuation anchor
+    // ever forms there. The first return through the long form settles it.
+    state.onRetResume(&proto, 5, 0, 0, state.codeFor(&proto));
+    try testing.expect(EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 5));
+    try testing.expectEqual(@as(usize, 1), sites.items.len);
+    try testing.expectEqual(@as(usize, 0), state.counters.count());
+    // A resume cursor one past the code has no instruction to anchor, and
+    // nothing to settle.
+    state.onRetResume(&proto, 8, 0, 0, state.codeFor(&proto));
+    try testing.expectEqual(@as(usize, 1), sites.items.len);
+    try testing.expectEqual(@as(usize, 0), state.counters.count());
+
+    // An attach clears every bit. Under its loop patch (`.jfor_loop` in the
+    // image) the pc settles again on the next return, and the patch is
+    // untouched by the bit.
+    const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
+    try state.registry.attach(t);
+    try testing.expectEqual(@as(usize, 0), sites.items.len);
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
+    try testing.expectEqual(OpCode.jfor_loop, state.codeFor(&proto)[5].op);
+    state.onRetResume(&proto, 5, 0, 0, state.codeFor(&proto));
+    try testing.expect(EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 5));
+    try testing.expectEqual(OpCode.jfor_loop, state.codeFor(&proto)[5].op);
+
+    // A continuation trace patched at pc 3: `.jcont` there, and a return
+    // into it is the patch's to enter, not the hook's to count. Decided at
+    // the call site (safe builds check it against the long form); it sets
+    // no bit, so unpatching needs no clear.
+    const tc = try entryPatchTestTrace(gpa, 2, &proto, trace.contAnchorPc(3));
+    try state.registry.attach(tc);
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(tc));
+    try testing.expectEqual(OpCode.jcont, state.codeFor(&proto)[3].op);
+    state.onRetResume(&proto, 3, 0, 0, state.codeFor(&proto));
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, state.codeFor(&proto), 3));
+    try testing.expectEqual(@as(usize, 0), state.counters.count());
+
+    // An ordinary pc still counts (the long form runs).
+    state.onRetResume(&proto, 4, 0, 0, state.codeFor(&proto));
+    try testing.expectEqual(@as(usize, 1), state.counters.count());
+}

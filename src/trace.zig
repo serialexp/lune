@@ -3483,6 +3483,8 @@ pub const TraceState = struct {
     /// `bar_cache` entry at once.
     pub inline fn noteGatesChanged(self: *TraceState) void {
         self.gate_gen +%= 1;
+        // Doc 84 §4.5: a settled return refusal claims "abandoned here".
+        self.registry.entry_registry.clearSettled();
     }
 
     /// The tick a gate entry bars recording until (`isGated`'s arithmetic):
@@ -3508,13 +3510,18 @@ pub const TraceState = struct {
         return hit;
     }
 
+    /// `recordingBarredMemo`'s answer: recording is open, barred for a
+    /// cooldown window, or barred for good (`recordingAbandoned`).
+    const Bar = enum { open, cooling, abandoned };
+
     /// `recordingBarred` for an anchor the caller found without a trace,
     /// remembering a barred answer in `bar_cache` for `barCached`.
-    fn recordingBarredMemo(self: *TraceState, anchor: AnchorKey) bool {
+    fn recordingBarredMemo(self: *TraceState, anchor: AnchorKey) Bar {
         const until = @max(self.gateBarUntil(self.gate.get(anchor)), self.gateBarUntil(self.record_gate.get(anchor)));
-        if (self.tick >= until) return false;
+        if (self.tick >= until) return .open;
+        const bar: Bar = if (until == std.math.maxInt(u64)) .abandoned else .cooling;
         const tab = self.bar_cache orelse blk: {
-            const t = self.gpa.create([BAR_CACHE_SIZE]BarEntry) catch return true;
+            const t = self.gpa.create([BAR_CACHE_SIZE]BarEntry) catch return bar;
             t.* = @splat(.{});
             self.bar_cache = t;
             break :blk t;
@@ -3527,7 +3534,7 @@ pub const TraceState = struct {
             .cache_gen = self.registry.cache_gen,
             .until = until,
         };
-        return true;
+        return bar;
     }
 
     /// A1' (task 27): PERMANENT-only variant of `recordingBarred` — true only
@@ -3955,7 +3962,7 @@ pub const TraceState = struct {
             self.maybeRepatchHead(proto, key, img);
             return;
         }
-        if (self.recordingBarredMemo(key)) return;
+        if (self.recordingBarredMemo(key) != .open) return;
         const gop = self.counters.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
@@ -3998,11 +4005,61 @@ pub const TraceState = struct {
     /// - the boundary return never reaches this funnel (`opRet`'s
     ///   `stop_depth` path exits `execImpl` before it).
     /// `opRet` calls it only with tracing enabled.
-    pub noinline fn onRetResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
-        // Most returns stop at the refusals, without `noteResume`'s frame
-        // (`onCallEntryTraced`'s split, and `noinline` for the same reason).
-        if (self.resumeRefused(proto, resume_pc, img)) return;
+    ///
+    /// Doc 84 §4.5: the steady refusals of a caller that has an image are
+    /// decided inline at the call site and make no call.
+    /// - A settled resume pc: one bit of the image, set by the long form
+    ///   where it finds a refusal that cannot change until a gate moves or
+    ///   a trace is attached or detached (`settleResume`: the collision
+    ///   rule, and a continuation abandoned without a trace). Both of those
+    ///   events clear every bit, so a set bit is what the long form would
+    ///   answer. Safe builds check each hit against the code and the maps.
+    /// - A live `.jcont` at the resume pc: entry is the patch's job.
+    /// A caller with no image has neither, and pays one pointer compare.
+    ///
+    /// The shape is measured (doc 84 §4.5, "Implemented"): the same test
+    /// out of line, and the collision rule tested inline from the resumed
+    /// op instead of settled, both cost more.
+    pub inline fn onRetResume(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
+        if (img.ptr != proto.code.ptr) {
+            if (trace_entry_registry.EntryRegistry.resumeSettled(proto, img, resume_pc)) {
+                if (std.debug.runtime_safety) std.debug.assert(self.resumeSettledHolds(proto, resume_pc));
+                return;
+            }
+            if (resume_pc < img.len and img[resume_pc].op == .jcont) {
+                if (std.debug.runtime_safety) std.debug.assert(self.resumeRefused(proto, resume_pc, img, false));
+                return;
+            }
+        }
+        self.onRetResumeUnsettled(proto, resume_pc, base, call_seq, img);
+    }
+
+    noinline fn onRetResumeUnsettled(self: *TraceState, proto: *const Proto, resume_pc: u32, base: usize, call_seq: u64, img: []const Instr) void {
+        // Most of these returns stop at the refusals, without `noteResume`'s
+        // frame (`onCallEntryTraced`'s split, and `noinline` for the same
+        // reason).
+        if (self.resumeRefused(proto, resume_pc, img, true)) return;
         @call(.never_inline, noteResume, .{ self, proto, resume_pc, base, call_seq, img, null });
+    }
+
+    /// What a settled bit at `resume_pc` claims, read from the code and the
+    /// maps: the continuation hooks refuse this pc, and will until a gate
+    /// moves or a trace is attached or detached. Either the collision rule
+    /// (the canonical op is a loop patch site, for good), or a continuation
+    /// anchor with no trace that is abandoned.
+    fn resumeSettledHolds(self: *const TraceState, proto: *const Proto, resume_pc: u32) bool {
+        if (resume_pc >= proto.code.len) return false;
+        if (trace_entry_registry.EntryRegistry.patchedEntryOp(proto.code[resume_pc].op) != null) return true;
+        const key = AnchorKey{ .proto = proto, .pc = contAnchorPc(resume_pc), .proto_id = proto.id };
+        return !self.hasTrace(key) and self.recordingAbandoned(key);
+    }
+
+    /// Mark `resume_pc`'s refusal settled (doc 84 §4.5). Call only where
+    /// `resumeSettledHolds` is true. It gives the proto an image if it has
+    /// none: one copy of its code, once per proto.
+    fn settleResume(self: *TraceState, proto: *const Proto, resume_pc: u32) void {
+        std.debug.assert(self.resumeSettledHolds(proto, resume_pc));
+        self.registry.entry_registry.settleResume(proto, resume_pc);
     }
 
     /// Trace stitching (doc 44): a `call_interp` terminal exited at the host
@@ -4017,12 +4074,14 @@ pub const TraceState = struct {
         // recursion's base case) has no continuation worth a trace; refuse
         // before the counter, which would otherwise be hashed per exit.
         if (call_pc + 1 < proto.code.len and proto.code[call_pc + 1].op == .ret) return;
-        if (self.resumeRefused(proto, call_pc + 1, img)) return;
+        if (self.resumeRefused(proto, call_pc + 1, img, true)) return;
         self.noteResume(proto, call_pc + 1, base, call_seq, img, call_pc);
     }
 
-    /// The continuation hooks' cheap refusals, in their original order.
-    inline fn resumeRefused(self: *const TraceState, proto: *const Proto, resume_pc: u32, img: []const Instr) bool {
+    /// The continuation hooks' cheap refusals. `settle` lets the collision
+    /// rule mark the pc settled (doc 84 §4.5); the Safe-build witness of
+    /// the inline `.jcont` test passes false and only reads.
+    inline fn resumeRefused(self: *TraceState, proto: *const Proto, resume_pc: u32, img: []const Instr, comptime settle: bool) bool {
         std.debug.assert(self.config.enabled);
         // A recording owns the stream; don't compete. Suspended (doc 63
         // §5.9): as `onCallEntry`, one `fast_block` test for both.
@@ -4036,9 +4095,13 @@ pub const TraceState = struct {
         // Patched steady state: one bounds-checked opcode compare (D9 S1).
         const resumed_op = img[resume_pc].op;
         if (resumed_op == .jcont) return true;
-        // Collision rule: the pc hosts (or could host) a different patch kind.
+        // Collision rule: the pc hosts (or could host) a different patch
+        // kind. The canonical op decides the loop kinds, for good.
+        if (trace_entry_registry.EntryRegistry.patchedEntryOp(proto.code[resume_pc].op) != null) {
+            if (settle) self.settleResume(proto, resume_pc);
+            return true;
+        }
         if (resumed_op == .jfor_loop or resumed_op == .jloop or resumed_op == .jfunc_head) return true;
-        if (trace_entry_registry.EntryRegistry.patchedEntryOp(proto.code[resume_pc].op) != null) return true;
         // A barred continuation with no trace: one memo probe, not three hashes.
         return self.barCached(.{ .proto = proto, .pc = contAnchorPc(resume_pc), .proto_id = proto.id });
     }
@@ -4053,7 +4116,14 @@ pub const TraceState = struct {
             self.maybeRepatchCont(proto, key, img);
             return;
         }
-        if (self.recordingBarredMemo(key)) return;
+        switch (self.recordingBarredMemo(key)) {
+            .open => {},
+            .cooling => return,
+            .abandoned => {
+                self.settleResume(proto, resume_pc);
+                return;
+            },
+        }
         const gop = self.counters.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;

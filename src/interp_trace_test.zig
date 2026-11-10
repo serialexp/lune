@@ -5986,6 +5986,68 @@ test "one-shot lane (doc 84 §3.6): an anchor at sibling capacity keeps the walk
     }.tune));
 }
 
+test "return hook (doc 84 §4.5): an abandoned continuation's resume pc ends up settled" {
+    // The loop compares two distinct tables, so neither it nor the
+    // continuation after `f(i)` can record: the continuation's anchor is
+    // abandoned after `max_strikes` aborts, and from then on every return
+    // from `f` stops at the settled bit in main's image. Safe builds check
+    // each of those returns against the maps (`resumeSettledHolds`), so
+    // running to the end is the exactness witness; the bit is the proof
+    // that the short form was reached.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local function f(n)
+        \\  local x = (n * 16807) % 1000003
+        \\  return x % 7
+        \\end
+        \\local a, b = {}, {}
+        \\local acc = 0
+        \\for i = 1, 3000 do
+        \\  if a ~= b then acc = acc + f(i) end
+        \\end
+        \\print(acc)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    vm.trace.config.backoff_base = 8;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("8829\n", sink.buffered());
+
+    const EntryRegistry = trace.trace_entry_registry.EntryRegistry;
+    const main = chunk.proto;
+    const img = vm.trace.codeFor(main);
+    try testing.expect(img.ptr != main.code.ptr);
+    var settled: usize = 0;
+    for (1..main.code.len) |pc| {
+        if (!EntryRegistry.resumeSettled(main, img, @intCast(pc))) continue;
+        settled += 1;
+        // The one settled pc is the instruction after the call of `f`,
+        // and its continuation anchor is abandoned with no trace.
+        try testing.expectEqual(bytecode.OpCode.call, main.code[pc - 1].op);
+        const key = trace.AnchorKey{ .proto = main, .pc = trace.contAnchorPc(@intCast(pc)), .proto_id = main.id };
+        try testing.expect(vm.trace.recordingAbandoned(key));
+        try testing.expect(!vm.trace.hasTrace(key));
+    }
+    try testing.expectEqual(@as(usize, 1), settled);
+}
+
 test "head handoff evidence symmetry (doc 44 D12a): the base-case-incumbent shape arms BOTH directions" {
     // Which sibling records FIRST is a deterministic function of hot-call
     // timing, and pre-D12a the base-case-incumbent shape (fib(27) in the

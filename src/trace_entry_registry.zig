@@ -80,10 +80,25 @@ const ImageKeyContext = struct {
     }
 };
 
+/// One set bit of an image's settled bitset (`EntryRegistry.settleResume`):
+/// the byte that holds it and its mask, so clearing never looks the image
+/// up again.
+const SettledSite = struct {
+    byte: *u8,
+    mask: u8,
+};
+
 pub const EntryRegistry = struct {
     gpa: std.mem.Allocator,
+    /// Each image is `proto.code.len` instructions with its settled bitset
+    /// behind them in the same allocation (`imageAllocLen`, `settledBits`).
+    /// Allocate and free only through `ensureImage` and `freeImage`.
     code_images: std.HashMapUnmanaged(ImageKey, []Instr, ImageKeyContext, std.hash_map.default_max_load_percentage) = .empty,
     image_gen: u64 = 0,
+    /// Doc 84 §4.5: every settled bit that is set, in the order it was set.
+    /// `clearSettled` clears exactly these, so its cost is the number of
+    /// settled sites, never the size of the images.
+    settled_sites: std.ArrayListUnmanaged(SettledSite) = .empty,
     entry_patches: std.ArrayListUnmanaged(*EntryPatch) = .empty,
     entry_patch_free: std.ArrayListUnmanaged(u16) = .empty,
     /// Owner-internal work counter; advance via `markEntryPatchPending` /
@@ -97,6 +112,7 @@ pub const EntryRegistry = struct {
     pub fn deinit(self: *EntryRegistry) void {
         self.dropEntryPatchState();
         self.code_images.deinit(self.gpa);
+        self.settled_sites.deinit(self.gpa);
         self.entry_patches.deinit(self.gpa);
         self.entry_patch_free.deinit(self.gpa);
     }
@@ -115,16 +131,80 @@ pub const EntryRegistry = struct {
         return self.code_images.get(.of(proto)) orelse proto.code;
     }
 
+    /// Bytes of settled bitset behind an image of `len` instructions: one
+    /// bit per pc, and one for `pc == len` (a resume cursor one past the
+    /// last call), which is never set.
+    fn settledLen(len: usize) usize {
+        return len / 8 + 1;
+    }
+
+    /// Instructions to allocate for an image of `len`: the code, then whole
+    /// instructions' worth of storage for the bitset.
+    fn imageAllocLen(len: usize) usize {
+        return len + (settledLen(len) + @sizeOf(Instr) - 1) / @sizeOf(Instr);
+    }
+
+    /// The settled bitset of `img`, which must be an image this registry
+    /// allocated (never canonical `proto.code`).
+    inline fn settledBits(img: []const Instr) [*]u8 {
+        return @ptrCast(@constCast(img.ptr + img.len));
+    }
+
+    fn freeImage(self: *EntryRegistry, img: []Instr) void {
+        self.gpa.free(img.ptr[0..imageAllocLen(img.len)]);
+    }
+
     pub fn ensureImage(self: *EntryRegistry, proto: *const Proto) ![]Instr {
         const gop = try self.code_images.getOrPut(self.gpa, .of(proto));
         if (!gop.found_existing) {
-            gop.value_ptr.* = self.gpa.dupe(Instr, proto.code) catch |err| {
+            const len = proto.code.len;
+            const full = self.gpa.alloc(Instr, imageAllocLen(len)) catch |err| {
                 self.code_images.removeByPtr(gop.key_ptr);
                 return err;
             };
+            @memcpy(full[0..len], proto.code);
+            @memset(std.mem.sliceAsBytes(full[len..]), 0);
+            gop.value_ptr.* = full[0..len];
             self.bumpImageGen();
         }
         return gop.value_ptr.*;
+    }
+
+    /// Doc 84 §4.5: is the return hook's refusal at `pc` settled? `img` is
+    /// what `codeFor(proto)` answered: canonical code has no bitset and is
+    /// never settled. One pointer compare and one bit test, for `opRet`.
+    pub inline fn resumeSettled(proto: *const Proto, img: []const Instr, pc: u32) bool {
+        if (img.ptr == proto.code.ptr) return false;
+        std.debug.assert(pc <= img.len);
+        return settledBits(img)[pc >> 3] & (@as(u8, 1) << @as(u3, @truncate(pc))) != 0;
+    }
+
+    /// Set `pc`'s settled bit, giving `proto` an image if it has none. The
+    /// caller has proved the return hook refuses this pc until the next
+    /// `clearSettled`. An allocation failure leaves the bit clear, which
+    /// only costs the hook its long form.
+    pub fn settleResume(self: *EntryRegistry, proto: *const Proto, pc: u32) void {
+        std.debug.assert(pc < proto.code.len);
+        self.settled_sites.ensureUnusedCapacity(self.gpa, 1) catch return;
+        const img = self.ensureImage(proto) catch return;
+        const byte = &settledBits(img)[pc >> 3];
+        const mask = @as(u8, 1) << @as(u3, @truncate(pc));
+        if (byte.* & mask != 0) return;
+        byte.* |= mask;
+        self.settled_sites.appendAssumeCapacity(.{ .byte = byte, .mask = mask });
+    }
+
+    /// Clear every settled bit. Called by whatever can change a settled
+    /// answer: a gate mutation and a trace attach or detach. With nothing
+    /// settled it is one load.
+    pub inline fn clearSettled(self: *EntryRegistry) void {
+        if (self.settled_sites.items.len == 0) return;
+        self.clearSettledSites();
+    }
+
+    noinline fn clearSettledSites(self: *EntryRegistry) void {
+        for (self.settled_sites.items) |s| s.byte.* &= ~s.mask;
+        self.settled_sites.clearRetainingCapacity();
     }
 
     /// Doc 58 §4.2: only the three loop back-edges are patchable
@@ -295,8 +375,10 @@ pub const EntryRegistry = struct {
     }
 
     pub fn dropEntryPatchState(self: *EntryRegistry) void {
+        // The sites point into the images: forget them first.
+        self.settled_sites.clearRetainingCapacity();
         var it = self.code_images.valueIterator();
-        while (it.next()) |img| self.gpa.free(img.*);
+        while (it.next()) |img| self.freeImage(img.*);
         self.code_images.clearRetainingCapacity();
         for (self.entry_patches.items) |p| self.gpa.destroy(p);
         self.entry_patches.clearRetainingCapacity();
@@ -387,4 +469,58 @@ test "cont entry patch (doc 44 D12b): install writes .jcont at the resume pc, un
     record3.code.anchor = .{ .proto = &proto, .pc = trace_code.contAnchorPc(99), .proto_id = proto.id };
     record3.code.inputs = &.{};
     try testing.expectEqual(InstallResult.no_patch_pc, registry.installEntryPatch(&record3));
+}
+
+test "settled bits (doc 84 §4.5): behind the image, cleared as a set, gone with the images" {
+    const testing = std.testing;
+    var registry = EntryRegistry.init(testing.allocator);
+    defer registry.deinit();
+    // 17 instructions: pcs 0..16 and the one-past cursor 17 span three
+    // bitset bytes, so the last byte is exercised.
+    var code: [17]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = 3, .name = "s", .num_registers = 4 };
+
+    // Canonical code is never settled, at any pc.
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, registry.codeFor(&proto), 16));
+
+    const gen0 = registry.image_gen;
+    registry.settleResume(&proto, 16);
+    registry.settleResume(&proto, 0);
+    registry.settleResume(&proto, 16); // already set: no second site
+    try testing.expect(registry.image_gen != gen0); // the proto got an image
+    const img = registry.codeFor(&proto);
+    try testing.expect(img.ptr != proto.code.ptr);
+    try testing.expectEqual(@as(usize, 2), registry.settled_sites.items.len);
+    for (0..18) |pc| {
+        try testing.expectEqual(pc == 0 or pc == 16, EntryRegistry.resumeSettled(&proto, img, @intCast(pc)));
+    }
+    // The image's instructions are the canonical ones.
+    for (img, code) |a, b| try testing.expectEqual(b.op, a.op);
+    // The canonical slice still answers "not settled".
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, proto.code, 16));
+
+    registry.clearSettled();
+    try testing.expectEqual(@as(usize, 0), registry.settled_sites.items.len);
+    for (0..18) |pc| try testing.expect(!EntryRegistry.resumeSettled(&proto, img, @intCast(pc)));
+
+    // Dropping the images forgets the sites that pointed into them.
+    registry.settleResume(&proto, 5);
+    registry.dropEntryPatchState();
+    try testing.expectEqual(@as(usize, 0), registry.settled_sites.items.len);
+    registry.clearSettled();
+    try testing.expectEqual(proto.code.ptr, registry.codeFor(&proto).ptr);
+}
+
+test "settled bits (doc 84 §4.5): an allocation refusal leaves the pc unsettled" {
+    const testing = std.testing;
+    var storage: [0]u8 = .{};
+    var allocator = std.heap.FixedBufferAllocator.init(&storage);
+    var registry = EntryRegistry.init(allocator.allocator());
+    defer registry.deinit();
+    var code = [_]Instr{ Instr.op0(.ret), Instr.op0(.ret) };
+    const proto = Proto{ .code = &code, .id = 1, .name = "oom", .num_registers = 4 };
+    registry.settleResume(&proto, 1);
+    try testing.expectEqual(proto.code.ptr, registry.codeFor(&proto).ptr);
+    try testing.expect(!EntryRegistry.resumeSettled(&proto, registry.codeFor(&proto), 1));
 }

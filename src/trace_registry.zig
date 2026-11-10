@@ -78,6 +78,8 @@ pub const TraceRegistry = struct {
     fn changed(self: *TraceRegistry) void {
         self.cache_gen +%= 1;
         if (self.cache_gen == 0) self.cache_gen = 1;
+        // Doc 84 §4.5: a settled return refusal claims "no trace here".
+        self.entry_registry.clearSettled();
     }
     /// Unpublished storage; caller prepares code, and owns its arrays until publish succeeds.
     pub fn allocate(self: *TraceRegistry) !*Trace {
