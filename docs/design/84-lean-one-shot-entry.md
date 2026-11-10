@@ -1,8 +1,10 @@
 # 84 — The lean one-shot entry lane — Design
 
-Status: partial — Phases 1 and 2a landed. Next: entry refusals (§3.6),
-then Phases 3 and 4; Phase 2b is parked until they are in. Q1-Q4 settled
-(§7) after reviews by Codex and Antigravity
+Status: partial — Phases 1 and 2a landed. The refusal want (§3.6) is
+prototyped and measured: it costs more than it saves until a declined
+entry is cheap, so its order against Phases 3 and 4 is open (Q5, §3.6).
+Phase 2b is parked until Phases 3 and 4 are in. Q1-Q4 settled (§7) after
+reviews by Codex and Antigravity
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -64,6 +66,18 @@ land; move whole phases to Done once everything inside them is checked.
   board is flat. The pure probe is at +500 per call (was +577 on the same
   measure).
 
+- [x] **A stale head-sibling want no longer bars every other anchor**
+  (1192436; found building §3.6). `wants_head_sibling` is one slot for the
+  program. `BottomUpTree`'s want was raised and its anchor gated in one
+  receipt, so no walk consumed it and no other anchor could ask for a
+  sibling. Another anchor's hot exit now displaces a standing want. The
+  board is unchanged; the refusal want needs it.
+- [x] **Phase 0c — the two-shape probe is a board row.**
+  `bench/call_two_shapes.lua` calls one small function with two table
+  shapes in turn, from a loop that cannot trace: 500,000 iterations, two
+  calls each, one of them refused at the head trace's entry checks. Its
+  hashgate rows agree in all three modes and with LuaJIT.
+
   Q1-Q4 were settled 2026-11-10. Bart asked for second opinions from Codex and
   Antigravity and for the tiebreak to be settled here. Both reviewers
   picked the same four options independently. Their factual corrections
@@ -77,7 +91,12 @@ land; move whole phases to Done once everything inside them is checked.
 - [ ] **Entry refusals raise a sibling want** (§3.6). 46% of
   binary-trees' one-shot entries are refused at the trace's own prologue
   and run on tier 0 after paying the entry. Bart picked option (a) on
-  2026-11-11: design note first, then build.
+  2026-11-11: design note first, then build. The note is in §3.6. The
+  prototype works and measures +2.7% on binary-trees and +6.9% on the
+  two-shape probe, because a declined entry costs about 610 instructions.
+  Not landed; waits on Q5.
+- [ ] **Q5 — what makes a declined entry cheap, and in which order**
+  (§3.6, "What would make a sibling pay"). Open, for Bart.
 - [ ] **Defer — Phase 2b, the blocker word** (§4.2, "Parked"). The
   lane's gate still reads its remaining program-wide conditions one by
   one (three in the gate, about fourteen in `headEpisodeQuiet`, ~40
@@ -304,8 +323,12 @@ is settled. That answer, too, doesn't change from call to call.
 ### 3.6 An entry refusal is not evidence
 
 Seen 2026-11-11 on binary-trees. `ItemCheck`'s head trace was recorded on
-an inner node. Its entry checks include a `guard_bounds` on `tree[2]`,
-which every leaf fails. At argument 10 that is 134,092 head entries
+an inner node. Its entry checks pin the argument's array lane: an inner
+node `{ item, left, right }` is a mixed array (the value lane), a leaf
+`{ item }` is an integer array, and the prologue's lane check refuses it.
+(This paragraph first blamed a `guard_bounds` on `tree[2]`. That was
+wrong: `guard_bounds` is a body guard with an exit of its own. Corrected
+2026-11-11.) At argument 10 that is 134,092 head entries
 refused at the prologue, and another 134,036 at the bottom of pushed
 descents. A prologue failure is an entry refusal, not a guard exit: it
 counts no hot exit and raises no sibling want. So no trace for the leaf
@@ -333,6 +356,133 @@ below this list before anything is built):
   are mostly refused is unpatched, so the leaf calls stop paying the
   entry. The inner-node calls lose their trace too.
 - **(c) Leave it.** The lane keeps lowering the price of a refusal.
+
+#### Design note for (a), 2026-11-11
+
+Built as a prototype and measured before anything landed. The prototype
+is not in the tree.
+
+**The mechanism.** About 25 lines, all of it reuse:
+
+- `Trace.refusal_count`, a saturating `u8` with the exit counters' `DONE`
+  latch. The `.entry_refusal` branch of the two receipt funnels
+  (`onSideExit`, `onSideExitReceipt`) bumps it for a one-shot anchor. The
+  branch is keyed on the explicit charge kind, never on
+  `exit_instr == maxInt` (doc 33 §3a), and every refusal site already goes
+  through it.
+- At `hotexit` it raises `wants_head_sibling` with the source
+  `(trace, maxInt)`, behind the same three tests the exit route uses: no
+  want standing for this anchor, recording not barred, the anchor below
+  `max_traces_per_anchor`.
+- Nothing new consumes it. The refused entry returns `.next_candidate`,
+  `finishPatchedWalk` walks the siblings, and when all of them decline it
+  transfers the want to the current activation, as it does for a hot
+  zero exit. The recording starts on the call that was just refused.
+- `noteHeadSiblingCompletion` latches the counter when another sibling
+  completes, so a covered shape stops asking.
+
+**A bug in the way (fixed, 1192436).** The first run raised nothing.
+`wants_head_sibling` is one slot for the whole program and `noteTakenExit`
+refused to raise while any want stood. `BottomUpTree`'s head trace raises
+one at exit 5, and the same receipt's thrash strike gates and unpatches
+that anchor, so no walk ever consumed it. It held the slot for the rest
+of the run. Another anchor's hot exit now displaces a standing want; the
+displaced source's counter stays saturated, so it asks again at its next
+zero exit.
+
+**What it records.** On binary-trees `ItemCheck` gets three more head
+traces, not one. A leaf is not one shape: the integer lane follows the
+width of `item`, and the run has leaves in lanes 7, 3 and 2. With the
+inner node's value lane that is four traces, which is
+`max_traces_per_anchor`. A fifth lane would stay uncovered.
+
+**What it costs.** Instructions, `--jit-native`:
+
+| Program | Tier 0 | JIT at HEAD | JIT with the want | Δ |
+|---|---:|---:|---:|---:|
+| binary-trees, argument 12 | 2.60 G | 4,074.6 M | 4,182.8 M | +2.7% |
+| `call_two_shapes`, per iteration (two calls) | 1,559 | 2,786 | 2,977 | +6.9% |
+
+With the want every call in the probe completes in native code, and the
+run is slower. The reason is what a declined entry costs. One call of a
+two-branch function, 10⁶ calls after the trace is recorded, against the
+same program on tier 0:
+
+| Call | Over tier 0 |
+|---|---:|
+| the shape the trace was recorded for (entry, body, completion) | +430 |
+| the other shape, today (refused entry, then the body on tier 0) | +802 |
+| the other shape with a sibling (refused entry, walk, sibling entry) | +1,019 |
+
+Where a refused call's 795 go (callgrind, 200,000 calls, against tier 0):
+
+| Where | Per call |
+|---|---:|
+| `finishOneShotLane` with `nextTraceExcluding` (the walk tail and its hash lookups) | 228 |
+| `enterHeadNativeQuiet` (the call prelude, the result marshal, the refusal's receipts) | 183 |
+| `opJFuncHead` | 114 |
+| `onRetResume` (the return hook every JIT-mode call pays) | 72 |
+| native code: the prologue, the fail stub, its ledger row | 49 |
+| `headEpisodeQuiet` | 40 |
+| the rest (back-edge handler, call hook, `opRet`) | ~110 |
+
+About 610 of the 795 are the entry attempt; the native prologue that
+does the refusing is 49 of them. binary-trees has 1,004,790 refused
+entries at argument 12, so about 0.6 G of the 1.47 G its JIT run spends
+over tier 0 is refusals (an estimate: the probe's per-call figure times
+the count).
+
+So a sibling cannot pay while a decline costs 610. A leaf call with a
+sibling pays a decline for the incumbent, then the walk, then a full
+entry, to replace a tier-0 body of about 150 instructions. On
+binary-trees it pays 2.04 declines per leaf on average, because the
+leaf lanes are three siblings deep.
+
+**What would make a sibling pay (Q5, open).** Three ways to make a
+decline cheap. They are not exclusive.
+
+- **(i) A lean refusal in the lane.** The refused outcome becomes a
+  first-class result of Phase 4's thin native call, and a refusal at an
+  anchor with no other candidate and no want due leaves on a short path,
+  as Phase 3 does for a completion. It removes most of the 228 and the
+  183 and leaves the gate and the handler (about 150) plus the native
+  49. The entry contract stays in one place, the native prologue. Inside
+  a pushed descent the leaf still leaves native code.
+- **(ii) An entry-fact check at the patch.** Each page publishes its
+  entry checks as a list (slot, kind, expected value), and the walk tests
+  a candidate against it before entering. A decline is then 15 to 20
+  instructions and only the matching sibling is entered. It is a second
+  description of the entry contract next to the emitted prologue (tags,
+  table type, metatable, frozen bit, lane, grid, function and builtin
+  identity, string pins), and seeded slots cannot be checked before the
+  seed call.
+- **(iii) A native miss chain.** The prologue-fail stub gets a jump slot
+  and is armed to the next sibling's entry, so a leaf at the bottom of a
+  descent runs without leaving native code. That is where fib is today:
+  its base case is a real guard exit, `.sibling_handoff` arms both ways,
+  and fib(27) runs 302 M instructions on tier 0 and 240 M with the JIT.
+  It needs a slot on the stub, `.prologue_fail` as a chain source in the
+  ledger grammar (today "always terminal"), and an order rule so that an
+  argument no sibling accepts cannot cycle to the ledger cap (the nsieve
+  ping-pong, +128%). Rule Z-8 sends it through a design doc of its own.
+
+Orders to choose from:
+
+- **A.** Phases 3 and 4 next, with the refused outcome in their scope
+  (i). Then re-measure the want and land it when the probe and
+  binary-trees both improve. (iii) afterwards, as its own doc, if
+  descents still dominate.
+- **B.** (ii) now, then the want, then Phases 3 and 4.
+- **C.** (iii) now: write its design doc before any more lane work.
+- **D.** Land the want as measured (+2.7% binary-trees, +6.9% on the
+  probe) and recover it in later phases.
+
+Two things this note does not solve. `BottomUpTree`'s base case cannot
+be recorded at all: `return { item }` aborts on `set_list` (doc 72 P3),
+so its 131k descents per run at argument 10 each end in a deopt at exit
+5 whatever is done here. And the integer lanes multiply shapes: a
+function that only reads `t[1]` needs one trace per width of the stored
+integers.
 
 ## 4. Design
 

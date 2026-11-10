@@ -895,14 +895,31 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       Phases 3 and 4 are in; Phases 3-6 remain (see the doc's checklist).
 - [ ] **A one-shot trace whose entry checks fail never gets a sibling**
       (seen 2026-11-11, doc 84 §3.6). binary-trees' `ItemCheck` head trace
-      was recorded on an inner node; every leaf fails its `guard_bounds` at
-      the prologue. An entry refusal counts no hot exit and raises no
-      sibling want, and a one-shot patch accrues no strikes below sibling
-      capacity, so 1.0 M of the program's 2.17 M one-shot entries (46%) pay
-      an entry and then run on tier 0. `BottomUpTree` has the same shape at
-      the bottom of its descents. Bart picked 2026-11-11: refusals raise a
-      sibling want (design note in doc 84 §3.6 first, then build). The loop
-      analog is the "SECOND trace for the second lane shape" entry below.
+      was recorded on an inner node; every leaf fails the prologue's
+      array-lane check (inner nodes are value-lane arrays, leaves integer
+      ones; not a `guard_bounds`, as this entry first said). An entry
+      refusal counts no hot exit and raises no sibling want, and a
+      one-shot patch accrues no strikes below sibling capacity, so 1.0 M
+      of the program's 2.17 M one-shot entries (46%) pay an entry and then
+      run on tier 0. Bart picked 2026-11-11: refusals raise a sibling want
+      (design note in doc 84 §3.6 first, then build). The loop analog is
+      the "SECOND trace for the second lane shape" entry below.
+      **Prototyped and measured 2026-11-11, not landed:** the want works
+      (about 25 lines) but binary-trees is +2.7% and the new probe
+      `bench/call_two_shapes.lua` +6.9%, because a declined entry costs
+      about 610 instructions and a leaf walks 2.04 of them. Doc 84 §3.6
+      has the note, the numbers and the open question (Q5: what makes a
+      decline cheap, and in which order). Found on the way and fixed
+      (1192436): a stale head-sibling want barred every other anchor's
+      want for the rest of the run.
+- [ ] **Narrow integer lanes multiply one-shot shapes** (seen 2026-11-11,
+      doc 84 §3.6). A function that only reads `t[1]` is specialised on
+      the array's lane, and an integer array's lane follows the width of
+      its values. binary-trees' leaves `{ item }` arrive in lanes 7, 3
+      and 2, so `ItemCheck` would need four head traces (with the inner
+      node's value lane), which is `max_traces_per_anchor`. A read that
+      was generic over the integer lanes would make the leaf one shape.
+      Not designed.
 - [x] **No gate builds the ReleaseFast library, so the no-safety block of
       `src/asm/offsets_x64.inc` goes stale unnoticed** (seen 2026-11-11).
       Fixed 2026-11-11: `just test` now runs `just check-release-lib`

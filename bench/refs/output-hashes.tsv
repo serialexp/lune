@@ -1,5 +1,5 @@
 # mahina frozen benchmark output digests — see tools/hashgate.py
-# generated from zig-out/bin/mahina at rev ecab3ea
+# generated from zig-out/bin/mahina at rev a9ff3fa
 # name	mode	argv	rc	sha256(stdout)
 array3d	jit	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
 array3d	t0	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
@@ -10,6 +10,9 @@ binary-trees	trace	12	0	a5814ed8f8e2a878b707e810b46e0979cfbcc369cc1960d51d5b2efa
 call_small_fn	jit	1000000	0	fb972eebd5bc8f12cfa7de989adf4e8e183f4f4a7243fca2c438f86076fd0344
 call_small_fn	t0	1000000	0	fb972eebd5bc8f12cfa7de989adf4e8e183f4f4a7243fca2c438f86076fd0344
 call_small_fn	trace	1000000	0	fb972eebd5bc8f12cfa7de989adf4e8e183f4f4a7243fca2c438f86076fd0344
+call_two_shapes	jit	500000	0	a92373742eac3ba9e17aa3c09b8bcb19aefda9be4f665a6a94048ab1ae6247c8
+call_two_shapes	t0	500000	0	a92373742eac3ba9e17aa3c09b8bcb19aefda9be4f665a6a94048ab1ae6247c8
+call_two_shapes	trace	500000	0	a92373742eac3ba9e17aa3c09b8bcb19aefda9be4f665a6a94048ab1ae6247c8
 co_churn	jit	50000	0	6856c26eb8e2584e83a4dc6edbacf4386d535a4d12567516e5b5c2d7a8cd741e
 co_churn	t0	50000	0	6856c26eb8e2584e83a4dc6edbacf4386d535a4d12567516e5b5c2d7a8cd741e
 co_churn	trace	50000	0	6856c26eb8e2584e83a4dc6edbacf4386d535a4d12567516e5b5c2d7a8cd741e
