@@ -117,6 +117,11 @@ land; move whole phases to Done once everything inside them is checked.
   `globals_script` −1.8%, ray −1.1%, spectral-norm −0.9%; `gsub_fn`
   +0.135% and `compile_multret_chain` +0.046% (a first image in a program
   that had none, §4.5). The tier-0 board is flat.
+- [x] **An activation's code memo is filled at its creation** (§4.5,
+  "Follow-up"). A resumable native's activation no longer pays the image
+  hash on every call once an image exists. JIT board: `tostring_meta`
+  −3.7%, `gsub_fn` −0.11% (back to +0.02% against the tree before
+  Phase 5). Tier 0: `tostring_meta` +0.14%.
 
   Q1-Q4 were settled 2026-11-10. Bart asked for second opinions from Codex and
   Antigravity and for the tiebreak to be settled here. Both reviewers
@@ -1127,6 +1132,39 @@ this today, so it is the existing price of images, moved earlier for
 these two rows. The activation's part of it is removable, since an
 activation's proto can never have an image. That is taken as its own
 change.
+
+**Follow-up, 2026-11-11: an activation's memo is filled at its
+creation.** A resumable native's activation is a fresh closure per call
+(`enterActivation`), so once any image existed its empty memo sent every
+activation through the image hash (47 instructions on `tostring_meta`).
+No anchor can arise in an activation's proto: it has no loop, its entry
+is not counted, and the return hook refuses a system proto before it
+settles anything. So it never has an image, and `enterActivation` now
+writes the canonical code into the new closure's memo when an image
+exists. Safe builds check the claim against the image map at every
+activation, and a test pins it with images present. JIT board:
+`tostring_meta` −3.68% (922.23 M → 888.26 M, 57 per activation),
+`gsub_fn` −0.112%, which leaves it +0.02% against the tree before
+Phase 5. Tier 0: `tostring_meta` +0.141% (the image-count test, 2 per
+activation), the rest flat.
+
+Three other placements were measured. Skipping the memo for an
+activation inside `enterCallee`, and testing for an activation proto in
+`closureCode`'s cold fill, both changed the code of the shared entry
+handler (`enterCallee` is inlined into it) and cost tier 0 on rows the
+change has nothing to do with: `pcall_faults` +0.036% to +0.072%, which
+makes no activation, and `sort_cmp` +0.115%. Filling the memo with no
+image-count test cost a tier-0 activation 6.
+
+The first measurements of this change were flat for a reason worth
+keeping: the Safe-build witness was written as a bare
+`std.debug.assert(reg.codeFor(proto).ptr == proto.code.ptr)`, and
+ReleaseFast still made the lookup it was meant to remove. An assert
+whose argument calls a lookup or a scan needs
+`if (std.debug.runtime_safety)` in front. The same mistake was in
+`settleResume` (cold, fixed with this), and a sweep found it in older
+code, where one instance rescanned every new string (`CLAUDE.md`, Rule
+Z-1's list).
 
 ### 4.6 Phase 6 — seeds, after doc 81 E2
 

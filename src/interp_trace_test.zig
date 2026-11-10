@@ -6048,6 +6048,43 @@ test "return hook (doc 84 §4.5): an abandoned continuation's resume pc ends up 
     try testing.expectEqual(@as(usize, 1), settled);
 }
 
+test "an activation's proto never has a code image (enterCallee reads its canonical code)" {
+    // `enterCallee` skips the closure memo for a resumable native's
+    // activation and runs the proto's canonical code. That holds only
+    // while nothing gives such a proto an image; Safe builds assert it at
+    // every activation, here with the first loop's image present.
+    try util.expectProgramTuned(
+        \\local function key(c)
+        \\  return c
+        \\end
+        \\local function lt(a, b)
+        \\  return a < b
+        \\end
+        \\local acc = 0
+        \\for i = 1, 100 do
+        \\  acc = acc + i
+        \\end
+        \\for i = 1, 300 do
+        \\  local s = string.gsub("a1b2c3", "%d", key)
+        \\  local t = { 3, 1, 2 }
+        \\  table.sort(t, lt)
+        \\  acc = acc + #s + t[1]
+        \\end
+        \\print(acc)
+    , "7150\n", .{ .hotguard = 2, .hotloop = 4, .inspect = &struct {
+        fn inspect(vm: *Vm, mode: util.TraceMode) !void {
+            const native_act = @import("native_act.zig");
+            const reg = &vm.trace.registry.entry_registry;
+            if (mode == .record_execute_native and comptime @import("nativegen.zig").is_x64_linux)
+                try testing.expect(reg.code_images.count() > 0);
+            inline for (.{ native_act.Kind.gsub, native_act.Kind.sort }) |kind| {
+                const p = native_act.protoOf(kind);
+                try testing.expect(reg.codeFor(p).ptr == p.code.ptr);
+            }
+        }
+    }.inspect });
+}
+
 test "head handoff evidence symmetry (doc 44 D12a): the base-case-incumbent shape arms BOTH directions" {
     // Which sibling records FIRST is a deterministic function of hot-call
     // timing, and pre-D12a the base-case-incumbent shape (fib(27) in the

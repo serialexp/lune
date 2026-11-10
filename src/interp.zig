@@ -11125,9 +11125,27 @@ pub const Vm = struct {
             /// in every run of the program, where a VM-wide cached one's
             /// would depend on where the run started. The frame roots it
             /// from the push, and no safepoint comes between.
+            ///
+            ///
+            /// Once any image exists, its code memo is filled here with the
+            /// proto's canonical code. An activation's proto never has an
+            /// image: it has no loop, its entry is not counted
+            /// (`enterCallee`), and the return hook refuses a system proto
+            /// before it settles anything, so no anchor arises in it. Left
+            /// to `closureCode`, a fresh closure pays the image hash on
+            /// every activation. With no image `closureCode` reads no memo,
+            /// so the fill is skipped.
             inline fn enterActivation(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm) HandlerResult {
                 const kind = vm.act_seed.?.kind;
-                const cl = vm.heap.newClosure(native_act.protoOf(kind), 0) catch |e| return parkErr(st, e);
+                const proto = native_act.protoOf(kind);
+                const cl = vm.heap.newClosure(proto, 0) catch |e| return parkErr(st, e);
+                const reg = &vm.trace.registry.entry_registry;
+                if (reg.code_images.count() != 0) {
+                    // Guarded: an unguarded assert still makes the lookup.
+                    if (std.debug.runtime_safety) std.debug.assert(reg.codeFor(proto).ptr == proto.code.ptr);
+                    cl.code_memo = proto.code.ptr;
+                    cl.code_memo_gen = reg.image_gen;
+                }
                 return enterCallee(mode, of, .activation, st, pc, instr, vm, st.base, callA(of, instr), cl, entryArgCount(of, st, instr, vm));
             }
         }.h;
