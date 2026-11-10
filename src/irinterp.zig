@@ -670,9 +670,11 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 },
                 // Read the hash-part field via the *exact* tier-0 reader
                 // (`Table.get`), so an executed trace reads byte-identical to tier-0.
-                // `guard_hash` (run before us) proved the key present and the table
-                // metatable-free, so this hits the hash-part and returns the present
-                // value. (The hash analogue of `aload`.)
+                // `guard_hash` (run before us) proved the key present, so this hits
+                // the hash part and returns the present value; the dominating
+                // `guard_table` decided whether a metatable may be there (doc 77
+                // §4.1), and a present key never consults it. (The hash analogue
+                // of `aload`.)
                 //
                 // `hload` is a **typed** load: `ins.ty` is the recorded field type
                 // (int/float/bool — the recorder restricts the field to those). Unlike a
@@ -769,9 +771,11 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     values[i] = Value.nil();
                     if (record) rec.value(i, values[i]);
                 },
-                // The hash-part structural-stability guard: the table is still
-                // metatable-free, the recorded key is still present, and the hash
-                // population is unchanged (`hash.count() == aux`). Pinning the count
+                // The hash-part structural-stability guard: the recorded key is
+                // still present and the hash population is unchanged
+                // (`hash.count() == aux`). Whether the table may carry a
+                // metatable is the dominating `guard_table`'s to decide (doc 77
+                // §4.1; `trace_finalize` asserts one precedes every href). Pinning the count
                 // catches insert/delete/grow since the cell was resolved; together with
                 // the present check it proves the (H1-hoisted) cell pointer is still
                 // valid. Any miss side-exits to tier-0 (full dispatch / migrate). `aux`
@@ -779,7 +783,7 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 .guard_hash => {
                     const hr = t.instrs[ins.a];
                     const tbl = table.Table.fromHeader(values[hr.a].asHeap());
-                    if (tbl.metatable == null and tbl.fieldPtr(values[hr.b]) != null and
+                    if (tbl.fieldPtr(values[hr.b]) != null and
                         tbl.hash.count() == @as(usize, @intCast(ins.aux)))
                     {
                         if (record) rec.guardPass(i, values[hr.a]);
@@ -788,15 +792,16 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                         break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
                 },
-                // The slot holds a heap table with NO metatable. Recording aborts
-                // on a metatable-bearing table (`trace.AbortReason.has_metatable`),
-                // so a trace only models raw array access; if `setmetatable` added a
-                // metatable between entries (or this is a different table than the
-                // one recorded), the raw `aload`/`astore` would skip
-                // `__index`/`__newindex` — so side-exit to tier-0 (full dispatch).
-                // A store's guard also wants the table unfrozen (doc 76 §5).
+                // The slot holds a heap table with NO metatable, unless `aux`
+                // carries `GUARD_TABLE_ANY_META` (doc 77 §4.1: the recorder
+                // proved the trace's accesses do not consult it). If
+                // `setmetatable` added a metatable between entries (or this is
+                // a different table than the one recorded), the raw
+                // `aload`/`astore` would skip `__index`/`__newindex` — so
+                // side-exit to tier-0 (full dispatch). A store's guard also
+                // wants the table unfrozen (doc 76 §5).
                 .guard_table => if (values[ins.a].isHeap() and values[ins.a].heapType() == .table and
-                    table.Table.fromHeader(values[ins.a].asHeap()).metatable == null and
+                    (ins.aux & trace_ir.GUARD_TABLE_ANY_META != 0 or table.Table.fromHeader(values[ins.a].asHeap()).metatable == null) and
                     (ins.aux & trace_ir.GUARD_TABLE_WRITABLE == 0 or !table.Table.fromHeader(values[ins.a].asHeap()).isReadonly()))
                 {
                     if (record) rec.guardPass(i, values[ins.a]);
@@ -815,6 +820,18 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                         if (record) rec.exit(i, .guard, tab);
                         break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
+                },
+                // Doc 77 §5.1: the table's metatable, or a fused exit when it
+                // has none — so the result is always a table. Logged like
+                // `hload`'s heap field (the log drops what it cannot render).
+                .load_meta => {
+                    const tbl = table.Table.fromHeader(values[ins.a].asHeap());
+                    const mt = tbl.metatable orelse {
+                        if (record) rec.exit(i, .guard, values[ins.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    };
+                    values[i] = Value.heap(&mt.header);
+                    if (record) rec.value(i, values[i]);
                 },
                 .guard_absent => {
                     const tab = values[ins.a];

@@ -3339,7 +3339,9 @@ pub const RecordingSession = struct {
             // `uload` (doc 43 P5) is a heap read for the C1 store-sink
             // decision: a store following it is a read-modify-write whose
             // write must defer below every guard.
-            if (ins.op == .aload or ins.op == .hload or ins.op == .gload or ins.op == .uload or ins.op == .guard_absent or ins.op == .guard_tostring) return true;
+            // `load_meta` (doc 77) too, fail-closed: no trace store writes
+            // the metatable field, but it reads the table's state.
+            if (ins.op == .aload or ins.op == .hload or ins.op == .gload or ins.op == .uload or ins.op == .guard_absent or ins.op == .guard_tostring or ins.op == .load_meta) return true;
         }
         return false;
     }
@@ -6687,6 +6689,7 @@ pub const RecordingSession = struct {
             .aload,
             .href,
             .hload,
+            .load_meta,
             .alen,
             .guard_table,
             .guard_lane,

@@ -123,6 +123,7 @@ export const IR_OP_NAMES = [
   "sjpart", // 101 keep template part b (konst int index) — a=string ref; result is a (doc 82)
   "sjoin", // 102 intern the template's b parts (konst int) — a=last part; allocating (doc 82)
   "guard_tostring", // 103 table a's metatable __tostring (key konst b) is a closure of proto aux (doc 82)
+  "load_meta", // 104 table a's metatable (heap); exits when it has none (doc 77)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];

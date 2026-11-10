@@ -104,6 +104,11 @@ pub const SlotInfo = struct {
     /// `guard_table` carries `GUARD_TABLE_WRITABLE`, so the prologue also checks
     /// once that the table is not frozen (doc 76 §5).
     writable: bool = false,
+    /// For a `.ptr` (table) invariant slot: every covering `guard_table`
+    /// carries `GUARD_TABLE_ANY_META` (the tropt merge is AND, doc 77 §4.1),
+    /// so the prologue skips its no-metatable check. False when no guard
+    /// covers the slot: the check then stays, as before the bit existed.
+    meta_ok: bool = false,
     /// For a `.func` (cross-frame callee snapshot) invariant slot: the recorded
     /// `Proto.id` its covering `guard_func` pins, checked once in the prologue
     /// (closure type + this id). Unused (0) for non-`.func` slots.
@@ -530,6 +535,9 @@ pub fn isTransient(op: trace_ir.IrOp) bool {
         // Doc 43 P5: uref/uload are their closed-upvalue-cell twins (uref the
         // seeded cell pointer, uload the decoded scalar); ustore is an effect.
         .href, .hload, .uref, .uload => true,
+        // doc 77 §5.1: load_meta materializes the metatable's `*GcHeader`
+        // in a GP home (kind `.heap`).
+        .load_meta => true,
         // grid (doc 14): garow materializes the row base (row0, like aref), gcell the
         // flat cell index, gload the decoded int cell. gstore/the grid guards are
         // effects/value-less.
@@ -1032,11 +1040,18 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
         // An aref on this slot REQUIRES a guard_lane (the recorder always emits both);
         // a malformed trace with array access but no lane would miscompile, so track it.
         var has_aref = false;
+        var guards: u32 = 0;
+        var any_meta_guards: u32 = 0;
         for (t.instrs) |g| {
             if (g.op == .aref and g.a == lr) has_aref = true;
             if (g.op == .guard_lane and g.a == lr) s.lane = g.aux;
-            if (g.op == .guard_table and g.a == lr and g.aux & trace.GUARD_TABLE_WRITABLE != 0) s.writable = true;
+            if (g.op == .guard_table and g.a == lr) {
+                guards += 1;
+                if (g.aux & trace.GUARD_TABLE_ANY_META != 0) any_meta_guards += 1;
+                if (g.aux & trace.GUARD_TABLE_WRITABLE != 0) s.writable = true;
+            }
         }
+        s.meta_ok = guards != 0 and any_meta_guards == guards;
         if (has_aref and s.lane < 0) return error.Bail; // array access without a pinned lane
     }
     // A `.ptr` table accessed as a GRID (doc 14) carries no `guard_lane`; instead a
@@ -2693,6 +2708,8 @@ pub fn opMayExitInBody(
         // (`uref` and `ustore` are exit-free: the cell is entry-proven and a
         // scalar overwrite cannot fail.)
         .uload,
+        // Doc 77 §5.1: the fused no-metatable exit.
+        .load_meta,
         .guard_gcol,
         .guard_gpresent,
         .alen,

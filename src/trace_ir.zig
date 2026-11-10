@@ -67,6 +67,17 @@ pub const ObsType = enum(u8) { unknown, int, float, boolean, nil, heap };
 /// once per entry for an invariant table.
 pub const GUARD_TABLE_WRITABLE: i32 = 1;
 
+/// `guard_table`'s `aux` bit for a table that may carry a metatable (doc 77
+/// §4.1): the guard then proves only "a heap table". The recorder sets it on
+/// paths that do not consult the metatable or that read it (`load_meta`);
+/// every other guard keeps the metatable-free meaning, so a trace that never
+/// sees a metatable is byte-identical to one built before the bit existed.
+/// Guards on one table merge by AND on this bit (tropt): the merged guard
+/// allows a metatable only if every guard it absorbed did. Sound for a whole
+/// native run for the reason `GUARD_TABLE_WRITABLE` is: nothing on trace sets
+/// a metatable (`setmetatable` is not a recorded builtin, doc 77 §4.2).
+pub const GUARD_TABLE_ANY_META: i32 = 2;
+
 pub const IrOp = enum(u8) {
     // ---- inputs ----
     /// `aux` = tier-0 register read at trace entry (a loop-variant input).
@@ -132,13 +143,16 @@ pub const IrOp = enum(u8) {
 
     // ---- array-access guards (check via the referenced node; side-exit on miss) ----
     /// `a`=table value ref → the value is a heap table **with no metatable**.
-    /// Recording aborts on a metatable-bearing table (`AbortReason.has_metatable`),
-    /// so every trace assumes raw array access; the no-metatable half of this guard
-    /// catches a `setmetatable` that lands between trace entries (chunk 2a) and
-    /// side-exits to tier-0, which does full `__index`/`__newindex` dispatch.
-    /// `aux` = `GUARD_TABLE_WRITABLE` on a guard ahead of a store: the table
-    /// must also not be frozen (doc 76 §5), or tier-0 raises. 0 otherwise, so
-    /// a trace that only reads a frozen table still runs.
+    /// The no-metatable half catches a `setmetatable` that lands between
+    /// trace entries (chunk 2a) and side-exits to tier-0, which does full
+    /// `__index`/`__newindex` dispatch. It is the one place a trace checks
+    /// that a table has no metatable: `guard_absent`, `guard_hash` and the
+    /// hash-cell seeds rely on it (doc 77 §4.1), and `trace_finalize`
+    /// asserts every table they reach is guarded first.
+    /// `aux` bits: `GUARD_TABLE_WRITABLE` on a guard ahead of a store, the
+    /// table must also not be frozen (doc 76 §5), or tier-0 raises;
+    /// `GUARD_TABLE_ANY_META`, a metatable is allowed (doc 77 §4.1). 0 means
+    /// a metatable-free table, frozen or not.
     guard_table,
     /// `a`=table value ref, `aux`=lane → the table's array lane equals `aux`
     /// (bails if a monotonic widen moved it past the recorded lane).
@@ -838,6 +852,14 @@ pub const IrOp = enum(u8) {
     /// and counts as a heap read for the store-after-load rule. One shared
     /// predicate (`stralloc.tostringHandlerIs`) in every tier. Wire ordinal 103.
     guard_tostring,
+    /// `load_meta` (doc 77 §5.1): `a` = a guarded table ref; the result is
+    /// that table's metatable, `ty = .heap`. Side-exits at the load when the
+    /// table has none (a fused producer exit, like `hload`'s tag check), so
+    /// its result is always a table and the native `.heap` home never holds
+    /// nil. The field's only writer is `setmetatable`, which no trace calls
+    /// (doc 77 §4.2). A memory load (tropt's `.aload` class) and a heap read
+    /// for the store-after-load rule. Wire ordinal 104.
+    load_meta,
 };
 
 /// Doc 63 §5.1: one host call site of a precise trace, indexed by
@@ -1028,7 +1050,7 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
 /// is side-trace evidence, not thrash.
 pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
-        .guard_absent, .guard_tostring => true,
+        .guard_absent, .guard_tostring, .load_meta => true,
         .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => true,
         .guard_step_up, .guard_step_down, .guard_for_nov => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
@@ -1075,7 +1097,7 @@ pub fn requiresPreciseSnapshot(op: IrOp) bool {
         .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar => true,
         .neg, .not, .bnot, .eq, .ne, .lt, .le => true,
         .fsqrt, .fsin, .fcos, .ffloor, .fceil => true,
-        .aload, .href, .hload, .uload => true,
+        .aload, .href, .hload, .uload, .load_meta => true,
         .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2, .supper, .slower, .sjpart, .sjoin => true,
         .scp, .sfindp, .smatch, .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f, .sgm_setpos => true,
         .tnew, .tset => true,

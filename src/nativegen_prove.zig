@@ -748,6 +748,15 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.b] != .int and !(kinds[ins.b] == .heap and is_string[ins.b])) return false;
                 kinds[i] = .none;
             },
+            // Doc 77 §5.1 `load_meta`: a = a guarded table (an invariant
+            // `.ptr` or a per-iteration `.heap`). The result is the
+            // metatable's `*GcHeader` — the fused exit keeps nil out — so
+            // `.heap`, like a VALUE_LANE heap aload result.
+            .load_meta => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
+                kinds[i] = .heap;
+            },
             // Doc 82 `guard_tostring`: a = the table value (a real runtime
             // heap value — the callout type-checks it), b = the interned key
             // string konst. Produces nothing.
@@ -1722,6 +1731,8 @@ pub fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         // analogue (aref token + value).
         .aref, .astore, .astore_append, .guard_absent, .guard_tostring => .{ .a = true, .b = true },
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
+        // Doc 77: load_meta reads the table it loads the metatable from (a).
+        .load_meta => .{ .a = true, .b = false },
         // guard_func reads the callee-snapshot value it identity-checks (a).
         .guard_func => .{ .a = true, .b = false },
         // guard_builtin reads the callee-snapshot native it identity-checks (a);

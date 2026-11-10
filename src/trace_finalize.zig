@@ -769,6 +769,8 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             .aload, .guard_table, .guard_lane, .guard_present, .guard_fits, .guard_append, .hload, .guard_hash => {
                 std.debug.assert(ins.a < i);
             },
+            // Doc 77 §5.1: `load_meta` reads its table (`a`).
+            .load_meta => std.debug.assert(ins.a < i),
             // `guard_bounds` carries producer-dispatched semantics (doc 18 D3):
             // tier-1a selects the bounds rule from the producer op, so the
             // producer must be one of exactly two memory ops — `aref` (scalar
@@ -833,4 +835,28 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
     if (preheader_idx) |ph| {
         for (instrs[0..ph]) |ins| std.debug.assert(ins.op != .phi);
     }
+    // Doc 77 §4.1: `guard_table` is the one place a trace checks a table's
+    // metatable, so every table a raw hash access or absence test reaches
+    // must be guarded before it — or be a metatable `load_meta` produced
+    // (its fused exit proves a table, and a metamethod lookup is raw).
+    if (std.debug.runtime_safety) {
+        for (instrs, 0..) |ins, i| {
+            const tab: ?Ref = switch (ins.op) {
+                .guard_absent, .href => ins.a,
+                .guard_hash => instrs[ins.a].a,
+                else => null,
+            };
+            if (tab) |r| std.debug.assert(tableGuardedBefore(instrs, i, r));
+        }
+    }
+}
+
+/// Is `tab` a table by the time instruction `at` runs: a `load_meta`
+/// result, or covered by an earlier `guard_table`?
+fn tableGuardedBefore(instrs: []const IrInstr, at: usize, tab: Ref) bool {
+    if (instrs[tab].op == .load_meta) return true;
+    for (instrs[0..at]) |g| {
+        if (g.op == .guard_table and g.a == tab) return true;
+    }
+    return false;
 }

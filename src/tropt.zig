@@ -165,6 +165,10 @@ fn kindOf(op: IrOp) OpKind {
         // when dead (its fused tag exit protects nothing then — deopt replay
         // re-reads the cell in tier-0).
         .aload, .hload, .uload => .aload,
+        // `load_meta` (doc 77 §5.1) reads the table's metatable field: the
+        // load class, never folded/CSE'd/hoisted, DCE'd when dead (its
+        // fused exit then protects nothing — no live use reads the result).
+        .load_meta => .aload,
         // Grid-cell load (doc 14, Phase 8): the hash/array-load analogue. Reads the
         // `gcell` address (`a`).
         .gload => .aload,
@@ -394,11 +398,23 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
         // `guard_sid` stashes the expected string's konst-pool id — semantic
         // identity (two pins expecting DIFFERENT strings must never be
         // deduplicated: doc 30 round-2 M01), so it joins the dedup-key auxes.
-        // `guard_table` dedups per table instead (`table_guard`): its
-        // `GUARD_TABLE_WRITABLE` merges into the first guard on the table.
+        // `guard_table` dedups per table instead (`table_guard`): its aux
+        // merges into the first guard on the table (`mergeTableGuardAux`).
         .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_sid => aux,
         else => 0,
     };
+}
+
+/// The aux of one `guard_table` standing for two on the same table (the
+/// earlier `kept`, the later `folded`). It checks what either checked:
+/// unfrozen if either wanted it (`GUARD_TABLE_WRITABLE`, OR), and a
+/// metatable allowed only if both allowed one (`GUARD_TABLE_ANY_META`,
+/// AND), so a trace with any access that relies on "no metatable" still
+/// checks for one (doc 77 §4.1, Q4).
+pub fn mergeTableGuardAux(kept: i32, folded: i32) i32 {
+    const writable = (kept | folded) & trace.GUARD_TABLE_WRITABLE;
+    const any_meta = kept & folded & trace.GUARD_TABLE_ANY_META;
+    return writable | any_meta;
 }
 
 /// The unoptimized path: dupe the recorder's arrays verbatim into owned slices
@@ -503,12 +519,14 @@ pub fn optimize(
     // Checking frozenness earlier is exact: nothing a trace runs can freeze
     // a table (`table.freeze` is not a recorded builtin, and a host call
     // that re-enters the VM ends at `guard_host_epoch`), the fact the entry
-    // prologue's hoisted check rests on too.
+    // prologue's hoisted check rests on too. Doc 77 §4.1 does the same for
+    // the metatable, with `setmetatable` in `table.freeze`'s place. The
+    // slot of a first guard holds its merged aux; -1 marks every other ref.
     var table_guard: std.AutoHashMapUnmanaged(Ref, Ref) = .empty;
     defer table_guard.deinit(gpa);
     const table_guard_aux = try gpa.alloc(i32, n);
     defer gpa.free(table_guard_aux);
-    @memset(table_guard_aux, 0);
+    @memset(table_guard_aux, -1);
 
     // Doc 51 Fix B (F3): value-keyed konst canonicalization state. `pool_map`
     // interns fold results against the pool (first occurrence of each value
@@ -589,8 +607,12 @@ pub fn optimize(
                     const gop = try table_guard.getOrPut(gpa, a2);
                     if (gop.found_existing) {
                         dead[i] = true;
-                        table_guard_aux[gop.value_ptr.*] |= ins.aux;
-                    } else gop.value_ptr.* = @intCast(i);
+                        const first = gop.value_ptr.*;
+                        table_guard_aux[first] = mergeTableGuardAux(table_guard_aux[first], ins.aux);
+                    } else {
+                        gop.value_ptr.* = @intCast(i);
+                        table_guard_aux[i] = ins.aux;
+                    }
                     continue;
                 }
                 const gk = GuardKey{ .op = ins.op, .a = a2, .aux = guardKeyAux(ins.op, ins.aux) };
@@ -952,7 +974,7 @@ pub fn optimize(
             .unary, .aload => out.a = new_index[canon[ins.a]],
             .guard => {
                 out.a = new_index[canon[ins.a]];
-                if (ins.op == .guard_table) out.aux |= table_guard_aux[i];
+                if (ins.op == .guard_table and table_guard_aux[i] >= 0) out.aux = table_guard_aux[i];
             },
             .cvt => {
                 out.a = new_index[canon[ins.a]];
@@ -1762,6 +1784,45 @@ test "doc 76: a store's writable table guard folds into the table's first guard"
         }
     }
     try testing.expectEqual(@as(usize, 1), writable);
+}
+
+test "doc 77 Q4: guard_table auxes merge writable by OR and any-metatable by AND" {
+    const W = trace.GUARD_TABLE_WRITABLE;
+    const M = trace.GUARD_TABLE_ANY_META;
+    try testing.expectEqual(@as(i32, M), mergeTableGuardAux(M, M));
+    try testing.expectEqual(@as(i32, 0), mergeTableGuardAux(M, 0));
+    try testing.expectEqual(@as(i32, 0), mergeTableGuardAux(0, M));
+    try testing.expectEqual(@as(i32, W), mergeTableGuardAux(M, W));
+    try testing.expectEqual(@as(i32, W), mergeTableGuardAux(W | M, 0));
+    try testing.expectEqual(@as(i32, W | M), mergeTableGuardAux(W | M, M));
+}
+
+/// Doc 77 Q4: the one guard left on a table after tropt merges `first`
+/// then `second`, both on the same slot.
+fn mergedTableGuardAux(first: i32, second: i32) !i32 {
+    const gpa = testing.allocator;
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0
+        .{ .op = .guard_table, .a = 0, .aux = first }, // %1 kept
+        .{ .op = .guard_table, .a = 0, .aux = second }, // %2 folds into %1
+        .{ .op = .loop }, // %3
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
+    var opt = try optimize(gpa, &instrs, &.{}, .{});
+    defer freeOpt(gpa, &opt);
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_table));
+    for (opt.instrs) |ins| if (ins.op == .guard_table) return ins.aux;
+    unreachable;
+}
+
+test "doc 77 Q4: a table guard allows a metatable only if every merged guard did, in either order" {
+    const M = trace.GUARD_TABLE_ANY_META;
+    const W = trace.GUARD_TABLE_WRITABLE;
+    try testing.expectEqual(@as(i32, M), try mergedTableGuardAux(M, M));
+    try testing.expectEqual(@as(i32, 0), try mergedTableGuardAux(M, 0));
+    try testing.expectEqual(@as(i32, 0), try mergedTableGuardAux(0, M));
+    // The writable bit still moves up whichever guard carries it.
+    try testing.expectEqual(@as(i32, W | M), try mergedTableGuardAux(M, W | M));
+    try testing.expectEqual(@as(i32, W), try mergedTableGuardAux(W | M, 0));
 }
 
 test "doc 30: guard_sid dedup keys on its konst id — same id dropped, different ids both kept" {

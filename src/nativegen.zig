@@ -1074,15 +1074,18 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
         };
         try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, TABLE_TYPE);
         try a.jcc(.ne, prologue_fail);
-        // [chunk 2a] The table must have NO metatable: recording aborted on a
-        // metatable-bearing table, so a trace that reached here only models raw
-        // array access. If `setmetatable` added one between trace entries, the
-        // raw load/store would skip `__index`/`__newindex` — so side-exit to
-        // tier-0 (full dispatch) when `metatable != null`. Checked once in the
-        // prologue: a metamethod call is a trace barrier, so the metatable cannot
-        // change *within* a single native run.
-        try a.cmpQwordMemImm8(preg, METATABLE_OFF, 0);
-        try a.jcc(.ne, prologue_fail);
+        // [chunk 2a] The table must have NO metatable unless every guard on
+        // it carries `GUARD_TABLE_ANY_META` (`s.meta_ok`, doc 77 §4.1). If
+        // `setmetatable` added one between trace entries, the raw load/store
+        // would skip `__index`/`__newindex` — so side-exit to tier-0 (full
+        // dispatch) when `metatable != null`. Checked once in the prologue:
+        // nothing on a trace sets a metatable (`setmetatable` is not a
+        // recorded builtin, doc 77 §4.2), so it cannot change *within* a
+        // single native run.
+        if (!s.meta_ok) {
+            try a.cmpQwordMemImm8(preg, METATABLE_OFF, 0);
+            try a.jcc(.ne, prologue_fail);
+        }
         // A table the trace stores into must not be frozen (doc 76 §5). Once,
         // here, like the metatable: freezing is a library call, never part
         // of a native run.
@@ -1276,9 +1279,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     try a.cmpByteMemImm(tbl_reg, HEADER_TYPE_OFF, TABLE_TYPE);
                     try jccNativeExit(a, exit_labels, i, .ne);
                     // Check Table.metatable == null (metatable field is at a
-                    // known offset from *GcHeader since header is the first field).
-                    try a.cmpQwordMemImm8(tbl_reg, METATABLE_OFF, 0);
-                    try jccNativeExit(a, exit_labels, i, .ne);
+                    // known offset from *GcHeader since header is the first
+                    // field), unless the guard allows one (doc 77 §4.1).
+                    if (ins.aux & trace.GUARD_TABLE_ANY_META == 0) {
+                        try a.cmpQwordMemImm8(tbl_reg, METATABLE_OFF, 0);
+                        try jccNativeExit(a, exit_labels, i, .ne);
+                    }
                     // A store's guard: not frozen (doc 76 §5).
                     if (ins.aux & trace.GUARD_TABLE_WRITABLE != 0) {
                         try a.btMemImm8(tbl_reg, 0, HEADER_READONLY_BIT);
@@ -1784,6 +1790,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // 8-byte payload; float → TAG_FLOAT + `movsd`. Heap values declined (proveKinds).
             .hstore => {
                 try emitHStore(a, kinds, alloc, ins);
+            },
+            // load_meta (doc 77 §5.1): the table's metatable pointer, with the
+            // fused exit when there is none, so the `.heap` home is always a
+            // table (a `.heap` Kind cannot carry nil). The operand is a
+            // guarded table (`trace_finalize` asserts it).
+            .load_meta => {
+                const treg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.movRegMem(.rax, treg, METATABLE_OFF);
+                try a.cmpRegImm32(.rax, 0);
+                try jccNativeExit(a, exit_labels, i, .e); // no metatable → tier-0 decides
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             // --- closed-upvalue-cell path (doc 43 P5) ---------------------------
             // The u-family shares the hash-cell machinery: the seeded slab slot

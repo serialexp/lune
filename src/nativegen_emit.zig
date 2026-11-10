@@ -2545,12 +2545,10 @@ pub fn emitGuardAbsent(
         const lane_off: i32 = ArrLayout.array_base + ArrLayout.lane;
         // rax = table header. rax/rcx are the body scratch pair (never homes).
         try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
-        // 1. type + metatable (no qword cmp-mem-imm encoder → load and test).
+        // 1. type. The metatable is the dominating `guard_table`'s (doc 77
+        // §4.1): this is a raw lookup, as `table_runtime.isAbsent` is.
         try a.cmpByteMemImm(.rax, HEADER_TYPE_OFF, TABLE_TYPE);
         try jccNativeExit(a, exit_labels, i, .ne); // not a table → guard fails
-        try a.movRegMem(.rcx, .rax, METATABLE_OFF);
-        try a.cmpRegImm32(.rcx, 0);
-        try jccNativeExit(a, exit_labels, i, .ne); // metatable appeared → guard fails
         // 2. grid meta-lane → full lookup.
         try a.cmpByteMemImm(.rax, lane_off, @intCast(GRID_LANE));
         try a.jcc(.e, callout);
