@@ -1209,6 +1209,11 @@ pub const TraceState = struct {
     /// instead of a hashmap probe per one-shot entry. Maintained ONLY by
     /// `setOrdinaryProbe`/`clearOrdinaryProbe`.
     ordinary_probe_count: u32 = 0,
+    /// Doc 84 §4.2: entries that took the one-shot lane
+    /// (`Vm.enterOneShotLane`). Counted in Safe builds only, where tests
+    /// read it to prove the lane is taken; a ReleaseFast lane entry pays
+    /// nothing for it and leaves it 0.
+    one_shot_lane_entries: u64 = 0,
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a
     /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
     /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).

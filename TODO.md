@@ -889,7 +889,30 @@ doesn't count it (§7.1, "Tiering parity"). The fixes are general:
       entry: binary-trees takes the full path on 402k of 402k entries
       (six `legacy_thrash` gates) and runs +91% instructions over tier 0.
       Doc 84 Phase 1 (per-anchor bits) fixed that: binary-trees -16.5%,
-      spectral-norm -7.2%. Phases 2-6 remain (see the doc's checklist).
+      spectral-norm -7.2%. Phase 2a (2026-11-11, the lane at the patch
+      site): call_small_fn -5.3%, binary-trees -1.8%; the pure probe is at
+      +500 per call. Phases 2b-6 remain (see the doc's checklist).
+- [ ] **A one-shot trace whose entry checks fail never gets a sibling**
+      (seen 2026-11-11, doc 84 §3.6). binary-trees' `ItemCheck` head trace
+      was recorded on an inner node; every leaf fails its `guard_bounds` at
+      the prologue. An entry refusal counts no hot exit and raises no
+      sibling want, and a one-shot patch accrues no strikes below sibling
+      capacity, so 1.0 M of the program's 2.17 M one-shot entries (46%) pay
+      an entry and then run on tier 0. `BottomUpTree` has the same shape at
+      the bottom of its descents. Options are in the doc (refusals raise a
+      sibling want; refusals count against the patch; leave it). Needs
+      Bart's pick. The loop analog is the "SECOND trace for the second
+      lane shape" entry below.
+- [ ] **No gate builds the ReleaseFast library, so the no-safety block of
+      `src/asm/offsets_x64.inc` goes stale unnoticed** (seen 2026-11-11).
+      The comptime check verifies only the block of the build's own safety
+      mode. `just test`, CI's `lib-wasm` job and `embed/rust` all build the
+      Debug library; at 3916181 `zig build lib -Doptimize=ReleaseFast`
+      failed with every `Vm`/`TraceState` offset 24 bytes behind (fixed
+      with doc 84 Phase 2a, which moved them again). `just
+      hostcall-acceptance` and `tools/mahina-bundle.sh` are the only
+      ReleaseFast builds of it. Options: build the ReleaseFast library in
+      `just test`, or in CI's `lib-wasm` job, or both.
 - [ ] **`ray` runs 2.7x slower with the JIT than on tier 0** (seen
       2026-11-11, doc 77 Phase 0: `bench/luajit/ray.lua 6 64`, t0 462 ms,
       jit 1248 ms, LuaJIT 32 ms). `--jit-stats`: 64% of the run is outside

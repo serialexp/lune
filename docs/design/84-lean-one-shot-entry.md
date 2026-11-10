@@ -1,9 +1,9 @@
 # 84 — The lean one-shot entry lane — Design
 
-Status: partial — Phase 1 landed; Phases 2-6 and 0b outstanding. Q1-Q4
-settled (§7) after reviews by Codex and Antigravity
+Status: partial — Phases 1 and 2a landed; Phases 2b-6 and 0b outstanding.
+Q1-Q4 settled (§7) after reviews by Codex and Antigravity
 Owner: Bart
-Last updated: 2026-11-10
+Last updated: 2026-11-11
 
 ## Implementation status
 
@@ -51,7 +51,19 @@ land; move whole phases to Done once everything inside them is checked.
   the §4.1 follow-up). call_small_fn is unchanged; its one anchor never
   had a penalty. The tier-0 board is flat.
 
-  Settled 2026-11-10. Bart asked for second opinions from Codex and
+- [x] **Phase 2a — the lane at the patch site** (§4.2, "Implemented").
+  `opJFuncHead` and `opJCont` test one gate first (`oneShotGate`). A
+  settled entry runs the quiet episode directly (`enterOneShotLane`): the
+  long-form gates, the walk prelude and the epilogue are not executed.
+  Safe builds assert the gate against the long form on every entry. JIT
+  board (instructions, against the parent's sources): call_small_fn
+  −5.3%, binary-trees −1.8%, co_pingpong_d20 −1.4%, spectral-norm −0.8%,
+  ray −0.2%; globals_script +0.10% and array3d +0.04% (their entries are
+  refused on a hash seed and pay a few instructions more). The tier-0
+  board is flat. The pure probe is at +500 per call (was +577 on the same
+  measure).
+
+  Q1-Q4 were settled 2026-11-10. Bart asked for second opinions from Codex and
   Antigravity and for the tiebreak to be settled here. Both reviewers
   picked the same four options independently. Their factual corrections
   were checked against the code and folded into §4.1–§4.4 as follow-up
@@ -61,10 +73,14 @@ land; move whole phases to Done once everything inside them is checked.
 
 - [ ] **Phase 0b — baselines on the pinned pool.** Record §2's rows there
   (needs a push, so it waits until Bart asks for one).
-- [ ] **Phase 2 — one admission test** (§4.2). The `jfunc_head`/`jcont`
-  bypass set, the quiet predicate and `enterPatchedTrace`'s per-call
-  prelude collapse into one compare on the patch. Safe builds assert it
-  against the long form. Pick from Q2.
+- [ ] **Phase 2b — the blocker word** (§4.2). The lane's gate still
+  reads its remaining program-wide conditions one by one (three in the
+  gate, about fourteen in `headEpisodeQuiet`, ~40 instructions). They
+  move into `one_shot_blockers`, each bit kept at its own mutation
+  funnel, with a Safe assert against the long form in both directions.
+- [ ] **Decide: a one-shot trace whose entry checks fail never gets a
+  sibling** (§3.6). 46% of binary-trees' one-shot entries are refused at
+  the trace's own prologue and run on tier 0 after paying the entry.
 - [ ] **Phase 3 — a lean completion** (§4.3). A terminal completion with
   nothing to consume does counters only. Pick from Q3.
 - [ ] **Phase 4 — a thin native call for one-shot pages** (§4.4). A small
@@ -200,6 +216,26 @@ Any program that calls small functions from code that doesn't trace runs
 through this lane. That makes it a general fix in the sense of Rule Z-6,
 not a binary-trees one.
 
+**What the entries do, 2026-11-11** (after Phase 1; throwaway counters in
+the two handlers and the quiet predicate, ReleaseFast, board arguments):
+
+| Program | One-shot entries | Quiet | Refused by | Outcome of the quiet ones |
+|---|---:|---:|---|---|
+| `call_small_fn` | 999,888 | all | | all complete at the `ret` |
+| binary-trees | 2,169,280 | 2,169,141 | | 1,004,790 fail the trace's entry checks; 1,164,489 move frames; none completes at a plain `ret` |
+| `co_pingpong_d20`, `_d150` | ~400,000 | nearly all | | nearly all move frames |
+| `globals_script` | 705,098 | 112 | hash seed (704,986) | |
+| spectral-norm | 28,032 | 20,985 | provenance edges (7,042), promoted sets (5) | |
+| array3d | 12,533 | 0 | hash seed | |
+
+Three things follow. The terms of the quiet predicate that refuse in
+practice are the hash seed (Phase 6) and provenance edges; region
+receipts, demotion, teardown and the debug-log sync never refused on the
+board. binary-trees' sibling walk ran 34 times in 2.17 M entries. And a
+lane that covered only a completion at the `ret` would cover none of
+binary-trees: its quiet entries end in frame motion or in an entry
+refusal (§3.6).
+
 ## 3. Findings
 
 ### 3.1 The quiet predicate is global
@@ -262,6 +298,38 @@ The trace leaves at the `ret`, as LuaJIT's `LJ_TRLINK_RETURN` does, and
 tier 0 runs it. The `opRet` hook `onRetResume` then walks its refusal
 chain (73 instructions) to conclude that the caller's continuation anchor
 is settled. That answer, too, doesn't change from call to call.
+
+### 3.6 An entry refusal is not evidence
+
+Seen 2026-11-11 on binary-trees. `ItemCheck`'s head trace was recorded on
+an inner node. Its entry checks include a `guard_bounds` on `tree[2]`,
+which every leaf fails. At argument 10 that is 134,092 head entries
+refused at the prologue, and another 134,036 at the bottom of pushed
+descents. A prologue failure is an entry refusal, not a guard exit: it
+counts no hot exit and raises no sibling want. So no trace for the leaf
+shape is ever recorded, and every leaf call pays an entry and then runs
+on tier 0. That is the 1,004,790 `.next_candidate` rows in §2.3, 46% of
+the program's one-shot entries. The patch is not retired either: a
+one-shot patch accrues no strikes while its anchor is below sibling
+capacity (doc 44 D8).
+
+`BottomUpTree`'s head trace has the same shape at exit 5, the bottom of
+131k descents, with 37 `record_abort` gates and repeated unpatch and
+repatch.
+
+The loop analog is already in TODO.md ("the anchor never records a
+SECOND trace for the second lane shape"). Nothing in this doc's phases
+addresses it: the lane makes a refused entry cheaper, it does not make it
+useful. Options, not yet decided:
+
+- **(a) Entry refusals raise a sibling want.** A counter per trace; at a
+  threshold the anchor asks for a second trace, recorded on the
+  activation that was just refused, as a zero-exit guard failure does
+  today.
+- **(b) Entry refusals count against the patch.** A patch whose entries
+  are mostly refused is unpatched, so the leaf calls stop paying the
+  entry. The inner-node calls lose their trace too.
+- **(c) Leave it.** The lane keeps lowering the price of a refusal.
 
 ## 4. Design
 
@@ -439,6 +507,54 @@ admission test. On the lane, the walk state is never set up, because
 admission guarantees there is no failer carry, sibling want or ordinary
 probe to consume.
 
+**Implemented, 2026-11-11 (Phase 2a).** The phase is cut in two. 2a is
+the lane itself, admitted by reading the existing fields, so it is exact
+by construction and needs no new funnel. 2b compresses those reads into
+the word. §2.3's measurement set the order: the prelude and epilogue
+cost more than the predicate's loads.
+
+- **One gate, `oneShotGate`.** Both handlers switch on its result: the
+  lane, the walk (`enterPatchedTrace`), the canonical instruction, or the
+  deferred unpatch. The settled test is `fast_block == 0`, the patch
+  live, no exec log. That proves the suspension test and the whole
+  bypass set, so a settled entry skips them whether or not it reaches
+  the lane. Any other state runs the handlers' old gate sequence.
+- **The lane, `enterOneShotLane`.** It does the prelude's two evidence
+  resets and enters `enterHeadNativeQuiet`. If the episode completed and
+  left no burst owners and no patch work, the epilogue is the strike
+  reset. Any other outcome (an entry refusal, burst owners, dirty
+  patches) runs the shared walk tail (`finishPatchedWalk`, split out of
+  `enterPatchedTrace`) from the state the walk would have had.
+- **`fast_block` is tested directly.** The review's plan mirrored its
+  bits into the new word. Reading the word that already exists costs one
+  load and adds no store to its setters, which are hot.
+- **A pending descent carry or ordinary probe refuses the lane**, as
+  planned. `head_walk_fail` needs no test (the prelude resets it and the
+  lane does too). `wants_head_sibling` is read only after a refused
+  entry, which the walk tail handles. A non-zero strike count needs no
+  test: a completion resets it on both paths.
+- **The decline memo needs no test on the lane.** It is armed only after
+  a walk found the patch's trace native-unsupported. That verdict is
+  permanent, a patch never changes its trace, and the quiet predicate
+  requires a compiled page.
+- **A refused entry does not ask twice.** When the quiet predicate
+  refuses a compiled page, the gate tells the walk, which goes straight
+  to the full entry. The first cut asked twice and re-ran the long gates
+  after a refusal; `globals_script` paid +1.1% for it.
+- **Asserts.** `assertOneShotSettled` (the settled test implies the
+  suspension test and the bypass set) and `assertOneShotLaneAdmission`
+  run on every entry in Safe builds. Tests read
+  `TraceState.one_shot_lane_entries` (counted in Safe builds only) to
+  prove the lane is taken, and refused under an exec log, coverage and a
+  held `.full` dispatch.
+
+Still read one by one on the lane, and left for 2b: the exec log, the
+descent carry, the probe count, and `headEpisodeQuiet`'s program-wide
+terms. The config terms (`native_codegen`, `coverage`, `record_exec_log`,
+the debug-log sync) have no mutation funnel: about 70 test sites assign
+config fields directly. They stay direct loads unless a funnel is worth a
+sweep of those sites.
+
 ### 4.3 Phase 3 — a lean completion
 
 When admission held and the native run ended at its terminal, the
@@ -571,6 +687,14 @@ The boundary is per-call seam cost. Budgets, in instructions:
 | pure probe (§2.1), JIT minus tier 0 | +573 per call | ≤ 0: the trace's body win pays for the seam |
 | binary-trees, JIT against tier 0 | +91% | ≤ tier 0 |
 | `globals_script`, JIT against 2dade3b (before `set_global` recorded) | ~+13.7% (+18.2%, then −3.8% from step 1) | ≤ 0% |
+
+Progress, `perf stat` on the board rows (JIT minus tier 0):
+
+| After | Pure probe, per call | binary-trees |
+|---|---:|---:|
+| step 1 (4a8c8e6) | +577 | +91% |
+| Phase 1 | +577 | +59.4% |
+| Phase 2a | +500 | +56.6% |
 
 Phase 0 puts the pure probe on the board. Each phase is measured with
 callgrind on both tiers, on the pure probe and binary-trees, and with a

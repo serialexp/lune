@@ -8005,6 +8005,11 @@ pub const Vm = struct {
         regs: RegWindow,
         base: usize,
         pc: usize,
+        /// Doc 84 §4.2: `oneShotGate` already asked the quiet predicate
+        /// about the incumbent's compiled page and it refused. Nothing
+        /// between the gate and the incumbent's entry below changes an
+        /// input of the predicate, so the walk does not ask again.
+        quiet_refused: bool,
     ) EntryDirective {
         const ct = patch.trace; // live pre-drain ⇒ valid (§R7-2)
         // Doc 44 D12b (round 6 change 4): one-shot is a BEHAVIOR class (head
@@ -8017,10 +8022,10 @@ pub const Vm = struct {
         const one_shot = trace.anchorKind(anchor_pc) != .loop;
         var dead: WalkDead = .{};
         // The walk marks each candidate visited before entering. Seed the
-        // exclusion set with the incumbent; the head sibling walk below grows it.
+        // exclusion set with the incumbent; the head sibling walk
+        // (`finishPatchedWalk`) grows it.
         var visited: [trial_visited_cap]*trace.Trace = undefined;
         visited[0] = ct;
-        var nvisited: usize = 1;
         var wctx: TrialWalkCtx = .{
             .visited = visited[0..1],
             .dead = &dead,
@@ -8124,7 +8129,9 @@ pub const Vm = struct {
             directive = .next_candidate;
         } else if (one_shot) {
             all_nonnative_declines = false;
-            directive = if (self.headEpisodeQuiet(ct)) |nt|
+            if (std.debug.runtime_safety and quiet_refused) std.debug.assert(self.headEpisodeQuiet(ct) == null);
+            const quiet = if (quiet_refused) null else self.headEpisodeQuiet(ct);
+            directive = if (quiet) |nt|
                 self.enterHeadNativeQuiet(ct, nt, closure, proto, regs, base)
             else
                 self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
@@ -8139,6 +8146,39 @@ pub const Vm = struct {
         } else {
             directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
         }
+        return self.finishPatchedWalk(mode, patch, slot, closure, proto, regs, base, pc, anchor_pc, native_mode, &visited, &wctx, directive, all_nonnative_declines);
+    }
+
+    /// Everything `enterPatchedTrace` does after the incumbent's entry: the
+    /// one-shot sibling walk, the want transfer, the decline memo, the
+    /// strike accounting and the safe-point drain. `visited[0]` is the
+    /// incumbent, `wctx` the walk context its entry used (or would have)
+    /// and `first` its directive. Split out so the one-shot lane
+    /// (`enterOneShotLane`, doc 84 §4.2) can fall into it after an entry
+    /// that skipped the prelude; inline, so `enterPatchedTrace` is the same
+    /// code as before the split.
+    inline fn finishPatchedWalk(
+        self: *Vm,
+        comptime mode: ExecMode,
+        patch: *trace.EntryPatch,
+        slot: u16,
+        closure: *const function.Closure,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        pc: usize,
+        anchor_pc: u32,
+        native_mode: bool,
+        visited: *[trial_visited_cap]*trace.Trace,
+        wctx: *TrialWalkCtx,
+        first: EntryDirective,
+        first_all_nonnative_declines: bool,
+    ) EntryDirective {
+        const is_head = trace.anchorKind(anchor_pc) == .head;
+        const one_shot = trace.anchorKind(anchor_pc) != .loop;
+        var directive = first;
+        var all_nonnative_declines = first_all_nonnative_declines;
+        var nvisited: usize = 1;
         // Doc 44 D10: a fused burst entered several owners — exclude them
         // from re-selection this walk.
         if (one_shot) {
@@ -8181,7 +8221,7 @@ pub const Vm = struct {
                 directive = if (self.headEpisodeQuiet(sib)) |nt|
                     self.enterHeadNativeQuiet(sib, nt, closure, proto, regs, base)
                 else
-                    self.enterSelectedTrace(mode, sib, closure, proto, regs, base, pc, &wctx);
+                    self.enterSelectedTrace(mode, sib, closure, proto, regs, base, pc, wctx);
                 // Doc 44 D10: merge this entry's fused-burst owners too.
                 self.mergeHeadBurstVisited(visited[0..], &nvisited);
                 wctx.visited = visited[0..nvisited];
@@ -8280,9 +8320,206 @@ pub const Vm = struct {
                 patch.strikes = 0;
             }
         }
-        dead.retire(&self.trace);
+        wctx.dead.retire(&self.trace);
         self.trace.drainEntryPatchWork();
         return directive;
+    }
+
+    /// Doc 84 §4.2: where a `jfunc_head`/`jcont` entry goes (`oneShotGate`).
+    const OneShotRoute = union(enum) {
+        /// The one-shot lane, on this compiled page.
+        lane: *const nativegen.CompiledTrace,
+        /// `enterPatchedTrace`. True when the quiet predicate already
+        /// refused the incumbent's compiled page.
+        walk: bool,
+        /// The canonical instruction, on tier 0.
+        canonical,
+        /// The deferred unpatch (§R6-1), then the canonical instruction.
+        unpatch,
+    };
+
+    /// Doc 84 §4.2: the one gate of a one-shot patch site, tested by
+    /// `opJFuncHead` and `opJCont` before anything else.
+    ///
+    /// The settled case is three loads. `fast_block == 0` is the suspension
+    /// test and the bypass set in one word (recording, the pending anchors,
+    /// `suspend_ctl`, safepoint lines), plus the quiet predicate's two
+    /// frame-link arms. Its `vm_final_cut` bit is no dispatch condition;
+    /// refusing on it is only conservative. With the patch live and no exec
+    /// log as well, every long-form test below is known to pass, and the
+    /// entry is the lane or the walk:
+    /// - The lane, when the walk prelude has nothing to consume (no descent
+    ///   carry, no ordinary probe) and the quiet predicate admits the
+    ///   patch's trace. The decline memo needs no test: it is armed only
+    ///   after a walk found the patch's trace native-unsupported, which is
+    ///   permanent, and the quiet predicate requires a compiled page.
+    /// - The walk otherwise. When the predicate refused a compiled page the
+    ///   walk is told and does not ask again; the memo cannot stand there
+    ///   either. A page that is not compiled yet may be compiled by the
+    ///   walk, so that case takes the memo test and asks again.
+    ///
+    /// Any other state runs the long form, which is the handlers' gate
+    /// sequence from before the lane.
+    inline fn oneShotGate(
+        self: *Vm,
+        comptime mode: ExecMode,
+        patch: *const trace.EntryPatch,
+        comptime site: enum { head, cont },
+    ) OneShotRoute {
+        const ts = &self.trace;
+        if (ts.fast_block == 0 and patch.live and !ts.config.record_exec_log) {
+            self.assertOneShotSettled(mode);
+            if (ts.pending_descent_fail == null and ts.ordinary_probe_count == 0) {
+                const ct = patch.trace;
+                if (self.headEpisodeQuiet(ct)) |nt| {
+                    self.assertOneShotLaneAdmission(patch);
+                    return .{ .lane = nt };
+                }
+                if (ct.native == .compiled) {
+                    if (std.debug.runtime_safety) std.debug.assert(patch.native_decline_gen != ts.registry.cache_gen);
+                    return .{ .walk = true };
+                }
+            }
+        } else {
+            // Doc 63 §5.9: suspended, run the canonical instruction before
+            // the non-live recovery, without touching the patch.
+            if (self.jitSuspended(mode)) return .canonical;
+            if (!patch.live) return .unpatch;
+            // §R1-5 bypass set (the loop arms' set + the pending call
+            // anchor): under any live observation/recording hook, present
+            // the canonical instruction to the ordinary handler so
+            // recording and replay see virgin behaviour. Coverage is NOT in
+            // this set (unlike the loop arms): a loop anchor still enters
+            // its trace through the back-edge walk under coverage, but the
+            // patch is a one-shot anchor's ONLY entry — bypassing here
+            // would make `--jit-stats` report 0%% one-shot residency by
+            // construction. The terminal consumer attributes the hop.
+            if (ts.isRecording() or self.suspend_ctl != null or
+                self.record_safepoint_lines or ts.config.record_exec_log or
+                ts.pending_exit_anchor != null or
+                ts.pending_replay_anchor != null or
+                ts.pending_call_anchor != null)
+            {
+                return .canonical;
+            }
+            switch (site) {
+                // A `.cont` recording arming at this very pc must see the
+                // virgin instruction.
+                .cont => if (ts.pending_ret_anchor != null) return .canonical,
+                // Always null at a head. Every setter flips to `.full` and
+                // parks at the anchor's resume pc, whose prologue consumes
+                // or discards it (`maybeStartCont`). The one pending that
+                // survives a prologue is kept at its host call's pc, which
+                // is a `call`; pc 0 never is (the callee is loaded first).
+                .head => if (std.debug.runtime_safety) std.debug.assert(ts.pending_ret_anchor == null),
+            }
+        }
+        // Doc 45 D6.1 fast decline: a prior full walk proved every candidate
+        // at this anchor is native-unsupported (memo keyed to `cache_gen`;
+        // any commit/retirement invalidates it). Run the canonical tier-0
+        // instruction — one compare instead of a decline-walk per call. A
+        // standing sibling want forces the full walk (its transfer must be
+        // consumed there).
+        if (ts.config.native_codegen and
+            patch.native_decline_gen == ts.registry.cache_gen and
+            ts.wants_head_sibling == null)
+        {
+            return .canonical;
+        }
+        return .{ .walk = false };
+    }
+
+    /// Safe builds: the settled test (`fast_block == 0`, no exec log) proves
+    /// the long form's suspension test and bypass set, `jcont`'s pending
+    /// return anchor included.
+    inline fn assertOneShotSettled(self: *Vm, comptime mode: ExecMode) void {
+        if (!std.debug.runtime_safety) return;
+        const ts = &self.trace;
+        std.debug.assert(ts.fast_block == self.fastBlockReference());
+        std.debug.assert(!self.jitSuspended(mode));
+        std.debug.assert(!(ts.isRecording() or self.suspend_ctl != null or
+            self.record_safepoint_lines or ts.config.record_exec_log or
+            ts.pending_exit_anchor != null or ts.pending_replay_anchor != null or
+            ts.pending_call_anchor != null or ts.pending_ret_anchor != null));
+    }
+
+    /// Safe builds: an entry admitted to the lane passes the tests of the
+    /// long form and of `enterPatchedTrace`'s prelude that the gate does
+    /// not spell out itself.
+    inline fn assertOneShotLaneAdmission(self: *Vm, patch: *const trace.EntryPatch) void {
+        if (!std.debug.runtime_safety) return;
+        const ts = &self.trace;
+        const ct = patch.trace;
+        std.debug.assert(patch.native_decline_gen != ts.registry.cache_gen);
+        std.debug.assert(trace.anchorKind(ct.code.anchor.pc) != .loop);
+        std.debug.assert(!ts.ordinaryProbeNeeded(ct.code.anchor));
+        std.debug.assert(ct.native == .compiled and ts.config.native_codegen);
+    }
+
+    /// Doc 84 §4.2: the one-shot lane. An admitted head or continuation
+    /// entry runs the quiet episode directly. The walk prelude reduces to
+    /// its two evidence resets, because admission proved the rest has
+    /// nothing to consume. The epilogue reduces to the strike reset when
+    /// the episode completed and left nothing to merge or drain; any other
+    /// outcome falls into the shared walk tail with the incumbent visited.
+    inline fn enterOneShotLane(
+        self: *Vm,
+        comptime mode: ExecMode,
+        patch: *trace.EntryPatch,
+        slot: u16,
+        nt: *const nativegen.CompiledTrace,
+        closure: *const function.Closure,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        pc: usize,
+    ) EntryDirective {
+        const ts = &self.trace;
+        const ct = patch.trace;
+        const anchor_pc = ct.code.anchor.pc;
+        // The prelude's freshness resets (doc 44 D10), verbatim.
+        ts.head_walk_fail = null;
+        ts.head_burst_visited_len = 0;
+        if (std.debug.runtime_safety) ts.one_shot_lane_entries +%= 1;
+        const directive = self.enterHeadNativeQuiet(ct, nt, closure, proto, regs, base);
+        // A completion with no burst owners to merge and no patch work to
+        // drain: the epilogue is the strike reset, in its §R6-1 place
+        // (the slot is stable, nothing drained yet).
+        if (directive != .next_candidate and ts.head_burst_visited_len == 0 and
+            ts.registry.entry_registry.entry_patch_dirty == 0)
+        {
+            if (patch.live) patch.strikes = 0;
+            return directive;
+        }
+        return self.finishOneShotLane(mode, patch, slot, closure, proto, regs, base, pc, ct, anchor_pc, directive);
+    }
+
+    /// The lane's slow tail: the incumbent zero-exited, or its episode left
+    /// burst owners or patch work behind. Runs the shared walk tail from
+    /// the state `enterPatchedTrace` would have after the same entry (the
+    /// incumbent visited, nothing dead, a real entry made).
+    noinline fn finishOneShotLane(
+        self: *Vm,
+        comptime mode: ExecMode,
+        patch: *trace.EntryPatch,
+        slot: u16,
+        closure: *const function.Closure,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        pc: usize,
+        ct: *trace.Trace,
+        anchor_pc: u32,
+        first: EntryDirective,
+    ) EntryDirective {
+        var dead: WalkDead = .{};
+        var visited: [trial_visited_cap]*trace.Trace = undefined;
+        visited[0] = ct;
+        var wctx: TrialWalkCtx = .{
+            .visited = visited[0..1],
+            .dead = &dead,
+        };
+        return self.finishPatchedWalk(mode, patch, slot, closure, proto, regs, base, pc, anchor_pc, true, &visited, &wctx, first, false);
     }
 
     /// Doc 42: one `execImpl` invocation = build the chain state on THIS
@@ -9381,7 +9618,7 @@ pub const Vm = struct {
         // fail-closed type check subsumes the fingerprint at entry,
         // per the B-4 discipline) and run the identical entry/receipt
         // routine the walk uses.
-        const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc);
+        const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc, false);
         if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
             st.code = self.cachedCodeFor(st.frame, st.proto);
             st.code_gen = self.trace.registry.entry_registry.image_gen;
@@ -9476,7 +9713,7 @@ pub const Vm = struct {
                 {
                     return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
                 }
-                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc);
+                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc, false);
                 if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
                     st.code = self.cachedCodeFor(st.frame, st.proto);
                     st.code_gen = self.trace.registry.entry_registry.image_gen;
@@ -9530,61 +9767,25 @@ pub const Vm = struct {
                 // the next jump/call re-derives from `st.code` and re-sees
                 // any patched pcs.
                 //
-                // Doc 63 §5.9: suspended, run the canonical instruction
-                // before the non-live recovery, without touching the patch.
-                if (self.jitSuspended(mode)) {
-                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
-                }
-                if (!patch.live) {
-                    // §R6-1 deferred-unpatch recovery, exactly the loop arms'
-                    // discipline: complete the transaction, then run the
-                    // canonical instruction.
-                    self.trace.unpatchSlot(slot);
-                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
-                }
-                // §R1-5 bypass set (the loop arms' set + the pending call
-                // anchor): under any live observation/recording hook, present
-                // the canonical instruction to the ordinary handler so
-                // recording and replay see virgin behaviour. Coverage is NOT
-                // in this set (unlike the loop arms): a loop anchor still
-                // enters its trace through the back-edge walk under coverage,
-                // but the pc-0 patch is a head's ONLY entry — bypassing here
-                // would make `--jit-stats` report 0%% head residency by
-                // construction. The terminal consumer attributes the hop.
-                if (self.trace.isRecording() or self.suspend_ctl != null or
-                    self.record_safepoint_lines or self.trace.config.record_exec_log or
-                    self.trace.pending_exit_anchor != null or
-                    self.trace.pending_replay_anchor != null or
-                    self.trace.pending_call_anchor != null)
-                {
-                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
-                }
-                // Not `pending_ret_anchor`, unlike jcont's set: it is always
-                // null here. Every setter flips to `.full` and parks at the
-                // anchor's resume pc, whose prologue consumes or discards it
-                // (`maybeStartCont`). The one pending that survives a
-                // prologue is kept at its host call's pc, which is a `call`;
-                // pc 0 never is (the callee is loaded first). Doc 84.
-                if (std.debug.runtime_safety) std.debug.assert(self.trace.pending_ret_anchor == null);
-                // Doc 45 D6.1 fast decline: a prior full walk proved every
-                // candidate at this anchor is native-unsupported (memo keyed
-                // to `cache_gen`; any commit/retirement invalidates it). Run
-                // the canonical tier-0 instruction — one compare instead of a
-                // decline-walk per call. A standing sibling want forces the
-                // full walk (its transfer must be consumed there).
-                if (self.trace.config.native_codegen and
-                    patch.native_decline_gen == self.trace.registry.cache_gen and
-                    self.trace.wants_head_sibling == null)
-                {
-                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
-                }
-                // Patched entry: the identical entry/receipt routine the loop
-                // arms use. Guard failures leave regs untouched since entry
-                // (tier-1a/native evaluate into scratch; only φ-writeback and
-                // committed flushes touch the file), so the zero-exit resume
-                // at `cur_pc` re-runs the body on tier-0 from the same state —
-                // the function-entry deopt snapshot IS pc 0's register state.
-                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, cur_pc);
+                // Doc 84 §4.2: one gate decides the route (`oneShotGate`).
+                const directive = switch (self.oneShotGate(mode, patch, .head)) {
+                    .lane => |nt| self.enterOneShotLane(mode, patch, slot, nt, st.closure, st.proto, regs, st.base, cur_pc),
+                    // Patched entry: the identical entry/receipt routine the loop
+                    // arms use. Guard failures leave regs untouched since entry
+                    // (tier-1a/native evaluate into scratch; only φ-writeback and
+                    // committed flushes touch the file), so the zero-exit resume
+                    // at `cur_pc` re-runs the body on tier-0 from the same state —
+                    // the function-entry deopt snapshot IS pc 0's register state.
+                    .walk => |quiet_refused| self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, cur_pc, quiet_refused),
+                    .canonical => return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads }),
+                    .unpatch => {
+                        // §R6-1 deferred-unpatch recovery, exactly the loop arms'
+                        // discipline: complete the transaction, then run the
+                        // canonical instruction.
+                        self.trace.unpatchSlot(slot);
+                        return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                    },
+                };
                 if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
                     st.code = self.cachedCodeFor(st.frame, st.proto);
                     st.code_gen = self.trace.registry.entry_registry.image_gen;
@@ -9656,43 +9857,22 @@ pub const Vm = struct {
                 // invariant) — never `&patch.orig` (no successor instruction
                 // behind a detached struct pointer; the jfunc_head note).
                 //
-                // Doc 63 §5.9: as jfunc_head.
-                if (self.jitSuspended(mode)) {
-                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
-                }
-                if (!patch.live) {
-                    // §R6-1 deferred-unpatch recovery.
-                    self.trace.unpatchSlot(slot);
-                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
-                }
-                // §R1-5 bypass set: jfunc_head's set + the pending RET anchor
-                // (a `.cont` recording arming at this very pc must see the
-                // virgin instruction). Coverage is NOT in the set for the same
-                // reason as jfunc_head: this patch is the anchor's ONLY entry.
-                if (self.trace.isRecording() or self.suspend_ctl != null or
-                    self.record_safepoint_lines or self.trace.config.record_exec_log or
-                    self.trace.pending_exit_anchor != null or
-                    self.trace.pending_replay_anchor != null or
-                    self.trace.pending_call_anchor != null or
-                    self.trace.pending_ret_anchor != null)
-                {
-                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
-                }
-                // Doc 45 D6.1 fast decline (jfunc_head twin): every candidate
-                // proved native-unsupported by a prior full walk — canonical
-                // tier-0 dispatch until the next `cache_gen` bump.
-                if (self.trace.config.native_codegen and
-                    patch.native_decline_gen == self.trace.registry.cache_gen and
-                    self.trace.wants_head_sibling == null)
-                {
-                    return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
-                }
-                // Patched entry: the identical entry/receipt routine. Guard
-                // failures leave regs untouched since entry, so the zero-exit
-                // resume at `cur_pc` re-runs the continuation on tier-0 from
-                // the same state — the entry deopt snapshot IS this pc's
-                // register state.
-                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, cur_pc);
+                // Doc 84 §4.2: one gate decides the route, as jfunc_head.
+                const directive = switch (self.oneShotGate(mode, patch, .cont)) {
+                    .lane => |nt| self.enterOneShotLane(mode, patch, slot, nt, st.closure, st.proto, regs, st.base, cur_pc),
+                    // Patched entry: the identical entry/receipt routine. Guard
+                    // failures leave regs untouched since entry, so the zero-exit
+                    // resume at `cur_pc` re-runs the continuation on tier-0 from
+                    // the same state — the entry deopt snapshot IS this pc's
+                    // register state.
+                    .walk => |quiet_refused| self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, cur_pc, quiet_refused),
+                    .canonical => return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads }),
+                    .unpatch => {
+                        // §R6-1 deferred-unpatch recovery.
+                        self.trace.unpatchSlot(slot);
+                        return @call(.always_tail, handlerTable(mode)[@intFromEnum(st.proto.code[cur_pc].op)], .{ st, pc, &st.proto.code[cur_pc], vm, tags, payloads });
+                    },
+                };
                 if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
                     st.code = self.cachedCodeFor(st.frame, st.proto);
                     st.code_gen = self.trace.registry.entry_registry.image_gen;
