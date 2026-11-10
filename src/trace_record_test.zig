@@ -13,6 +13,7 @@ const regwindow = @import("regwindow.zig");
 const RegWindow = regwindow.RegWindow;
 const io = @import("io.zig");
 const tropt = @import("tropt.zig");
+const trace_ir = @import("trace_ir.zig");
 const execlog = @import("execlog.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
@@ -472,10 +473,10 @@ test "abort log records (anchor, reason, opcode) and dedups recurrences" {
     try testing.expectEqual(@as(usize, 0), quiet.abort_log.items.len);
 }
 
-test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
+test "recArrayGet/recArraySet on a metatable-bearing table: present slots record, an append aborts (doc 77 §5.3)" {
     const gpa = testing.allocator;
-    // A dense boolean array — exactly the shape the recorder would otherwise
-    // trace (`recArrayGet`/`recArraySet` lower it) — but carrying a metatable.
+    // A dense boolean array (the shape `recArrayGet`/`recArraySet` lower)
+    // carrying a metatable.
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
     var i: i64 = 1;
@@ -486,28 +487,39 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
 
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
 
-    // get_index: present, in-bounds, bool-lane — would record without a metatable.
+    // get_index: present, in-bounds, bool-lane. A present slot never consults
+    // the metatable: it records under a guard_table that allows one.
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
         try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
         state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
-        try testing.expect(!state.isRecording());
-        try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
+        try testing.expect(state.isRecording());
+        var any_meta = false;
+        for (state.rec.instrs.items) |ins| {
+            if (ins.op == .guard_table) any_meta = ins.aux & trace_ir.GUARD_TABLE_ANY_META != 0;
+        }
+        try testing.expect(any_meta);
     }
-    // set_index in-bounds in-lane store.
+    // set_index in-bounds in-lane store: records, with a guard_present so the
+    // trace exits once the slot is a hole (a store there would call
+    // `__newindex`).
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
         try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&t.header), Value.int(3), Value.boolean(false) };
         state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
-        try testing.expect(!state.isRecording());
-        try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
+        try testing.expect(state.isRecording());
+        var present = false;
+        for (state.rec.instrs.items) |ins| {
+            if (ins.op == .guard_present) present = true;
+        }
+        try testing.expect(present);
     }
-    // set_index append store (`t[len+1]=true`) — the path that would fire
-    // `__newindex` on an absent key.
+    // set_index append store (`t[len+1]=true`): the key is absent, so the
+    // store would call `__newindex`; it aborts.
     {
         var state = TraceState.init(gpa);
         defer state.deinit();
@@ -1247,7 +1259,7 @@ test "recBType: lookup miss aborts .bad_type and allocates nothing (the arc-A in
     try testing.expectEqual(objs_before, h.heap.strtab_count);
 }
 
-test "recBType: metatable'd table aborts; plain table folds 'table' under guard_table" {
+test "recBType: plain and metatable'd tables both fold 'table' under guard_table (doc 77 §5.4)" {
     const gpa = testing.allocator;
     var h = try FoldHarness.init(gpa, .type, &.{});
     defer h.deinit(gpa);
@@ -1266,7 +1278,10 @@ test "recBType: metatable'd table aborts; plain table folds 'table' under guard_
     const ops = h.state.rec.instrs.items;
     try testing.expectEqual(IrOp.guard_table, ops[3].op);
 
-    // Metatable'd table: no guard can express "table WITH metatable" — abort.
+    try testing.expectEqual(@as(i32, 0), ops[3].aux & trace_ir.GUARD_TABLE_ANY_META);
+
+    // Metatable'd table: `type` never consults the metatable, so the guard
+    // allows one.
     t.metatable = mt;
     var h2 = try FoldHarness.init(gpa, .type, &.{});
     defer h2.deinit(gpa);
@@ -1274,8 +1289,10 @@ test "recBType: metatable'd table aborts; plain table folds 'table' under guard_
     try h2.start(gpa);
     var regs2 = [_]Value{ Value.heap(&h2.nat.header), Value.heap(&t.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
     h2.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
-    try testing.expect(!h2.state.isRecording());
-    try testing.expectEqual(AbortReason.has_metatable, h2.state.rec.abort_reason.?);
+    try testing.expect(h2.state.isRecording());
+    const ops2 = h2.state.rec.instrs.items;
+    try testing.expectEqual(IrOp.guard_table, ops2[3].op);
+    try testing.expect(ops2[3].aux & trace_ir.GUARD_TABLE_ANY_META != 0);
 }
 
 test "recBSelect: konst '#' selector folds to the fixed arg count; non-konst aborts" {
@@ -1856,7 +1873,10 @@ test "len opcode: alen abort matrix — in-band lane, hash border, metatable" {
         try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
     }
 
-    // Metatable: `__len` could fire — abort .has_metatable.
+    // Metatable: proving `__len` absent needs the interned name, and this
+    // bare harness has no heap to intern it in, so it aborts .has_metatable
+    // (fail-closed). The recorded miss is covered at language level in
+    // interp_meta_trace_test.zig.
     {
         const t = try table_mod.Table.create(gpa);
         defer t.destroy(gpa);

@@ -30,6 +30,7 @@ const Ref = @import("trace_ir.zig").Ref;
 const ObsType = @import("trace_ir.zig").ObsType;
 const PHI_INTERNAL = @import("trace_ir.zig").PHI_INTERNAL;
 const GUARD_TABLE_WRITABLE = @import("trace_ir.zig").GUARD_TABLE_WRITABLE;
+const GUARD_TABLE_ANY_META = @import("trace_ir.zig").GUARD_TABLE_ANY_META;
 const guardExitPc = @import("trace_ir.zig").guardExitPc;
 const guardSourcePc = @import("trace_ir.zig").guardSourcePc;
 const isSideExitGuardOp = @import("trace_ir.zig").isSideExitGuardOp;
@@ -1828,7 +1829,7 @@ pub const RecordingSession = struct {
             .len => {
                 const v = regs.get(instr.b);
                 if (v.isHeap() and v.heapType() == .table) {
-                    try self.recAlenShape(instr.a, instr.b, .b, regs);
+                    try self.recAlenShape(instr.a, instr.b, .b, regs, false);
                 } else if (v.isHeap() and v.heapType() == .string) {
                     const rstr = try self.refOf(instr.b);
                     if (self.konstValueOf(rstr)) |kv| {
@@ -2658,6 +2659,9 @@ pub const RecordingSession = struct {
         key: Operand,
         tab_od: OperandDesig,
         key_od: OperandDesig,
+        /// `rawget`: never consults the metatable, so an absent key needs
+        /// no "no `__index`" proof (doc 77 §5.4).
+        raw: bool = false,
     };
 
     /// Slot frame for the write shapes: `val` is the stored value's register.
@@ -2670,6 +2674,9 @@ pub const RecordingSession = struct {
         tab_od: OperandDesig,
         key_od: OperandDesig,
         val_od: OperandDesig,
+        /// `rawset`: never consults the metatable, so a store to an absent
+        /// key needs no "no `__newindex`" proof (doc 77 §5.4).
+        raw: bool = false,
     };
 
     /// The observed table of a get or set frame.
@@ -2680,6 +2687,41 @@ pub const RecordingSession = struct {
     /// The SSA ref of a get or set frame's table.
     fn frameTabRef(self: *RecordingSession, tab: u16, tab_in: ?TabIn) !Ref {
         return if (tab_in) |t| t.ref else self.refOf(tab);
+    }
+
+    /// Doc 77 §4.1: the `guard_table` aux bit for an access that does not
+    /// consult `tbl`'s metatable. `GUARD_TABLE_ANY_META` when it has one, 0
+    /// otherwise, so a trace that never sees a metatable keeps its IR (and
+    /// the guard keeps refusing a metatable that appears later).
+    fn metaAux(tbl: *const table_mod.Table) i32 {
+        return if (tbl.metatable != null) GUARD_TABLE_ANY_META else 0;
+    }
+
+    /// Doc 77 §5.2: prove that the metatable of `rtab` (observed `mt`) has
+    /// no `name` metamethod, LuaJIT's `lj_record_mm_lookup` for the miss:
+    /// `load_meta` (whose fused exit fires if the table has lost its
+    /// metatable), then a raw `guard_absent` of the interned name on it. A
+    /// metamethod that is present aborts `.has_metatable` (calling it is
+    /// doc 77 Phase 3/4). The lookup is a read of the metatable, so a sunk
+    /// store goes through `forwardPendingHashLoad` first: a pending store
+    /// that may write `name` into this metatable gets the usual alias
+    /// guard, or aborts. A forward is impossible here: tier-0 has already
+    /// run every pending store, so a store into `mt.name` would have made
+    /// the name present above. Returns false when the recording stopped.
+    fn guardNoMetamethod(self: *RecordingSession, rtab: Ref, mt: *table_mod.Table, name: []const u8, od: OperandDesig, dst: u16) !bool {
+        const key_ref = (try self.foldInternedStr(name)) orelse {
+            self.abort(.has_metatable);
+            return false;
+        };
+        if (!mt.get(self.konstValueOf(key_ref).?).isNil()) {
+            self.abort(.has_metatable);
+            return false;
+        }
+        const rmt = try self.emit(.{ .op = .load_meta, .a = rtab, .ty = .heap });
+        self.stampProv(rmt, .metamethod, od, .neutral);
+        if (try self.forwardPendingHashLoad(dst, rmt, key_ref, &mt.header)) return false;
+        self.stampProv(try self.emit(.{ .op = .guard_absent, .a = rmt, .b = key_ref }), .metamethod, od, .neutral);
+        return true;
     }
 
     /// Record `t[k]` (`get_index`, `dst=a b=table c=key`) as an array read.
@@ -2719,10 +2761,12 @@ pub const RecordingSession = struct {
             return self.abort(.bad_type);
         };
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
-        // A metatable means an absent slot could fire `__index` (chunk 2a). Even a
-        // present slot today could become a hole on a later iteration, so the only
-        // sound conservative choice is to bail the whole trace to tier-0.
-        if (tbl.metatable != null) return self.abort(.has_metatable);
+        // A metatable (doc 77 §5.3): a present slot never consults it, and the
+        // presence proof below (`guard_present`, or the `.value` lane's type
+        // guard that nil fails) exits when the slot becomes a hole, so the
+        // read records under `GUARD_TABLE_ANY_META`. An absent slot is
+        // `recordAbsentGet`'s, which proves "no `__index`".
+        const meta_aux = metaAux(tbl);
         const lane = tbl.array.lane;
         const loaded = tbl.getInt(idx);
         if (loaded.isNil()) return self.recordAbsentGet(regs, f);
@@ -2750,14 +2794,13 @@ pub const RecordingSession = struct {
             const elem_is_table = loaded.isHeap() and loaded.heapType() == .table;
             const elem_is_num = loaded.isInt() or loaded.isFloat();
             if (!elem_is_table and !elem_is_num) return self.abort(.nyi_opcode);
-            if (elem_is_table) {
-                const elem_tbl = table_mod.Table.fromHeader(loaded.asHeap());
-                if (elem_tbl.metatable != null) return self.abort(.has_metatable);
-            }
+            // Loading an element consults none of its metatable; whatever
+            // the trace does with it next guards its own needs.
+            const elem_aux: i32 = if (elem_is_table) metaAux(table_mod.Table.fromHeader(loaded.asHeap())) else 0;
 
             const lane_ord: i32 = @intFromEnum(lane); // 0 for .value
             const rtab = try self.refOf(f.tab);
-            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = meta_aux }), .container_type, f.tab_od, .neutral);
             try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
             const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
             if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx, vtab.asHeap())) return;
@@ -2776,7 +2819,7 @@ pub const RecordingSession = struct {
             self.stampProv(rload, .element_type, .loaded, .neutral);
             // Pin the element's type so a later iteration changing it side-exits.
             if (elem_is_table) {
-                self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload }), .element_type, .loaded, .neutral);
+                self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload, .aux = elem_aux }), .element_type, .loaded, .neutral);
             } else {
                 try self.guardNum(rload, loaded, .element_type, .loaded);
             }
@@ -2786,7 +2829,7 @@ pub const RecordingSession = struct {
 
         const lane_ord: i32 = @intFromEnum(lane);
         const rtab = try self.refOf(f.tab);
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = meta_aux }), .container_type, f.tab_od, .neutral);
         try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
         const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
         if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx, vtab.asHeap())) return;
@@ -3043,12 +3086,19 @@ pub const RecordingSession = struct {
         const idx = keyIndexOf(vkey) orelse return self.abort(.bad_type);
         if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
-        // A metatable means an absent-key store could fire `__newindex` (chunk 2a);
-        // the append path below stores to exactly such an absent key (`len+1`).
-        // Abort the whole trace to tier-0, which does full `__newindex` dispatch.
-        if (tbl.metatable != null) return self.abort(.has_metatable);
-        if (tbl.isReadonly()) return self.abort(.readonly_table);
+        // A metatable (doc 77 §5.3): a store to an absent key could fire
+        // `__newindex`, and the append path below stores to exactly such a key
+        // (`len+1`), so that aborts (deferred: an append after a `guard_absent`
+        // conflicts). An overwrite of a present slot never consults the
+        // metatable: it records under `GUARD_TABLE_ANY_META` with a
+        // `guard_present` (below) so a hole exits first. The `.value` lane has
+        // no presence guard (nil is in-band), so it aborts. `rawset` consults
+        // nothing and records as on a metatable-free table.
+        const meta_guarded = tbl.metatable != null and !f.raw;
         const lane = tbl.array.lane;
+        if (meta_guarded and (lane == .value or tbl.getInt(idx).isNil())) return self.abort(.has_metatable);
+        if (tbl.isReadonly()) return self.abort(.readonly_table);
+        const table_aux = GUARD_TABLE_WRITABLE | metaAux(tbl);
         // `.value`-lane store (doc 32): the type-erased lane holds full 16-byte
         // Values, so *any* value fits and no widen can ever be forced. Admitted for
         // **int/float** values only — the same restriction `hashSetShape` applies,
@@ -3110,7 +3160,7 @@ pub const RecordingSession = struct {
             // P0d: `t[#t+1] = v` (length-dependent append) is non-idempotent under
             // coarse deopt-replay — bar it fail-closed. See `traceHasAlenOf`.
             if (self.traceHasAlenOf(rtab)) return self.abort(.aliased_input);
-            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_WRITABLE }), .container_type, f.tab_od, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = table_aux }), .container_type, f.tab_od, .neutral);
             try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
             const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
@@ -3152,11 +3202,14 @@ pub const RecordingSession = struct {
 
         const lane_ord: i32 = @intFromEnum(lane);
         const rtab = try self.refOf(f.tab);
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_WRITABLE }), .container_type, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = table_aux }), .container_type, f.tab_od, .neutral);
         try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
         const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
+        // Doc 77 §5.3: on a table with a metatable only an overwrite is
+        // raw — a hole here would fire `__newindex` in tier-0, so exit.
+        if (meta_guarded) self.stampProv(try self.emit(.{ .op = .guard_present, .a = ref }), .present, .none, .neutral);
         // Pin the stored value's type. Which guard does that depends on the lane, and
         // exactly one of the two is emitted:
         //
@@ -3475,11 +3528,11 @@ pub const RecordingSession = struct {
     /// type-guard on the `hload` ref (`guard_int`/`guard_float`/…). The cell address
     /// is loop-invariant for a constant key (hoistable to the native prologue in
     /// H1), so the read mirrors the array `aref`/`aload` path. Aborts (leaving
-    /// tier-0 untouched) unless the access is a *present, non-metatable, constant-
-    /// key* hash field — the only shape the oracle/native path models:
+    /// tier-0 untouched) unless the access is a *present, constant-key* hash
+    /// field — the only shape the oracle/native path models. A metatable is
+    /// allowed (doc 77 §5.3): a present slot never consults it, and the
+    /// pinned cell's `guard_hash` exits once the slot could be absent:
     ///   * non-table container → `.bad_type`;
-    ///   * `tbl.metatable != null` → `.has_metatable` (an absent slot could fire
-    ///     `__index`; even a present slot could become absent on a later iteration);
     ///   * key absent from the hash part at record time → `.bad_type` (an absent-key
     ///     access is the migrate/`__index`/grow territory v1 excludes; the present-
     ///     key rule is what keeps the hoisted cell from dangling);
@@ -3506,8 +3559,14 @@ pub const RecordingSession = struct {
         if (key.isNumber()) {
             if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, keyIndexOf(key).?, vtab.asHeap())) return;
         } else if (try self.forwardPendingHashLoad(f.dst, rtab, rkey, vtab.asHeap())) return;
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = metaAux(tbl) }), .container_type, f.tab_od, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_absent, .a = rtab, .b = rkey }), .present, .loaded, .neutral);
+        // Doc 77 §5.3: a raw miss on a table with a metatable reads nil only
+        // while that metatable has no `__index`; `rawget` never asks.
+        if (tbl.metatable) |mt| if (!f.raw) {
+            if (!try self.guardNoMetamethod(rtab, mt, "__index", f.tab_od, f.dst)) return;
+        };
         self.setReg(f.dst, try self.konst(Value.nil()));
     }
 
@@ -3520,7 +3579,10 @@ pub const RecordingSession = struct {
         const vkey = operandValue(regs, f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
-        if (tbl.metatable != null) return self.abort(.has_metatable);
+        // A metatable (doc 77 §5.3): a present field never consults it, and
+        // `hload`'s fused tag check exits if the field is gone (a dead cell
+        // reads nil), so the read records under `GUARD_TABLE_ANY_META`. A miss
+        // is `recordAbsentGet`'s, which proves "no `__index`".
         const cell = tbl.fieldPtr(vkey) orelse return self.recordAbsentGet(regs, f);
         // Field-type restriction (the hash analogue of the narrow-array-lane rule).
         // A present cell holds a non-`nil` tagged `Value` of any type. We trace
@@ -3557,10 +3619,9 @@ pub const RecordingSession = struct {
         const is_fn_field = fv.isHeap() and fv.heapType() == .function;
         const is_tbl_field = fv.isHeap() and fv.heapType() == .table;
         if (!(fv.isInt() or fv.isFloat() or fv.isBool() or is_fn_field or is_tbl_field)) return self.abort(.nyi_opcode);
-        if (is_tbl_field) {
-            const ftbl = table_mod.Table.fromHeader(fv.asHeap());
-            if (ftbl.metatable != null) return self.abort(.has_metatable);
-        }
+        // Loading a table field consults none of its metatable (the element
+        // precedent in `arrayGetShape`).
+        const field_aux: i32 = if (is_tbl_field) metaAux(table_mod.Table.fromHeader(fv.asHeap())) else 0;
         // The key must be a recorded `konst` (the bytecode literal interned via
         // `load_const`), so its ref is provably the constant — no runtime key-
         // identity guard is needed and the cell is pinnable. A computed key reaches
@@ -3575,7 +3636,7 @@ pub const RecordingSession = struct {
         // same table ref + key konst, so no chain is re-emitted here), NO keeps
         // scanning / falls through to the heap read, MAY aborts fail-closed.
         if (try self.forwardPendingHashLoad(f.dst, rtab, rkey, vtab.asHeap())) return;
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = metaAux(tbl) }), .container_type, f.tab_od, .neutral);
         // Seed the loop-invariant cell pointer for native (H1); `href.aux` carries
         // the synthetic slab slot, the hrefk `(slot, mask)` encoding for a
         // dynamic root (doc 49), or `-1` (per-iteration callout).
@@ -3614,7 +3675,7 @@ pub const RecordingSession = struct {
         } else if (is_tbl_field) {
             // P3: pin "table, metatable-free" at run time — the mirror of the
             // `.value`-lane element pin. Downstream accesses chain off `rload`.
-            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload }), .field_type, .loaded, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload, .aux = field_aux }), .field_type, .loaded, .neutral);
         } else if (!fv.isBool()) {
             try self.guardNum(rload, fv, .field_type, .loaded);
         }
@@ -3629,8 +3690,9 @@ pub const RecordingSession = struct {
     /// Aborts unless:
     ///   * non-table container → `.bad_type`;
     ///   * `nil` value (delete) → `.bad_type`;
-    ///   * `tbl.metatable != null` → `.has_metatable` (`__newindex` territory);
-    ///   * key absent at record time → `.bad_type` (insert — out of v1 scope);
+    ///   * key absent at record time → `.bad_type` (insert — out of v1 scope;
+    ///     with a metatable it would be `__newindex` territory). Overwriting a
+    ///     present key never consults the metatable (doc 77 §5.3);
     ///   * computed (non-`konst`) key → `.bad_type`;
     ///   * recorder allocation failure → `.alloc` (ordinary recording abort).
     pub fn recHashSet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
@@ -3667,7 +3729,9 @@ pub const RecordingSession = struct {
         // (`obj.next = node`) stay tier-0 pending P2/P3.
         if (!(vval.isInt() or vval.isFloat() or vval.isBool())) return self.abort(.nyi_opcode);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
-        if (tbl.metatable != null) return self.abort(.has_metatable);
+        // A metatable (doc 77 §5.3): only a present key is recorded, and an
+        // overwrite of one never consults `__newindex`; `guard_hash` exits
+        // if the key has gone. So the store records under ANY_META.
         if (tbl.isReadonly()) return self.abort(.readonly_table);
         _ = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent = insert
         const rkey = try self.operandRef(f.key);
@@ -3704,7 +3768,7 @@ pub const RecordingSession = struct {
             try self.guardNum(rval, vval, .value_type, f.val_od);
         }
         const rtab = try self.frameTabRef(f.tab, f.tab_in);
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_WRITABLE }), .container_type, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_WRITABLE | metaAux(tbl) }), .container_type, f.tab_od, .neutral);
         // Seed the cell pointer for native (H1) — see `recHashGet`. An RMW's read and
         // write `href`s dedup onto the same slot via `seedHashCell`. A dynamic
         // root gets the hrefk `(slot, mask)` aux instead (doc 49).
@@ -4011,11 +4075,8 @@ pub const RecordingSession = struct {
                 try self.guardNum(r1, v1, .operand_type, .a);
             } else if (v1.isHeap()) switch (v1.heapType()) {
                 .string => self.stampProv(try self.emit(.{ .op = .guard_string, .a = r1 }), .operand_type, .a, .neutral),
-                .table => {
-                    const tbl = table_mod.Table.fromHeader(v1.asHeap());
-                    if (tbl.metatable != null) return self.abort(.has_metatable);
-                    self.stampProv(try self.emit(.{ .op = .guard_table, .a = r1 }), .operand_type, .a, .neutral);
-                },
+                // The control value is only carried (doc 77 §5.4).
+                .table => self.stampProv(try self.emit(.{ .op = .guard_table, .a = r1, .aux = metaAux(table_mod.Table.fromHeader(v1.asHeap())) }), .operand_type, .a, .neutral),
                 else => return self.abort(.bad_type),
             } else return self.abort(.bad_type);
         }
@@ -4056,12 +4117,9 @@ pub const RecordingSession = struct {
             } else if (vc.isHeap()) {
                 switch (vc.heapType()) {
                     .string => self.stampProv(try self.emit(.{ .op = .guard_string, .a = rc }), .operand_type, .a, .neutral),
-                    .table => {
-                        const ctbl = table_mod.Table.fromHeader(vc.asHeap());
-                        if (ctbl.metatable == null)
-                            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rc }), .operand_type, .a, .neutral);
-                        // metatable-bearing ctrl: leave unpinned (tier-1a).
-                    },
+                    // Doc 77 §5.4: a ctrl with a metatable pins under ANY_META;
+                    // nothing here consults it.
+                    .table => self.stampProv(try self.emit(.{ .op = .guard_table, .a = rc, .aux = metaAux(table_mod.Table.fromHeader(vc.asHeap())) }), .operand_type, .a, .neutral),
                     else => {}, // exotic heap ctrl: leave unpinned (tier-1a).
                 }
             }
@@ -5043,11 +5101,8 @@ pub const RecordingSession = struct {
                 // bool producer is always a bool — either way the result is
                 // fixed.
             } else if (argv.isHeap()) switch (argv.heapType()) {
-                .table => {
-                    const tbl = table_mod.Table.fromHeader(argv.asHeap());
-                    if (tbl.metatable != null) return self.abort(.has_metatable);
-                    self.stampProv(try self.emit(.{ .op = .guard_table, .a = arg_ref }), .operand_type, .a1, .neutral);
-                },
+                // Doc 77 §5.4: the answer never consults a metatable.
+                .table => self.stampProv(try self.emit(.{ .op = .guard_table, .a = arg_ref, .aux = metaAux(table_mod.Table.fromHeader(argv.asHeap())) }), .operand_type, .a1, .neutral),
                 .native => {
                     const nat = function.Native.fromHeader(argv.asHeap());
                     const tag = nat.recorded orelse return self.abort(.bad_type);
@@ -5130,11 +5185,8 @@ pub const RecordingSession = struct {
                 // bool producer is always a bool — either way the result is
                 // fixed.
             } else if (argv.isHeap()) switch (argv.heapType()) {
-                .table => {
-                    const tbl = table_mod.Table.fromHeader(argv.asHeap());
-                    if (tbl.metatable != null) return self.abort(.has_metatable);
-                    self.stampProv(try self.emit(.{ .op = .guard_table, .a = arg_ref }), .operand_type, .a1, .neutral);
-                },
+                // Doc 77 §5.4: the answer never consults a metatable.
+                .table => self.stampProv(try self.emit(.{ .op = .guard_table, .a = arg_ref, .aux = metaAux(table_mod.Table.fromHeader(argv.asHeap())) }), .operand_type, .a1, .neutral),
                 .native => {
                     const nat = function.Native.fromHeader(argv.asHeap());
                     const tag = nat.recorded orelse return self.abort(.bad_type);
@@ -5735,10 +5787,10 @@ pub const RecordingSession = struct {
             try self.guardBuiltinCallee(instr.a, .rawequal);
             try self.guardNum(ra, argv, .operand_type, .a1);
         } else if (argv.isHeap() and argv.heapType() == .table) {
+            // Doc 77 §5.4: raw, so a metatable is never consulted.
             const tbl = table_mod.Table.fromHeader(argv.asHeap());
-            if (tbl.metatable != null) return self.abort(.has_metatable);
             try self.guardBuiltinCallee(instr.a, .rawequal);
-            self.stampProv(try self.emit(.{ .op = .guard_table, .a = ra }), .operand_type, .a1, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = ra, .aux = metaAux(tbl) }), .operand_type, .a1, .neutral);
         } else {
             return self.abort(.bad_type); // float same-ref: NaN ~= NaN
         }
@@ -5758,7 +5810,7 @@ pub const RecordingSession = struct {
         const argv = regs.get(arg_slot);
         if (argv.isHeap() and argv.heapType() == .table) {
             try self.guardBuiltinCallee(instr.a, .rawlen);
-            return self.recAlenShape(instr.a, arg_slot, .a1, regs);
+            return self.recAlenShape(instr.a, arg_slot, .a1, regs, true);
         }
         const arg_ref = try self.refOf(arg_slot);
         const kv = self.konstValueOf(arg_ref) orelse return self.abort(.bad_type);
@@ -5788,9 +5840,9 @@ pub const RecordingSession = struct {
         try self.guardBuiltinCallee(instr.a, .rawget);
         const vkey = regs.get(key_slot);
         if (vkey.isNumber())
-            try self.arrayGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = .{ .reg = key_slot }, .tab_od = .a1, .key_od = .a2 })
+            try self.arrayGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = .{ .reg = key_slot }, .tab_od = .a1, .key_od = .a2, .raw = true })
         else if (isStringKey(vkey))
-            try self.hashGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = .{ .reg = key_slot }, .tab_od = .a1, .key_od = .a2 })
+            try self.hashGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = .{ .reg = key_slot }, .tab_od = .a1, .key_od = .a2, .raw = true })
         else
             return self.abort(.bad_type);
     }
@@ -5817,9 +5869,9 @@ pub const RecordingSession = struct {
         try self.guardBuiltinCallee(instr.a, .rawset);
         const vkey = regs.get(key_slot);
         if (vkey.isNumber())
-            try self.arraySetShape(regs, .{ .tab = tab_slot, .key = .{ .reg = key_slot }, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3 })
+            try self.arraySetShape(regs, .{ .tab = tab_slot, .key = .{ .reg = key_slot }, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3, .raw = true })
         else if (isStringKey(vkey))
-            try self.hashSetShape(regs, .{ .tab = tab_slot, .key = .{ .reg = key_slot }, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3 })
+            try self.hashSetShape(regs, .{ .tab = tab_slot, .key = .{ .reg = key_slot }, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3, .raw = true })
         else
             return self.abort(.bad_type);
         if (!self.active) return; // the shape aborted
@@ -5852,17 +5904,22 @@ pub const RecordingSession = struct {
     ///     a different table cannot alias this one's header fields.
     /// So: no pending-store abort. Gate: the rawset-then-`#t` differential in
     /// trace_record_test.zig plus scalar's end-to-end run (doc 24 D7).
-    pub fn recAlenShape(self: *RecordingSession, dst: u16, tab_slot: u16, tab_od: OperandDesig, regs: RegWindow) !void {
+    pub fn recAlenShape(self: *RecordingSession, dst: u16, tab_slot: u16, tab_od: OperandDesig, regs: RegWindow, raw: bool) !void {
         const vtab = regs.get(tab_slot);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
-        if (tbl.metatable != null) return self.abort(.has_metatable);
         if (tbl.hash.count() != 0) return self.abort(.bad_type);
         if (!tbl.array.lane.scalarPresenceLane()) return self.abort(.bad_type);
         const asize = tbl.array.asize;
         if (asize > 1 and !tbl.array.isPresent(asize - 1)) return self.abort(.bad_type);
         const rtab = try self.refOf(tab_slot);
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = metaAux(tbl) }), .container_type, tab_od, .neutral);
+        // Doc 77 §5.4: `#t` on a table with a metatable is the raw border
+        // only while it has no `__len` (calling one is Phase 4); `rawlen`
+        // never asks.
+        if (tbl.metatable) |mt| if (!raw) {
+            if (!try self.guardNoMetamethod(rtab, mt, "__len", tab_od, dst)) return;
+        };
         const r = try self.emit(.{ .op = .alen, .a = rtab, .ty = .int });
         self.stampProv(r, .border, tab_od, .neutral);
         self.setReg(dst, r);

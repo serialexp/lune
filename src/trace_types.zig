@@ -87,6 +87,9 @@ pub const GuardRole = enum(u8) {
     /// the `for_prep`, which re-runs the test — so it attaches like any
     /// other: its child is the LuaJIT side trace off a FORI exit.
     for_entry,
+    /// Doc 77 §5.2: a metamethod lookup's miss, `load_meta` (the receiver
+    /// still has a metatable) and its `guard_absent` (the name is not in it).
+    metamethod,
 };
 
 /// Static register designator for the guarded operand (H-1c). Covers `a`/`b`/`c`,

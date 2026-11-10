@@ -1,8 +1,8 @@
 # 77 — Recording metamethods — Design
 
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
-decided; Phase 0 landed (2026-11-11), Phases 1–7 outstanding (doc 68 P2,
-which Phase 4 waits on, has landed)
+decided; Phases 0 and 1 landed (2026-11-11); Phases 2–7 outstanding
+(doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -37,25 +37,47 @@ land; move whole phases to Done once everything inside them is checked.
     are pending (`recHostResults`), which a metamethod frame cannot
     interleave with.
 
+- [x] **Phase 1 — tables that carry a metatable, on their raw paths** (§4,
+  §5, 2026-11-11).
+  - [x] `guard_table` aux bit `GUARD_TABLE_ANY_META` (Q4: merged with AND,
+    the writable bit with OR), in tier-1a, native and tropt
+    (`tropt.mergeTableGuardAux`). The native prologue skips its metatable
+    check for a slot table only when every guard on it carries the bit
+    (`SlotInfo.meta_ok`).
+  - [x] the metatable refusals in `guard_absent` (tier-1a `isAbsent` and
+    the native int-key path), tier-1a `guard_hash` and native hash-cell
+    entry seeding (`seedHashCell`) are gone; `guard_table` is the only
+    metatable check on a trace. A test pins that a present field of a slot
+    table with a metatable is seeded and read natively
+    (`seed_hash_declines` stays 0).
+    `trace_finalize` asserts in safety builds that every table a
+    `guard_absent`, `href` or `guard_hash` reaches is a `load_meta` result
+    or has an earlier `guard_table`.
+  - [x] IR op `load_meta` (wire 104), tier-1a and native, with a fused
+    exit (decision note below)
+  - [x] metamethod lookup (`guardNoMetamethod` in `trace_recorder.zig`):
+    the interned name, then `load_meta`, then `forwardPendingHashLoad`,
+    then `guard_absent`; a metamethod that is present aborts
+    `has_metatable` (Phases 3 and 4)
+  - [x] present-key reads on hash fields, array slots and table fields;
+    absent reads with no `__index`; overwrites of present hash fields and
+    present array slots (with a `guard_present`). Not covered: `.value`-lane
+    overwrites and appends, which still abort. A grid never has a metatable
+    (decision note below).
+  - [x] `#t` (no `__len`: `guardNoMetamethod` then `alen`), `type(t)`,
+    `math.type(t)`, `rawequal`, `rawget`/`rawset`/`rawlen` (raw frames:
+    no metamethod proof) and the generic-for control (§5.4)
+  - [x] the §9.2 gates for these paths, in `src/interp_meta_trace_test.zig`
+    (all ten `expectProgram` legs, so both GC disciplines): a metatable on
+    the metatable, frozen receivers, stores into the metatable inside the
+    loop, `setmetatable` between entries, `__index`/`__len`/`__newindex`
+    appearing later. §4.2 is pinned by a test that `setmetatable` has no
+    `recorded` arm.
+
 ### Outstanding
 
 - [ ] **Phase 0 numbers on the board** (the pinned pool): needs a push, then
   `gt profile`.
-- [ ] **Phase 1 — tables that carry a metatable, on their raw paths** (§4, §5).
-  - [ ] `guard_table` aux bit `GUARD_TABLE_ANY_META` (Q4: merged with AND,
-    the writable bit with OR), in tier-1a, native and tropt
-  - [ ] every other metatable refusal migrated (§4.1's list): `guard_absent`
-    (tier-1a and the native int-key path), tier-1a `guard_hash`, native
-    hash-cell entry seeding
-  - [ ] IR op `load_meta` (a table's metatable, or nil), tier-1a and native
-  - [ ] metamethod lookup through the recorder's hash shapes, forwarded
-    through `forwardPendingHashLoad` before any load is emitted (§5.2)
-  - [ ] the overwrite shapes (hash, array, grid) and present-key reads on a
-    table with a metatable (§5.3's capability table)
-  - [ ] `#t`, `type(t)`, `math.type(t)`, `rawequal`, `rawget`/`rawset`/
-    `rawlen` and the generic-for control on a table with a metatable (§5.4)
-  - [ ] the gates of §9 for these paths, all tiers, metatables on both the
-    receiver and the metatable itself
 - [ ] **Phase 2 — invariant lookups leave the loop body** (§5.5): the
   metatable pointer as an invariant field only `setmetatable` writes, and
   the lookup chain of an invariant receiver evaluated once per entry;
@@ -549,6 +571,46 @@ Local machine (load ~4.6 on 24 cores), `bench/run.py`, best of 5, at the
 one-shot head traces (213-380 cycles a call) around tier-0 callers that
 abort on the class fields. That is doc 84's entry cost plus this doc's
 Phases 1 and 3 (TODO.md).
+
+### 10.2 After Phase 1 (2026-11-11)
+
+Same machine and method (load ~3; the `meta_fields` row ~5).
+
+| program | t0 ms | jit ms | LuaJIT ms | res% | remaining aborts |
+|---|---|---|---|---|---|
+| meta_fields | 384.9 | 92.8 | 15.0 | 65.4 | `bad_type` on `len` (`#ps`, no metatable involved), `needs_precise` on `new_table` |
+| ray | 457.2 | 1251.0 | 32.8 | 28.2 | `has_metatable` on method lookups through `__index = self` (Phase 3), `for_prep`, `host_barrier` |
+| meta_ops | 404.2 | 418.7 | 7.0 | 0.0 | unchanged (Phase 4) |
+| meta_proxy | 297.6 | 301.8 | 13.3 | 0.0 | unchanged (Phase 4) |
+| meta_close_reused | 414.5 | 415.6 | n/a | 0.0 | unchanged (Phase 5) |
+| meta_calls (doc 68) | 45.9 | 45.2 | 0.9 | 0.0 | unchanged (Phase 4) |
+
+`meta_fields`, Phase 1's own target, went from 435.4 to 92.8 ms with the
+JIT (144.8 ms before `seedHashCell` stopped declining a table with a
+metatable, which sent every entry of its field loops to tier-1a); the
+others wait on later phases.
+
+### 10.3 Phase 1 decision notes (2026-11-11)
+
+- **`load_meta` has a fused exit instead of yielding nil.** §5.1 and §5.2
+  specify `load_meta` as "the metatable or nil", followed by a
+  `guard_table mt ANY_META`. Phase 1 emits `load_meta` only where the
+  recording saw a metatable, so the op exits itself when the metatable is
+  gone, and its result is always a table (`.heap` in `nativegen_prove`).
+  That removes a guard per lookup and keeps a nil out of the native
+  register model. A trace that needs to observe a nil metatable (none in
+  Phases 1–4) would add a non-exiting variant.
+- **A grid never has a metatable.** `inflateToGrid` declines a table with
+  one, and every writer of `Table.metatable` deflates a grid first
+  (`setmetatable` through `tableArg`, the C API through `tableOf`, `proc`'s
+  fresh tables). The grid shapes keep their `has_metatable` abort, which
+  cannot fire, and §5.3's "grid" overwrite row needs no work.
+- **`.value`-lane overwrites abort.** nil is in-band in that lane, so the
+  overwrite has no presence guard to exit on before a store to a hole
+  would call `__newindex`.
+- **Absent reads go through `forwardPendingHashLoad` before `guard_absent`
+  on the metatable**, as §5.2 asks, so a sunk store of `__index` into the
+  metatable earlier in the iteration is forwarded or aborts, never missed.
 
 ## 11. Open questions for review
 

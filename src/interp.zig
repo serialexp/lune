@@ -1808,10 +1808,11 @@ pub const Vm = struct {
     /// guard) deopts if the snapshot changed since recording.
     ///
     /// `native_eligible` (caller pre-set to `true`) is cleared iff a `hash_cell`
-    /// seed (H1, doc 11 §5) fails to resolve/validate at this entry — the table
-    /// isn't a metatable-free table, the constant key is absent, or the recorded
-    /// population changed. The caller then runs this entry on **tier-1a** instead of
-    /// native: the oracle re-derives the cell from `href`'s operands and side-exits
+    /// seed (H1, doc 11 §5) fails to resolve/validate at this entry — the value
+    /// isn't a table, the constant key is absent, or the recorded population
+    /// changed. A metatable is the trace's `guard_table`'s business (doc 77
+    /// §4.1), not the seed's. The caller then runs this entry on **tier-1a**
+    /// instead of native: the oracle re-derives the cell from `href`'s operands and side-exits
     /// at the same `guard_table`/`guard_hash` native would have, so the outcome is
     /// byte-identical (zero-iteration exit → tier-0 re-runs). `upvalue`/`global`
     /// seeds never touch it (their staleness is caught by an ordinary guard on the
@@ -1856,8 +1857,9 @@ pub const Vm = struct {
                 .hash_cell => blk: {
                     // Resolve the loop-invariant value-cell pointer and stash it raw
                     // for the native prologue (`[rsi + slot*8]`). Validate exactly the
-                    // oracle's per-iteration `guard_hash`: metatable-free, key present,
-                    // population unchanged. A `0` result means "ineligible" — a real
+                    // oracle's per-iteration `guard_hash`: key present, population
+                    // unchanged (the metatable is `guard_table`'s, doc 77 §4.1). A
+                    // `0` result means "ineligible" — a real
                     // cell pointer is never null — so native declines and tier-1a owns
                     // this entry. The slot is tagged `.int` so the raw pointer is never
                     // mistaken for a `GcHeader` by a GC scan of this dead scratch.
@@ -2043,12 +2045,14 @@ pub const Vm = struct {
     }
 
     /// A `hash_cell` seed's value-cell pointer, or 0 when `vtab` is not a
-    /// metatable-free table holding `key` at population `expected_count`
-    /// (a real cell pointer is never null). Out of line, as `seedGlobal`.
+    /// table holding `key` at population `expected_count` (a real cell
+    /// pointer is never null). Out of line, as `seedGlobal`. A metatable
+    /// does not decline the seed: the trace's `guard_table` on this table
+    /// checks it, with the aux the recorder chose (`trace_finalize` asserts
+    /// that one precedes every `href`, doc 77 §4.1).
     noinline fn seedHashCell(vtab: Value, key: Value, expected_count: u32) u64 {
         if (!(vtab.isHeap() and vtab.heapType() == .table)) return 0;
         const tbl = table.Table.fromHeader(vtab.asHeap());
-        if (tbl.metatable != null) return 0;
         const cell = tbl.fieldPtr(key) orelse return 0;
         if (tbl.hash.count() != expected_count) return 0;
         return @intFromPtr(cell);

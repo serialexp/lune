@@ -3915,13 +3915,13 @@ test "recorder (hash field, P3): a table field records hload ty=.heap + guard_ta
     try testing.expect(saw_shape);
 }
 
-test "recorder (hash field, P3): a table field WITH a metatable aborts fail-closed" {
+test "recorder (hash field, P3): a table field WITH a metatable records; its present reads allow the metatable (doc 77 §5.3)" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // The record-time gate mirrors arrayGetShape's element-table rule: a
-    // metatable on the field table means index misses dispatch to __index,
-    // which the traced fast path cannot replay — refuse at the load.
+    // Loading the field consults no metatable, and the present `image[3]`
+    // read never consults the field table's: the field's guard_table allows
+    // one (a miss would prove `__index` absent first, doc 77 §5.3).
     var chunk = try runForTrace(&vm, gpa,
         \\local obj = { image = setmetatable({}, {}) }
         \\for i = 1, 8 do obj.image[i] = 0 end
@@ -3934,9 +3934,13 @@ test "recorder (hash field, P3): a table field WITH a metatable aborts fail-clos
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
-    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
-    try testing.expect(!vm.trace.isRecording());
+    var any_meta = false;
+    for (vm.trace.registry.cache.items) |t| {
+        for (t.code.instrs) |ins| {
+            if (ins.op == .guard_table and ins.aux & trace_ir.GUARD_TABLE_ANY_META != 0) any_meta = true;
+        }
+    }
+    try testing.expect(any_meta);
 }
 
 test "hash field P3 end-to-end: table field loaded INSIDE the loop, array RMW through it; all ten legs" {
@@ -4297,13 +4301,13 @@ test "hash field (doc 45): a store after an absent read defers below the guard" 
     , "200 200\n");
 }
 
-test "recorder (hash field): a metatable-bearing table aborts (.has_metatable)" {
+test "recorder (hash field): a present field on a metatable-bearing table records (doc 77 §5.3)" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // A present, constant-key, int field that would otherwise record — but the table
-    // carries a metatable, so a present slot could go absent (or `__index` could fire)
-    // on a later iteration. The recorder aborts on the metatable edge.
+    // A present, constant-key, int field never consults the metatable. The
+    // pinned cell's guard_hash exits if the slot goes absent, which is when
+    // `__index` could fire.
     var chunk = try runForTrace(&vm, gpa,
         \\local t = setmetatable({x = 1}, {})
         \\local s = 0
@@ -4312,9 +4316,16 @@ test "recorder (hash field): a metatable-bearing table aborts (.has_metatable)" 
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
-    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
-    try testing.expect(!vm.trace.isRecording());
+    var any_meta = false;
+    var hash_guard = false;
+    for (vm.trace.registry.cache.items) |t| {
+        for (t.code.instrs) |ins| {
+            if (ins.op == .guard_table and ins.aux & trace_ir.GUARD_TABLE_ANY_META != 0) any_meta = true;
+            if (ins.op == .guard_hash) hash_guard = true;
+        }
+    }
+    try testing.expect(any_meta);
+    try testing.expect(hash_guard);
 }
 
 test "recorder (hash field): a heap-valued (string) field aborts (no string-field pin yet)" {
@@ -5827,6 +5838,83 @@ test "head descent formation (doc 44 D11): the self-call terminal actually pushe
     try testing.expectEqualStrings("56625\n", sink.buffered());
     // Committed descents: each sum(150) after commit pushes ~149 frames.
     try testing.expect(vm.trace.self_call_pushes >= 100);
+}
+
+/// Doc 84 §4.2 helper: run the small-callee probe (a pure function called
+/// from a loop that cannot trace) natively and return how many entries
+/// took the one-shot lane. `tune` adjusts the VM before the run.
+fn oneShotLaneProbe(comptime tune: fn (*Vm) void) !u64 {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local function f(n)
+        \\  local x = (n * 16809) % 2147483647
+        \\  return x % 7
+        \\end
+        \\local a, b = {}, {}
+        \\local acc = 0
+        \\for i = 1, 400 do
+        \\  if a ~= b then acc = acc + f(i) end
+        \\end
+        \\print(acc)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    tune(&vm);
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("1199\n", sink.buffered());
+    return vm.trace.one_shot_lane_entries;
+}
+
+test "one-shot lane (doc 84 §4.2): a settled small call enters through the lane" {
+    // Output equality cannot tell the lane from the long form (they are
+    // byte-identical by construction), so the witness is the lane's own
+    // counter: once the head trace is committed, every call takes the lane.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const lane = try oneShotLaneProbe(struct {
+        fn tune(_: *Vm) void {}
+    }.tune);
+    try testing.expect(lane >= 350);
+}
+
+test "one-shot lane (doc 84 §4.2): an exec log, coverage and a held .full dispatch each refuse it" {
+    // Each condition belongs to a different layer of the long form: the
+    // exec log is in the handlers' bypass set, coverage in the quiet
+    // predicate, and safepoint lines in `fast_block`. The program's output
+    // is the same on every leg (asserted in the helper).
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    try testing.expectEqual(@as(u64, 0), try oneShotLaneProbe(struct {
+        fn tune(vm: *Vm) void {
+            vm.trace.config.record_exec_log = true;
+        }
+    }.tune));
+    try testing.expectEqual(@as(u64, 0), try oneShotLaneProbe(struct {
+        fn tune(vm: *Vm) void {
+            vm.trace.config.coverage = true;
+        }
+    }.tune));
+    try testing.expectEqual(@as(u64, 0), try oneShotLaneProbe(struct {
+        fn tune(vm: *Vm) void {
+            vm.setRecordSafepointLines(true);
+        }
+    }.tune));
 }
 
 test "head handoff evidence symmetry (doc 44 D12a): the base-case-incumbent shape arms BOTH directions" {
