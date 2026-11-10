@@ -2,6 +2,33 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## JIT coverage: a field holding a native or a string aborts the recording (seen 2026-11-11)
+
+- [ ] **`math.floor(x)` or `obj.name` in a hot loop never traces.**
+      `hashGetShape` (`src/trace_recorder.zig`, "String/native-builtin
+      fields still abort") admits a field only when its value is a number,
+      a bool, a closure or a table; a native or a string aborts with
+      `nyi_opcode` at the `get_field`. So a loop that calls a library
+      function without caching it in a local, or reads a string field,
+      runs on tier 0 for good, and pays the JIT's hooks on top:
+
+      ```lua
+      for i = 1, 3000 do acc = acc + math.floor(i / 2) end
+      ```
+
+      is 1.64 M instructions with `--jit-native`, 1.50 M on tier 0 and
+      0.71 M with `local floor = math.floor` hoisted. `--dump-aborts`
+      shows 5 aborts at the `get_field` and no trace. `#M.k + M.n` with
+      a string `k` does the same (1.41 M against 1.28 M). The board does
+      not show it: its programs cache library functions in locals, the
+      LuaJIT-era idiom. The consumers exist for slot-loaded refs
+      (`guard_native`/`guard_builtin` at the call, `guard_string`), so
+      the first thing to try is admitting both as `hload ty=.heap` with
+      the guard at the load, as closures and tables do; check tier-1a
+      and the native lowering take an `hload` ref there. Wants a board
+      row that calls `math.*`/`string.*` uncached and reads a string
+      field. Found while writing a test for doc 84; not started.
+
 ## Language: declaring a global (noted 2026-10-30)
 
 - [ ] **Lua 5.5 global declarations, attributes and frozen tables.**
