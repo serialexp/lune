@@ -1,7 +1,9 @@
 # 84 — The lean one-shot entry lane — Design
 
-Status: partial — Phases 1 and 2a landed, and the first slice of a cheap
-decline (the lean decline tail, §3.6). The refusal want (§3.6) is
+Status: partial — Phases 1, 2a and 3 landed, with the runtime half of
+Phase 4 (the quiet episode reads the raw native result) and the first
+slice of a cheap decline (the lean decline tail, §3.6). Phase 4's other
+parts need a page capability and are sized in §4.4. The refusal want (§3.6) is
 prototyped and measured: it costs more than it saves until a declined
 entry is cheap. Q5 (its order against Phases 3 and 4) went unanswered on
 2026-11-11; order A is being followed until Bart says otherwise. Phase 2b
@@ -91,6 +93,22 @@ land; move whole phases to Done once everything inside them is checked.
   `call_two_shapes` −7.8%, binary-trees −5.9%, the rest flat. The tier-0
   board is flat.
 
+- [x] **Phase 3 — a lean completion** (§4.3, "Implemented").
+  `noteHostCallTerminal`, `noteHeadSiblingCompletion` and
+  `consumeHeadWalkFail` test their own first condition inline, at every
+  call site, and make a call only when there is something to file,
+  retire or charge. A plain completion makes none of the three.
+- [x] **Phase 4, the runtime half — the quiet episode reads the raw
+  result** (§4.4, "Implemented"). `enterHeadNativeQuiet` keeps the
+  `NativeResult` and decodes it (ledger rows, `ExecResult`) only for a
+  pushed descent or a fused burst. A completion, a refusal and a guard
+  exit read their scalar fields from it. With Phase 3: a completing call
+  costs 87 instructions less and a refused one 67. JIT board
+  (instructions, against the parent's sources): `call_small_fn` −6.3%,
+  `call_two_shapes` −6.0%, binary-trees −1.1%, spectral-norm −1.1%, ray
+  −0.6%, `globals_script` −0.6%, `meta_fields` −0.3%, array3d −0.3%;
+  nothing rose. The tier-0 board is flat.
+
   Q1-Q4 were settled 2026-11-10. Bart asked for second opinions from Codex and
   Antigravity and for the tiebreak to be settled here. Both reviewers
   picked the same four options independently. Their factual corrections
@@ -118,11 +136,13 @@ land; move whole phases to Done once everything inside them is checked.
   one (three in the gate, about fourteen in `headEpisodeQuiet`, ~40
   instructions). Parked by Bart on 2026-11-11 until Phases 3 and 4 are
   in.
-- [ ] **Phase 3 — a lean completion** (§4.3). A terminal completion with
-  nothing to consume does counters only. Pick from Q3.
-- [ ] **Phase 4 — a thin native call for one-shot pages** (§4.4). A small
-  fixed result in registers. The `NativeResult` init, the lease and
-  `prepareNativeEpisode` run only on the paths that read them.
+- [ ] **Phase 4, the page capability — entries that skip the episode
+  ctx and the result frame** (§4.4, "What is left"). Per entry:
+  `prepareNativeEpisode` 38 instructions, the `NativeResult` init 20, and
+  on the native side the trampoline and the terminal's ledger row. All
+  three need the page to promise that nothing it can reach reads them,
+  and a page's armed exits jump into other pages, so the promise has to
+  cover what can be armed. Not started; §4.4 has the options.
 - [ ] **Phase 5 — a one-load return refusal** (§4.5). `onRetResume`'s
   refusal chain becomes one per-pc settled bit.
 - [ ] **Phase 6 — re-measure binary-trees' seed cost after doc 81 E2**
@@ -823,6 +843,23 @@ today. (b) would also bake addresses inside the movable `Vm`
 need a mode bit so that fused and full consumers don't charge twice, all
 to save a few instructions.
 
+**Implemented, 2026-11-11.** Nothing was left to design after the
+review: the completion already ran `accountTraceRun` and the entered
+charge inline. What cost instructions was the three notes after them,
+each an out-of-line call that returned at its first test (18, 6 and 3
+instructions in the callee, plus the calls). Each is now an inline test
+in front of a `noinline` body:
+
+- `noteHostCallTerminal` tests the terminal kind; `fileHostCallTerminal`
+  files the continuation anchor of a `call_interp`.
+- `noteHeadSiblingCompletion` tests `wants_head_sibling`;
+  `retireHeadSiblingWant` does the rest.
+- `consumeHeadWalkFail` tests `head_walk_fail`; `chargeHeadWalkFail`
+  does the rest.
+
+Every caller gets it (the burst, descent and full-path consumers too),
+and there is no second completion to keep in step with the first.
+
 ### 4.4 Phase 4 — a thin native call for one-shot pages
 
 One-shot pages get an entry wrapper with a small fixed result: the exit
@@ -849,6 +886,73 @@ This is the half of the LuaJIT seam that is codegen work. LuaJIT's
 `vm_exit_interp` is cheap because the trace has already written its
 results to the stack, and the handoff is a jump with three live
 registers.
+
+**Implemented, 2026-11-11: the runtime half.** The run wrapper
+(`runWithLinkedLoopDone`) is now three inline pieces: `initResult`,
+`enterPage` and `decodeResult`. Every other caller composes the same
+three and compiles as before. The quiet episode calls `enterQuiet`
+(init and call) and keeps the raw `NativeResult`:
+
+- a pushed descent or a fused burst (`pushed_frames > 0`, or more than
+  one ledger row) calls `decodeQuiet` and goes to the same two consumers
+  as before;
+- every other outcome is scalar. The episode reads `exit_reason`,
+  `exit_instr` and the local count (`localCompleted`) from the raw
+  fields, in the same order of tests as before. The one ledger row is
+  not copied and no `ExecResult` is built.
+
+A refusal names no exit, so `noteTakenExit`'s first test (the exit has a
+counter) runs at the call site and the call is not made. Safe builds
+decode every scalar result as well and assert the fields agree; the
+wrapper's own tripwire (`assertResult`) still runs on every entry.
+
+Where a completing call's 191 instructions in `enterHeadNativeQuiet`
+went, before this (callgrind, the pure probe):
+
+| Part | Per call | Now |
+|---|---:|---|
+| `prepareNativeEpisode` | 38 | unchanged |
+| the three completion notes, with their calls | 40 | three inline tests (Phase 3) |
+| the `ExecResult` marshal | 20 | gone |
+| the `NativeResult` init | 20 | unchanged |
+| the ledger row copy | 17 | gone |
+| outcome tests | 20 | about the same |
+| the function's own frame (pushes, pops, 1.4 KiB of stack) | 16 | unchanged |
+| the lease, the entry counters, the call, the directive | 21 | unchanged |
+
+**What is left.** Three costs, each needing the page to promise
+something:
+
+- **The episode ctx (38).** `prepareNativeEpisode` publishes the
+  activation for code that bakes the ctx address: the seed prologue, the
+  frame-motion sequences, the dynamic-window terminal, traced host calls
+  and every helper that reaches the `Vm` through `ctx.vm`. There are
+  thirteen bake sites in `nativegen.zig` and `nativegen_emit.zig`. A
+  page that bakes none still has exits, and an armed exit jumps into
+  another page that may. So "this entry needs no ctx" is a property of
+  the page and of everything armed out of it.
+- **The result frame (20) and the native side.** The page writes its
+  outcome and one ledger row into `NativeResult` at every exit; the
+  shared trampoline saves and restores six registers around it. A
+  result in registers needs exit stubs that know which kind of entry
+  they are returning to, since the same page is also entered by the
+  walk, by chains and by other pages' arms.
+- **The lease (6).** It guards the running page against a retirement
+  from a collection inside a helper call, so it stays for any page that
+  can call one.
+
+Options for the promise, not yet chosen:
+
+- **(a) A static flag and no arms.** The compiler sets `ctx_free` when
+  no bake site fired. The lane skips the ctx only while the page has no
+  armed slot, counted at `commitSlotMutation` (the one funnel) and at
+  exit-adapter publication.
+- **(b) Arming refuses.** An arm out of a `ctx_free` page to a page
+  that is not `ctx_free` is refused, so the property is closed under
+  arming and the lane tests one bit.
+- **(c) Leave the ctx and the frame.** Take the 58 as the price of one
+  ABI for every entry, and spend the effort on Phase 5 (72 per return,
+  every program) and Phase 2b (45 per entry).
 
 ### 4.5 Phase 5 — a one-load return refusal
 
@@ -918,6 +1022,7 @@ Progress, `perf stat` on the board rows (JIT minus tier 0):
 | Phase 1 | +577 | +59.4% |
 | Phase 2a | +500 | +56.6% |
 | the lean decline tail (§3.6) | +500 | +47.3% |
+| Phase 3 and Phase 4's runtime half | +413 | +45.7% |
 
 Phase 0 puts the pure probe on the board. Each phase is measured with
 callgrind on both tiers, on the pure probe and binary-trees, and with a

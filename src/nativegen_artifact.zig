@@ -758,11 +758,36 @@ pub const CompiledTrace = struct {
     /// forcing only the inner fn would just move the call boundary to the
     /// ~1KB public wrappers.
     inline fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]trace_exec.LedgerEntry, silent: SilentStaging, exit_side_ok: bool) trace_exec.ExecResult {
+        var result: NativeResult = undefined;
+        initResult(&result, linked_loop_done, silent, exit_side_ok);
+        self.enterPage(regs, &result);
+        return self.decodeResult(&result, ledger_out, exit_side_ok);
+    }
+
+    /// Doc 84 §4.4: the quiet one-shot episode's call into the page. It
+    /// leaves the raw `NativeResult` with the caller, who reads the scalar
+    /// outcome from it directly and pays for `decodeQuiet` (the ledger
+    /// rows and the `ExecResult` marshal) only when the episode moved
+    /// frames or fused. Ordinary mode, no silent staging and no exit-side
+    /// permission, as `runCapturingLedger(regs, out, .{})` passes.
+    pub inline fn enterQuiet(self: CompiledTrace, regs: RegWindow, result: *NativeResult) void {
+        initResult(result, false, .{}, false);
+        self.enterPage(regs, result);
+        assertResult(result, false);
+    }
+
+    /// The decode half of `runCapturingLedger` for a result `enterQuiet`
+    /// produced.
+    pub inline fn decodeQuiet(self: CompiledTrace, result: *const NativeResult, ledger_out: []trace_exec.LedgerEntry) trace_exec.ExecResult {
+        return self.decodeResult(result, ledger_out, false);
+    }
+
+    /// The fresh state every native entry starts from.
+    inline fn initResult(result: *NativeResult, linked_loop_done: bool, silent: SilentStaging, exit_side_ok: bool) void {
         // Field by field, never a struct literal: a literal with `undefined`
         // ledger arrays still lowers to a copy of the whole ~1 KiB struct
         // from a constant template, on every entry — a quarter of a
         // short-trip entry's cost (a head trace of a tiny callee).
-        var result: NativeResult = undefined;
         result.completed = 0;
         result.exit_instr = std.math.maxInt(u32);
         result.linked_loop_done = if (linked_loop_done) 1 else 0;
@@ -797,12 +822,22 @@ pub const CompiledTrace = struct {
         // Doc 54 P2 amendment: fresh sibling-hop allowance per episode.
         result.sibling_hop_taken = 0;
         result.exit_side_ok = if (exit_side_ok) 1 else 0;
+    }
+
+    /// The call itself: through the shared trampoline when the page has
+    /// one, else the page's own entry.
+    inline fn enterPage(self: CompiledTrace, regs: RegWindow, result: *NativeResult) void {
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
-            f(regs.tags, regs.payloads, &result, self.page.code.ptr);
+            f(regs.tags, regs.payloads, result, self.page.code.ptr);
         } else {
-            self.page.entry(EntryFn)(regs.tags, regs.payloads, &result);
+            self.page.entry(EntryFn)(regs.tags, regs.payloads, result);
         }
+    }
+
+    /// `ExecResult.local_completed` of a native result: the final trace's
+    /// OWN committed count.
+    pub inline fn localCompleted(self: CompiledTrace, result: *const NativeResult) usize {
         // 2.3b-0/2.3b-1: the final trace's OWN committed count = cumulative rbx − the
         // rbx it inherited at entry. `-%` because a spurious wrap is never worse than the
         // old behaviour and there is no valid case where entry_rbx > completed. Before
@@ -811,22 +846,25 @@ pub const CompiledTrace = struct {
         // into a child under the shared frame, the fused child inherits the parent's
         // cumulative `rbx`, so `entry_rbx > 0` is the expected steady state and the old
         // `assert(entry_rbx == 0)` no longer holds.
-        const local: usize = blk: {
-            const raw = result.completed -% result.entry_rbx;
-            // Doc 39: a peeled trace's first back-edge closes TWO tier-0
-            // iterations (run-once pass + first steady pass) but increments rbx
-            // once, so nonzero local progress under-counts by exactly 1. Add it
-            // back HERE — the seam where tier-1a's contract (irinterp bakes the
-            // +1 into its returned `completed`) meets native's raw rbx delta —
-            // so every consumer sees the same iteration accounting on both
-            // tiers. `result.completed` itself stays the raw chain-cumulative
-            // rbx (the ledger asserts below compare raw values); peeled traces
-            // are excluded from fusion (armNativeLink refuses them), so the
-            // raw/adjusted split never crosses a chain boundary. Zero local
-            // progress stays zero: an exit before the first back-edge replays
-            // both partial iterations on tier-0.
-            break :blk if (self.peeled and raw > 0) raw + 1 else raw;
-        };
+        const raw = result.completed -% result.entry_rbx;
+        // Doc 39: a peeled trace's first back-edge closes TWO tier-0
+        // iterations (run-once pass + first steady pass) but increments rbx
+        // once, so nonzero local progress under-counts by exactly 1. Add it
+        // back HERE — the seam where tier-1a's contract (irinterp bakes the
+        // +1 into its returned `completed`) meets native's raw rbx delta —
+        // so every consumer sees the same iteration accounting on both
+        // tiers. `result.completed` itself stays the raw chain-cumulative
+        // rbx (the ledger asserts in `assertResult` compare raw values);
+        // peeled traces are excluded from fusion (armNativeLink refuses
+        // them), so the raw/adjusted split never crosses a chain boundary.
+        // Zero local progress stays zero: an exit before the first
+        // back-edge replays both partial iterations on tier-0.
+        return if (self.peeled and raw > 0) raw + 1 else raw;
+    }
+
+    /// Safe builds: the tripwire every native result passes before it is
+    /// consumed.
+    inline fn assertResult(result: *const NativeResult, exit_side_ok: bool) void {
         // 2.3c-2a: the per-transition ledger's TERMINAL entry must reproduce the scalar
         // result fields. The ledger's whole reason to exist — recover the HIDDEN
         // intermediate hops a fused span drops — is only trustworthy if its last entry
@@ -887,6 +925,13 @@ pub const CompiledTrace = struct {
                 if (term_kind == .exit_side) std.debug.assert(exit_side_ok);
             }
         }
+    }
+
+    /// The ledger rows and the scalar fields of a native result, as the
+    /// dispatcher's consumers read them.
+    inline fn decodeResult(self: CompiledTrace, result: *const NativeResult, ledger_out: ?[]trace_exec.LedgerEntry, exit_side_ok: bool) trace_exec.ExecResult {
+        const local = self.localCompleted(result);
+        assertResult(result, exit_side_ok);
         // 2.3c-2b: decode the per-transition ledger for the caller's replay. Only
         // `[0..ledger_len]` is meaningful; the append fully writes every counted slot.
         if (ledger_out) |out| {

@@ -6162,7 +6162,15 @@ pub const Vm = struct {
     /// (`noteSiblingTerminal`), which arms `.sibling_handoff` at `hotguard`.
     /// Shared by the quiet and full terminal consumers; clears the channel
     /// unconditionally (one observation per walk, by design).
-    fn consumeHeadWalkFail(self: *Vm, completed_id: u32) void {
+    ///
+    /// Doc 84 §4.3: the test for standing evidence is inline; a completion
+    /// with none (the usual one) makes no call.
+    inline fn consumeHeadWalkFail(self: *Vm, completed_id: u32) void {
+        if (self.trace.head_walk_fail == null) return;
+        self.chargeHeadWalkFail(completed_id);
+    }
+
+    noinline fn chargeHeadWalkFail(self: *Vm, completed_id: u32) void {
         const ts = &self.trace;
         const fk = ts.head_walk_fail orelse return;
         ts.head_walk_fail = null;
@@ -6730,48 +6738,69 @@ pub const Vm = struct {
         // Doc 22 §B.1: the native page seeds itself from this ctx.
         self.prepareNativeEpisode(closure, proto, base);
         ts.native_entries +%= 1;
-        const result = nt.runCapturingLedger(regs, &ts.ledger_scratch, .{});
+        // Doc 84 §4.4: the raw result stays here. A pushed descent or a
+        // fused burst is described by the frame fields and the ledger rows,
+        // so those two decode it (`decodeQuiet`, what `runCapturingLedger`
+        // did on every entry). Every other outcome is scalar and is read
+        // from the raw fields below.
+        var nr: nativegen.NativeResult = undefined;
+        nt.enterQuiet(regs, &nr);
         // What the predicate bought (no promoted sets ⇒ no silent state):
-        std.debug.assert(result.silent_active == 0);
-        // Doc 44 D11: a pushed descent — the native run changed the VM frame
-        // stack, so it MUST branch before every other consumer (they all
-        // reason against the ENTRY activation; the top frame is now the
-        // descent's leaf). Pushes mutate no receipt state, so the quiet
-        // predicate needed no new line.
-        if (result.pushed_frames > 0) {
-            ts.last_exit_instr = result.exit_instr;
-            return self.consumePushedDescent(ct, result, proto);
-        }
-        // Doc 44 D10 (quiet v2): an armed `.sibling_handoff` slot fired —
-        // the whole chain is described by the multi-row ledger; the shared
-        // burst consumer owns validation, accounting, and resumption. May
-        // set `pending_sibling_arm` / penalty state, which correctly ends
-        // quietness for the NEXT entry.
-        if (result.ledger_len > 1) {
+        std.debug.assert(nr.silent_active == 0);
+        if (nr.pushed_frames > 0 or nr.ledger_len > 1) {
+            const result = nt.decodeQuiet(&nr, &ts.ledger_scratch);
+            // Doc 44 D11: a pushed descent — the native run changed the VM
+            // frame stack, so it MUST branch before every other consumer
+            // (they all reason against the ENTRY activation; the top frame
+            // is now the descent's leaf). Pushes mutate no receipt state,
+            // so the quiet predicate needed no new line.
+            if (result.pushed_frames > 0) {
+                ts.last_exit_instr = result.exit_instr;
+                return self.consumePushedDescent(ct, result, proto);
+            }
+            // Doc 44 D10 (quiet v2): an armed `.sibling_handoff` slot fired
+            // — the whole chain is described by the multi-row ledger; the
+            // shared burst consumer owns validation, accounting, and
+            // resumption. May set `pending_sibling_arm` / penalty state,
+            // which correctly ends quietness for the NEXT entry.
             ts.last_exit_instr = result.exit_instr; // full-path diagnostic parity
             return self.consumeHeadBurst(ct, ts.ledger_scratch[0..result.ledger_len], proto);
         }
-        std.debug.assert(result.final_trace_id == ct.id);
-        std.debug.assert(result.exit_reason != .seed_hash_decline);
-        if (result.exit_reason == .seed_capacity_decline) {
+        const exit_reason: trace_exec.ExitReason = @enumFromInt(nr.exit_reason);
+        const exit_instr = nr.exit_instr;
+        if (std.debug.runtime_safety) {
+            // The scalar fields read below are the ones the decode reports.
+            var row: [1]trace_exec.LedgerEntry = undefined;
+            const decoded = nt.decodeQuiet(&nr, &row);
+            std.debug.assert(decoded.pushed_frames == 0 and decoded.ledger_len <= 1);
+            std.debug.assert(decoded.exit_reason == exit_reason and decoded.exit_instr == exit_instr);
+            std.debug.assert(decoded.final_trace_id == nr.final_trace_id and decoded.completed == nr.completed);
+            std.debug.assert(decoded.local_completed == nt.localCompleted(&nr));
+        }
+        std.debug.assert(nr.final_trace_id == ct.id);
+        std.debug.assert(exit_reason != .seed_hash_decline);
+        if (exit_reason == .seed_capacity_decline) {
             // Verbatim the full path's handler: an entry-condition mismatch,
             // not a guard failure — no receipt, no `last_exit_instr`.
             ts.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ ct.id, ct.code.anchor.pc });
             ts.seed_capacity_declines +|= 1;
             return .next_candidate;
         }
-        ts.last_exit_instr = result.exit_instr;
-        if (result.exit_instr != std.math.maxInt(u32) and
-            result.exit_instr < ct.code.instrs.len and
-            ct.code.instrs[result.exit_instr].op == .terminal)
+        ts.last_exit_instr = exit_instr;
+        if (exit_instr != std.math.maxInt(u32) and
+            exit_instr < ct.code.instrs.len and
+            ct.code.instrs[exit_instr].op == .terminal)
         {
-            const term = ct.code.instrs[result.exit_instr];
+            const term = ct.code.instrs[exit_instr];
             ts.dbg("terminal: trace={d} kind={d} resume={d}", .{ ct.id, term.a, term.aux });
             // `onSideExitReceipt(ct, 1, exit, 1, .deferred, .entered)` reduced
             // under the predicate: the while-probe rejects on op (terminal is
             // not `guard_true`), the region machine returns false
             // (`receiptsInert`), and the legacy productive path's two map
             // removals no-op on empty maps — leaving exactly these two calls.
+            // Doc 84 §4.3: the three notes after them test their own first
+            // condition inline, so a completion with nothing to file, no
+            // want to retire and no walk evidence makes no call.
             ts.accountTraceRun(ct, 1);
             trace.TraceState.accountCandidateCharge(ct, .entered);
             self.noteHostCallTerminal(term);
@@ -6789,20 +6818,22 @@ pub const Vm = struct {
         // The receipt calls are the REAL funnels, verbatim semantics: they
         // mutate penalty/want state, correctly ending quietness for
         // subsequent entries. `.next_candidate` feeds the D8 sibling walk.
-        const local_done: usize = result.local_completed;
-        ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ ct.id, true, @tagName(result.exit_reason), result.exit_instr, result.completed });
+        const local_done: usize = nt.localCompleted(&nr);
+        ts.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ ct.id, true, @tagName(exit_reason), exit_instr, nr.completed });
         // Doc 44 D10: a REAL guard deopt (never a prologue-fail — that says
         // nothing about the branch) records the walk-local handoff evidence.
-        if (result.exit_instr != std.math.maxInt(u32))
-            ts.head_walk_fail = .{ .trace_id = ct.id, .exit_instr = result.exit_instr };
-        ts.noteTakenExit(ct, result.exit_instr, local_done, .legacy);
+        if (exit_instr != std.math.maxInt(u32))
+            ts.head_walk_fail = .{ .trace_id = ct.id, .exit_instr = exit_instr };
+        // `noteTakenExit`'s first test, here: an entry refusal names no
+        // exit (`maxInt`), so it has no counter and makes no call.
+        if (exit_instr < ct.exit_counts.len) ts.noteTakenExit(ct, exit_instr, local_done, .legacy);
         ts.onSideExitReceipt(
             ct,
             local_done,
-            result.exit_instr,
+            exit_instr,
             local_done,
             .deferred,
-            if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
+            if (exit_reason == .prologue_fail) .entry_refusal else .entered,
         );
         return .next_candidate;
     }
@@ -6946,8 +6977,16 @@ pub const Vm = struct {
     /// Trace stitching (doc 44): a `.terminal(call_interp)` completed; tier-0
     /// resumes AT the host call (`term.aux`) and performs it. File the
     /// continuation anchor after it, on the frame that runs the call.
-    noinline fn noteHostCallTerminal(self: *Vm, term: trace.IrInstr) void {
+    ///
+    /// Doc 84 §4.3: the kind test is inline; any other terminal (a plain
+    /// `ret`, the usual one) makes no call.
+    inline fn noteHostCallTerminal(self: *Vm, term: trace.IrInstr) void {
         if (term.a != @intFromEnum(trace.trace_ir.TerminalKind.call_interp)) return;
+        self.fileHostCallTerminal(term);
+    }
+
+    noinline fn fileHostCallTerminal(self: *Vm, term: trace.IrInstr) void {
+        std.debug.assert(term.a == @intFromEnum(trace.trace_ir.TerminalKind.call_interp));
         const top = &self.frames[self.depth - 1];
         if (top.ctl.protect != .none) return;
         self.trace.onHostCallTerminal(top.closure.proto, @intCast(term.aux), top.base, top.call_seq, self.cachedCodeFor(top, top.closure.proto));

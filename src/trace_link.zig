@@ -971,7 +971,15 @@ pub fn drainPendingExitSideDisarm(self: *TraceState) void {
 /// saturated incumbent exit re-raises the want on its next zero exit and the
 /// anchor records duplicate shapes until the population cap (review round 2
 /// blocker 3). Deterministic: pure function of the want state.
-pub fn noteHeadSiblingCompletion(self: *TraceState, anchor: AnchorKey, completed_id: u32) void {
+///
+/// Doc 84 §4.3: the test for a standing want is inline; a completion with
+/// none (the usual one) makes no call.
+pub inline fn noteHeadSiblingCompletion(self: *TraceState, anchor: AnchorKey, completed_id: u32) void {
+    if (self.wants_head_sibling == null) return;
+    retireHeadSiblingWant(self, anchor, completed_id);
+}
+
+noinline fn retireHeadSiblingWant(self: *TraceState, anchor: AnchorKey, completed_id: u32) void {
     const wanted = self.wants_head_sibling orelse return;
     if (wanted.proto != anchor.proto or wanted.pc != anchor.pc) return;
     if (self.head_want_src) |src| {
