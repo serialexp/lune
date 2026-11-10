@@ -123,14 +123,19 @@ land; move whole phases to Done once everything inside them is checked.
   binary-trees' one-shot entries are refused at the trace's own prologue
   and run on tier 0 after paying the entry. Bart picked option (a) on
   2026-11-11: design note first, then build. The note is in §3.6. The
-  prototype works and measures +2.7% on binary-trees and +6.9% on the
-  two-shape probe, because a declined entry costs about 610 instructions.
-  Not landed; waits on Q5.
+  prototype works. Re-measured on 5eef689 it costs +9.7% on binary-trees,
+  +14.4% on the two-shape probe and +3.7% on ray: a decline at an anchor
+  with siblings costs about 380 instructions (the walk tail 275, the
+  declined entry 105), and a lean sibling walk would leave the probe 93
+  per call behind a plain refusal (§3.6, "Re-measured"). Not landed;
+  waits on Q5, and on (ii) or (iii) in particular.
 - [ ] **Q5 — what makes a declined entry cheap, and in which order**
   (§3.6, "What would make a sibling pay"). Open, for Bart. Asked on
   2026-11-11 and not answered; order A (Phases 3 and 4 with the refused
   outcome in scope, then re-measure the want) is being followed
   meanwhile, because it is his earlier order and lands no regression.
+  The re-measurement is in: (i) alone does not make the want pay, so the
+  question is now (ii) or (iii).
 - [ ] **Defer — Phase 2b, the blocker word** (§4.2, "Parked"). The
   lane's gate still reads its remaining program-wide conditions one by
   one (three in the gate, about fourteen in `headEpisodeQuiet`, ~40
@@ -549,6 +554,64 @@ pays nothing.
 It does not help a decline at an anchor that has siblings, which is what
 the refusal want creates. That case still walks, so the want is not
 re-measured yet.
+
+#### Re-measured after Phases 3 and 4, 2026-11-11
+
+The prototype rebuilt on 5eef689 (the same 25 lines, with the
+displacement rule of 1192436 on the raise). Still not in the tree.
+Instructions, `--jit-native`:
+
+| Program | Tier 0 | JIT at 5eef689 | JIT with the want | Δ |
+|---|---:|---:|---:|---:|
+| `call_two_shapes` | 779.9 M | 1,208.4 M | 1,382.6 M | +14.4% |
+| binary-trees, argument 12 | 2,602.8 M | 3,792.6 M | 4,158.7 M | +9.7% |
+| ray | 11,532 M | 24,908 M | 25,830 M | +3.7% |
+
+The rest of the board is flat. ray is the same story as the other two:
+five more head traces (12 pages become 17, at argument 3) and 28% more
+trace entries, each of the new ones behind a decline.
+
+The want costs more against HEAD than it did before, because HEAD's
+decline got cheap only where there is no sibling, and the want is what
+creates siblings. The probe, per call over tier 0 (three measurements
+and one callgrind run, 100,000 iterations):
+
+| Call | Over tier 0 |
+|---|---:|
+| the recorded shape (entry, native body, completion) | +413 |
+| the other shape, no sibling (refused, body on tier 0) | +445 |
+| the other shape, with a sibling (refused, walk, sibling entry) | +793 |
+
+The third row splits like this:
+
+| Part | Per call |
+|---|---:|
+| what every call at a patched anchor pays (handler, return hook, call hook, gate) | ~340 |
+| the incumbent's declined entry (`enterHeadNativeQuiet`, the prologue and its fail stub, the refusal's receipt) | ~105 |
+| the walk tail (`finishOneShotLane` 170, `nextTraceExcluding` 86, `laneDeclineSettled` 19) | 275 |
+| the sibling's entry and native body, less the tier-0 body it replaces | ~73 |
+
+Two readings.
+
+A lean sibling walk in the lane (walk the anchor's list from the
+incumbent, about 20 instructions) is not enough. It takes the third row
+to about +538, still 93 over a plain refusal, and on binary-trees a leaf
+pays 2.04 declines of about 125 each before the sibling that accepts it.
+The walk would also be thrown away by (iii), where a refusal with a
+sibling never returns to the lane.
+
+The last row is the floor for anything done in the runtime. Entering a
+page for a body this small (two index reads and a test) costs 73 more
+than interpreting it, so even a decline that cost nothing would leave
+the sibling path at about +413 against +445. The margin comes from
+Phase 4's page capability (the episode ctx and the result frame, about
+58 of the 73) or from bodies larger than this probe's.
+
+What this leaves for Q5: the want does not land on (i). It needs a
+decline of 20 instructions or fewer, which is (ii) or (iii), and of
+those only (iii) keeps a leaf at the bottom of a pushed descent in
+native code (134,036 of binary-trees' refusals at argument 10 are
+there).
 
 Two things this note does not solve. `BottomUpTree`'s base case cannot
 be recorded at all: `return { item }` aborts on `set_list` (doc 72 P3),
