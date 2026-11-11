@@ -54,21 +54,23 @@ jobs:
         run: bash tools/install-zig.sh
 
       - name: Build the bundle
-        run: bash tools/mahina-bundle.sh "$RUNNER_TEMP/mahina-bundle"
+        run: bash tools/mahina-bundle.sh zig-out/mahina-bundle
 
       - name: Rebuild from another path with a cold cache, and compare
         run: |
           set -eu
           rsync -a --exclude /.zig-cache --exclude /zig-out ./ "$RUNNER_TEMP/repro/"
           (cd "$RUNNER_TEMP/repro" && bash tools/mahina-bundle.sh "$RUNNER_TEMP/mahina-bundle-repro")
-          diff "$RUNNER_TEMP/mahina-bundle/SHA256SUMS" "$RUNNER_TEMP/mahina-bundle-repro/SHA256SUMS"
-          cat "$RUNNER_TEMP/mahina-bundle/SHA256SUMS"
+          diff zig-out/mahina-bundle/SHA256SUMS "$RUNNER_TEMP/mahina-bundle-repro/SHA256SUMS"
+          cat zig-out/mahina-bundle/SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
           name: mahina-bundle
-          path: ${{ runner.temp }}/mahina-bundle
-          relative-to: ${{ runner.temp }}/mahina-bundle
+          # Inside the workspace (gothab refuses a path outside it); zig-out is
+          # gitignored, so the build stays "clean" for LUNE_COMMIT.
+          path: zig-out/mahina-bundle
+          relative-to: zig-out/mahina-bundle
           if-no-files-found: error
 
   bundle-smoke:
@@ -125,21 +127,21 @@ jobs:
           node-version: 24
 
       - name: Build the CLI
-        run: bash tools/mahina-cli.sh "$RUNNER_TEMP/mahina-cli"
+        run: bash tools/mahina-cli.sh zig-out/mahina-cli
 
       - name: Rebuild from another path with cold caches, and compare
         run: |
           set -eu
           rsync -a --exclude /.zig-cache --exclude /zig-out --exclude /viz/node_modules ./ "$RUNNER_TEMP/repro/"
           (cd "$RUNNER_TEMP/repro" && bash tools/mahina-cli.sh "$RUNNER_TEMP/mahina-cli-repro")
-          diff "$RUNNER_TEMP/mahina-cli/SHA256SUMS" "$RUNNER_TEMP/mahina-cli-repro/SHA256SUMS"
-          cat "$RUNNER_TEMP/mahina-cli/SHA256SUMS"
+          diff zig-out/mahina-cli/SHA256SUMS "$RUNNER_TEMP/mahina-cli-repro/SHA256SUMS"
+          cat zig-out/mahina-cli/SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
           name: mahina-cli
-          path: ${{ runner.temp }}/mahina-cli
-          relative-to: ${{ runner.temp }}/mahina-cli
+          path: zig-out/mahina-cli
+          relative-to: zig-out/mahina-cli
           if-no-files-found: error
 
   cli-smoke:
