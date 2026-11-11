@@ -3,8 +3,10 @@
 Status: partial — Phase 0 (a tier-0 ordering bug in `math.max`/`math.min`,
 found while reading for Phase 3), Phase 1 (string and native hash fields),
 Phase 2 (string, native, closure and bool array elements) and the typed-load
-exit fix that Phase 2 turned up (§5.2, §5.3) landed, and `type()` of a
-string records (§5.3 follow-up). Phases 3 and 4 are not
+exit fix that Phase 2 turned up (§5.2, §5.3) landed, `type()` of a
+string records (§5.3 follow-up), and Phase 4's board row is in
+(`bench/records_script.lua`, §7): the JIT runs it 1.67x slower than tier
+0, and Phases 1 and 2 and the exit fix each made it slower (§7.2). Phase 3 is not
 started; Q1, Q2 and Q3 (§8) are open. Bart has not picked this arc: it was
 started on 2026-11-11 under "continue using your best judgement" after four
 asks went unanswered. Phase 3 needs his answer to Q1.
@@ -61,13 +63,20 @@ land; move whole phases to Done once everything inside them is checked.
   6,958 M to 536 M (904 M), elements alternating string and table 3,115 M
   to 473 M (984 M). Board geomean +0.012%.
 
+- [x] **Phase 4 — a board row** in the script idiom, asked for by Bart on
+  2026-11-11 after the board did not move for Phases 1 and 2:
+  `bench/records_script.lua` with its hashgate digests (§7.1). Agrees
+  across the three tiers and with LuaJIT. Baseline and what it shows:
+  §7.2.
+
 ### Outstanding
+
+- [ ] **`records_script` is slower with the JIT than on tier 0** (§7.2):
+  9,300 M instructions against 5,561 M, LuaJIT 853 M. Four causes, each
+  with its own entry in `TODO.md`; none is in this doc's phases.
 
 - [ ] **Phase 3 — `math.abs`, `math.min`, `math.max` get recorder arms**
   (§6). Needs Q1.
-- [ ] **Phase 4 — a board row** that calls `math.*` and `string.*` without
-  caching them in locals and reads string fields and elements, with its
-  hashgate digests (§7).
 - [ ] **Q1 — how `abs`/`min`/`max` record** (§8).
 - [ ] **Q2 — whether the module-table load chain is hoisted out of the
   loop** (§8).
@@ -560,6 +569,95 @@ in loops and in small functions, string fields read off records, string
 elements read out of an array. It must be valid for LuaJIT so the
 hashgate's cross-check applies. `globals_script` stays as it is; it
 measures globals, and this row measures library calls and heap loads.
+
+### 7.1 The program (2026-11-11)
+
+`bench/records_script.lua`, 20,000 rounds. An inventory of 64 records
+built from a hand-written catalogue (so `weight` is an integer in one
+record and a fraction in the next), and six passes per round, each a
+small function with a loop over a small collection:
+
+| pass | what it does |
+|---|---|
+| `carried` | sums `item.weight * item.qty`, then `math.floor` |
+| `owed` | `rules[item.kind]` (a table found by a string key), `math.floor(price * qty * rule.rate)`, and `rule.bonus(item)` (one of four closures) |
+| `tags` | `string.upper(string.sub(item.name, 1, 3))`, `#item.name`, `#rules[item.kind].label` |
+| `count` | `item.kind == kind` on two strings, else `item.magic` (a bool) |
+| `configured` | `weigh(v)` over a list of numbers, strings, bools and a table, behind `type(v)` |
+| `refine` | three closures in an array, called in order |
+
+It was written as a script would be and then measured, not shaped to
+what records. `string.byte` is not in mahina (doc 06), so the tag pass
+uses `string.upper`.
+
+### 7.2 Baseline, and what it shows
+
+Instructions (`instructions:u`), 20,000 rounds, at b835226:
+
+| | instructions | against tier 0 |
+|---|---|---|
+| tier 0 | 5,561 M | |
+| `--trace` (tier-1a only) | 12,520 M | 2.25x |
+| `--trace --jit-native` | 9,300 M | 1.67x |
+| LuaJIT | 853 M | 0.15x |
+
+The same JIT run at each step of this doc:
+
+| binary | instructions |
+|---|---|
+| 54b0a62 (before Phase 1) | 7,317 M |
+| 7ed7ff0 (Phase 1) | 7,825 M |
+| 693ffaa (Phase 2) | 8,719 M |
+| 78cbca7 (typed-load exits) | 9,337 M |
+| b835226 (`type()` of a string) | 9,300 M |
+
+So on this program every phase made the JIT slower. Before Phase 1 the
+loops aborted at their first string or native load and ran on tier 0
+behind a bar; now three of the six record and cost more than tier 0 did.
+
+Each pass alone (5,000 rounds, a scratch copy of the program that runs
+one pass per round):
+
+| pass | tier 0 | JIT at 54b0a62 | JIT at b835226 | LuaJIT | what happens with the JIT |
+|---|---|---|---|---|---|
+| `carried` | 141 M | 152 M | 279 M | 9.8 M | records, with a continuation at the `weight` load; 55% of its cycles are the ledger seam |
+| `owed` | 501 M | 819 M | 892 M | 81 M | the loop aborts (`bad_type get_index`); the four `bonus` closures are head traces entered from tier 0, 320k times at ~375 cycles |
+| `tags` | 610 M | 620 M | 621 M | 113 M | the loop aborts (`bad_type get_index`) |
+| `count` | 132 M | 145 M | 145 M | 15 M | the loop aborts (`bad_type jeq`) |
+| `configured` | 46 M | 130 M | 221 M | 6.8 M | records; five types in eight elements, ~1,300 cycles per traced iteration against 267 on tier 0 |
+| `refine` | 19 M | 46 M | 61 M | 2.0 M | a three-trip loop: 0.2% of its iterations run in its loop trace |
+
+Four causes, none of them a missing recorder arm for a library call:
+
+1. **A loop that runs a few dozen iterations per call never goes
+   silent.** `carried` is one root trace and one continuation, armed and
+   fused (84,970 native hops in 5,000 calls, `yields=0`), in a region
+   minted `armable=true`. Every hop writes ledger rows. Promotion
+   to a silent set needs `promote_after` (4) full-cap ledgers in a row,
+   and the streak is per activation: one call of `carried` fills one
+   ledger, the loop exits, the region closes. `silent: candidates=298
+   promotions=0` over 300 calls, with every reject counter at zero. So
+   each call pays two ledger walks at ~4,100 cycles. The same cycle in
+   one long loop (§5.3's probes) promotes after four ledgers and its
+   seam is 3.9%. This is Rule Z-8's layer 2, and the cousin of
+   `TODO.md`'s "a nested `while` goes silent late on a short run".
+2. **A small function called from a loop that does not trace is a head
+   trace entered once per call** (`owed`'s closures; doc 84's subject).
+3. **A table found by a string key that is not a constant does not
+   record** (`rules[item.kind]`: `bad_type get_index`), nor does `==` on
+   two strings (`bad_type jeq`, §2.2), nor `#t` on a `.value`-lane array
+   (`recAlenShape` takes scalar lanes only, so an array of tables,
+   strings, closures or mixed values is `bad_type len`, §2.2). The last
+   one stops the program's outer loop and all six functions' heads at
+   their `for i = 1, #list`.
+4. **A short loop in a function is entered from tier 0 on every call.**
+   LuaJIT records the caller's loop through the call and the inner loop;
+   here the outer loop does not record (cause 3), so each inner loop
+   pays an entry and an exit per call (`TODO.md`, "a short loop in a
+   function called from a loop").
+
+The probes this doc used (§2.1, §5.3) were single loops of three million
+iterations. They measured the trace body and missed all four.
 
 ## 8. Open questions for review
 

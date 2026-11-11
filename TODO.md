@@ -90,6 +90,53 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       abort. LuaJIT's `lj_record_objcmp` compares references for
       everything without an `__eq`. Not started.
 
+## `records_script` runs 1.67x slower with the JIT than on tier 0 (noted 2026-11-11)
+
+`bench/records_script.lua` (doc 85 Phase 4, the board row Bart asked for
+when Phases 1 and 2 moved nothing): 5,561 M instructions on tier 0,
+9,300 M with `--trace --jit-native`, 853 M on LuaJIT. Doc 85 §7.2 has
+the per-pass table. Each doc 85 phase made this row slower (7,317 M
+before Phase 1), because loops that were barred now record and cost
+more than tier 0. Four causes, by pass:
+
+- [ ] **A loop of a few dozen iterations per call never goes silent**
+      (`carried`: 279 M against 141 M on tier 0 at 5,000 rounds). Root
+      and continuation are armed and fused, the region is
+      `armable=true`, and `silent: candidates=298 promotions=0` over
+      300 calls with no reject counted: promotion wants `promote_after`
+      (4) full-cap ledgers in a row and the streak is per activation,
+      and one call fills one ledger. Two ledger walks per call at
+      ~4,100 cycles, 55% of the pass. Rule Z-8 layer 2. Options seen,
+      none tried: keep the candidate streak across activations of the
+      same region (a parked candidate, as the parked proof already is);
+      a cheaper walk (128 cycles per row today); recording the caller's
+      loop through the call (the last item below), which removes the
+      per-call activation altogether. Related: "A nested `while` goes
+      silent late on a short run" below.
+- [ ] **`#t` on a `.value`-lane array aborts the recording**
+      (`bad_type len`; `recAlenShape` takes scalar presence lanes
+      only). `for i = 1, #items` over records, strings or closures is
+      every function's first line here, so no function head and no
+      caller's loop records through it. 88 aborts on the board before
+      this row (globals_script, tbl_stack, meta_fields).
+- [ ] **A table found by a string key that is not a constant aborts**
+      (`rules[item.kind]`: `bad_type get_index`; `owed` and `tags`,
+      four fifths of the row's tier-0 time). `hashGetShape` wants the
+      key to be a recorded constant ("v1 scope" in its comment).
+- [ ] **`==` on two strings aborts** (`bad_type jeq`; `count`). Already
+      listed under doc 85 above as heap `==`/`~=`.
+- [ ] **A short loop in a function is entered from tier 0 on every
+      call** (`refine`: three trips, 0.2% of its iterations in its loop
+      trace, 61 M against 19 M; `configured`: 221 M against 46 M, five
+      types in eight elements at ~1,300 cycles per traced iteration).
+      The heapsort entry below ("A short loop in a function called from
+      a loop") is the same shape; LuaJIT records the caller's loop
+      through the call and the inner loop.
+- [ ] **`owed`'s four closures are head traces entered from tier 0**,
+      320k times at ~375 cycles (892 M against 501 M). Doc 84's subject
+      ("Entering a head trace from tier-0 costs more than a small body
+      saves" below).
+
 ## Language: declaring a global (noted 2026-10-30)
 
 - [ ] **Lua 5.5 global declarations, attributes and frozen tables.**
