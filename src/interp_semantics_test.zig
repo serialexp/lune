@@ -484,14 +484,13 @@ test "a multret consumer that faults on a non-callable value consumes its produc
         \\print("after")
         \\
     ,
-        "false\tmain:3: attempt to call a nil value\nfalse\tmain:4: attempt to call a nil value\nafter\n",
+        "false\tmain:3: attempt to call a nil value (upvalue 'f')\nfalse\tmain:4: attempt to call a nil value (upvalue 'f')\nafter\n",
     );
 }
 
 test "a call or index fault names the value as Lua 5.4 does" {
-    // Globals, fields and methods are named; mahina keeps no local or
-    // upvalue names, so those stay bare. A tail call and a call under
-    // `return` fault the same way.
+    // Globals, fields, methods, locals and upvalues are named (doc 86 §4).
+    // A tail call and a call under `return` fault the same way.
     // (Two programs: the harness's output buffer is 256 bytes.)
     try expectProgram(
         \\local t = {}
@@ -515,7 +514,7 @@ test "a call or index fault names the value as Lua 5.4 does" {
         \\
     ,
         "false\tmain:2: attempt to call a nil value (field 'nope')\n" ++
-            "false\tmain:3: attempt to call a nil value\n" ++
+            "false\tmain:3: attempt to call a nil value (upvalue 'f')\n" ++
             "false\tmain:4: attempt to call a nil value\n" ++
             "false\tmain:5: attempt to index a nil value (global 'undefined')\n",
     );
@@ -1123,11 +1122,6 @@ test "doc 66 P2: the constant-key field forms match the register-key access" {
         \\print(ns.a.b.f(), ns.a.b:g(), ns["a"]["b"].f())
         \\local s = "Hello"
         \\print(s:upper(), ("x"):rep(3))
-        \\local function idx(t) return t.field end
-        \\local function put(t) t.field = 1 end
-        \\print(pcall(idx, nil))
-        \\print(pcall(put, 7))
-        \\print(pcall(function() local n; return n:method() end))
         \\local mixed = { 1, 2, x = "X", ["y"] = "Y", [3] = 3 }
         \\print(mixed[1], mixed[3], mixed.x, mixed.y, #mixed)
         \\local up = setmetatable({}, { __index = { deep = setmetatable({}, { __index = { v = 42 } }) } })
@@ -1141,11 +1135,22 @@ test "doc 66 P2: the constant-key field forms match the register-key access" {
             "3\t7\t5\t1\n" ++
             "deep\ttrue\tdeep\n" ++
             "HELLO\txxx\n" ++
-            "false\tmain:25: attempt to index a nil value\n" ++
-            "false\tmain:26: attempt to index a number value\n" ++
-            "false\tmain:29: attempt to index a nil value\n" ++
             "1\t3\tX\tY\t3\n" ++
             "42\tnil\n",
+    );
+    // A non-table container's error, named as Lua 5.4 names it (a second
+    // program: the harness's output buffer is 256 bytes).
+    try expectProgram(
+        \\local function idx(t) return t.field end
+        \\local function put(t) t.field = 1 end
+        \\print(pcall(idx, nil))
+        \\print(pcall(put, 7))
+        \\print(pcall(function() local n; return n:method() end))
+        \\
+    ,
+        "false\tmain:1: attempt to index a nil value (local 't')\n" ++
+            "false\tmain:2: attempt to index a number value (local 't')\n" ++
+            "false\tmain:5: attempt to index a nil value (local 'n')\n",
     );
 }
 
@@ -2451,7 +2456,7 @@ test "metatable: calling a table with no __call raises a located TypeError" {
         \\print(pcall(function() local t = {}; return t() end))
         \\
     ,
-        "false\tmain:1: attempt to call a table value\n",
+        "false\tmain:1: attempt to call a table value (local 't')\n",
     );
 }
 

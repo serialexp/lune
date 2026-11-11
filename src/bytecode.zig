@@ -1227,6 +1227,38 @@ pub const RegLiveness = struct {
 /// bytecode does not depend on `ast`.
 pub const Span = struct { start: u32 = 0, end: u32 = 0, line: u32 = 0 };
 
+/// Doc 86 §4: one local variable of a function, for debuggers, tracebacks
+/// and the visualiser. The compiler writes a row when the local becomes
+/// visible and closes it when its scope ends; rows are sorted by
+/// `start_pc`. A name can have several rows (shadowing, loops that redeclare
+/// it each pass): at a pc, the visible rows are those with
+/// `start_pc <= pc < end_pc`, and of two visible rows with one name the
+/// later one is the binding in scope.
+pub const LocalVar = struct {
+    /// The name as written. Owned by the compile's arena.
+    name: []const u8,
+    /// The first pc at which the local is visible and initialised.
+    start_pc: u32,
+    /// The first pc past its scope.
+    end_pc: u32,
+    loc: Loc,
+
+    pub const Loc = union(enum) {
+        /// The local lives in this register. Its value is meaningful only
+        /// where `Proto.reg_live` says the register is live: the GC masks
+        /// a dead register (doc 61), so a debugger shows it as unavailable.
+        reg: u16,
+        /// Doc 76 D8: a `<const>` the resolver folded. It takes no register;
+        /// its value is the literal at this source span.
+        literal: Span,
+    };
+
+    /// Whether the row is visible at `pc`.
+    pub fn visibleAt(self: LocalVar, pc: u32) bool {
+        return self.start_pc <= pc and pc < self.end_pc;
+    }
+};
+
 /// A function prototype: the immutable compiled form of one function body (the
 /// main chunk is just the top-level prototype). A runtime *closure* (Increment D)
 /// pairs a `Proto` with captured upvalues; the `Proto` itself is shared and
@@ -1260,6 +1292,12 @@ pub const Proto = struct {
     /// order. An error unwinding through a frame closes the ones live at
     /// its instruction; so do `close`, from its operand up, and `ret_close`.
     tbc_vars: []const TbcVar = &.{},
+    /// Doc 86 §4: the function's local variables (see `LocalVar`), sorted
+    /// by `start_pc`. Empty on hand-built protos.
+    locals: []const LocalVar = &.{},
+    /// Doc 86 §4: the name of each upvalue, parallel to `upvalues`. Empty on
+    /// hand-built protos.
+    upval_names: []const []const u8 = &.{},
     /// Global-access cache: one hash-slot hint per constant, used by
     /// `get_global`/`set_global` for the global named by `constants[i]`
     /// (`Table.getHinted`). A hint only: every use re-checks it, so it never
@@ -1305,6 +1343,25 @@ pub const Proto = struct {
     /// uses it to correlate a trace with its proto's disassembly. Defaults to 0
     /// so hand-built test protos compile; the compiler overwrites it.
     id: u32 = 0,
+
+    /// Doc 86 §4: the name of the local in register `reg` at `pc`, if a
+    /// local occupies it there (the innermost, when an inner scope reuses a
+    /// name). Null for a temporary.
+    pub fn localName(self: *const Proto, reg: u16, pc: u32) ?[]const u8 {
+        var i = self.locals.len;
+        while (i > 0) {
+            i -= 1;
+            const lv = self.locals[i];
+            if (lv.start_pc > pc) continue;
+            if (lv.visibleAt(pc) and lv.loc == .reg and lv.loc.reg == reg) return lv.name;
+        }
+        return null;
+    }
+
+    /// Doc 86 §4: the name of upvalue `idx`, if the compiler recorded one.
+    pub fn upvalName(self: *const Proto, idx: usize) ?[]const u8 {
+        return if (idx < self.upval_names.len) self.upval_names[idx] else null;
+    }
 };
 
 // ---------------------------------------------------------------------------

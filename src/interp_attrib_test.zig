@@ -410,7 +410,7 @@ test "doc 76: an uncaught error closes the variables it unwinds through" {
         \\local t = nil
         \\print(t.x)
         \\
-    , "m\tmain:6: attempt to index a nil value\n", "attempt to index a nil value", .{});
+    , "m\tmain:6: attempt to index a nil value (local 't')\n", "attempt to index a nil value (local 't')", .{});
     // An error a `__close` raises is the one the program ends with.
     try testutil.expectProgramFault(loud ++
         \\local m <close> = loud("m")

@@ -147,7 +147,10 @@ pub fn compileWithOptions(
         c.repl_outer = r.outer.len;
         // Root upvalue `i` is the earlier line's local `i`: the VM hands the
         // closure its cells, so the descriptors are never followed.
-        for (r.outer) |_| try c.upvalues.append(c.arena, .{ .in_stack = false, .index = 0 });
+        for (r.outer) |o| {
+            try c.upvalues.append(c.arena, .{ .in_stack = false, .index = 0 });
+            try c.upval_names.append(c.arena, try c.arena.dupe(u8, o.name));
+        }
     }
 
     if (try c.reportProblems()) return Error.CompileError;
@@ -178,6 +181,8 @@ pub fn compileWithOptions(
         .is_vararg = c.is_vararg,
         .tbc_vars = c.tbc_vars.items,
         .upvalues = c.upvalues.items,
+        .locals = c.finishLocals(),
+        .upval_names = c.upval_names.items,
         // Doc 56 §4.2: per-pc register liveness, from the finished code.
         .reg_live = try bc_liveness.compute(c.arena, c.scratch, c.code.items, c.max_reg, c.protos.items, c.tbc_vars.items),
         // Doc 58 §4.8: the CFG's dominator tree, from the finished code.
@@ -422,11 +427,20 @@ const Local = struct {
     binding: resolve.BindingId,
     reg: u16,
     depth: u32,
+    /// Doc 86 §4: its row in `Compiler.local_vars`, closed when the scope ends.
+    row: u32,
     /// Set when an inner function captures this local as an upvalue: its cell
     /// must be *closed* when the scope exits (so the captured value outlives the
     /// register).
     captured: bool = false,
 };
+
+/// Doc 86 §4: the row of a folded `<const>` local and the scope depth it
+/// was declared at.
+const FoldedRow = struct { row: u32, depth: u32 };
+
+/// The `end_pc` of a `LocalVar` row whose scope is still open.
+const open_row = std.math.maxInt(u32);
 
 const Loop = struct {
     /// Code indices of `break` jumps to patch to the loop's exit.
@@ -499,6 +513,15 @@ const Compiler = struct {
     protos: std.ArrayList(*Proto) = .empty,
     /// This function's upvalue capture plan (arena-owned) → `Proto.upvalues`.
     upvalues: std.ArrayList(UpvalDesc) = .empty,
+    /// Doc 86 §4: the name of each upvalue, parallel to `upvalues`
+    /// (arena-owned) → `Proto.upval_names`.
+    upval_names: std.ArrayList([]const u8) = .empty,
+    /// Doc 86 §4: this function's local-variable rows (arena-owned) →
+    /// `Proto.locals`. A row's `end_pc` is `open_row` until its scope ends.
+    local_vars: std.ArrayList(bytecode.LocalVar) = .empty,
+    /// The rows of folded `<const>` locals (which take no `Local`, so no
+    /// register) still in scope, with their scope depth.
+    folded_open: std.ArrayList(FoldedRow) = .empty,
     /// Doc 76 §6: this function's to-be-closed variables (arena-owned) →
     /// `Proto.tbc_vars`, in `tbc` order.
     tbc_vars: std.ArrayList(bytecode.TbcVar) = .empty,
@@ -520,6 +543,7 @@ const Compiler = struct {
         self.const_index.deinit(self.scratch);
         self.repl_cells.deinit(self.scratch);
         self.locals.deinit(self.scratch);
+        self.folded_open.deinit(self.scratch);
         self.open_tbc.deinit(self.scratch);
         for (self.loops.items) |*lp| lp.breaks.deinit(self.scratch);
         self.loops.deinit(self.scratch);
@@ -821,11 +845,19 @@ const Compiler = struct {
 
     fn endScope(self: *Compiler) Error!void {
         self.scope_depth -= 1;
+        const here: u32 = @intCast(self.code.items.len);
+        var f = self.folded_open.items.len;
+        while (f > 0 and self.folded_open.items[f - 1].depth > self.scope_depth) {
+            f -= 1;
+            self.local_vars.items[self.folded_open.items[f].row].end_pc = here;
+        }
+        self.folded_open.items.len = f;
         var n = self.locals.items.len;
         var any_captured = false;
         while (n > 0 and self.locals.items[n - 1].depth > self.scope_depth) {
             n -= 1;
             const local = self.locals.items[n];
+            self.local_vars.items[local.row].end_pc = here;
             // The resolver's whole-chunk answer and the capture marking done
             // while compiling closures must agree: one scoping model.
             // (A tool's recovering compile skips statements, so a closure that
@@ -873,6 +905,7 @@ const Compiler = struct {
         const b = self.bindingAt(span);
         const idx: u16 = @intCast(self.upvalues.items.len);
         try self.upvalues.append(self.arena, .{ .in_stack = false, .index = 0 });
+        try self.upval_names.append(self.arena, try self.arena.dupe(u8, name));
         try self.repl_cells.put(self.scratch, b, idx);
         // The name outlives the tree it was parsed into: the chunk owns a copy.
         try self.repl_exports.append(self.arena, .{ .name = try self.arena.dupe(u8, name), .attrib = attrib });
@@ -882,7 +915,38 @@ const Compiler = struct {
     /// Declare the local the name token at `span` introduces, in `reg`.
     fn declareLocal(self: *Compiler, span: ast.Span, reg: u16) Error!void {
         const b = self.bindingAt(span);
-        try self.locals.append(self.scratch, .{ .binding = b, .reg = reg, .depth = self.scope_depth });
+        const row = try self.addLocalRow(b, .{ .reg = reg });
+        try self.locals.append(self.scratch, .{ .binding = b, .reg = reg, .depth = self.scope_depth, .row = row });
+    }
+
+    /// Doc 86 §4: declare the folded `<const>` local the name token at
+    /// `span` introduces, whose value is the literal `lit`.
+    fn declareFolded(self: *Compiler, span: ast.Span, lit: ast.Span) Error!void {
+        const row = try self.addLocalRow(self.bindingAt(span), .{ .literal = .{ .start = lit.start, .end = lit.end, .line = self.lineOf(lit.start) } });
+        try self.folded_open.append(self.scratch, .{ .row = row, .depth = self.scope_depth });
+    }
+
+    /// Doc 86 §4: open the `LocalVar` row of binding `b`, visible from the
+    /// next instruction on.
+    fn addLocalRow(self: *Compiler, b: resolve.BindingId, loc: bytecode.LocalVar.Loc) Error!u32 {
+        const row: u32 = @intCast(self.local_vars.items.len);
+        try self.local_vars.append(self.arena, .{
+            .name = try self.arena.dupe(u8, self.res.binding(b).name),
+            .start_pc = @intCast(self.code.items.len),
+            .end_pc = open_row,
+            .loc = loc,
+        });
+        return row;
+    }
+
+    /// Doc 86 §4: the finished `Proto.locals`. The rows still open (the
+    /// function's outermost scope) end at the end of the code.
+    fn finishLocals(self: *Compiler) []const bytecode.LocalVar {
+        const end: u32 = @intCast(self.code.items.len);
+        for (self.local_vars.items) |*lv| {
+            if (lv.end_pc == open_row) lv.end_pc = end;
+        }
+        return self.local_vars.items;
     }
 
     fn isGlobalBinding(self: *const Compiler, b: resolve.BindingId) bool {
@@ -918,16 +982,16 @@ const Compiler = struct {
         const parent = self.parent orelse return self.replCell(b);
         if (parent.resolveLocalSlot(b)) |slot| {
             parent.locals.items[slot].captured = true;
-            return try self.addUpvalue(.{ .in_stack = true, .index = parent.locals.items[slot].reg });
+            return try self.addUpvalue(.{ .in_stack = true, .index = parent.locals.items[slot].reg }, self.res.binding(b).name);
         }
         if (try parent.resolveUpvalue(b)) |up| {
-            return try self.addUpvalue(.{ .in_stack = false, .index = up });
+            return try self.addUpvalue(.{ .in_stack = false, .index = up }, self.res.binding(b).name);
         }
         return null;
     }
 
     /// Append a capture descriptor (deduplicated) and return its upvalue index.
-    fn addUpvalue(self: *Compiler, desc: UpvalDesc) Error!u16 {
+    fn addUpvalue(self: *Compiler, desc: UpvalDesc, name: []const u8) Error!u16 {
         for (self.upvalues.items, 0..) |u, i| {
             if (u.in_stack == desc.in_stack and u.index == desc.index) return @intCast(i);
         }
@@ -937,6 +1001,7 @@ const Compiler = struct {
             return Error.CompileError;
         }
         try self.upvalues.append(self.arena, desc);
+        try self.upval_names.append(self.arena, try self.arena.dupe(u8, name));
         return @intCast(idx);
     }
 
@@ -1144,6 +1209,8 @@ const Compiler = struct {
             const next_reg = self.next_reg;
             const depth = self.scope_depth;
             const n_locals = self.locals.items.len;
+            const n_rows = self.local_vars.items.len;
+            const n_folded = self.folded_open.items.len;
             const n_loops = self.loops.items.len;
             const n_tbc = self.tbc_vars.items.len;
             const n_open_tbc = self.open_tbc.items.len;
@@ -1152,6 +1219,8 @@ const Compiler = struct {
                     self.next_reg = next_reg;
                     self.scope_depth = depth;
                     self.locals.items.len = n_locals;
+                    self.local_vars.items.len = n_rows;
+                    self.folded_open.items.len = n_folded;
                     self.loops.items.len = n_loops;
                     self.tbc_vars.items.len = n_tbc;
                     self.open_tbc.items.len = n_open_tbc;
@@ -1249,7 +1318,10 @@ const Compiler = struct {
         try self.compileValuesInto(kept[0..n], start, n);
         var reg = start;
         for (l.names) |nm| {
-            if (self.res.binding(self.bindingAt(nm.name_span)).value != null) continue;
+            if (self.res.binding(self.bindingAt(nm.name_span)).value) |lit| {
+                try self.declareFolded(nm.name_span, lit.span);
+                continue;
+            }
             try self.declareLocal(nm.name_span, reg);
             if (nm.attrib == .close) try self.declareTbc(reg, nm.name);
             reg += 1;
@@ -2461,6 +2533,8 @@ const Compiler = struct {
             .protos = child.protos.items,
             .upvalues = child.upvalues.items,
             .tbc_vars = child.tbc_vars.items,
+            .locals = child.finishLocals(),
+            .upval_names = child.upval_names.items,
             .global_slot_hints = try zeroedHints(self.arena, child.constants.items.len),
             .name = body.name orelse name,
             // Doc 56 §4.2: per-pc register liveness, from the finished code.
@@ -4292,4 +4366,138 @@ test "doc 74 P2: a clean chunk checks clean, as it compiles clean" {
 
     try checkSource("local function f(n) if n < 2 then return n end return f(n - 1) + f(n - 2) end\nreturn f(10)", &diags);
     try testing.expectEqual(@as(usize, 0), diags.count());
+}
+
+/// Doc 86 §4: every row of `p` and its children is well formed: sorted by
+/// `start_pc`, inside the code, a register below the frame size, and one
+/// name per upvalue.
+fn expectLocalsWellFormed(p: *const Proto) !void {
+    var prev: u32 = 0;
+    for (p.locals) |lv| {
+        try testing.expect(lv.start_pc >= prev);
+        prev = lv.start_pc;
+        try testing.expect(lv.start_pc <= lv.end_pc);
+        try testing.expect(lv.end_pc <= p.code.len);
+        try testing.expect(lv.name.len > 0);
+        switch (lv.loc) {
+            .reg => |r| try testing.expect(r < p.num_registers),
+            .literal => |s| try testing.expect(s.start < s.end),
+        }
+    }
+    try testing.expectEqual(p.upvalues.len, p.upval_names.len);
+    for (p.protos) |child| try expectLocalsWellFormed(child);
+}
+
+/// The rows of `p` named `name`, in order.
+fn rowsNamed(p: *const Proto, name: []const u8, out: []bytecode.LocalVar) []bytecode.LocalVar {
+    var n: usize = 0;
+    for (p.locals) |lv| {
+        if (!std.mem.eql(u8, lv.name, name)) continue;
+        out[n] = lv;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "doc 86 P0: locals carry names, scopes and locations" {
+    const src: [:0]const u8 =
+        \\local a = 1
+        \\do
+        \\  local a = 2
+        \\  local b = a
+        \\end
+        \\local c <const> = 7
+        \\local function f(p, q) return p + q + a end
+        \\for i = 1, 2 do local s = i end
+        \\for k, v in pairs({}) do end
+        \\return a + c + f(1, 2)
+    ;
+    var r = try run(src);
+    defer r.deinit();
+    const root = r.chunk.proto;
+    try expectLocalsWellFormed(root);
+
+    var buf: [8]bytecode.LocalVar = undefined;
+    // Shadowing: the inner `a` is a second row, its scope inside the outer's.
+    const as = rowsNamed(root, "a", &buf);
+    try testing.expectEqual(@as(usize, 2), as.len);
+    try testing.expect(as[0].start_pc <= as[1].start_pc and as[1].end_pc <= as[0].end_pc);
+    try testing.expect(as[1].end_pc < root.code.len); // the `do` block ends
+    try testing.expectEqual(@as(u32, @intCast(root.code.len)), as[0].end_pc); // the chunk's own scope runs to the end
+    // Inside the block the inner `a` names its register; after it, the outer.
+    try testing.expectEqualStrings("a", root.localName(as[1].loc.reg, as[1].start_pc).?);
+    try testing.expect(!as[1].visibleAt(as[1].end_pc));
+    try testing.expectEqualStrings("a", root.localName(as[0].loc.reg, as[1].end_pc).?);
+
+    // A folded `<const>` takes no register: its location is the literal.
+    const cs = rowsNamed(root, "c", &buf);
+    try testing.expectEqual(@as(usize, 1), cs.len);
+    const lit = cs[0].loc.literal;
+    try testing.expectEqualStrings("7", src[lit.start..lit.end]);
+    try testing.expectEqual(@as(u32, 6), lit.line);
+
+    // Loop variables are locals of the loop body.
+    inline for (.{ "i", "s", "k", "v", "f" }) |name| {
+        try testing.expectEqual(@as(usize, 1), rowsNamed(root, name, &buf).len);
+    }
+
+    // `f`: its parameters from pc 0, in their registers; `a` is its upvalue.
+    const f = root.protos[0];
+    try testing.expectEqualStrings("p", f.locals[0].name);
+    try testing.expectEqualStrings("q", f.locals[1].name);
+    try testing.expectEqual(@as(u32, 0), f.locals[0].start_pc);
+    try testing.expectEqual(@as(u16, 1), f.locals[1].loc.reg);
+    try testing.expectEqual(@as(usize, 1), f.upval_names.len);
+    try testing.expectEqualStrings("a", f.upvalName(0).?);
+}
+
+test "doc 86 P0: a local is visible only after its initialiser" {
+    const src: [:0]const u8 =
+        \\local x = 1
+        \\local x = x + 1
+        \\return x
+    ;
+    var r = try run(src);
+    defer r.deinit();
+    const root = r.chunk.proto;
+    var buf: [4]bytecode.LocalVar = undefined;
+    const xs = rowsNamed(root, "x", &buf);
+    try testing.expectEqual(@as(usize, 2), xs.len);
+    // The code computing the second `x` runs while only the first is visible.
+    try testing.expect(xs[1].start_pc > xs[0].start_pc);
+    for (xs[0].start_pc..xs[1].start_pc) |pc| {
+        try testing.expect(!xs[1].visibleAt(@intCast(pc)));
+    }
+}
+
+test "doc 86 P0: every proto of a varied program has well-formed locals" {
+    const src: [:0]const u8 =
+        \\local function sum(...)
+        \\  local s = 0
+        \\  for _, v in ipairs({...}) do s = s + v end
+        \\  return s
+        \\end
+        \\local obj = {n = 1}
+        \\function obj:inc(k) self.n = self.n + k return self end
+        \\local fs = {}
+        \\for i = 1, 4 do
+        \\  local x <const> = 3
+        \\  local y = i * x
+        \\  fs[i] = function() local z = y return z + i end
+        \\  repeat local w = y until w > 0
+        \\  while false do local u = 1 end
+        \\end
+        \\do local h <close> = nil end
+        \\return sum(1, 2), obj:inc(1).n, fs[1]()
+    ;
+    var r = try run(src);
+    defer r.deinit();
+    try expectLocalsWellFormed(r.chunk.proto);
+    // `self` is a named parameter of the method.
+    const inc = r.chunk.proto.protos[1];
+    try testing.expectEqualStrings("self", inc.locals[0].name);
+    try testing.expectEqualStrings("k", inc.locals[1].name);
+    // The closure names both of its upvalues.
+    const closure = r.chunk.proto.protos[2];
+    try testing.expectEqual(@as(usize, 2), closure.upval_names.len);
 }

@@ -11,8 +11,10 @@
 //! or a branch that assigns it on one side only, gives no name rather than a
 //! wrong one.
 //!
-//! mahina keeps no local or upvalue names, so a value read from one gets no
-//! name (Lua's "local 'f'" / "upvalue 'f'").
+//! A register that is a named local at the faulting pc is that local (Lua's
+//! "local 'f'"), whatever put the value there: the name is the register's,
+//! from `Proto.locals` (doc 86 §4). A value copied from a local, or read from
+//! an upvalue, is named after it ("upvalue 'f'") through the same proof.
 //!
 //! Cost: per question, a backward scan to the candidate and a pass over the
 //! code's jumps (a table lookup per instruction), with no allocation. A
@@ -33,18 +35,18 @@ const Proto = bytecode.Proto;
 
 pub const Origin = struct {
     kind: Kind,
-    /// The global's name or the field's key.
+    /// The global's, local's or upvalue's name, or the field's key.
     name: []const u8,
     /// For a field or method: the global its table was read from (`io` in
     /// `io.open`), when it was one.
     table_global: ?[]const u8 = null,
 
-    pub const Kind = enum { global, field, method };
+    pub const Kind = enum { global, field, method, local, upvalue };
 };
 
 /// What register `reg` holds just before the instruction at `pc` runs, or
 /// null when that can't be named. The names point into the proto's
-/// constants. Allocates nothing.
+/// constants or its local and upvalue names. Allocates nothing.
 pub fn originOf(proto: *const Proto, pc: u32, reg: u16) ?Origin {
     if (pc >= proto.code.len) return null;
     return origin(proto, pc, reg);
@@ -128,6 +130,7 @@ const jumps_away = blk: {
 };
 
 fn origin(proto: *const Proto, pc: u32, reg: u16) ?Origin {
+    if (proto.localName(reg, pc)) |name| return .{ .kind = .local, .name = name };
     const code = proto.code;
     const def = candidate(code, pc, reg) orelse return null;
     const ins = code[def];
@@ -135,6 +138,15 @@ fn origin(proto: *const Proto, pc: u32, reg: u16) ?Origin {
     if (ins.op == .get_global) {
         if (!proven(1, code, .{.{ def, pc }})[0]) return null;
         return .{ .kind = .global, .name = constText(proto, ins.b) orelse return null };
+    }
+    if (ins.op == .get_upval) {
+        if (!proven(1, code, .{.{ def, pc }})[0]) return null;
+        return .{ .kind = .upvalue, .name = proto.upvalName(ins.b) orelse return null };
+    }
+    // A copy is named after what it copied, as Lua's `OP_MOVE` case is.
+    if (ins.op == .move) {
+        if (!proven(1, code, .{.{ def, pc }})[0]) return null;
+        return origin(proto, def, @intCast(ins.b));
     }
     if (ins.op != .get_field) return null;
     const key = constText(proto, ins.c) orelse return null;
@@ -296,10 +308,27 @@ test "a global, a field of a global, a nested field and a method are named" {
     try expectCallee("os.date(a and b or c, x > 1 and 2)", 0, .field, "os.date");
 }
 
-test "a local and a loop variable get no name" {
-    try expectNoName("local f = os.time f()", 0);
-    try expectNoName("for _, g in ipairs({}) do g() end", 1);
-    try expectNoName("local f = io.open if c then f = os.time end f()", 0);
+test "doc 86 P0: a local, a loop variable and an upvalue are named" {
+    try expectCallee("local f = os.time f()", 0, .local, "f");
+    try expectCallee("for _, g in ipairs({}) do g() end", 1, .local, "g");
+    // The register's name is certain even when its value is not.
+    try expectCallee("local f = io.open if c then f = os.time end f()", 0, .local, "f");
+    // A local passed on in a fresh register is named after the local.
+    try expectCallee("local f = os.time local t = {f()}", 0, .local, "f");
+}
+
+test "doc 86 P0: a callee read from an upvalue is named after it" {
+    var c = try compileSrc("local f = os.time function g() f() end");
+    defer c.deinit();
+    const g = c.chunk.proto.protos[0];
+    for (g.code, 0..) |ins, pc| {
+        if (ins.op != .call) continue;
+        const o = originOf(g, @intCast(pc), ins.a) orelse return error.TestExpectedName;
+        try testing.expectEqual(Origin.Kind.upvalue, o.kind);
+        try testing.expectEqualStrings("f", o.name);
+        return;
+    }
+    return error.NoSuchCall;
 }
 
 /// Name `reg` before `pc` in hand-built `code` over the constants `a`, `b`.
