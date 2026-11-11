@@ -154,6 +154,10 @@ pub const Error = error{
     /// Doc 75 §4: Ctrl-C reached a running line (`Heap.requestInterrupt`).
     /// An unwind no `pcall` may stop; the REPL reports it and goes on.
     Interrupted,
+    /// Doc 86 §5.5: a debug session ended the program (its client sent
+    /// `terminate` or `disconnect`). Like `Exit`, an unwind no `pcall` may
+    /// stop, and `run` leaves the VM idle and reusable.
+    DebugTerminated,
 };
 
 /// Fixed VM register/call stack: every frame's register window is a slice of
@@ -822,6 +826,27 @@ comptime {
 /// stopped before.
 pub const ResumePoint = struct { call_seq: u64, pc: usize };
 
+/// Doc 86 §3, §5.1: what a debug session hangs on a VM (`Vm.debug`). The VM
+/// calls `check` from the dispatch prologue through it, so the session
+/// (`src/debug/`) depends on the VM and never the reverse.
+pub const DebugHooks = struct {
+    /// The step at or after which the next prologue calls `check` whatever
+    /// `flags` says: a keyframe falling due, a replay's target step. Max
+    /// for none.
+    next_event_step: u64 = std.math.maxInt(u64),
+    /// The session's event bits (`debug.session.Flags`). The session sets
+    /// them, and so may a transport thread while the program runs; while
+    /// any is set, every prologue calls `check`.
+    flags: std.atomic.Value(u32) = .init(0),
+    ctx: *anyopaque,
+    /// Runs in an instruction's prologue, after steps (1)–(4), with
+    /// `frame.pc` published as the instruction about to run. It may stop
+    /// the program in place, returning when the client resumes it, or end
+    /// the run with `Error.DebugTerminated`. It never touches the VM heap,
+    /// so neither the collection schedule nor the step count sees it.
+    check: *const fn (ctx: *anyopaque, vm: *Vm, proto: *const Proto, pc: usize) Error!void,
+};
+
 /// The tier-0 virtual machine. Owns the resources a running program needs that
 /// outlive a single frame: the object heap, the global table, and the shared
 /// register/call stack.
@@ -1054,6 +1079,11 @@ pub const Vm = struct {
     /// Armed by a test / future debugger to capture a resumable keyframe.
     /// Write through `setSuspendCtl` only (it owns a `trace.fast_block` bit).
     suspend_ctl: ?SuspendCtl = null,
+    /// Doc 86 §3: the debug session attached to this VM, or null in every
+    /// run that is not being debugged. Set by `debug.Session.attach`, which
+    /// also holds the JIT suspended, so a session dispatches `.full` and
+    /// its check runs in every prologue.
+    debug: ?*DebugHooks = null,
     /// Doc 86 §6.1: the instruction a stop left the dispatch at, with
     /// prologue steps (1)–(4) already run for it — the collection check,
     /// the `safepoint_seq` count, the line index and the suspend check
@@ -2544,8 +2574,9 @@ pub const Vm = struct {
         const outcome = self.exec() catch |err| {
             // Doc 65 §7: `os.exit` ends the run, not the VM. Unwind every
             // frame, as a finished run leaves the stack, so the host can
-            // still snapshot and reuse the VM.
-            if (err == Error.Exit) self.unwindTo(0, 0);
+            // still snapshot and reuse the VM. A debugger's terminate
+            // (doc 86 §5.5) ends a run the same way.
+            if (err == Error.Exit or err == Error.DebugTerminated) self.unwindTo(0, 0);
             return err;
         };
         switch (outcome) {
@@ -2943,6 +2974,10 @@ pub const Vm = struct {
         };
         if (err == Error.IoErrorModeMismatch) return .{
             .message = try arena.dupe(u8, "the recording was made under the other io error mode (--lua-io-errors); replay it under the same mode"),
+            .self_located = true,
+        };
+        if (err == Error.DebugTerminated) return .{
+            .message = try arena.dupe(u8, "the debugger ended the program"),
             .self_located = true,
         };
         if (err == Error.Interrupted) return .{
@@ -5840,6 +5875,19 @@ pub const Vm = struct {
                     st.frame.pc = pc;
                     self.resume_at = .{ .call_seq = st.frame.call_seq, .pc = pc };
                     return .suspended;
+                }
+            }
+        }
+
+        // (4b) Doc 86 §5.1: a debug session's check, after the suspend point
+        // so a capture never sees a stop half-taken. `.full` only: a session
+        // holds the JIT suspended, which keeps every dispatch `.full`, and in
+        // `.fast` this folds away.
+        if (mode == .full) {
+            if (self.debug) |d| {
+                if (self.safepoint_seq >= d.next_event_step or d.flags.load(.monotonic) != 0) {
+                    st.frame.pc = pc;
+                    d.check(d.ctx, self, st.proto, pc) catch |e| return parkErr(st, e);
                 }
             }
         }
@@ -13579,6 +13627,7 @@ pub fn narrowError(e: anyerror) Error {
         error.ProcNotRecordable => Error.ProcNotRecordable,
         error.Exit => Error.Exit,
         error.Interrupted => Error.Interrupted,
+        error.DebugTerminated => Error.DebugTerminated,
         else => Error.HostError,
     };
 }
@@ -13615,6 +13664,7 @@ pub fn catchable(e: Error) bool {
         Error.ProcNotRecordable,
         Error.Exit,
         Error.Interrupted,
+        Error.DebugTerminated,
         // A top-level `run`/`start` contract violation — it can never surface inside
         // a `pcall`/`xpcall` (those don't re-enter top-level), so it is unreachable
         // here; classified not-catchable for completeness (doc 17, H-3 / 9-A(ii)).

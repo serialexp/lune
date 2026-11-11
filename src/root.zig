@@ -73,6 +73,8 @@ pub const parser = @import("parser.zig");
 pub const resolve = @import("resolve.zig");
 /// Doc 74: the language server (positions, JSON-RPC framing, the sans-IO core).
 pub const lsp = @import("lsp.zig");
+/// Doc 86: the debugger core (sessions, breakpoints, stepping), sans-IO.
+pub const debug = @import("debug.zig");
 
 /// Phase 3 — runtime heap objects + bytecode ISA + tier-0 interpreter.
 pub const string = @import("string.zig");
@@ -208,6 +210,7 @@ test {
     _ = parser;
     _ = resolve;
     _ = lsp;
+    _ = debug;
     _ = string;
     _ = array;
     _ = table;

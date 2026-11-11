@@ -2,7 +2,7 @@
 
 Status: partial — P0 and P1 landed; P2–P7 outstanding
 Owner: Bart
-Last updated: 2026-11-11
+Last updated: 2026-11-12
 
 ## Implementation status
 
@@ -54,15 +54,26 @@ everything inside them is checked.
 ### Outstanding
 
 - [ ] **P2 — the debugger core, forward only** (§3, §5, §7). `src/debug/`
-  covers:
-  - the session and its live VM;
-  - line and conditional breakpoints, and hit counts;
-  - step in, over and out, and pause;
-  - error stops at every site where an error is raised (§5.4);
-  - threads, the stack, scopes, variables with slot-order paging, and
+  covers the items below, and does no I/O.
+  - [x] The session and its live VM (`src/debug/session.zig`). It
+    attaches through `Vm.debug` (`interp.DebugHooks`), whose check runs in
+    the dispatch prologue after the suspend point, and only in `.full`
+    dispatch. A stop is in place: the driver's `stopped` callback runs on
+    the VM's own stack, inside a native's activation frame as well. The
+    session holds the JIT suspended while attached (`raiseSuspend`). This
+    slice includes stop on entry, `pause`, requests taken while the
+    program runs, `terminate` (`Error.DebugTerminated`, which `pcall`
+    cannot catch and which leaves the VM idle and reusable), and the end
+    stop (§5.5). Tests are in `src/debug/session_test.zig`. They show one
+    stop per program step, and that a session with stops leaves the same
+    step count and final snapshot bytes as a plain tier-0 run.
+  - [ ] Line breakpoints, including pending ones.
+  - [ ] Conditional breakpoints and hit counts, on the pure-read
+    evaluator.
+  - [ ] Step in, over and out.
+  - [ ] Error stops at every site where an error is raised (§5.4).
+  - [ ] Threads, the stack, scopes, variables with slot-order paging, and
     pure-read `evaluate`.
-
-  It does no I/O.
 - [ ] **P3 — `mahina dap`** (§8). The DAP server on stdio, with the full
   lifecycle (initialize, configuration, disconnect and terminate) and a
   post-exit stop. Program output goes to `output` events, and stdin comes

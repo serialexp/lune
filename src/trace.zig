@@ -1009,8 +1009,10 @@ pub const TraceState = struct {
     /// records, enters, arms, links, drains or repatches; hot counters still
     /// count. Exactly one party raises and lowers it per host call (the
     /// traced-call shim, or `callHostNative` for a call made while
-    /// recording). Changed only through `raiseSuspend`/`lowerSuspend`, which
-    /// keep `FastBit.jit_suspended` in step; read through `suspended`.
+    /// recording), and a debug session holds one more level for as long as
+    /// it is attached (doc 86 §5.6, `debug.Session`). Changed only through
+    /// `raiseSuspend`/`lowerSuspend`, which keep `FastBit.jit_suspended` in
+    /// step; read through `suspended`.
     suspend_depth: u32 = 0,
     /// Doc 63 §5.10: entry wrappers (`enterSelectedTrace`,
     /// `enterHeadNativeQuiet`, `enterPatchedTrace`, the back-edge walk) hold a
