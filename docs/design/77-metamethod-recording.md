@@ -3,7 +3,8 @@
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
 decided; Phases 0–3 landed (2026-11-11); Phase 4 started (computed-callee
 upvalue reads and the anchor-window alias, §6.6; `__index`/`__newindex`
-functions, §6.1; arithmetic, bitwise, unary and `__len` handlers, §6.4);
+functions, §6.1; arithmetic, bitwise, unary and `__len` handlers, §6.4;
+`__lt`/`__le`/`__eq` and the compare-and-branch forms, §6.4);
 the rest of
 Phases 4–7 outstanding (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
@@ -214,6 +215,51 @@ land; move whole phases to Done once everything inside them is checked.
     removed and replaced between entries beside `rawlen`; a guard inside an
     arithmetic handler that exits; the tier-0 cases above.
   - [x] measured (§10.10).
+- [x] **Phase 4, fifth part — `__lt`, `__le`, `__eq` and the
+  compare-and-branch forms** (§6.4, 2026-11-11). A comparison with a table
+  operand (`lt`/`le`/`gt`/`ge`, their constant forms and the `jlt`-style
+  compare-and-branch forms) records as an inlined call of the relation's
+  handler, in relation order (`a > b` is `__lt(b, a)`), through
+  `recBinaryMetaCall`, which the arithmetic operators share. `==`/`~=` (and
+  `jeq`) over two tables guard both and emit their identity comparison:
+  when neither has `__eq` the absences are proved and the identity is the
+  answer; otherwise a guard pins the identity seen, identical tables fold
+  to `true`, and distinct ones call the first operand's `__eq`, else the
+  second's. The handler's return finishes the instruction from
+  `InlineFrame.finish` (`finishMetaCompare`), not from the §6.3 stack (see
+  the §6.3 amendment): the result's truthiness to `R[A]` (negated for
+  `~=`), or the branch on it.
+  - [x] truthiness as tier 0 takes it: a bool as is, nil and false
+    pinned, a number pinned a number (true, 0 included); any other result
+    aborts `bad_type`.
+  - [x] a table compared against nil, false or a number folds to the
+    answer behind a `guard_table` that allows any metatable (`__eq` is
+    never asked across types). That ends the abort TODO.md noted for
+    `v == nil` on a table.
+  - [x] the branch of a compare-and-branch in the anchor frame gets its own
+    exit boundary after the handler, so it attaches like any branch (§7
+    amendment). In an inlined frame it is a coarse guard, as every guard
+    there.
+  - [x] `InlineFrame` keeps its size: `finish` is one byte in its padding,
+    and the truthy destination is `ret_dest`. The recorder's frames sit
+    inside `Vm`, whose layout `src/asm/offsets_x64.inc` pins; a first cut
+    with a tagged union grew `Vm` by 120 bytes.
+  - [x] stays with tier 0: a string operand of `<`/`<=` (`bad_type`), a
+    native handler (`has_metatable`), no handler on either table
+    (`bad_type`; tier 0 raises), `==` over two strings or other heap values
+    (TODO.md).
+  - [x] gated in `src/interp_meta_trace_test.zig`: every compare form with
+    order-revealing handlers; a handler whose answer turns, its branch exit
+    attachable (resuming at the successor or the target), run once per
+    iteration; the `__eq` choice and identity, changed between entries;
+    truthiness, with a counting handler whose answer turns to nil; table
+    against nil and false, with no `bad_type` abort.
+  - [x] the doc 84 one-shot-lane and return-hook tests used `a ~= b` over
+    two tables as a loop that cannot trace. They now set
+    `Config.refuse_op = .jeq`, a test instrument that makes the recorder
+    abort at that opcode, so the next construct to start recording does
+    not move them again.
+  - [x] measured (§10.11).
 
 ### Outstanding
 
@@ -232,7 +278,6 @@ land; move whole phases to Done once everything inside them is checked.
   - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
     of a cell with an alias class, through a computed callee still abort
     `.cross_frame`
-  - [ ] `__eq`, `__lt`, `__le`, the compare-and-branch forms (§6.4)
   - [ ] `__call` (§6.7)
 - [ ] **Phase 5 — `__close`** (§8): doc 76's Phase 3b, with the
   "closes done, return only" completion.
@@ -571,6 +616,14 @@ the pending instruction still owns.
 | `none` | `__newindex` fn, each `__close` | results dropped |
 | `truthy` | `__eq`, `__lt`, `__le` | the result's truthiness, then the relation's polarity (§6.4) |
 
+Amendment (2026-11-11, Phase 4 fifth part): every instruction recorded so
+far makes one call and finishes in one step, so its finish rides on the
+handler's `InlineFrame` (`finish`: `result`, `truthy`, `truthy_not`,
+`branch_true`, `branch_false`; a byte, so the frame keeps its size) and
+`recRet` applies it when that frame returns. The stack is still the plan
+for the instructions with more than one stage (the fused index pair,
+`__close`); the frame's byte becomes the top entry's finish when it lands.
+
 ### 6.4 Exact call signatures
 
 As tier 0 makes them, so the 8-mode equivalence holds:
@@ -688,6 +741,19 @@ entry has the `result`-like finish of a call with its result count.
 
 So a handler needs no continuation frame in any snapshot, but the
 mid-instruction guards need the explicit coarse marking.
+
+Amendment (2026-11-11, Phase 4 fifth part): the branch guard of a
+compare-and-branch is not mid-instruction in the sense above. Once the
+handler has returned, the branch is all that is left of the instruction,
+and a failing branch guard means the other successor, which is exactly
+where an adapter resumes. So in the anchor frame the recorder opens an
+exit boundary at the instruction's successor after the handler returns
+(`finishMetaCompare`) and the branch guard takes that snapshot, as a plain
+`if f(a, b)` does. The handler's stores sit in earlier ordinals, so the
+exit commits them and the handler does not run again. Without the boundary
+the guard exited coarse and never healed: a handler whose answer turned
+left 99.5% of the iterations on tier 0, against 0.1% with it. The result's
+type guards (`truthRef`) stay coarse.
 
 ## 8. `__close` (doc 76 Phase 3b)
 
@@ -951,6 +1017,22 @@ field of their operands), 2M iterations:
 `--jit-stats`: ~5.8 cycles per traced iteration, no aborts; the handler
 loads are hoisted with their metatables (§5.5). `bench/meta_ops.lua` still
 stops at its comparisons (`__lt`, `__le`, `__eq`), the next part.
+
+### 10.11 After the compare handlers (2026-11-11)
+
+ReleaseFast builds of the tree with and without this part (the
+arithmetic handlers already in both), load 15–18.
+`bench/meta_ops.lua 2000000`, three runs each:
+
+| | t0 s | jit s |
+|---|---|---|
+| before (aborts `bad_type` at its `jlt`) | 0.43, 0.43, 0.44 | 0.69, 0.68, 0.68 |
+| after | 0.43, 0.49, 0.43 | 0.03, 0.04, 0.03 |
+
+`--jit-stats` after: 91.3% of cycles native, 0.8% tier 0 with a trace,
+~70 cycles per traced iteration (five handler calls each), no recording
+aborts. Before, the loop aborted at `lim < acc` and the JIT run was slower
+than tier 0.
 
 ## 11. Open questions for review
 

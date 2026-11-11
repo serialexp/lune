@@ -2753,12 +2753,14 @@ test "one-shot lane: a small call still takes the lane after a loop nest has lin
     // The quiet predicate asked `receiptsInert()` too, so an admitted
     // region anywhere sent every head entry in the program down the long
     // form. It now asks whether THIS trace's receipt can touch the region
-    // machine. The loop around the call cannot trace (`a ~= b` compares two
-    // tables), so `f` is entered from tier 0 on every round; the lane's own
-    // counter is the witness, as in the doc 84 §4.2 test.
+    // machine. The loop around the call cannot trace (its `a ~= b` is the
+    // program's only `jeq`, which `refuse_op` makes the recorder refuse), so
+    // `f` is entered from tier 0 on every round; the lane's own counter is
+    // the witness, as in the doc 84 §4.2 test.
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
+    vm.trace.config.refuse_op = .jeq;
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     var chunk = try runFrameMotion(&vm,

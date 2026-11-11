@@ -6471,7 +6471,8 @@ test "head descent formation (doc 44 D11): the self-call terminal actually pushe
 }
 
 /// Doc 84 §4.2 helper: run the small-callee probe (a pure function called
-/// from a loop that cannot trace) natively and return how many entries
+/// from a loop that cannot trace: its `a ~= b` is the program's only
+/// `jeq`, which `refuse_op` makes the recorder refuse) natively and return how many entries
 /// took the one-shot lane. `tune` adjusts the VM before the run.
 fn oneShotLaneProbe(comptime tune: fn (*Vm) void) !u64 {
     const gpa = testing.allocator;
@@ -6501,6 +6502,7 @@ fn oneShotLaneProbe(comptime tune: fn (*Vm) void) !u64 {
     vm.trace.config.native_codegen = true;
     vm.trace.config.hotloop = 4;
     vm.trace.config.hotcall = 4;
+    vm.trace.config.refuse_op = .jeq;
     tune(&vm);
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
@@ -6548,7 +6550,8 @@ test "one-shot lane (doc 84 §4.2): an exec log, coverage and a held .full dispa
 }
 
 /// Doc 84 §3.6 helper: one function called with two table shapes from a
-/// loop that cannot trace. Its head trace pins the array lane of whichever
+/// loop that cannot trace (`refuse_op` refuses its `jeq`, as in
+/// `oneShotLaneProbe`). Its head trace pins the array lane of whichever
 /// shape recorded, so every call with the other shape is refused at entry
 /// and runs on tier 0. Returns how many refused entries took the lane's
 /// lean tail. `tune` adjusts the VM before the run.
@@ -6582,6 +6585,7 @@ fn laneDeclineProbe(comptime tune: fn (*Vm) void) !u64 {
     vm.trace.config.native_codegen = true;
     vm.trace.config.hotloop = 4;
     vm.trace.config.hotcall = 4;
+    vm.trace.config.refuse_op = .jeq;
     tune(&vm);
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
@@ -6617,8 +6621,9 @@ test "one-shot lane (doc 84 §3.6): an anchor at sibling capacity keeps the walk
 }
 
 test "return hook (doc 84 §4.5): an abandoned continuation's resume pc ends up settled" {
-    // The loop compares two distinct tables, so neither it nor the
-    // continuation after `f(i)` can record: the continuation's anchor is
+    // The loop's `a ~= b` is the program's only `jeq`, which `refuse_op`
+    // makes the recorder refuse, so neither it nor the continuation after
+    // `f(i)` can record: the continuation's anchor is
     // abandoned after `max_strikes` aborts, and from then on every return
     // from `f` stops at the settled bit in main's image. Safe builds check
     // each of those returns against the maps (`resumeSettledHolds`), so
@@ -6650,6 +6655,7 @@ test "return hook (doc 84 §4.5): an abandoned continuation's resume pc ends up 
     vm.trace.config.optimize = true;
     vm.trace.config.hotloop = 4;
     vm.trace.config.hotcall = 4;
+    vm.trace.config.refuse_op = .jeq;
     vm.trace.config.backoff_base = 8;
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);

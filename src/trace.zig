@@ -473,6 +473,10 @@ pub const TraceConfig = struct {
     /// loop iterations a side or continuation recording may unroll — loops it
     /// goes round without linking to a root — before aborting `.loop_unroll`.
     loopunroll: u8 = 15,
+    /// Test instrument (see `RecordingSession.Options.refuse_op`): an opcode
+    /// every recording aborts at, as one the recorder does not model. Null
+    /// in every shipped configuration.
+    refuse_op: ?OpCode = null,
     /// LuaJIT's `minstitch` (see `RecordingSession.Options.minstitch`).
     /// Measured break-even: a stitched half costs ~460 instructions of
     /// entry/exit, a traced IR instruction saves ~8–10 over tier-0.
@@ -3855,7 +3859,7 @@ pub const TraceState = struct {
     /// frame; recording proper begins at the next dispatch-loop iteration (which
     /// is the anchor instruction). On OOM we simply don't arm.
     fn configureRecording(self: *TraceState) void {
-        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .loopunroll = self.config.loopunroll, .minstitch = self.config.minstitch, .host_calls = self.config.trace_host_calls and !self.config.record_exec_log, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
+        self.rec.options = .{ .maxrecord = self.config.maxrecord, .peel = self.config.peel, .instunroll = self.config.instunroll, .loopunroll = self.config.loopunroll, .minstitch = self.config.minstitch, .refuse_op = self.config.refuse_op, .host_calls = self.config.trace_host_calls and !self.config.record_exec_log, .optimize = self.config.optimize, .snapshot_budget = self.config.snapshot_budget };
         self.rec.host_epoch_probe = if (self.exec_heap) |h| &h.host_epoch else null;
     }
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {

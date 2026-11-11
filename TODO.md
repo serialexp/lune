@@ -86,11 +86,19 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       (`bad_type jeq`, 28 on the board: globals_script's `a ~= b` over
       two tables, call_small_fn, call_two_shapes). `eqRef`
       (`src/trace_recorder.zig`) folds constants and compares numbers and
-      proven bools; two tables, or a string against a string constant,
-      abort. LuaJIT's `lj_record_objcmp` compares references for
-      everything without an `__eq`. Not started.
+      proven bools; a string against a string, or any other pair of heap
+      values that are not both tables, aborts. LuaJIT's
+      `lj_record_objcmp` compares references for everything without an
+      `__eq`. Two tables record since doc 77 Phase 4's fifth part
+      (2026-11-11): their identity, or their `__eq` as an inlined call.
+      Strings and the rest not started.
 
 ## `v == nil` on a table value stops the recording (noted 2026-11-11)
+
+Fixed for tables (doc 77 Phase 4, fifth part, 2026-11-11): a table
+against nil, false or a number folds to the answer behind a `guard_table`
+that allows any metatable. Other heap values (strings, closures) still
+abort `bad_type`.
 
 `if v == nil then` compiles to `jeq_p`; when `v` holds a table (or any
 heap value) at record time, `recCmpBranch` aborts `bad_type`. A loop over

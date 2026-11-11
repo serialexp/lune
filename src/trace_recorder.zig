@@ -549,7 +549,23 @@ pub const InlineFrame = struct {
     /// such ref (a `__tostring` handler, pinned by `guard_tostring` through
     /// the receiver): its upvalue reads abort `.cross_frame`.
     callee: ?Ref = null,
+    /// What the instruction that called this frame's metamethod handler
+    /// does with its first result (doc 77 §6.3; `finishOp` in tier 0).
+    /// `.result` is the `ret_dest`/`ret_count` landing every other frame
+    /// uses. One byte, so the frame keeps its size (the recorder's frames
+    /// sit inside `Vm`, whose offsets `src/asm/offsets_x64.inc` pins).
+    finish: MetaFinish = .result,
 };
+
+/// Doc 77 §6.3: how a metamethod handler's return finishes the instruction
+/// that called it (`InlineFrame.call_pc`), as `finishOp` does. `.result`
+/// stores the results like a call's (`ret_dest`/`ret_count`). `.truthy`
+/// stores the first result's truthiness in the calling frame's `ret_dest`
+/// (`ret_count` is 0), negated for `~=` (`.truthy_not`). `.branch_true`
+/// and `.branch_false` take a compare-and-branch's branch on it
+/// (`cmpBranchTail`), for a branch that jumps when the relation holds or
+/// when it fails.
+pub const MetaFinish = enum(u8) { result, truthy, truthy_not, branch_true, branch_false };
 
 /// Build a guard's ordered inline-path prefix (doc 17, A-i.2) from the recorder's
 /// live inline-frame stack: `path[i]` is the call edge that opened frame `i`.
@@ -647,6 +663,11 @@ pub const RecordingSession = struct {
         /// tier-0 → trace entry; a shorter one is slower than tier-0 would
         /// have been, so the recording aborts as it did before stitching.
         minstitch: u32 = 0,
+        /// Test instrument: the recording aborts `.nyi_opcode` at this
+        /// opcode, as at one it does not model. Tests that need a loop which
+        /// cannot trace set it instead of relying on a construct that does
+        /// not record yet, which stops being one when coverage grows.
+        refuse_op: ?bytecode.OpCode = null,
         /// Doc 63 §5.3: record host calls in precise loop roots (`guard_native`,
         /// `call_host`, `guard_host_epoch`, `host_result`) instead of
         /// stitching around them. `Config.trace_host_calls`, and never under an
@@ -1441,6 +1462,7 @@ pub const RecordingSession = struct {
         self.cur_pc = pc;
         self.cur_op = instr.op;
         self.cur_proto_id = proto.id; // leaf proto for GuardProvenance (A-i.3)
+        if (self.options.refuse_op == instr.op) return self.abort(.nyi_opcode);
         // A-ii.3: capture the recorded program-point for region membership. Fail-soft
         // — an OOM here marks membership unavailable and continues; it must NEVER
         // abort the trace (that would change trace selection → non-byte-identical).
@@ -1771,10 +1793,10 @@ pub const RecordingSession = struct {
 
             // comparisons (gt/ge normalise to lt/le with swapped operands).
             .eq, .ne, .eq_p, .ne_p, .eq_s, .ne_s, .eq_n, .ne_n => try self.recEq(if (bytecode.eqFormOf(instr.op).?.negate) .ne else .eq, eqFrameOf(instr, proto), regs),
-            .lt => try self.recCompare(.lt, false, instr, regs),
-            .le => try self.recCompare(.le, false, instr, regs),
-            .gt => try self.recCompare(.lt, true, instr, regs),
-            .ge => try self.recCompare(.le, true, instr, regs),
+            .lt => try self.recCompare(.lt, false, instr, regs, proto),
+            .le => try self.recCompare(.le, false, instr, regs, proto),
+            .gt => try self.recCompare(.lt, true, instr, regs, proto),
+            .ge => try self.recCompare(.le, true, instr, regs, proto),
 
             // control flow.
             // Doc 58: a `jmp` records nothing. Every jump is now straight-line
@@ -2470,7 +2492,7 @@ pub const RecordingSession = struct {
     /// its right operand (the compiler moves a constant on the left there).
     pub fn eqFrameOf(instr: Instr, proto: *const Proto) BinaryFrame {
         const rhs: Operand = if (bytecode.eqConstant(instr, proto)) |k| .{ .konst = k } else .{ .reg = instr.c };
-        return .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = rhs, .lhs_od = .b, .rhs_od = .c };
+        return .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = rhs, .lhs_od = .b, .rhs_od = .c, .frame_proto = proto };
     }
 
     /// Record an arithmetic or bitwise instruction, any shape.
@@ -2560,33 +2582,61 @@ pub const RecordingSession = struct {
     /// or callable-table handler, or no handler at all (tier 0 raises).
     fn recBinaryMeta(self: *RecordingSession, name: []const u8, f: BinaryFrame, vb: Value, vc: Value) !void {
         const fp = f.frame_proto orelse return self.abort(.bad_type);
-        if (!(vb.isNumber() or isTableValue(vb)) or !(vc.isNumber() or isTableValue(vc))) return self.abort(.bad_type);
-        const rb = try self.operandRef(f.lhs);
-        const rc = try self.operandRef(f.rhs);
-        const args = [_]Ref{ rb, rc };
-        if (isTableValue(vb)) {
-            if (try self.metaReceiver(rb, vb, name, f.lhs_od, f.dst)) |mt|
-                return self.recMetaCall(fp, rb, mt, name, &args, f.dst, 1, f.lhs_od);
-            if (!self.active) return;
-        } else try self.guardNum(rb, vb, .operand_type, f.lhs_od);
-        if (isTableValue(vc)) {
-            if (try self.metaReceiver(rc, vc, name, f.rhs_od, f.dst)) |mt|
-                return self.recMetaCall(fp, rc, mt, name, &args, f.dst, 1, f.rhs_od);
-            if (!self.active) return;
+        const a: MetaOperand = .{ .ref = try self.operandRef(f.lhs), .v = vb, .od = f.lhs_od };
+        const b: MetaOperand = .{ .ref = try self.operandRef(f.rhs), .v = vc, .od = f.rhs_od };
+        return self.recBinaryMetaCall(fp, name, a, b, f.dst, .result);
+    }
+
+    /// One operand of a binary metamethod call, in the handler's argument
+    /// order: its ref, its observed value and its designator.
+    const MetaOperand = struct { ref: Ref, v: Value, od: OperandDesig };
+
+    /// Doc 77 Phase 4: `binMeta` for operands `a` and `b`, already in the
+    /// order tier 0 passes them (source order for arithmetic, relation
+    /// order for `<`/`<=`): `a`'s handler `name`, else `b`'s, called as
+    /// `h(a, b)` and finished as `finish` says (`.result` lands in `dst`).
+    /// Each operand is a number or a table; anything else stays with tier 0.
+    /// `a`'s choice is proved either way: a table's handler is loaded and
+    /// pinned or its absence proved (`metaReceiver`), and a number is
+    /// pinned a number, since a table there would be asked first.
+    fn recBinaryMetaCall(self: *RecordingSession, fp: *const Proto, name: []const u8, a: MetaOperand, b: MetaOperand, dst: u16, finish: MetaFinish) !void {
+        if (!(a.v.isNumber() or isTableValue(a.v)) or !(b.v.isNumber() or isTableValue(b.v))) return self.abort(.bad_type);
+        const args = [_]Ref{ a.ref, b.ref };
+        // A compare's finish writes `dst` itself (`finishMetaCompare`).
+        const ret_count: u16 = if (finish == .result) 1 else 0;
+        for ([_]MetaOperand{ a, b }, 0..) |o, i| {
+            if (isTableValue(o.v)) {
+                if (try self.metaReceiver(o.ref, o.v, name, o.od, dst)) |mt|
+                    return self.recMetaCall(fp, o.ref, mt, name, &args, dst, ret_count, o.od, finish);
+                if (!self.active) return;
+            } else if (i == 0) try self.guardNum(o.ref, o.v, .operand_type, o.od);
         }
         // Neither operand has the handler: tier 0 raises.
         return self.abort(.bad_type);
     }
 
     /// Doc 77 Phase 4: the table `v` (ref `r`) as the receiver of
-    /// metamethod `name`: `guard_table`, then its metatable when that holds
-    /// `name` as a Lua function (the caller inlines it). Null when it does
-    /// not, with the absence proved (no metatable: `guard_table` allows
-    /// none; else `guardNoMetamethod`), or with the recording stopped (a
-    /// present `name` that is not a Lua function aborts `has_metatable`).
+    /// metamethod `name`: `guard_table`, then `metaHandlerOf`.
     fn metaReceiver(self: *RecordingSession, r: Ref, v: Value, name: []const u8, od: OperandDesig, dst: u16) !?*table_mod.Table {
+        const tbl = try self.guardMetaTable(r, v, od);
+        return self.metaHandlerOf(r, tbl, name, od, dst);
+    }
+
+    /// `guard_table` on the table `v` (ref `r`), allowing a metatable only
+    /// when it has one (`metaAux`). Its table.
+    fn guardMetaTable(self: *RecordingSession, r: Ref, v: Value, od: OperandDesig) !*table_mod.Table {
         const tbl = table_mod.Table.fromHeader(v.asHeap());
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = r, .aux = metaAux(tbl) }), .container_type, od, .neutral);
+        return tbl;
+    }
+
+    /// The metatable of `tbl` (ref `r`, already guarded by
+    /// `guardMetaTable`) when it holds `name` as a Lua function (the caller
+    /// inlines it). Null when it does not, with the absence proved (no
+    /// metatable: the guard allows none; else `guardNoMetamethod`), or with
+    /// the recording stopped (a present `name` that is not a Lua function
+    /// aborts `has_metatable`).
+    fn metaHandlerOf(self: *RecordingSession, r: Ref, tbl: *table_mod.Table, name: []const u8, od: OperandDesig, dst: u16) !?*table_mod.Table {
         const mt = tbl.metatable orelse return null;
         if (try self.metamethodIsClosure(mt, name)) return mt;
         _ = try self.guardNoMetamethod(r, mt, name, od, dst);
@@ -2602,7 +2652,123 @@ pub const RecordingSession = struct {
         const r = try self.refOf(src);
         // No handler: tier 0 raises (`abort` keeps an earlier reason).
         const mt = (try self.metaReceiver(r, v, name, .b, dst)) orelse return self.abort(.bad_type);
-        return self.recMetaCall(frame_proto, r, mt, name, &.{ r, r }, dst, 1, .b);
+        return self.recMetaCall(frame_proto, r, mt, name, &.{ r, r }, dst, 1, .b, .result);
+    }
+
+    /// Doc 77 Phase 4: `==`/`~=` over two tables (refs `rb`, `rc`), as
+    /// `valuesEqual` decides it: when neither metatable has `__eq`, by
+    /// identity (the IR `eq`/`ne` compares `GcHeader.id`), with the
+    /// absences proved. Otherwise the identity is pinned to what it is now:
+    /// the same table is equal without a call, and two tables call the
+    /// first one's `__eq`, else the second's (`h(a, b)`, finished as
+    /// `finish` says; null is returned). A handler that is not a Lua
+    /// function stays with tier 0.
+    fn eqTables(self: *RecordingSession, op: IrOp, f: BinaryFrame, vb: Value, vc: Value, rb: Ref, rc: Ref, finish: MetaFinish) !?Ref {
+        const tb = try self.guardMetaTable(rb, vb, f.lhs_od);
+        const tc = try self.guardMetaTable(rc, vc, f.rhs_od);
+        const a: MetaOperand = .{ .ref = rb, .v = vb, .od = f.lhs_od };
+        const b: MetaOperand = .{ .ref = rc, .v = vc, .od = f.rhs_od };
+        const tables = [_]*table_mod.Table{ tb, tc };
+        if (!(try self.hasMetamethod(tb, "__eq")) and !(try self.hasMetamethod(tc, "__eq"))) {
+            for ([_]MetaOperand{ a, b }, tables) |o, t| {
+                _ = try self.metaHandlerOf(o.ref, t, "__eq", o.od, f.dst);
+                if (!self.active) return null;
+            }
+            return try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
+        }
+        const identical = vb.eql(vc);
+        const same = try self.emit(.{ .op = .eq, .a = rb, .b = rc, .ty = .boolean });
+        self.stampProv(try self.emit(.{ .op = if (identical) .guard_true else .guard_false, .a = same }), .operand_type, f.lhs_od, .neutral);
+        if (identical) return try self.konst(Value.boolean(op == .eq));
+        const fp = f.frame_proto orelse {
+            self.abort(.bad_type);
+            return null;
+        };
+        const args = [_]Ref{ rb, rc };
+        for ([_]MetaOperand{ a, b }, tables) |o, t| {
+            if (try self.metaHandlerOf(o.ref, t, "__eq", o.od, f.dst)) |mt| {
+                try self.recMetaCall(fp, o.ref, mt, "__eq", &args, f.dst, 0, o.od, finish);
+                return null;
+            }
+            if (!self.active) return null;
+        }
+        unreachable; // one of them has `__eq`: a handler, or an abort above
+    }
+
+    /// Whether `tbl`'s metatable has a `name` field at all.
+    fn hasMetamethod(self: *RecordingSession, tbl: *const table_mod.Table, name: []const u8) !bool {
+        const mt = tbl.metatable orelse return false;
+        return !(try self.metamethodValue(mt, name)).isNil();
+    }
+
+    /// Doc 77 §6.3: a compare handler's `ret` (`v` its first result, `r`
+    /// that result's ref, both of the handler's frame, which the caller has
+    /// popped) finishes the comparison as `finishOp` does: its truthiness
+    /// into the calling frame's register (`.truthy`), or the branch taken on
+    /// it (`.branch`). The ops this emits belong to the triggering
+    /// instruction (doc 77 §7), so they are stamped with its pc and proto
+    /// at depth 0. The result's pins stay in the `ret`'s bytecode ordinal,
+    /// which has no exit snapshot (`exitBoundary` takes none inside an
+    /// inlined frame): a failure there is coarse and re-runs the iteration,
+    /// so the handler is not called twice. The branch guard gets a boundary
+    /// of its own, a second ordinal of the triggering instruction, after
+    /// the handler: its exit resumes at the successor the recorded path did
+    /// not take (`resumeOf`'s branch fix-up), never at the instruction, and
+    /// the handler's stores, of lower ordinals, are applied there. That is
+    /// a plain `if f(a, b) then` exit, which a side trace can take.
+    fn finishMetaCompare(self: *RecordingSession, fr: InlineFrame, r: Ref, v: Value) !void {
+        const saved_pc = self.cur_pc;
+        const saved_proto = self.cur_proto_id;
+        defer {
+            self.cur_pc = saved_pc;
+            self.cur_proto_id = saved_proto;
+        }
+        self.cur_pc = fr.call_pc + 1;
+        self.cur_proto_id = fr.caller_proto_id;
+        const t = (try self.truthRef(r, v)) orelse return self.abort(.bad_type);
+        switch (fr.finish) {
+            .result => unreachable,
+            .truthy => self.setReg(fr.ret_dest, t),
+            .truthy_not => self.setReg(fr.ret_dest, if (self.konstValueOf(t)) |kv|
+                try self.konst(Value.boolean(!kv.isTruthy()))
+            else
+                try self.emit(.{ .op = .not, .a = t, .ty = .boolean })),
+            .branch_true, .branch_false => {
+                const on_true = fr.finish == .branch_true;
+                const pc = fr.call_pc + 1;
+                if (self.inline_depth == 0) {
+                    // The anchor frame: its instruction gives the branch.
+                    const proto = self.anchor.proto;
+                    const cb = bytecode.condBranchOf(proto.code[fr.call_pc], fr.call_pc).?;
+                    std.debug.assert(cb.on_true == on_true);
+                    self.exitBoundary(proto, pc) catch return self.abort(.alloc);
+                    try self.branchOn(t, v.isTruthy(), cb, proto, pc);
+                } else {
+                    // An inlined frame takes no boundary snapshot (its
+                    // exits are coarse) and is never the anchor loop's
+                    // exit, so the guard needs only the polarity.
+                    try self.branchGuard(t, v.isTruthy(), .{ .cond = .compare, .on_true = on_true, .target = -1 });
+                }
+            },
+        }
+    }
+
+    /// A boolean ref for the truthiness of `r` (observed `v`): a typed
+    /// boolean as it is, a slot's boolean or nil pinned to its konst, a
+    /// konst folded, a number (always truthy) pinned a number. Null for any
+    /// other value, whose truthiness has no native form.
+    fn truthRef(self: *RecordingSession, r: Ref, v: Value) !?Ref {
+        if (self.konstValueOf(r)) |kv| return try self.konst(Value.boolean(kv.isTruthy()));
+        if (v.isBool() and self.boolTyped(r)) return r;
+        if (v.isBool() or v.isNil()) {
+            const k = (try self.pinPrim(r, v, .a)) orelse return null;
+            return try self.konst(Value.boolean(self.konstValueOf(k).?.isTruthy()));
+        }
+        if (v.isNumber()) {
+            try self.guardNum(r, v, .operand_type, .a);
+            return try self.konst(Value.boolean(true));
+        }
+        return null;
     }
 
     pub fn recNeg(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
@@ -2643,18 +2809,32 @@ pub const RecordingSession = struct {
     }
 
     /// `lt`/`le`/`gt`/`ge` into `R[a]`.
-    pub fn recCompare(self: *RecordingSession, op: IrOp, swap: bool, instr: Instr, regs: RegWindow) !void {
-        const f: BinaryFrame = .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = .{ .reg = instr.c }, .lhs_od = .b, .rhs_od = .c };
-        if (try self.compareRef(op, swap, f, regs)) |r| self.setReg(instr.a, r);
+    pub fn recCompare(self: *RecordingSession, op: IrOp, swap: bool, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        const f: BinaryFrame = .{ .dst = instr.a, .lhs = .{ .reg = instr.b }, .rhs = .{ .reg = instr.c }, .lhs_od = .b, .rhs_od = .c, .frame_proto = proto };
+        if (try self.compareRef(op, swap, f, regs, .truthy)) |r| self.setReg(instr.a, r);
     }
 
     /// The IR value of `lt`/`le` over `f`'s operands, swapped for `gt`/`ge`
-    /// (`f.dst` unused), or null after an abort. Numbers only.
-    fn compareRef(self: *RecordingSession, op: IrOp, swap: bool, f: BinaryFrame, regs: RegWindow) !?Ref {
+    /// (`f.dst` unused), or null after an abort or when a metamethod
+    /// handler was inlined (doc 77 Phase 4: a table operand, `__lt`/`__le`
+    /// called in relation order as `compareMeta` does, its result finished
+    /// as `finish` says). Numbers otherwise.
+    fn compareRef(self: *RecordingSession, op: IrOp, swap: bool, f: BinaryFrame, regs: RegWindow, finish: MetaFinish) !?Ref {
         const vb = operandValue(regs, f.lhs);
         const vc = operandValue(regs, f.rhs);
         if (!vb.isNumber() or !vc.isNumber()) {
-            self.abort(.bad_type);
+            const fp = f.frame_proto orelse {
+                self.abort(.bad_type);
+                return null;
+            };
+            if (!isTableValue(vb) and !isTableValue(vc)) {
+                self.abort(.bad_type);
+                return null;
+            }
+            const l: MetaOperand = .{ .ref = try self.operandRef(f.lhs), .v = vb, .od = f.lhs_od };
+            const r: MetaOperand = .{ .ref = try self.operandRef(f.rhs), .v = vc, .od = f.rhs_od };
+            const name: []const u8 = if (op == .lt) "__lt" else "__le";
+            try self.recBinaryMetaCall(fp, name, if (swap) r else l, if (swap) l else r, f.dst, finish);
             return null;
         }
         var rb = try self.operandRef(f.lhs);
@@ -2688,28 +2868,24 @@ pub const RecordingSession = struct {
     fn recCmpBranch(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
         const form = bytecode.cmpBranchOf(instr.op).?;
         const rhs: Operand = if (bytecode.cmpConstant(instr, proto)) |k| .{ .konst = k } else .{ .reg = instr.c };
-        const f: BinaryFrame = .{ .dst = 0, .lhs = .{ .reg = instr.b }, .rhs = rhs, .lhs_od = .b, .rhs_od = .c };
+        const f: BinaryFrame = .{ .dst = 0, .lhs = .{ .reg = instr.b }, .rhs = rhs, .lhs_od = .b, .rhs_od = .c, .frame_proto = proto };
         const vb = operandValue(regs, f.lhs);
         const vc = operandValue(regs, f.rhs);
+        const cb = bytecode.condBranchOf(instr, pc - 1).?;
+        // Doc 77 Phase 4: a metamethod handler the comparison inlines takes
+        // the branch when it returns (`finishMetaCompare`); `ref_or_abort`
+        // is then null, as after an abort.
+        const finish: MetaFinish = if (cb.on_true) .branch_true else .branch_false;
         const holds: bool, const ref_or_abort: ?Ref = switch (form.rel) {
-            .eq => blk: {
-                // Two distinct tables may have `__eq`, whose answer the
-                // recorder cannot see. `eqRef` aborts them unless both fold
-                // to constants; refuse them here outright.
-                if (vb.isHeap() and vb.heapType() == .table and vc.isHeap() and vc.heapType() == .table and !vb.eql(vc)) {
-                    self.abort(.bad_type);
-                    return;
-                }
-                break :blk .{ vb.eql(vc), try self.eqRef(.eq, f, regs) };
-            },
+            .eq => .{ vb.eql(vc), try self.eqRef(.eq, f, regs, finish) },
             // Numbers only past `compareRef`, which `arith` orders exactly.
-            .lt => .{ arith.lt(vb, vc) catch false, try self.compareRef(.lt, false, f, regs) },
-            .le => .{ arith.le(vb, vc) catch false, try self.compareRef(.le, false, f, regs) },
-            .gt => .{ arith.lt(vc, vb) catch false, try self.compareRef(.lt, true, f, regs) },
-            .ge => .{ arith.le(vc, vb) catch false, try self.compareRef(.le, true, f, regs) },
+            .lt => .{ arith.lt(vb, vc) catch false, try self.compareRef(.lt, false, f, regs, finish) },
+            .le => .{ arith.le(vb, vc) catch false, try self.compareRef(.le, false, f, regs, finish) },
+            .gt => .{ arith.lt(vc, vb) catch false, try self.compareRef(.lt, true, f, regs, finish) },
+            .ge => .{ arith.le(vc, vb) catch false, try self.compareRef(.le, true, f, regs, finish) },
         };
         const r = ref_or_abort orelse return;
-        try self.branchOn(r, holds, bytecode.condBranchOf(instr, pc - 1).?, proto, pc);
+        try self.branchOn(r, holds, cb, proto, pc);
     }
 
     // --- index-recording shapes (doc 23 D3) --------------------------------
@@ -2934,7 +3110,7 @@ pub const RecordingSession = struct {
     /// at inline depth > 0, so it has no snapshot of its own and exits
     /// coarse (§7): tier 0 re-runs the whole iteration and calls the
     /// handler once.
-    fn recMetaCall(self: *RecordingSession, frame_proto: *const Proto, rtab: Ref, mt: *table_mod.Table, name: []const u8, args: []const Ref, ret_dest: u16, ret_count: u16, od: OperandDesig) !void {
+    fn recMetaCall(self: *RecordingSession, frame_proto: *const Proto, rtab: Ref, mt: *table_mod.Table, name: []const u8, args: []const Ref, ret_dest: u16, ret_count: u16, od: OperandDesig, finish: MetaFinish) !void {
         if (self.pending_link_close != null or self.precise) return self.abort(.nyi_opcode);
         const key_ref = (try self.foldInternedStr(name)) orelse return self.abort(.has_metatable);
         const handler = mt.get(self.konstValueOf(key_ref).?);
@@ -2959,6 +3135,7 @@ pub const RecordingSession = struct {
             .caller_proto_id = frame_proto.id,
             .call_pc = self.cur_pc - 1,
             .callee = href,
+            .finish = finish,
         };
         self.inline_depth += 1;
         self.base_off = callee_base_off;
@@ -3872,7 +4049,7 @@ pub const RecordingSession = struct {
             }
             if (f.frame_proto) |fp| if (try self.metamethodIsClosure(mt, "__index")) {
                 const args = [_]Ref{ rtab, try self.operandRef(f.key) };
-                return self.recMetaCall(fp, rtab, mt, "__index", &args, f.dst, 1, f.tab_od);
+                return self.recMetaCall(fp, rtab, mt, "__index", &args, f.dst, 1, f.tab_od, .result);
             };
             if (!try self.guardNoMetamethod(rtab, mt, "__index", f.tab_od, f.dst)) return;
         };
@@ -3940,7 +4117,7 @@ pub const RecordingSession = struct {
         self.stampProv(try self.emit(.{ .op = .guard_absent, .a = rtab, .b = rkey }), .present, .none, .neutral);
         if (!hop) {
             const args = [_]Ref{ rtab, try self.operandRef(f.key), try self.refOf(f.val) };
-            return self.recMetaCall(f.frame_proto.?, rtab, mt, "__newindex", &args, 0, 0, f.tab_od);
+            return self.recMetaCall(f.frame_proto.?, rtab, mt, "__newindex", &args, 0, 0, f.tab_od, .result);
         }
         const next = (try self.metaTableHop(rtab, mt, "__newindex", f.hops, f.tab_od)) orelse return;
         var nf = f;
@@ -4204,13 +4381,14 @@ pub const RecordingSession = struct {
 
     /// `eq`/`ne` into `f.dst`.
     pub fn recEq(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow) !void {
-        if (try self.eqRef(op, f, regs)) |r| self.setReg(f.dst, r);
+        if (try self.eqRef(op, f, regs, if (op == .ne) .truthy_not else .truthy)) |r| self.setReg(f.dst, r);
     }
 
     /// The IR value of `eq`/`ne` over `f`'s operands (`f.dst` unused), or
-    /// null after an abort. Numbers, booleans, and folds of constants and of
-    /// operands of differing types; other types abort.
-    fn eqRef(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow) !?Ref {
+    /// null after an abort or when an `__eq` handler was inlined (finished
+    /// as `finish` says, `eqTables`). Numbers, booleans, tables, and folds
+    /// of constants and of operands of differing types; other types abort.
+    fn eqRef(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow, finish: MetaFinish) !?Ref {
         const vb = operandValue(regs, f.lhs);
         const vc = operandValue(regs, f.rhs);
         // Doc 57: value-specialize nil/bool inputs first, so a pinned input
@@ -4230,6 +4408,7 @@ pub const RecordingSession = struct {
             const equal = kb.eql(kc);
             return try self.konst(Value.boolean(if (op == .eq) equal else !equal));
         };
+        if (isTableValue(vb) and isTableValue(vc)) return self.eqTables(op, f, vb, vc, rb, rc, finish);
         if (!vb.isNumber() or !vc.isNumber()) {
             // Doc 57: two booleans whose types are both proven (a konst, or a
             // typed producer — a compare, `not`, a bool-lane load, a bool
@@ -4249,12 +4428,18 @@ pub const RecordingSession = struct {
             // konst (the bytecode literal, or a doc 57 pin), a number (pinned by
             // the guardNum emitted here), or a proven-bool producer. Anything
             // else (an unproven heap/nil value) still aborts.
-            const b_pinned = self.konstValueOf(rb) != null or vb.isNumber() or self.boolTyped(rb);
-            const c_pinned = self.konstValueOf(rc) != null or vc.isNumber() or self.boolTyped(rc);
+            //
+            // A table is pinned by a `guard_table` that allows any
+            // metatable: against a value of another type `__eq` never fires
+            // (`valuesEqual`), so the fold holds whatever its metatable.
+            const b_pinned = self.konstValueOf(rb) != null or vb.isNumber() or self.boolTyped(rb) or isTableValue(vb);
+            const c_pinned = self.konstValueOf(rc) != null or vc.isNumber() or self.boolTyped(rc) or isTableValue(vc);
             const same_class = (vb.isNumber() and vc.isNumber()) or vb.tag == vc.tag;
             if (b_pinned and c_pinned and !same_class) {
                 if (vb.isNumber() and self.konstValueOf(rb) == null) try self.guardNum(rb, vb, .operand_type, f.lhs_od);
                 if (vc.isNumber() and self.konstValueOf(rc) == null) try self.guardNum(rc, vc, .operand_type, f.rhs_od);
+                if (isTableValue(vb)) self.stampProv(try self.emit(.{ .op = .guard_table, .a = rb, .aux = GUARD_TABLE_ANY_META }), .operand_type, f.lhs_od, .neutral);
+                if (isTableValue(vc)) self.stampProv(try self.emit(.{ .op = .guard_table, .a = rc, .aux = GUARD_TABLE_ANY_META }), .operand_type, f.rhs_od, .neutral);
                 return try self.konst(Value.boolean(op == .ne));
             }
             self.abort(.bad_type);
@@ -4273,9 +4458,20 @@ pub const RecordingSession = struct {
             if (!self.active) return;
         }
         if (self.inline_depth > 0) {
-            if (self.frames[self.inline_depth - 1].tostr_answer) {
+            const fr = self.frames[self.inline_depth - 1];
+            if (fr.tostr_answer) {
                 try self.recTostrAnswer(instr, regs);
                 if (!self.active) return;
+            }
+            if (fr.finish != .result) {
+                // Doc 77 §6.3: a compare handler. Its first result is read
+                // in its own frame, which `recReturn` (`ret_count` 0) pops.
+                if (instr.b == bytecode.all_results) return self.abort(.cross_frame);
+                const v = if (instr.b == 0) Value.nil() else regs.get(instr.a);
+                const r = if (instr.b == 0) try self.konst(Value.nil()) else try self.refOf(instr.a);
+                try self.recReturn(instr, multret);
+                if (!self.active) return;
+                return self.finishMetaCompare(fr, r, v);
             }
             return self.recReturn(instr, multret);
         }

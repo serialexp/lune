@@ -9,6 +9,7 @@ const util = @import("interp_testutil.zig");
 const interp = @import("interp.zig");
 const trace_ir = @import("trace_ir.zig");
 const basic = @import("stdlib/basic.zig");
+const bytecode = @import("bytecode.zig");
 
 const Vm = interp.Vm;
 const TraceMode = util.TraceMode;
@@ -1079,4 +1080,180 @@ test "doc 77 Phase 4: a native operator handler, and an operand with no handler,
         \\end)
         \\print(s, ok)
     , "400\tfalse\n");
+}
+
+test "doc 77 Phase 4: __lt and __le in every value and branch form, and == over tables" {
+    // `v > k` asks `__lt(k, v)` and `k >= w` asks `__le(w, k)` (relation
+    // order), which an asymmetric handler tells apart. `v == u` calls
+    // `__eq`; `v == v` and two plain tables compare by identity; a table
+    // against nil folds to false.
+    try expectProgramTuned(
+        \\local function val(x) if type(x) == "table" then return x.x end return x end
+        \\local V = {}
+        \\V.__lt = function(a, b) return val(a) < val(b) end
+        \\V.__le = function(a, b) return val(a) <= val(b) end
+        \\V.__eq = function(a, b) return val(a) == val(b) end
+        \\local v = setmetatable({ x = 3 }, V)
+        \\local w = setmetatable({ x = 4 }, V)
+        \\local u = setmetatable({ x = 3 }, V)
+        \\local plain, other = {}, {}
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  local k = i % 7
+        \\  if v < w then s = s + 1 end
+        \\  if w <= v then s = s + 2 end
+        \\  if v > k then s = s + 4 end
+        \\  if k >= w then s = s + 8 end
+        \\  if v == u then s = s + 16 end
+        \\  if v ~= w then s = s + 32 end
+        \\  if v == v then s = s + 64 end
+        \\  if plain == other then s = s + 128 end
+        \\  if plain ~= plain then s = s + 256 end
+        \\  if v == nil then s = s + 512 end
+        \\  local a, b, c, d, e = v < w, v <= k, v == u, v ~= u, w > v
+        \\  if a then s = s + 1000 end
+        \\  if b then s = s + 2000 end
+        \\  if c then s = s + 4000 end
+        \\  if d then s = s + 8000 end
+        \\  if e then s = s + 16000 end
+        \\end
+        \\print(s)
+    , "4451624\n", .{ .inspect = expectMetaCallRan });
+}
+
+/// Doc 77 §7: the branch a compare handler's result takes is an ordinary
+/// attachable exit that resumes at a successor of the compare-and-branch,
+/// never at the instruction itself (which would call the handler again).
+fn expectCompareBranchAttachable(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectMetaCallRan(vm, mode);
+    if (!recorded(mode)) return;
+    var seen: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        const c = &t.code;
+        for (0..c.instrs.len) |e| {
+            if (c.instrs[e].op != .guard_true and c.instrs[e].op != .guard_false) continue;
+            const b = c.anchorSourcePc(e) orelse continue;
+            if (c.anchor.proto.code[b].op != .jlt) continue;
+            const p = c.exitResumePc(e) orelse continue;
+            const cb = bytecode.condBranchOf(c.anchor.proto.code[b], b).?;
+            try testing.expect(p == b + 1 or p == cb.target);
+            seen += 1;
+        }
+    }
+    try testing.expect(seen > 0);
+}
+
+test "doc 77 §7: a compare handler whose answer turns runs once per iteration, and its branch exit attaches" {
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, function(a, b)
+        \\    c.n = c.n + 1
+        \\    return a.x < b.x
+        \\  end
+        \\end
+        \\local c, h = mk()
+        \\local M = { __lt = h }
+        \\local a = setmetatable({ x = 0 }, M)
+        \\local b = setmetatable({ x = 150 }, M)
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  a.x = i
+        \\  if a < b then s = s + 1 else s = s + 10 end
+        \\end
+        \\print(s, c.n)
+    , "1659\t300\n", .{ .inspect = expectCompareBranchAttachable });
+}
+
+test "doc 77 Phase 4: __eq is asked only for two distinct tables, the first operand's handler first" {
+    // `run(p, p)` and `run(r, r)` never call; `run(r, p)` calls `p`'s
+    // handler (`r`'s metatable has none) until `F.__eq` appears; removing
+    // `E.__eq` leaves identity. Three calls an iteration while one runs.
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, function(a, b) c.n = c.n + 1; return a.k == b.k end
+        \\end
+        \\local c, h = mk()
+        \\local E = { __eq = h }
+        \\local F = {}
+        \\local p = setmetatable({ k = 1 }, E)
+        \\local q = setmetatable({ k = 1 }, E)
+        \\local r = setmetatable({ k = 2 }, F)
+        \\local function run(x, y)
+        \\  local s = 0
+        \\  for i = 1, 100 do
+        \\    if x == y then s = s + 1 end
+        \\    if x ~= y then s = s + 10 end
+        \\    local e = x == y
+        \\    if e then s = s + 100 end
+        \\  end
+        \\  return s
+        \\end
+        \\local r1 = run(p, q)
+        \\local r2 = run(p, p)
+        \\local r3 = run(r, p)
+        \\local r4 = run(r, r)
+        \\F.__eq = function(a, b) return true end
+        \\local r5 = run(r, p)
+        \\E.__eq = nil
+        \\local r6 = run(p, q)
+        \\print(r1, r2, r3, r4, r5, r6, c.n)
+    , "10100\t10100\t1000\t10100\t10100\t1000\t600\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 Phase 4: a compare handler's result is taken for its truthiness" {
+    // `__lt` returns a number (0 included) or nil, and counts its calls
+    // before answering, so the turn to nil exits after the handler's store
+    // and the count says it ran once per iteration. A table result, a
+    // native handler and an allocating one stay with tier 0.
+    try expectProgramTuned(
+        \\local c = { n = 0 }
+        \\local M = {}
+        \\M.__lt = function(a, b)
+        \\  c.n = c.n + 1
+        \\  if a.x > 100 then return nil end
+        \\  return a.x
+        \\end
+        \\local a = setmetatable({ x = 0 }, M)
+        \\local b = setmetatable({ x = 0 }, M)
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  a.x = i % 150
+        \\  if a < b then s = s + 1 end
+        \\end
+        \\print(s, c.n)
+    , "151\t200\n", .{ .inspect = expectMetaCallRan });
+    try expectProgram(
+        \\local T = setmetatable({}, { __le = function(a, b) return { a } end, __lt = rawequal })
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if T <= T then s = s + 1 end
+        \\  if T < T then s = s + 2 end
+        \\end
+        \\print(s)
+    , "600\n");
+}
+
+test "doc 77 Phase 4: a table compared against nil or false records" {
+    try expectProgramTuned(
+        \\local xs = {}
+        \\for i = 1, 100 do xs[i] = (i % 3 == 0) and {} or false end
+        \\local n = 0
+        \\for r = 1, 3 do
+        \\  for i = 1, 100 do
+        \\    local v = xs[i]
+        \\    if v == nil then n = n + 100 end
+        \\    if v ~= false then n = n + 1 end
+        \\  end
+        \\end
+        \\print(n)
+    , "99\n", .{ .record_aborts = true, .inspect = expectNoBadTypeAbort });
+}
+
+/// No recording stopped at a type it could not handle, and a trace ran.
+fn expectNoBadTypeAbort(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    for (vm.trace.abort_log.items) |r| try testing.expect(r.reason != .bad_type);
+    if (executed(mode)) try testing.expect(vm.trace.entries > 0);
 }

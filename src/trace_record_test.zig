@@ -2144,7 +2144,9 @@ test "recEq: doc 57 — an observed bool input vs konst nil pins the input and f
     try testing.expect(state.rec.konstValueOf(r0).?.eql(Value.boolean(false)));
 }
 
-test "recEq: an observed unproven heap value vs konst nil still aborts bad_type" {
+test "recEq: an observed table vs konst nil folds to false behind a guard_table that allows any metatable" {
+    // Doc 77 Phase 4: against a value of another type `__eq` never fires,
+    // so the table's type is the whole proof, whatever its metatable.
     const gpa = testing.allocator;
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
@@ -2152,12 +2154,17 @@ test "recEq: an observed unproven heap value vs konst nil still aborts bad_type"
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
     try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
-    // r1 = observed table: no pin covers a heap value's type here (only the
-    // numeric guards and doc 57's nil/bool pins do), so this stays out of scope.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil(), Value.nil() };
     state.recordInstr(.{ .op = .load_nil, .a = 2 }, winRO(&regs), &proto, 0, Value.nil());
     state.recordInstr(Instr.opABC(.eq, 0, 1, 2), winRO(&regs), &proto, 1, Value.nil());
-    try testing.expect(!state.isRecording());
+    try testing.expect(state.isRecording());
+    var any_meta: usize = 0;
+    for (state.rec.instrs.items) |ins| {
+        try testing.expect(ins.op != .eq);
+        if (ins.op == .guard_table and ins.aux & trace_ir.GUARD_TABLE_ANY_META != 0) any_meta += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), any_meta);
+    try testing.expect(!state.rec.konstValueOf(try state.rec.refOf(0)).?.asBool());
 }
 
 test "per-guard PC recording: guard_int aux carries the bytecode PC" {
