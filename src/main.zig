@@ -108,6 +108,10 @@ const usage =
     \\                       Phase 4 ablation): a hot attachable exit falls back to
     \\                       the coarse deopt instead of resuming mid-iteration in
     \\                       a side trace. On by default since doc 58 B2.
+    \\  --jit-no-loop-lane   a loop entered from tier 0 takes the long entry form
+    \\                       and never the loop lane (doc 87 §5.6). The two make
+    \\                       the same tiering decisions; the switch is for
+    \\                       bisecting and for comparing their --jit-debug logs.
     \\  --trace-hotguard <N>  imply --trace and override the guard-failure threshold
     \\                       for side-trace recording (default 50).  When a specific
     \\                       guard fails this many times, the next back-edge records
