@@ -71,11 +71,12 @@ pub const AbortReason = enum {
     /// sinking machinery handles this; for appends and grids the recorder
     /// aborts instead.
     store_after_load,
-    /// The access would call a metamethod the recorder does not model yet: a
-    /// function `__index`/`__newindex`, `__len` and the operator metamethods
-    /// (doc 77 Phase 4), a non-table `__index`/`__newindex` value, a store
-    /// into a grid hop target, or a metamethod name the heap has not
-    /// interned. Raw paths and table chains record (doc 77 Phases 1 and 3).
+    /// The access would call a metamethod the recorder does not model yet:
+    /// a handler that is not a Lua function (a native, a callable table), a
+    /// non-table `__index`/`__newindex` value that is not a function, a
+    /// store into a grid hop target, or a metamethod name the heap has not
+    /// interned. Raw paths, table chains (doc 77 Phases 1 and 3) and Lua
+    /// function handlers (Phase 4) record.
     has_metatable,
     /// A store's table is frozen (`table.freeze`, doc 76 §5): tier-0 raises.
     readonly_table,
@@ -3111,6 +3112,15 @@ pub const RecordingSession = struct {
     /// coarse (§7): tier 0 re-runs the whole iteration and calls the
     /// handler once.
     fn recMetaCall(self: *RecordingSession, frame_proto: *const Proto, rtab: Ref, mt: *table_mod.Table, name: []const u8, args: []const Ref, ret_dest: u16, ret_count: u16, od: OperandDesig, finish: MetaFinish) !void {
+        return self.recMetaCallAt(frame_proto.num_registers, frame_proto, rtab, mt, name, args, ret_dest, ret_count, od, finish);
+    }
+
+    /// `recMetaCall` with the handler's window `callee_off` registers above
+    /// the calling frame's base, where tier 0 puts it: the window end for a
+    /// `.finish_op` frame (`pushMetaFrame`), and above the argument span
+    /// when a `__call`'s span reaches past it (`enterCallee`, doc 61 P1).
+    fn recMetaCallAt(self: *RecordingSession, callee_off: u32, frame_proto: *const Proto, rtab: Ref, mt: *table_mod.Table, name: []const u8, args: []const Ref, ret_dest: u16, ret_count: u16, od: OperandDesig, finish: MetaFinish) !void {
+        std.debug.assert(callee_off >= frame_proto.num_registers);
         if (self.pending_link_close != null or self.precise) return self.abort(.nyi_opcode);
         const key_ref = (try self.foldInternedStr(name)) orelse return self.abort(.has_metatable);
         const handler = mt.get(self.konstValueOf(key_ref).?);
@@ -3118,7 +3128,7 @@ pub const RecordingSession = struct {
         const cp = function.Closure.fromHeader(handler.asHeap()).proto;
         if (cp.is_vararg) return self.abort(.cross_frame);
         if (self.inline_depth >= MAX_INLINE_DEPTH) return self.abort(.too_deep);
-        const callee_base_off: u32 = self.base_off + frame_proto.num_registers;
+        const callee_base_off: u32 = self.base_off + callee_off;
         if (@as(usize, callee_base_off) + cp.num_registers > self.reg_map.len)
             return self.abort(.frame_bounds);
         const href = (try self.loadMetaField(rtab, mt, key_ref, od)) orelse return;
@@ -5323,8 +5333,8 @@ pub const RecordingSession = struct {
     /// temporaries on the single anchor `RegWindow` (see the safety rails, doc 10).
     ///
     /// Aborts cleanly (tier-0 owns the loop) on every shape we don't inline:
-    /// a host (`native`) callee is a trace barrier; a non-callable / `__call`
-    /// metamethod, a vararg callee, and exceeding `MAX_INLINE_DEPTH` or the
+    /// a host (`native`) callee is a trace barrier; a non-callable value (a
+    /// table goes to `recCallMeta`, doc 77 §6.7), a vararg callee, and exceeding `MAX_INLINE_DEPTH` or the
     /// `reg_map` reservation all abort. Dynamic multret windows (doc 27) no
     /// longer abort per se: an `all_results` ARGUMENT window resolves its fixed
     /// count against the recorder's multret shadow (`multret`, set by the
@@ -5372,25 +5382,13 @@ pub const RecordingSession = struct {
                 return self.abort(.host_barrier);
             },
             .function => {},
-            // `__call` on a table/userdata, or anything else callable only via a
-            // metamethod, is not a plain Lua-closure call. Not inlined.
+            // Doc 77 §6.7: a table called through its `__call`.
+            .table => return self.recCallMeta(instr, regs, proto, multret),
+            // Anything else callable only via a metamethod (userdata) is not
+            // a plain Lua-closure call. Not inlined.
             else => return self.abort(.cross_frame),
         }
-        // Doc 27 D3: a dynamic argument window resolves against the multret
-        // shadow — `top - (a + 1)`, the same arithmetic tier-0 runs against
-        // `reg_top` (`interp.zig` `.call`), in recorder frame-space (producer and
-        // consumer always share a frame, so `base` never enters). All arithmetic
-        // in u32 and fail-closed below the `all_results` sentinel (§3a). A
-        // dynamic RESULT window needs nothing here: `ret_count = instr.c` stores
-        // the sentinel verbatim and `recReturn` resolves it (D4).
-        const nargs: u32 = if (instr.b == bytecode.all_results) blk: {
-            const top = multret orelse return self.abort(.cross_frame);
-            const first_arg = @as(u32, instr.a) + 1;
-            if (top < first_arg) return self.abort(.cross_frame);
-            const n = top - first_arg;
-            if (n >= bytecode.all_results) return self.abort(.cross_frame);
-            break :blk n;
-        } else instr.b;
+        const nargs = callArgCount(instr, multret) orelse return self.abort(.cross_frame);
 
         const cl = function.Closure.fromHeader(callee.asHeap());
         const cp = cl.proto;
@@ -5475,6 +5473,65 @@ pub const RecordingSession = struct {
         };
         self.inline_depth += 1;
         self.base_off = callee_base_off;
+    }
+
+    /// Doc 27 D3: the argument count of `call a, b, c`. A dynamic argument
+    /// window resolves against the multret shadow — `top - (a + 1)`, the
+    /// same arithmetic tier-0 runs against `reg_top` (`interp.zig` `.call`),
+    /// in recorder frame-space (producer and consumer always share a frame,
+    /// so `base` never enters). All arithmetic in u32 and fail-closed below
+    /// the `all_results` sentinel (§3a): null, and the caller aborts
+    /// `.cross_frame`. A dynamic RESULT window needs nothing here:
+    /// `ret_count = instr.c` stores the sentinel verbatim and `recReturn`
+    /// resolves it (D4).
+    fn callArgCount(instr: Instr, multret: ?u32) ?u32 {
+        if (instr.b != bytecode.all_results) return instr.b;
+        const top = multret orelse return null;
+        const first_arg = @as(u32, instr.a) + 1;
+        if (top < first_arg) return null;
+        const n = top - first_arg;
+        if (n >= bytecode.all_results) return null;
+        return n;
+    }
+
+    /// Doc 77 §6.7: `call a, b, c` on a table, which tier 0 calls through
+    /// its `__call` (`callTail`): a Lua handler is entered as an ordinary
+    /// frame after the span `[obj, args...]` moves up one slot and the
+    /// handler takes `R[a]`, so it runs as `h(obj, args...)` and its results
+    /// land in the call's own window. The recording makes the same move in
+    /// the caller's registers and inlines the handler through `recMetaCall`
+    /// (loaded from the metatable, pinned by `guard_func`). Stays with tier
+    /// 0: no `__call` (tier 0 raises, `bad_type`), a native or table
+    /// handler (`has_metatable`), and a dynamic argument span past the
+    /// caller's window, which `recCall` refuses too. A fixed span ends at
+    /// the window's end or below it, so the move takes at most one slot
+    /// past it; tier 0 then puts the handler's window above the span
+    /// (`enterCallee`, doc 61 P1), and so does the recording. That slot is
+    /// no register of the caller, and the handler's window does not
+    /// overlap it.
+    fn recCallMeta(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, multret: ?u32) !void {
+        const nargs = callArgCount(instr, multret) orelse return self.abort(.cross_frame);
+        const a: u32 = instr.a;
+        if (a + 1 + nargs > proto.num_registers) return self.abort(.frame_bounds);
+        const span_end = a + 2 + nargs;
+        const obj = try self.refOf(instr.a);
+        const mt = (try self.metaReceiver(obj, regs.get(instr.a), "__call", .a, instr.a)) orelse return self.abort(.bad_type);
+        const args = try self.gpa.alloc(Ref, nargs + 1);
+        defer self.gpa.free(args);
+        args[0] = obj;
+        var k: u32 = 0;
+        while (k < nargs) : (k += 1) args[1 + k] = try self.refOf(@intCast(a + 1 + k));
+        // Tier 0's move: `[obj, args...]` one slot up, the caller's
+        // registers only (the slot past the window is the span's, which the
+        // handler's frame reads as its arguments).
+        k = 0;
+        while (k <= nargs and a + 1 + k < proto.num_registers) : (k += 1) self.setReg(@intCast(a + 1 + k), args[k]);
+        const depth = self.inline_depth;
+        try self.recMetaCallAt(@max(proto.num_registers, span_end), proto, obj, mt, "__call", args, instr.a, instr.c, .a, .result);
+        if (self.inline_depth == depth) return;
+        // And the handler in `R[a]`, which its results overwrite.
+        const fr = self.frames[depth];
+        self.defineSlotAbs(fr.base_off + a, fr.callee.?);
     }
 
     /// Doc 66 P1: `itern a, c`, the generic-`for` step. With the `next`

@@ -4,8 +4,8 @@ Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
 decided; Phases 0–3 landed (2026-11-11); Phase 4 started (computed-callee
 upvalue reads and the anchor-window alias, §6.6; `__index`/`__newindex`
 functions, §6.1; arithmetic, bitwise, unary and `__len` handlers, §6.4;
-`__lt`/`__le`/`__eq` and the compare-and-branch forms, §6.4);
-the rest of
+`__lt`/`__le`/`__eq` and the compare-and-branch forms, §6.4; `__call`,
+§6.7); the rest of
 Phases 4–7 outstanding (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-11
@@ -260,6 +260,28 @@ land; move whole phases to Done once everything inside them is checked.
     abort at that opcode, so the next construct to start recording does
     not move them again.
   - [x] measured (§10.11).
+- [x] **Phase 4, sixth part — `__call`** (§6.7, 2026-11-11). A call of a
+  table records as an inlined call of its metatable's `__call`
+  (`recCallMeta` in `trace_recorder.zig`), as `callTail` enters a Lua
+  handler: the span `[obj, args...]` moves up one slot in the caller's
+  registers, the handler takes `R[a]`, and it runs as `h(obj, args...)`
+  with the call's own result window (`ret_count` is the call's, a dynamic
+  one included), through `recMetaCallAt`. The handler is loaded from the
+  metatable and pinned (`guard_func`), as every metamethod; a table with
+  no metatable or no `__call` aborts `bad_type`, as tier 0 raises.
+  - [x] a span the move pushes one slot past the caller's window (a call
+    at the register top, the common statement call): the handler's window
+    sits above the span, where `enterCallee` puts it (§6.7 amendment).
+  - [x] a dynamic argument window resolves from the multret shadow, as
+    `recCall` resolves its own (`callArgCount`, now shared).
+  - [x] stays with tier 0: a native handler (`has_metatable`), a vararg
+    handler (`cross_frame`), userdata and other non-table callees.
+  - [x] gated in `src/interp_meta_trace_test.zig`: two, one and no results
+    with a counting handler and no recording stopped at a call; a handler
+    replaced in its metatable and a metatable replaced between entries;
+    `__call` removed, so tier 0 raises; the tier-0 cases, and a callable
+    table as a generic-`for` iterator.
+  - [x] measured (§10.12).
 
 ### Outstanding
 
@@ -278,7 +300,6 @@ land; move whole phases to Done once everything inside them is checked.
   - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
     of a cell with an alias class, through a computed callee still abort
     `.cross_frame`
-  - [ ] `__call` (§6.7)
 - [ ] **Phase 5 — `__close`** (§8): doc 76's Phase 3b, with the
   "closes done, return only" completion.
 - [ ] **Phase 6 — doc amendments** (§9.3): doc 61 §2 and F3, the
@@ -729,6 +750,21 @@ instruction is a `.call`, so its result window is already the caller's;
 tier 0 runs the handler through `callValue`, so the pending-instruction
 entry has the `result`-like finish of a call with its result count.
 
+Amendment (2026-11-11, Phase 4 sixth part): since doc 68 P2 tier 0 enters
+a Lua `__call` handler as an ordinary frame (`callTail`), not through
+`callValue`: it moves the span up one slot, puts the handler in `R[a]` and
+calls it with one more argument. The recording mirrors that move and
+inlines the handler with the call's own `ret_dest`/`ret_count`, so no
+pending-instruction entry is needed (finish `result`). A call at the
+register top moves its span one slot past the caller's window; tier 0 then
+puts the handler's window above the span
+(`max(base + nreg, base + a + 1 + nargs)`, `enterCallee`), and the
+recording puts the inlined frame at the same offset (`recMetaCallAt`), so
+the recorder's frame windows match the slab positions an open upvalue is
+compared against. Refusing that span instead (`frame_bounds`, as `recCall`
+refuses a dynamic span past the window) left every statement call to
+tier 0.
+
 ## 7. Exits, by route (D4)
 
 | route | where | contract |
@@ -1033,6 +1069,21 @@ arithmetic handlers already in both), load 15–18.
 ~70 cycles per traced iteration (five handler calls each), no recording
 aborts. Before, the loop aborted at `lim < acc` and the JIT run was slower
 than tier 0.
+
+### 10.12 After `__call` (2026-11-11)
+
+ReleaseFast builds with and without this part, load 6–8. No bench program
+calls a table, so a probe: `s = s + o(i)` with a `__call` reading a field
+of its table, 2M iterations, two runs each:
+
+| | t0 s | jit s |
+|---|---|---|
+| before (aborts `cross_frame` at the call) | 0.05, 0.06 | 0.14, 0.13 |
+| after | 0.05, 0.05 | < 0.01, < 0.01 |
+
+`--jit-stats` after: ~1.9 cycles per traced iteration. The handler's load
+from the metatable and its `guard_func` are in the preheader; its read of
+`self.k` stays in the body (`href` on the table, its guards).
 
 ## 11. Open questions for review
 

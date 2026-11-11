@@ -1257,3 +1257,84 @@ fn expectNoBadTypeAbort(vm: *Vm, mode: TraceMode) anyerror!void {
     for (vm.trace.abort_log.items) |r| try testing.expect(r.reason != .bad_type);
     if (executed(mode)) try testing.expect(vm.trace.entries > 0);
 }
+
+/// A function metamethod was inlined and no recording stopped at a call.
+fn expectMetaCallRanNoCallAbort(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectMetaCallRan(vm, mode);
+    if (recorded(mode)) for (vm.trace.abort_log.items) |r| try testing.expect(r.op != .call);
+}
+
+test "doc 77 §6.7: a table's __call is called as h(obj, args...) and its results land in the call's window" {
+    // Two results, one, and none (a statement call, whose shifted span
+    // reaches one slot past the frame: the handler's window sits above it,
+    // as tier 0 puts it). The handler counts its calls in a field.
+    try expectProgramTuned(
+        \\local C = {}
+        \\C.__call = function(self, a, b)
+        \\  self.n = self.n + 1
+        \\  return self.k * a + (b or 0), a
+        \\end
+        \\local o = setmetatable({ n = 0, k = 3 }, C)
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  local x, y = o(i, 2)
+        \\  s = s + x + y
+        \\  s = s + o(1)
+        \\  o(i)
+        \\end
+        \\print(s, o.n)
+    , "182100\t900\n", .{ .record_aborts = true, .inspect = expectMetaCallRanNoCallAbort });
+}
+
+test "doc 77 §6.7: a changed or removed __call exits to tier 0" {
+    // The handler is replaced in its metatable, then the table's metatable
+    // is replaced; removing `__call` makes tier 0 raise at the call.
+    try expectProgramTuned(
+        \\local C = {}
+        \\C.__call = function(self, a) return a + 1 end
+        \\local o = setmetatable({}, C)
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  if i == 100 then C.__call = function(self, a) return a * 2 end end
+        \\  if i == 200 then setmetatable(o, { __call = function(self, a, b) return (b or 7) - a end }) end
+        \\  s = s + o(i)
+        \\end
+        \\local M = { __call = function(_, x) return x end }
+        \\local q = setmetatable({}, M)
+        \\local ok, err = pcall(function()
+        \\  local z = 0
+        \\  for i = 1, 300 do
+        \\    if i == 250 then M.__call = nil end
+        \\    z = z + q(i)
+        \\  end
+        \\  return z
+        \\end)
+        \\print(s, ok, (string.find(err, "attempt to call a table value", 1, true)) ~= nil)
+    , "10406\tfalse\ttrue\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 §6.7: a native or vararg __call stays with tier 0" {
+    try expectProgram(
+        \\local N = setmetatable({}, { __call = rawequal })
+        \\local t = 0
+        \\for i = 1, 300 do
+        \\  if N(N) then t = t + 1 end
+        \\end
+        \\local m = setmetatable({}, { __call = function(self, ...) return ... end })
+        \\local function three(i) return i, i + 1, i + 2 end
+        \\local w = 0
+        \\for i = 1, 300 do
+        \\  local a, b, c = m(three(i))
+        \\  w = w + a + b + c
+        \\end
+        \\local it = setmetatable({ lim = 5 }, { __call = function(self, st, c)
+        \\  if c >= self.lim then return nil end
+        \\  return c + 1
+        \\end })
+        \\local u = 0
+        \\for r = 1, 100 do
+        \\  for c in it, nil, 0 do u = u + c end
+        \\end
+        \\print(t, w, u)
+    , "300\t136350\t1500\n");
+}
