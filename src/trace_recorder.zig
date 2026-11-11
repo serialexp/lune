@@ -7519,12 +7519,22 @@ pub const RecordingSession = struct {
     ///     `.aliased_input`. A cell open below the anchor stays live and
     ///     unwritten for the whole run, so it reads like a closed one;
     ///   * nil, userdata or another untraced value → `.bad_type`;
-    ///   * an anchor window wider than `UvloadAux` holds → `.input_cap`.
+    ///   * an anchor window wider than `UvloadAux` holds → `.input_cap`;
+    ///   * an upvalue store is pending → `.store_fwd_ambiguity`. The store is
+    ///     sunk below the read, and a closure of the same proto can reach the
+    ///     stored cell at run time, whatever cell the recording observed. The
+    ///     check comes before the dedup, so a repeat read after the store is
+    ///     refused too.
     /// A cell that already has an alias class (a recorded store) never
     /// reaches here: `recInputGet` sends it to `recUpvalLoad`, which aborts a
     /// computed callee `.cross_frame`, as does a `set_upval` through one.
     fn recComputedCalleeUpval(self: *RecordingSession, dest: u16, source: u16, callee_ref: Ref, resolved: Value) !void {
         if (self.context.upval_cell == null) return self.abort(.nyi_opcode);
+        for (self.pending_stores.items) |ps| {
+            if (ps.op != .ustore) continue;
+            self.dbg("uvload: an upvalue store is pending; the computed callee's cell may be it", .{});
+            return self.abort(.store_fwd_ambiguity);
+        }
         if (self.context.upval_open) |open_idx| {
             if (open_idx >= self.anchor_abs_base) return self.abort(.aliased_input);
         }

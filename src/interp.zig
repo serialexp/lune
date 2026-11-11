@@ -1892,6 +1892,8 @@ pub const Vm = struct {
         var count: usize = proto.num_registers;
         for (ct.inputs) |seed| count = @max(count, @as(usize, seed.slot) + 1);
         if (base + count > self.regCapacity()) return null;
+        var classes: usize = 0;
+        var uv_snaps: usize = 0;
         for (ct.inputs) |seed| {
             // Doc 43 P5: an `upvalue_cell` seed resolves `&cell.loc.closed` (a
             // `*Value`) — writer paths stash it raw (tagged `.int`, the
@@ -1909,9 +1911,11 @@ pub const Vm = struct {
                     if (self.regGet(base + seed.slot).payload.bits != bits) return null;
                 } else {
                     self.regSet(base + seed.slot, Value{ .tag = .int, .payload = .{ .bits = bits } });
+                    classes += 1;
                 }
                 continue;
             }
+            if (seed.kind == .upvalue or seed.kind == .callee_upvalue) uv_snaps += 1;
             // Doc 53: validation-only — re-prove the open-cell↔anchor-slot
             // relation for the canonicalized upvalue read; any failure declines
             // the whole candidate (same grammar as `upvalue_cell`, same reason:
@@ -1957,6 +1961,9 @@ pub const Vm = struct {
                 .globals => Value.heap(&self.globals.header),
             };
             self.regSet(base + seed.slot, v);
+        }
+        if (classes > 1 or (classes > 0 and uv_snaps > 0)) {
+            if (!self.upvalueClassesDisjoint(base, closure, ct)) return null;
         }
         return self.frameWindow(base, count);
     }
@@ -2011,6 +2018,44 @@ pub const Vm = struct {
         };
     }
 
+    /// Doc 43 P5 (amended 2026-11-12): re-prove the record-time NO-alias
+    /// relations of the trace's upvalue alias classes, the counterpart of the
+    /// verifier seeds' MUST-alias proof. The recorder keys a class on the
+    /// observed cell, so two classes, or a class and an upvalue snapshot
+    /// (`.upvalue`/`.callee_upvalue`), were distinct cells at record time,
+    /// and two things rely on it: a read of one class never forwards from a
+    /// pending store to another (`forwardPendingUload`), and no snapshot
+    /// reads a cell the trace writes (`snapshot_read_cells`). The paths are
+    /// resolved afresh at each entry, so a same-proto closure in a callee
+    /// slot can reach another class's cell; the candidate then declines, as
+    /// a verifier mismatch does. Called after the seed loop, so every writer
+    /// and callee slot is already in place. Pure reads; O(classes × upvalue
+    /// seeds), and only for a trace with a class and a second upvalue seed.
+    fn upvalueClassesDisjoint(self: *const Vm, base: usize, closure: *const function.Closure, ct: *const trace.TraceCode) bool {
+        for (ct.inputs, 0..) |w, i| {
+            if (w.kind != .upvalue_cell or w.verify) continue;
+            const bits = self.regGet(base + w.slot).payload.bits;
+            for (ct.inputs, 0..) |s, j| {
+                const other: u64 = switch (s.kind) {
+                    // Each pair of writers once; a verifier agrees with its own.
+                    .upvalue_cell => if (s.verify or j <= i) continue else self.regGet(base + s.slot).payload.bits,
+                    .upvalue => self.resolveUpvalueCellBits(base, closure, .{
+                        .kind = .upvalue_cell,
+                        .source = s.source,
+                        .slot = s.slot,
+                        .callee_slot = trace.UPVALUE_CELL_ANCHOR,
+                    }) orelse continue,
+                    // An open cell is never a class's (classes are closed), and
+                    // a non-function callee is the callee guard's to exit on.
+                    .callee_upvalue => self.resolveUpvalueCellBits(base, closure, s) orelse continue,
+                    else => continue,
+                };
+                if (other == bits) return false;
+            }
+        }
+        return true;
+    }
+
     /// Doc 22 §B.2: the C-ABI seeding twin of `seedTraceInputs`, installed once
     /// into `NativeSeedCtx.seed_fn` at VM init. Called from a seeded page's
     /// entry prologue (B-ii) and from `driveChain`'s tier-1a seeding (B-iii),
@@ -2054,6 +2099,8 @@ pub const Vm = struct {
         }
         if (ctx.base + count > ctx.reg_capacity) return trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
         var ok = true;
+        var classes: usize = 0;
+        var uv_snaps: usize = 0;
         for (ct.inputs, 0..) |seed, i| {
             if (!plan.isActive(i)) continue;
             // Doc 43 P5: upvalue_cell resolution/verification failure declines
@@ -2068,9 +2115,11 @@ pub const Vm = struct {
                         return trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
                 } else {
                     self.regSet(ctx.base + seed.slot, Value{ .tag = .int, .payload = .{ .bits = bits } });
+                    classes += 1;
                 }
                 continue;
             }
+            if (seed.kind == .upvalue or seed.kind == .callee_upvalue) uv_snaps += 1;
             // Doc 53: same validation + decline grammar as `seedTraceInputs`'s
             // arm — whole-candidate decline, nothing to re-derive from.
             if (seed.kind == .upvalue_slot_alias) {
@@ -2103,6 +2152,11 @@ pub const Vm = struct {
                 .globals => Value.heap(&self.globals.header),
             };
             self.regSet(ctx.base + seed.slot, v);
+        }
+        // Every upvalue seed is active (`computeSeedPlan`), so the proof sees
+        // the same seeds as `seedTraceInputs`'s.
+        if (classes > 1 or (classes > 0 and uv_snaps > 0)) {
+            if (!self.upvalueClassesDisjoint(ctx.base, closure, ct)) return trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
         }
         return if (ok) trace.NativeSeedCtx.SEED_OK else trace.NativeSeedCtx.SEED_HASH_DECLINE;
     }

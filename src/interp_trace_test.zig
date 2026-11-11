@@ -3836,6 +3836,121 @@ test "doc 77 §6.6 end-to-end: a same-proto closure swap reads the new closure's
     , "101990\n");
 }
 
+test "doc 77 §6.6 end-to-end: a method's upvalue read after a pending upvalue store; all ten legs" {
+    // `c = c + 1` is `run`'s own cell, its store sunk below the read of
+    // `f`'s cell. Recorded with `o.get` over another `make`'s cell, the
+    // trace then meets `get1`, a closure of the same proto over `c` itself:
+    // the read must see the iteration's store. (It read the cell's old
+    // value, before the recorder refused the read while a store is pending.)
+    try expectProgram(
+        \\local function make()
+        \\  local c = 0
+        \\  local o = {}
+        \\  local function get() return c end
+        \\  local function run(n)
+        \\    local s = 0
+        \\    for i = 1, n do
+        \\      local f = o.get
+        \\      c = c + 1
+        \\      s = s + f()
+        \\    end
+        \\    return s
+        \\  end
+        \\  return get, run, o
+        \\end
+        \\local get1, run1, o1 = make()
+        \\local get2, run2, o2 = make()
+        \\o1.get = get2
+        \\print(run1(300))
+        \\o1.get = get1
+        \\print(run1(300))
+    , "0\n135150\n");
+}
+
+test "doc 43 P5: two upvalue alias classes that reach one cell at entry decline it; all ten legs" {
+    // `run`'s `c` (the anchor path) and `G`'s cell (a callee-slot path) were
+    // two cells when the loop recorded, so the trace treats them as two
+    // alias classes. The second call puts a closure over `run`'s own `c` in
+    // `G`: the two paths now reach one cell, and the entry must decline
+    // instead of losing one of the two stores.
+    try expectProgram(
+        \\local function make()
+        \\  local c = 0
+        \\  local function bump() c = c + 10; return c end
+        \\  local function run(n)
+        \\    local s = 0
+        \\    for i = 1, n do
+        \\      c = c + 1
+        \\      s = s + G()
+        \\    end
+        \\    return s, c
+        \\  end
+        \\  return bump, run
+        \\end
+        \\local bump1, run1 = make()
+        \\local bump2, run2 = make()
+        \\G = bump2
+        \\print(run1(300))
+        \\G = bump1
+        \\print(run1(300))
+    , "451500\t300\n586650\t3600\n");
+}
+
+test "doc 43 P5: an upvalue snapshot of a cell an alias class writes declines the entry; all ten legs" {
+    // `run` reads its `c` as a per-entry snapshot (nil is never routed
+    // through a load); `put` writes its own cell through a callee-slot
+    // alias class. Once `G` is a closure over `run`'s `c`, the snapshot
+    // would go stale at the first store: the entry must decline.
+    try expectProgram(
+        \\local function make()
+        \\  local c = nil
+        \\  local function put(v) c = v; return 1 end
+        \\  local function run(n)
+        \\    local s = 0
+        \\    for i = 1, n do
+        \\      if c == nil then s = s + 1 else s = s + 100 end
+        \\      s = s + G(i)
+        \\    end
+        \\    return s
+        \\  end
+        \\  return put, run
+        \\end
+        \\local put1, run1 = make()
+        \\local put2, run2 = make()
+        \\G = put2
+        \\print(run1(300))
+        \\G = put1
+        \\print(run1(300))
+    , "600\n30201\n");
+}
+
+test "doc 43 P5: a callee's upvalue snapshot of a cell an alias class writes declines the entry; all ten legs" {
+    // The snapshot is `H`'s (a callee-slot `callee_upvalue` seed), the class
+    // `G`'s. Once `G` is `put1`, both reach `peek1`'s cell.
+    try expectProgram(
+        \\local function make()
+        \\  local c = nil
+        \\  local function put(v) c = v; return 1 end
+        \\  local function peek() if c == nil then return 1 end return 100 end
+        \\  return put, peek
+        \\end
+        \\local put1, peek1 = make()
+        \\local put2, peek2 = make()
+        \\local function run(n)
+        \\  local s = 0
+        \\  for i = 1, n do
+        \\    s = s + H() + G(i)
+        \\  end
+        \\  return s
+        \\end
+        \\H = peek1
+        \\G = put2
+        \\print(run(300))
+        \\G = put1
+        \\print(run(300))
+    , "600\n30201\n");
+}
+
 test "doc 77 §6.6 end-to-end: per-object closures of one proto, mixed value types; all ten legs" {
     // One proto, many closures, alternating per iteration: an int, a float
     // and a string-valued cell. The tag exit takes the type changes.

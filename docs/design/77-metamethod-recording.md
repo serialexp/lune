@@ -1,15 +1,14 @@
 # 77 — Recording metamethods — Design
 
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
-decided; Phases 0–3 landed (2026-11-11); Phase 4 started (computed-callee
-upvalue reads and the anchor-window alias, §6.6; `__index`/`__newindex`
-functions, §6.1; arithmetic, bitwise, unary and `__len` handlers, §6.4;
-`__lt`/`__le`/`__eq` and the compare-and-branch forms, §6.4; `__call`,
-§6.7; a function `__index` under a fused read, §6.3; the fused store
-into a plain table); Phase 5's `__close` recording landed (2026-11-12),
-its "closes done, return only" completion outstanding; Phase 6 landed
-(2026-11-12); the rest of Phases 4, 5 and 7 outstanding (doc 68 P2, which
-Phase 4 waits on, has landed)
+decided; Phases 0–3 landed (2026-11-11); Phase 4 landed (2026-11-12:
+computed-callee upvalue reads and the anchor-window alias, §6.6;
+`__index`/`__newindex` functions, §6.1; arithmetic, bitwise, unary and
+`__len` handlers, §6.4; `__lt`/`__le`/`__eq` and the compare-and-branch
+forms, §6.4; `__call`, §6.7; function `__index` under fused reads and
+stores, §6.3), its computed-callee upvalue writes deferred; Phase 5's
+`__close` recording landed (2026-11-12), its "closes done, return only"
+completion outstanding; Phase 6 landed (2026-11-12); Phase 7 outstanding
 Owner: Bart
 Last updated: 2026-11-12
 
@@ -138,6 +137,10 @@ land; move whole phases to Done once everything inside them is checked.
     (`.aliased_input`) and nil or untraced values (`.bad_type`);
   - [x] LICM hoists a `uvload` of a hoisted closure when the trace has no
     `ustore`;
+  - [x] fix (2026-11-12): a `uvload` recorded while an upvalue store is
+    pending aborts `.store_fwd_ambiguity` (§6.6, second follow-up); it had
+    read the cell's old value when a same-proto closure reached the stored
+    cell;
   - [x] gated in `src/interp_meta_trace_test.zig` (closed cell, hoisted; a
     `ustore` keeps it in the body; a cell open below the anchor, changed
     between entries; the anchor-window alias aborts; table, string and
@@ -400,6 +403,16 @@ land; move whole phases to Done once everything inside them is checked.
   `src/interp_native_test.zig` ("fused index: a store …", four tests; the
   `no_grid` guard and the `gridPlan` refusal were each removed by hand and
   a test failed).
+- [x] **Phase 4 — function metamethods as inlined calls** (§6, closed
+  2026-11-12; its parts are the bullets above). Computed-callee upvalue
+  writes are deferred (Outstanding).
+  - [x] doc 68 P2 landed: tier 0 runs metamethods as continuation frames,
+    and §6.3's pending-instruction stages mirror its `finish_op` stages
+  - [x] the pending-instruction stack (§6.3) and its stage transitions:
+    the fused read's handler stage landed as a frame finish (seventh part,
+    §6.3 second amendment); the fused store's (tenth part) and
+    `__close`'s (Phase 5, first part) landed too. The "closes done, return
+    only" completion is Phase 5's bullet under Outstanding.
 
 ### Outstanding
 
@@ -409,18 +422,6 @@ land; move whole phases to Done once everything inside them is checked.
   `__index` hop ending in an array read (`aref`/`guard_bounds`/
   `guard_present`/`aload`) keeps that read in the body. The native
   preheader cannot home an `aref`.
-- [ ] **Phase 4 — function metamethods as inlined calls** (§6). Starts
-  after doc 68 P2 (Q1).
-  - [x] doc 68 P2 landed: tier 0 runs metamethods as continuation frames,
-    and §6.3's pending-instruction stages mirror its `finish_op` stages
-  - [x] the pending-instruction stack (§6.3) and its stage transitions:
-    the fused read's handler stage landed as a frame finish (seventh part,
-    §6.3 second amendment); the fused store's (tenth part) and
-    `__close`'s (Phase 5, first part) landed too. The "closes done, return
-    only" completion is Phase 5's bullet below.
-  - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
-    of a cell with an alias class, through a computed callee still abort
-    `.cross_frame`
 - [ ] **Phase 5 — the "closes done, return only" completion** (§8): a
   depth-0 `ret_close` of a one-shot recording still ends the trace before
   its closes (the interim §8 allows; see the first part under Done). The
@@ -428,6 +429,10 @@ land; move whole phases to Done once everything inside them is checked.
   return.
 - [ ] **Phase 7 — measured** (§10): the Phase 0 programs after each phase,
   and `just bench` on the pinned pool.
+- [ ] **Defer — computed-callee upvalue writes** (§6.6, second follow-up):
+  a `set_upval`, and a read of a cell with an alias class, through a
+  computed callee still abort `.cross_frame`. No bench or board program
+  hits it (2026-11-12); the corrected design is recorded in §6.6.
 - [ ] **Defer — allocating handlers** (Q5, §2.1): doc 78 (allocation in
   inlined calls), parked.
 - [ ] **Defer — hash insertion on trace.** An absent string-key store
@@ -870,6 +875,33 @@ lives, which nothing on a trace changes: cells close when their scope
 ends, and a scope a trace runs to its end that has a captured local also
 makes the closure that captured it, which no recording admits. So LICM
 hoists it with its closure, and a run checks it once per entry.
+
+**Second follow-up (2026-11-12): a read after a pending store, and the
+writes.** The proto-only argument above covers what a read finds, not when
+it runs. A `ustore` after a heap load is sunk below every guard (C1), so a
+`uvload` recorded after it reads the cell before the store lands. With the
+proto pinned and nothing about the cell recorded, any closure of the proto
+may reach the stored cell: a loop doing `c = c + 1; s = s + o.get()`,
+recorded with `o.get` over another cell, read `c`'s old value once `o.get`
+closed over `c` itself (134851 against tier 0's 135150). The bug came
+with `uvload`: before it (dd1444d) the read aborted and the loop printed
+135150. The recorder now refuses the read while any upvalue store is pending
+(`.store_fwd_ambiguity`), before the dedup, so a repeat read after the
+store is refused too. A read before the store and a store before the read
+in program order with no heap load between them (an unsunk store) both
+stay correct and record.
+
+Writes stay aborting. Bart first chose a "may-alias barrier": an unsunk
+store through the closure ref, aliasing every class. That does not hold: a
+computed callee comes from a heap load, so a store done in place runs twice
+when a later guard exits coarse and tier 0 re-runs the iteration (C1). The
+sound form is a sunk `uvstore` that, while pending, lets an upvalue read
+forward only from the same (closure ref, index) and aborts on any other
+upvalue read; and since its cell may be any cell of any closure of the
+proto, the trace may hold no upvalue snapshot at all (a nil- or
+function-valued snapshot is never routed through a load). No bench or
+board program hits the abort (`--dump-aborts` over `bench/`, 2026-11-12),
+so Bart left the choice to judgement and it is deferred with that design.
 
 ### 6.7 `__call`
 

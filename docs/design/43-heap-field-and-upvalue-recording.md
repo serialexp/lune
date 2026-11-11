@@ -11,7 +11,7 @@ review rounds folded in (codex + technical-architect; ledger at bottom).
 The adversarial sweep (a01–a20) is permanent in `trace_p0_alias_test.zig`,
 green on all ten legs.**
 Owner: Bart
-Last updated: 2026-11-11
+Last updated: 2026-11-12
 
 Prerequisite reading: doc 10 (cross-frame tracing, input seeds, `guard_func`),
 doc 11 (hash-field tracing), doc 32 (value-lane scalar access — the exec-log
@@ -192,6 +192,15 @@ to Done once everything inside a phase is checked.
       loops keep the free snapshot hoist; function/table reads always stay
       snapshots. The scalar bar precedes the mutable-read bar in
       `recSetUpval` so unfixable shapes never memo a pointless retry.
+- [x] **Fix (2026-11-12): the NO-alias half of the class relation is
+      re-proven at entry** (§8 follow-up). Entry proved only MUST-alias
+      (verifier paths agree); two classes, or a class and an upvalue
+      snapshot, that reached one cell at run time lost a store or read a
+      stale snapshot, in tier-1a and native alike. `upvalueClassesDisjoint`
+      (`interp.zig`, both seeding twins) declines the entry instead. Tests:
+      three ten-leg e2e programs in `interp_trace_test.zig` (class×class,
+      class×anchor snapshot, class×callee snapshot), each checked by
+      breaking its arm.
 
 ### Outstanding
 - [ ] **Open question — P0a scope.** Precise anchor-base aliasing check vs
@@ -624,6 +633,35 @@ heap values is deferred with its own bullet).
   it records since 2026-11-09, doc 81 §7.1), heap-valued
   stores (deferred), `close_upvalues` and on-trace `.closure` (the euler14
   arc), stores where the recorder can't resolve the cell (MAY class).
+
+**Follow-up (2026-11-12): NO-alias is a relation to prove, not a record-time
+fact.** The first bullet's "distinct observed cells are NO-alias" held only
+at record time, and entry re-proved only the MUST half. A path re-resolves
+at every entry, so a same-proto closure in a callee slot can reach another
+class's cell, or a cell the trace snapshotted: the loop
+
+    local function make()
+      local c = 0
+      local function bump() c = c + 10; return c end
+      local function run(n)
+        local s = 0
+        for i = 1, n do c = c + 1; s = s + G() end
+        return s, c
+      end
+      return bump, run
+    end
+
+recorded with `G` over another `make`'s cell, then run with `G = bump1`,
+printed `541501 3301` against tier 0's `586650 3600`: the two pending
+stores to one cell flushed in order, and the read of `G`'s class forwarded
+nothing from `run`'s. With an upvalue snapshot in place of the second class
+the trace read the entry value for the whole run. Since 2026-11-12 entry
+proves the NO half as well, after the seed loop (`upvalueClassesDisjoint`):
+the writer seeds of distinct classes resolve to distinct cells, and no
+`.upvalue`/`.callee_upvalue` seed's cell is a class's. A failure declines
+the candidate, the verifier-mismatch grammar. The check runs only for a
+trace with a class and a second upvalue seed, and costs O(classes × upvalue
+seeds) at entry, never per iteration.
 
 ## 9. Costing, order, and what moves when
 
