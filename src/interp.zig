@@ -7120,6 +7120,80 @@ pub const Vm = struct {
         self.trace.onHostCallTerminal(top.closure.proto, @intCast(term.aux), top.base, top.call_seq, self.cachedCodeFor(top, top.closure.proto));
     }
 
+    /// The outcomes of a NATIVE entry that end before the exit grammar
+    /// (`consumeEntryResult`): a pushed descent, a silent burst, and a seed
+    /// capacity decline. Returns the directive of the one that applies, or
+    /// null when the result goes on to the exit grammar; a scalar result's
+    /// provenance is settled by then (`driveDispatcherSilentResult`). The
+    /// seed-hash decline is not here: its tier-1a rerun belongs to
+    /// `enterSelectedTrace`. `pc_in` is the entry pc.
+    inline fn consumeNativeEntryHead(
+        self: *Vm,
+        comptime mode: ExecMode,
+        ct: *trace.Trace,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        pc_in: usize,
+        wctx: *TrialWalkCtx,
+        result: trace_exec.ExecResult,
+        safe_to_arm: bool,
+    ) ?EntryDirective {
+        var pc = pc_in;
+        // Doc 44 D11: a pushed descent — the native run changed the VM
+        // frame stack, so it MUST branch before EVERY other consumer
+        // below (silent drain, seed-decline handlers, D10 burst, scalar
+        // heads): they all reason against the ENTRY activation, and a
+        // pushed-descent ledger can be `len == 1` (round 5 change 3).
+        if (result.pushed_frames > 0) {
+            self.trace.last_exit_instr = result.exit_instr;
+            const d = self.consumePushedDescent(ct, result, proto);
+            wctx.dead.retire(&self.trace);
+            return d;
+        }
+        if (self.trace.driveDispatcherSilentResult(ct, result, proto, regs, safe_to_arm)) |chain| {
+            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+            // Doc 56 Phase 6 (§4.8.2 item 7): silence can end in a
+            // reporting suffix whose last row is an UNARMED exit
+            // adapter's (an unpromoted adapter takes its reporting
+            // path under silence). The slab is coherent at `pc`, its
+            // resume pc; route it exactly as the ledger branch does.
+            if (chain.exit_side) |es| {
+                const d = self.consumeExitSideTerminal(mode, es, proto, regs, base, safe_to_arm);
+                wctx.dead.retire(&self.trace);
+                return d;
+            }
+            const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
+            wctx.dead.retire(&self.trace);
+            if (armed_side and mode == .fast) {
+                return .{ .switch_mode_at = pc };
+            }
+            return .{ .resume_tier0 = pc };
+        }
+        // Doc 22 §B.2: seed-decline dispatch. A seeded page's entry prologue
+        // declined BEFORE its body ran (nothing committed, regs untouched at
+        // this anchor). Neither decline charges a strike or feeds the receipt
+        // funnel — the decline is an entry-condition mismatch, not a guard
+        // failure. B-iv: these direct handlers own ONLY the scalar
+        // `ledger_len <= 1` case (the directly-entered trace itself
+        // declined). A FUSED span that reaches a seeded successor's
+        // prologue stamps the same shared `exit_reason` but carries a
+        // committed prefix in its multi-row ledger — it must flow to the
+        // `driveDispatcherLedger` consumer below, whose replay walks the
+        // prefix and applies the §B.2 fused-decline directive; rerunning
+        // `ct` (the ENTERED trace, not the decliner) here would discard
+        // that prefix.
+        if (result.ledger_len <= 1 and result.exit_reason == .seed_capacity_decline) {
+            // The native twin of `seedTraceInputs` returning null (the seed
+            // slots don't fit the register slab): the candidate itself is
+            // unusable at this depth — same directive as the VM-side wall.
+            self.trace.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ ct.id, ct.code.anchor.pc });
+            self.trace.seed_capacity_declines +|= 1;
+            return .next_candidate;
+        }
+        return null;
+    }
+
     fn enterSelectedTrace(
         self: *Vm,
         comptime mode: ExecMode,
@@ -7128,7 +7202,7 @@ pub const Vm = struct {
         proto: *const Proto,
         regs: RegWindow,
         base: usize,
-        pc_in: usize,
+        pc: usize,
         wctx: *TrialWalkCtx,
     ) EntryDirective {
         // Doc 63 §5.10: a retirement inside this entry (a collection in a
@@ -7141,7 +7215,6 @@ pub const Vm = struct {
         const outer = self.trace.executing;
         self.trace.executing = ct;
         defer self.trace.executing = outer;
-        var pc = pc_in;
         // Doc 45 D8 interim: a PRECISE trace cannot serialize yet
         // (`traceser` has no snapshot schema until the format bump), so under
         // an exec-log recording session it must not RUN either — its exec-log
@@ -7322,60 +7395,8 @@ pub const Vm = struct {
                 }
                 break :blk irinterp.executeCtx(ir_ctx, &ct.code, trace_regs, buf);
             };
-            // Doc 44 D11: a pushed descent — the native run changed the VM
-            // frame stack, so it MUST branch before EVERY other consumer
-            // below (silent drain, seed-decline handlers, D10 burst, scalar
-            // heads): they all reason against the ENTRY activation, and a
-            // pushed-descent ledger can be `len == 1` (round 5 change 3).
-            if (ran_native and result.pushed_frames > 0) {
-                self.trace.last_exit_instr = result.exit_instr;
-                const d = self.consumePushedDescent(ct, result, proto);
-                wctx.dead.retire(&self.trace);
-                return d;
-            }
             if (ran_native) {
-                if (self.trace.driveDispatcherSilentResult(ct, result, proto, regs, safe_to_arm)) |chain| {
-                    if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                    // Doc 56 Phase 6 (§4.8.2 item 7): silence can end in a
-                    // reporting suffix whose last row is an UNARMED exit
-                    // adapter's (an unpromoted adapter takes its reporting
-                    // path under silence). The slab is coherent at `pc`, its
-                    // resume pc; route it exactly as the ledger branch does.
-                    if (chain.exit_side) |es| {
-                        const d = self.consumeExitSideTerminal(mode, es, proto, regs, base, safe_to_arm);
-                        wctx.dead.retire(&self.trace);
-                        return d;
-                    }
-                    const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
-                    wctx.dead.retire(&self.trace);
-                    if (armed_side and mode == .fast) {
-                        return .{ .switch_mode_at = pc };
-                    }
-                    return .{ .resume_tier0 = pc };
-                }
-            }
-            // Doc 22 §B.2: seed-decline dispatch. A seeded page's entry prologue
-            // declined BEFORE its body ran (nothing committed, regs untouched at
-            // this anchor). Neither decline charges a strike or feeds the receipt
-            // funnel — the decline is an entry-condition mismatch, not a guard
-            // failure. B-iv: these direct handlers own ONLY the scalar
-            // `ledger_len <= 1` case (the directly-entered trace itself
-            // declined). A FUSED span that reaches a seeded successor's
-            // prologue stamps the same shared `exit_reason` but carries a
-            // committed prefix in its multi-row ledger — it must flow to the
-            // `driveDispatcherLedger` consumer below, whose replay walks the
-            // prefix and applies the §B.2 fused-decline directive; rerunning
-            // `ct` (the ENTERED trace, not the decliner) here would discard
-            // that prefix.
-            if (ran_native and result.ledger_len <= 1 and
-                result.exit_reason == .seed_capacity_decline)
-            {
-                // The native twin of `seedTraceInputs` returning null (the seed
-                // slots don't fit the register slab): the candidate itself is
-                // unusable at this depth — same directive as the VM-side wall.
-                self.trace.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ ct.id, ct.code.anchor.pc });
-                self.trace.seed_capacity_declines +|= 1;
-                return .next_candidate;
+                if (self.consumeNativeEntryHead(mode, ct, proto, regs, base, pc, wctx, result, safe_to_arm)) |d| return d;
             }
             if (ran_native and result.ledger_len <= 1 and
                 result.exit_reason == .seed_hash_decline)
@@ -7407,725 +7428,756 @@ pub const Vm = struct {
                 ran_native = false;
                 ran_native_link_mode = false;
             }
-            // B-2b: `tryArmSiblingHandoff` is entry-sited above,
-            // before lazy native compilation. This post-receipt
-            // safe point lets a provenance edge publish as soon as
-            // that child has compiled even when the result is the
-            // scalar (`ledger_len <= 1`) path. Multi-row receipts
-            // also drain after replay; the exact-arm fast reject
-            // makes the second call inert.
-            self.trace.drainProvenanceArms(safe_to_arm);
-            // Always record the exit instruction — useful for
-            // per-guard PC debugging even on productive exits.
-            self.trace.last_exit_instr = result.exit_instr;
+            return @call(.always_inline, consumeEntryResult, .{ self, mode, ct, proto, regs, trace_regs, base, pc, wctx, result, ran_native, ran_native_link_mode, buf, safe_to_arm });
+        }
+    }
 
-            // P-B (doc 17): resolve the FINAL trace in the chain
-            // from the id baked into the native exit stub. The
-            // consumers below route through `final` — the trace that
-            // performed the final native exit — which for a directly-
-            // entered UNARMED trace is `ct`, but for an ARMED parent
-            // whose slot fused into a child is the CHILD (a distinct
-            // id ≠ ct.id). 2.3b-1 arms the first `.link` slot, so
-            // `final == ct` no longer holds and its assert is dropped
-            // (as this comment always promised: "dropped there").
-            // Fail closed (2.3b-1): a native exit ALWAYS bakes a live
-            // trace id (P-B), and under an ARMED slot that id can be a
-            // fused child ≠ ct. Native resolution is therefore STRICT —
-            // a null here means the baked id is missing/retired (the
-            // dangling-link bug P-E guards against) and there is no safe
-            // `ct` substitute (routing a child's exit through `ct`'s
-            // instrs would misclassify the guard / resume PC). Panic
-            // rather than silently fall back, in release builds too.
-            // tier-1a never arms, so its `final` is unconditionally `ct`.
-            // Doc 63 §5.10: the one exception is `ct` itself, retired by a
-            // collection in a host call's callback: its id no longer
-            // resolves, but its record outlives the lease, and a precise page
-            // never links or fuses, so the final trace is the borrow.
-            const resolved: ?*trace.Trace = self.trace.traceById(result.final_trace_id) orelse
-                if (ct.doomed and result.final_trace_id == ct.id and ct.code.host_sites.len != 0) ct else null;
-            const final: *trace.Trace = if (ran_native)
-                (resolved orelse @panic("dispatcher: native final_trace_id did not resolve"))
+    /// The exit grammar of one trace entry: everything `enterSelectedTrace`
+    /// does with a run's result once the outcomes that end before it are
+    /// out of the way (`consumeNativeEntryHead`, and the seed-hash decline's
+    /// tier-1a rerun). `result` is a native run's (`ran_native`, its ledger
+    /// rows in `ledger_scratch`) or a tier-1a run's, whose value frame is
+    /// `buf`. `pc_in` is the entry pc: where tier 0 resumes unless a chain
+    /// or a snapshot says otherwise. The caller holds the entry lease and
+    /// the `executing` borrow.
+    ///
+    /// Its own function so an entry path that ran the page itself can hand
+    /// over the result; `enterSelectedTrace` inlines it.
+    fn consumeEntryResult(
+        self: *Vm,
+        comptime mode: ExecMode,
+        ct: *trace.Trace,
+        proto: *const Proto,
+        regs: RegWindow,
+        trace_regs: RegWindow,
+        base: usize,
+        pc_in: usize,
+        wctx: *TrialWalkCtx,
+        result: trace_exec.ExecResult,
+        ran_native: bool,
+        ran_native_link_mode: bool,
+        buf: []Value,
+        safe_to_arm: bool,
+    ) EntryDirective {
+        var pc = pc_in;
+        // B-2b: `tryArmSiblingHandoff` is entry-sited above,
+        // before lazy native compilation. This post-receipt
+        // safe point lets a provenance edge publish as soon as
+        // that child has compiled even when the result is the
+        // scalar (`ledger_len <= 1`) path. Multi-row receipts
+        // also drain after replay; the exact-arm fast reject
+        // makes the second call inert.
+        self.trace.drainProvenanceArms(safe_to_arm);
+        // Always record the exit instruction — useful for
+        // per-guard PC debugging even on productive exits.
+        self.trace.last_exit_instr = result.exit_instr;
+
+        // P-B (doc 17): resolve the FINAL trace in the chain
+        // from the id baked into the native exit stub. The
+        // consumers below route through `final` — the trace that
+        // performed the final native exit — which for a directly-
+        // entered UNARMED trace is `ct`, but for an ARMED parent
+        // whose slot fused into a child is the CHILD (a distinct
+        // id ≠ ct.id). 2.3b-1 arms the first `.link` slot, so
+        // `final == ct` no longer holds and its assert is dropped
+        // (as this comment always promised: "dropped there").
+        // Fail closed (2.3b-1): a native exit ALWAYS bakes a live
+        // trace id (P-B), and under an ARMED slot that id can be a
+        // fused child ≠ ct. Native resolution is therefore STRICT —
+        // a null here means the baked id is missing/retired (the
+        // dangling-link bug P-E guards against) and there is no safe
+        // `ct` substitute (routing a child's exit through `ct`'s
+        // instrs would misclassify the guard / resume PC). Panic
+        // rather than silently fall back, in release builds too.
+        // tier-1a never arms, so its `final` is unconditionally `ct`.
+        // Doc 63 §5.10: the one exception is `ct` itself, retired by a
+        // collection in a host call's callback: its id no longer
+        // resolves, but its record outlives the lease, and a precise page
+        // never links or fuses, so the final trace is the borrow.
+        const resolved: ?*trace.Trace = self.trace.traceById(result.final_trace_id) orelse
+            if (ct.doomed and result.final_trace_id == ct.id and ct.code.host_sites.len != 0) ct else null;
+        const final: *trace.Trace = if (ran_native)
+            (resolved orelse @panic("dispatcher: native final_trace_id did not resolve"))
+        else
+            ct;
+
+        // Doc 44 D10: fused head burst. MUST precede the scalar terminal /
+        // head-zero consumers below — they read only the TERMINAL body's
+        // scalars and would silently mis-consume a multi-row head ledger,
+        // dropping the intermediate rows' accounting and validation
+        // (round 4's factual correction). Loop-anchor multi-row ledgers
+        // still flow to `driveDispatcherLedger` further down.
+        if (ran_native and result.ledger_len > 1 and
+            trace.anchorKind(ct.code.anchor.pc) != .loop)
+        {
+            const d = self.consumeHeadBurst(ct, self.trace.ledger_scratch[0..result.ledger_len], proto);
+            wctx.dead.retire(&self.trace);
+            return d;
+        }
+
+        // 2.3b-1 (doc 17): every EXIT consumer below routes
+        // through `final` (the trace that performed the final
+        // native exit), not `ct` (the trace we entered). With no
+        // link armed yet they are the same object, so this is
+        // byte-identical; once `driveChain` arms a `C.link →
+        // I.linked_entry` handoff, a direct native run of the
+        // continuation `C` can fuse straight into the inner root
+        // `I` and return `final == I ≠ ct`, and the exit identity
+        // (guard PC, resume, side-exit accounting) belongs to `I`.
+        //
+        // `local_done` is the FINAL trace's OWN committed count:
+        // on the native path `result.local_completed`
+        // (= completed − entry_rbx), which equals `completed` for
+        // an un-fused run but is the child's local count once
+        // fused (never the cumulative `rbx`); on the tier-1a path
+        // `local_completed` is defaulted 0 and unused, so fall
+        // back to `completed`. Every productivity/guard-failure
+        // decision uses `local_done`; only chain-cumulative
+        // resume accounting (inside `driveChain`) uses `completed`.
+        const local_done: usize = if (ran_native) result.local_completed else result.completed;
+
+        // 2c-E: native ONE-TRIP linked loop-done. A linked-mode
+        // native entry commits its final-iteration snapshot at
+        // the loop-done exit even when `local_completed == 0`
+        // (a one-iteration inner: the loop-done guard fires
+        // before any back-edge `rbx` increment) — regs ARE
+        // coherent at the post-loop PC and one enclosing
+        // iteration completed, exactly the event `replayLedger`
+        // accounts as `onSideExit(I, max(local, 1))`. The scalar
+        // zero path below would misread it as a failed entry
+        // (guard-failure count + penalty + no chain). Recognize
+        // it and route it through the PRODUCTIVE path with an
+        // effective productivity of 1, passing the ORIGINAL
+        // `result` to `driveChain` (real exit identity — the
+        // chain classifies the loop-done itself; no fabricated
+        // count). Native-only: tier-1a has NOT committed the
+        // final iteration at this point (it still owes
+        // `flushNumericForLoopDone`), so counting 1 there would
+        // charge phantom progress. Bounds-check `exit_instr`
+        // BEFORE the guard-shape probe (maxInt = prologue-fail).
+        // Doc 44 P0: a `.terminal` exit is a COMPLETION of a head trace,
+        // NOT a side exit — the φ writeback already published the end
+        // state, and tier-0 resumes AT the still-unexecuted ret/self-call
+        // (`terminal.aux`). It bypasses the entire exit-consumer grammar
+        // below by design (review round 1: no strike, no hot-exit charge,
+        // no side-trace want, no chain — those all reason about loop
+        // anchors and would misread a straight-line completion with
+        // `completed == 0` as a failed entry).
+        if (result.exit_instr != std.math.maxInt(u32) and
+            result.exit_instr < final.code.instrs.len and
+            final.code.instrs[result.exit_instr].op == .terminal)
+        {
+            const term = final.code.instrs[result.exit_instr];
+            self.trace.dbg("terminal: trace={d} kind={d} resume={d}", .{ final.id, term.a, term.aux });
+            // A PRODUCTIVE receipt — the run completed the whole recorded
+            // body, so it must both attribute coverage AND clear the
+            // penalty/gate state (doc 31 D2 clear-on-productive; without
+            // this, base-case zero exits would ratchet a gate the head's
+            // successes could never un-earn — exactly the str_gmatch
+            // starvation shape). One completed head run = one iteration.
+            self.trace.onSideExitReceipt(final, 1, result.exit_instr, 1, .deferred, .entered);
+            self.noteHostCallTerminal(term);
+            // Doc 44 D8: a completion by a NON-source sibling retires a
+            // standing head-sibling want (clear + DONE-latch the raising
+            // exit) — the walk only reached this trace past the source's
+            // zero exit, so the failing path is covered now.
+            self.trace.noteHeadSiblingCompletion(.{ .proto = final.code.anchor.proto, .pc = final.code.anchor.pc, .proto_id = final.code.anchor.proto_id }, final.id);
+            // Doc 44 D10: earlier walk failer + this completion = one
+            // handoff observation on the failer's exit.
+            self.consumeHeadWalkFail(final.id);
+            wctx.dead.retire(&self.trace);
+            return .{ .resume_tier0 = @intCast(term.aux) };
+        }
+        // Doc 45 D6: tier-1a PRECISE deopt. The executor already
+        // materialized the failing op's per-bytecode snapshot into the
+        // guest registers, so the ONLY sound continuation is tier-0 at
+        // the snapshot's `resume_pc` — for every anchor kind (a precise
+        // head/cont deopt bypasses the entry pc; a loop deopt bypasses
+        // the anchor). Registers are MID-ITERATION state now: no sibling
+        // trial (`.next_candidate` would enter a sibling on non-entry
+        // regs), no chain, no continuation arm, no side-trace want
+        // (`noteTakenExit` skipped — a want here would bucket an
+        // entry-replay successor on a mid-body resume pc, D6's
+        // mis-bucketed-fallthrough hazard). The ordinary receipt still
+        // charges productivity/penalty so a thrashing precise anchor
+        // gates and tier-0 takes it back. `final == ct` holds for BOTH
+        // executors: a precise page never links/fuses, so a native
+        // exit's baked final id is always the entered trace's own.
+        // Doc 45 D5: a precise effect shim raised a runtime error — the
+        // executor restored the failing op's snapshot (pre-instruction
+        // registers; the iteration's earlier committed effects stand,
+        // partial heap preserved) and the error is about to unwind, so
+        // NO tiering accounting runs: no receipt, no strike, no
+        // side-trace want, no chain/sibling continuation, no mode
+        // switch. Validate exactly like `.precise_resume`, map the shim
+        // status to the guest error, and hand the raise directive up —
+        // the consumer parks the error at the snapshot's pc without
+        // re-executing the bytecode (execute-once, never an OOM retry).
+        // Doc 45 D6: the native executor produces both precise reasons
+        // now (per-snapshot materializers restored the window before the
+        // exit), so these arms validate rather than assume tier-1a.
+        if (result.exit_reason == .precise_error) {
+            // Doc 45 D6: BOTH executors produce this reason now. A precise
+            // page never links/fuses (arm-side prohibitions), so the
+            // native final id must resolve to the entered trace itself,
+            // with a single terminal non-yielded ledger row whose kind
+            // agrees with the reason, and no silent/frame-motion state.
+            std.debug.assert(final == ct);
+            if (ran_native) {
+                std.debug.assert(result.ledger_len == 1);
+                std.debug.assert(result.silent_active == 0);
+                std.debug.assert(result.pushed_frames == 0 and result.popped_frames == 0);
+                std.debug.assert(self.trace.ledger_scratch[0].kind == .precise_error);
+                std.debug.assert(self.trace.ledger_scratch[0].outcome == .normal);
+                std.debug.assert(self.trace.ledger_scratch[0].id == result.final_trace_id);
+                std.debug.assert(self.trace.ledger_scratch[0].exit == result.exit_instr);
+            }
+            std.debug.assert(ct.code.deopt_mode == .precise);
+            std.debug.assert(result.snapshot_id >= 1 and result.snapshot_id <= ct.code.snapshots.len);
+            std.debug.assert(result.activation_base == 0 and result.activation_depth == 0);
+            const snap = ct.code.snapshots[result.snapshot_id - 1];
+            std.debug.assert(snap.register_count == proto.num_registers);
+            std.debug.assert(snap.resume_pc < proto.code.len);
+            self.trace.dbg("precise-error raw: trace={d} native={} exit={d} snap={d} status={d}", .{ ct.id, ran_native, result.exit_instr, result.snapshot_id, result.runtime_error });
+            // `.ok` cannot reach here: the executor sets `runtime_error`
+            // only on failure. Today only `tnew` and the string helpers
+            // fail (`out_of_memory`); doc 63's host call adds the rest.
+            const err: Error = table_runtime.toError(@enumFromInt(result.runtime_error));
+            self.trace.dbg("precise-error: trace={d} exit={d} snap={d} raise_pc={d} status={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, result.runtime_error });
+            self.trace.precise_errors +|= 1;
+            wctx.dead.retire(&self.trace);
+            return .{ .raise_at = .{ .pc = @intCast(snap.resume_pc), .err = err } };
+        }
+        if (result.exit_reason == .precise_resume) {
+            // Doc 45 D6: both executors — same validation grammar as the
+            // `.precise_error` arm above.
+            std.debug.assert(final == ct);
+            if (ran_native) {
+                std.debug.assert(result.ledger_len == 1);
+                std.debug.assert(result.silent_active == 0);
+                std.debug.assert(result.pushed_frames == 0 and result.popped_frames == 0);
+                std.debug.assert(self.trace.ledger_scratch[0].kind == .precise_deopt);
+                std.debug.assert(self.trace.ledger_scratch[0].outcome == .normal);
+                std.debug.assert(self.trace.ledger_scratch[0].id == result.final_trace_id);
+                std.debug.assert(self.trace.ledger_scratch[0].exit == result.exit_instr);
+            }
+            std.debug.assert(ct.code.deopt_mode == .precise);
+            std.debug.assert(result.activation_base == 0 and result.activation_depth == 0);
+            // D6 dispatcher validation — internal invariant failures,
+            // never a replay fallback.
+            std.debug.assert(result.snapshot_id >= 1 and result.snapshot_id <= ct.code.snapshots.len);
+            const snap = ct.code.snapshots[result.snapshot_id - 1];
+            std.debug.assert(snap.register_count == proto.num_registers);
+            std.debug.assert(snap.resume_pc < proto.code.len);
+            const done: usize = result.completed;
+            self.trace.dbg("precise-resume: trace={d} exit={d} snap={d} resume_pc={d} completed={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, done });
+            self.trace.precise_resumes +|= 1;
+            self.trace.onSideExitReceipt(ct, done, result.exit_instr, done, .deferred, .entered);
+            // Doc 63 §5.9: a `guard_native` exit whose native has
+            // disturbed retires the trace (logically; the entry lease
+            // defers the physical half), so it stops paying an entry and
+            // an exit per iteration. The re-recording declines the native.
+            if (nativeBlacklisted(ct, result.exit_instr) and !wctx.dead.full() and !wctx.dead.has(ct)) {
+                self.trace.dbg("host-blacklist: trace={d} exit={d}", .{ ct.id, result.exit_instr });
+                self.trace.host_blacklists +|= 1;
+                wctx.dead.add(ct);
+            }
+            wctx.dead.retire(&self.trace);
+            if (mode == .full and self.runFastPath()) {
+                return .{ .switch_mode_at = @intCast(snap.resume_pc) };
+            }
+            return .{ .resume_tier0 = @intCast(snap.resume_pc) };
+        }
+        // Doc 56 Phases 3–4: an exit-side exit (tier-1a, or a native exit
+        // adapter). The slab is coherent at the exit's resume pc, so none
+        // of the anchor-coherent grammar below applies (no sibling trial,
+        // no anchor chain, no deopt replay). This arm owns only the
+        // scalar case, the entered trace's own adapter as the only row
+        // (doc 56 Phase 5): a longer native ledger ending in an adapter
+        // row (a yield at the adapter, or an unarmed exit reached after
+        // chained rows) must replay its prefix, so it flows to
+        // `driveDispatcherLedger` below.
+        if (result.exit_reason == .exit_side and (!ran_native or result.ledger_len <= 1)) {
+            std.debug.assert(final == ct);
+            if (ran_native) std.debug.assert(result.ledger_len == 1 and
+                self.trace.ledger_scratch[0].kind == .exit_side and
+                self.trace.ledger_scratch[0].id == ct.id and
+                result.local_completed == result.completed);
+            const d = if (ran_native)
+                self.consumeExitSide(mode, .native_only, ct, result, proto, trace_regs, base, safe_to_arm)
             else
-                ct;
-
-            // Doc 44 D10: fused head burst. MUST precede the scalar terminal /
-            // head-zero consumers below — they read only the TERMINAL body's
-            // scalars and would silently mis-consume a multi-row head ledger,
-            // dropping the intermediate rows' accounting and validation
-            // (round 4's factual correction). Loop-anchor multi-row ledgers
-            // still flow to `driveDispatcherLedger` further down.
-            if (ran_native and result.ledger_len > 1 and
-                trace.anchorKind(ct.code.anchor.pc) != .loop)
-            {
-                const d = self.consumeHeadBurst(ct, self.trace.ledger_scratch[0..result.ledger_len], proto);
-                wctx.dead.retire(&self.trace);
-                return d;
+                self.consumeExitSide(mode, .ir, ct, result, proto, trace_regs, base, safe_to_arm);
+            wctx.dead.retire(&self.trace);
+            return d;
+        }
+        // Doc 44 P0/D12b: a one-shot trace's (head or cont) guard-fail
+        // exit — deopt to its entry pc (regs untouched since entry). The
+        // loop-anchor grammar below (hot-exit wants, continuations,
+        // prime sides, chains) reasons about back-edge anchors; none of
+        // it applies to a sentinel/tagged anchor, and `noteTakenExit`'s
+        // side-trace want would only UNPATCH the sole entry. Charge the
+        // ordinary zero receipt — the thrash gate stays live, so a
+        // one-shot page that keeps failing its guards still retires —
+        // and fall to `.next_candidate`: the patch arm then runs the
+        // canonical instruction (returning `.resume_tier0(entry)` here
+        // would re-dispatch the patch and spin).
+        if (trace.anchorKind(final.code.anchor.pc) != .loop) {
+            self.trace.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ final.id, ran_native, @tagName(result.exit_reason), result.exit_instr, result.completed });
+            // Doc 44 D10: a REAL native guard deopt records the walk-local
+            // handoff evidence (native-only, matching Part S — evidence
+            // from a tier-1a run would memo-reject on the uncompiled
+            // parent; prologue-fail carries no branch information).
+            if (ran_native and result.exit_instr != std.math.maxInt(u32))
+                self.trace.head_walk_fail = .{ .trace_id = final.id, .exit_instr = result.exit_instr };
+            // Doc 44 D8: head guard fails DO accrue hot-exit hotness now —
+            // `noteTakenExit`'s head route raises the sibling want without
+            // ever unpatching (the pc-0 patch is the sole entry). A
+            // prologue-fail exit (`exit_instr == maxInt`) is bounds-refused
+            // inside, exactly like the loop arms.
+            self.trace.noteTakenExit(final, result.exit_instr, local_done, .legacy);
+            self.trace.onSideExitReceipt(
+                final,
+                local_done,
+                result.exit_instr,
+                local_done,
+                .deferred,
+                if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
+            );
+            wctx.dead.retire(&self.trace);
+            return .next_candidate;
+        }
+        // Doc 45 D6: a PRECISE loop trace's remaining `.normal` exits are
+        // PROLOGUE failures (`IrInstr.snap == 0` — the per-iteration
+        // `slot_load`s and eager `guard_gc` re-execute each pass on the
+        // dupe path, so a fail here is iteration-entry coherent: regs
+        // untouched since the last φ flush). The ordinary ENTRY contract
+        // applies, minus everything D6 suppresses for precise pages — no
+        // side-trace wants (`noteTakenExit` below is skipped), no
+        // continuation arms, no prime sides, no chains. (It does take
+        // the widen-eviction probe, below.) Productive → receipt + tier-0 at the
+        // anchor (`pc` is unadvanced here); zero → penalty receipt +
+        // next candidate (regs entry-coherent, so the sibling trial walk
+        // stays sound). One-shot precise prologue exits took the head
+        // zero-exit arm above — same entry contract, same soundness.
+        if (ct.code.deopt_mode == .precise) {
+            std.debug.assert(final == ct);
+            if (ran_native) {
+                // Doc 45 D6: a NATIVE precise page's remaining exits are
+                // the eager guard_gc's snap==0 exit (`.normal` through
+                // the ordinary carried-home flush — iteration-entry
+                // coherent, exactly this arm's contract, even after
+                // completed iterations) and the hoisted-guard
+                // `.prologue_fail` (pre-entry, regs untouched). Single
+                // terminal non-yielded row, no silent/frame motion.
+                std.debug.assert(result.exit_reason == .normal or result.exit_reason == .prologue_fail);
+                std.debug.assert(result.ledger_len == 1);
+                std.debug.assert(result.silent_active == 0);
+                std.debug.assert(result.pushed_frames == 0 and result.popped_frames == 0);
             }
-
-            // 2.3b-1 (doc 17): every EXIT consumer below routes
-            // through `final` (the trace that performed the final
-            // native exit), not `ct` (the trace we entered). With no
-            // link armed yet they are the same object, so this is
-            // byte-identical; once `driveChain` arms a `C.link →
-            // I.linked_entry` handoff, a direct native run of the
-            // continuation `C` can fuse straight into the inner root
-            // `I` and return `final == I ≠ ct`, and the exit identity
-            // (guard PC, resume, side-exit accounting) belongs to `I`.
-            //
-            // `local_done` is the FINAL trace's OWN committed count:
-            // on the native path `result.local_completed`
-            // (= completed − entry_rbx), which equals `completed` for
-            // an un-fused run but is the child's local count once
-            // fused (never the cumulative `rbx`); on the tier-1a path
-            // `local_completed` is defaulted 0 and unused, so fall
-            // back to `completed`. Every productivity/guard-failure
-            // decision uses `local_done`; only chain-cumulative
-            // resume accounting (inside `driveChain`) uses `completed`.
-            const local_done: usize = if (ran_native) result.local_completed else result.completed;
-
-            // 2c-E: native ONE-TRIP linked loop-done. A linked-mode
-            // native entry commits its final-iteration snapshot at
-            // the loop-done exit even when `local_completed == 0`
-            // (a one-iteration inner: the loop-done guard fires
-            // before any back-edge `rbx` increment) — regs ARE
-            // coherent at the post-loop PC and one enclosing
-            // iteration completed, exactly the event `replayLedger`
-            // accounts as `onSideExit(I, max(local, 1))`. The scalar
-            // zero path below would misread it as a failed entry
-            // (guard-failure count + penalty + no chain). Recognize
-            // it and route it through the PRODUCTIVE path with an
-            // effective productivity of 1, passing the ORIGINAL
-            // `result` to `driveChain` (real exit identity — the
-            // chain classifies the loop-done itself; no fabricated
-            // count). Native-only: tier-1a has NOT committed the
-            // final iteration at this point (it still owes
-            // `flushNumericForLoopDone`), so counting 1 there would
-            // charge phantom progress. Bounds-check `exit_instr`
-            // BEFORE the guard-shape probe (maxInt = prologue-fail).
-            // Doc 44 P0: a `.terminal` exit is a COMPLETION of a head trace,
-            // NOT a side exit — the φ writeback already published the end
-            // state, and tier-0 resumes AT the still-unexecuted ret/self-call
-            // (`terminal.aux`). It bypasses the entire exit-consumer grammar
-            // below by design (review round 1: no strike, no hot-exit charge,
-            // no side-trace want, no chain — those all reason about loop
-            // anchors and would misread a straight-line completion with
-            // `completed == 0` as a failed entry).
-            if (result.exit_instr != std.math.maxInt(u32) and
-                result.exit_instr < final.code.instrs.len and
-                final.code.instrs[result.exit_instr].op == .terminal)
-            {
-                const term = final.code.instrs[result.exit_instr];
-                self.trace.dbg("terminal: trace={d} kind={d} resume={d}", .{ final.id, term.a, term.aux });
-                // A PRODUCTIVE receipt — the run completed the whole recorded
-                // body, so it must both attribute coverage AND clear the
-                // penalty/gate state (doc 31 D2 clear-on-productive; without
-                // this, base-case zero exits would ratchet a gate the head's
-                // successes could never un-earn — exactly the str_gmatch
-                // starvation shape). One completed head run = one iteration.
-                self.trace.onSideExitReceipt(final, 1, result.exit_instr, 1, .deferred, .entered);
-                self.noteHostCallTerminal(term);
-                // Doc 44 D8: a completion by a NON-source sibling retires a
-                // standing head-sibling want (clear + DONE-latch the raising
-                // exit) — the walk only reached this trace past the source's
-                // zero exit, so the failing path is covered now.
-                self.trace.noteHeadSiblingCompletion(.{ .proto = final.code.anchor.proto, .pc = final.code.anchor.pc, .proto_id = final.code.anchor.proto_id }, final.id);
-                // Doc 44 D10: earlier walk failer + this completion = one
-                // handoff observation on the failer's exit.
-                self.consumeHeadWalkFail(final.id);
-                wctx.dead.retire(&self.trace);
-                return .{ .resume_tier0 = @intCast(term.aux) };
+            self.trace.dbg("precise prologue-exit: trace={d} exit={d} completed={d}", .{ ct.id, result.exit_instr, local_done });
+            self.trace.onSideExitReceipt(ct, local_done, result.exit_instr, local_done, .deferred, .entered);
+            // Widen-eviction, as for an ordinary zero exit below: a
+            // precise trace has no side traces to grow past a lane its
+            // array widened beyond, so without it the trace fails its
+            // entry check until the anchor gates, and never re-records.
+            // Zero iterations only: the regs are then entry-coherent.
+            if (local_done == 0 and !wctx.dead.full() and !wctx.dead.has(ct) and self.trace.laneWidenedPast(ct, regs)) {
+                wctx.dead.add(ct);
             }
-            // Doc 45 D6: tier-1a PRECISE deopt. The executor already
-            // materialized the failing op's per-bytecode snapshot into the
-            // guest registers, so the ONLY sound continuation is tier-0 at
-            // the snapshot's `resume_pc` — for every anchor kind (a precise
-            // head/cont deopt bypasses the entry pc; a loop deopt bypasses
-            // the anchor). Registers are MID-ITERATION state now: no sibling
-            // trial (`.next_candidate` would enter a sibling on non-entry
-            // regs), no chain, no continuation arm, no side-trace want
-            // (`noteTakenExit` skipped — a want here would bucket an
-            // entry-replay successor on a mid-body resume pc, D6's
-            // mis-bucketed-fallthrough hazard). The ordinary receipt still
-            // charges productivity/penalty so a thrashing precise anchor
-            // gates and tier-0 takes it back. `final == ct` holds for BOTH
-            // executors: a precise page never links/fuses, so a native
-            // exit's baked final id is always the entered trace's own.
-            // Doc 45 D5: a precise effect shim raised a runtime error — the
-            // executor restored the failing op's snapshot (pre-instruction
-            // registers; the iteration's earlier committed effects stand,
-            // partial heap preserved) and the error is about to unwind, so
-            // NO tiering accounting runs: no receipt, no strike, no
-            // side-trace want, no chain/sibling continuation, no mode
-            // switch. Validate exactly like `.precise_resume`, map the shim
-            // status to the guest error, and hand the raise directive up —
-            // the consumer parks the error at the snapshot's pc without
-            // re-executing the bytecode (execute-once, never an OOM retry).
-            // Doc 45 D6: the native executor produces both precise reasons
-            // now (per-snapshot materializers restored the window before the
-            // exit), so these arms validate rather than assume tier-1a.
-            if (result.exit_reason == .precise_error) {
-                // Doc 45 D6: BOTH executors produce this reason now. A precise
-                // page never links/fuses (arm-side prohibitions), so the
-                // native final id must resolve to the entered trace itself,
-                // with a single terminal non-yielded ledger row whose kind
-                // agrees with the reason, and no silent/frame-motion state.
-                std.debug.assert(final == ct);
-                if (ran_native) {
-                    std.debug.assert(result.ledger_len == 1);
-                    std.debug.assert(result.silent_active == 0);
-                    std.debug.assert(result.pushed_frames == 0 and result.popped_frames == 0);
-                    std.debug.assert(self.trace.ledger_scratch[0].kind == .precise_error);
-                    std.debug.assert(self.trace.ledger_scratch[0].outcome == .normal);
-                    std.debug.assert(self.trace.ledger_scratch[0].id == result.final_trace_id);
-                    std.debug.assert(self.trace.ledger_scratch[0].exit == result.exit_instr);
-                }
-                std.debug.assert(ct.code.deopt_mode == .precise);
-                std.debug.assert(result.snapshot_id >= 1 and result.snapshot_id <= ct.code.snapshots.len);
-                std.debug.assert(result.activation_base == 0 and result.activation_depth == 0);
-                const snap = ct.code.snapshots[result.snapshot_id - 1];
-                std.debug.assert(snap.register_count == proto.num_registers);
-                std.debug.assert(snap.resume_pc < proto.code.len);
-                self.trace.dbg("precise-error raw: trace={d} native={} exit={d} snap={d} status={d}", .{ ct.id, ran_native, result.exit_instr, result.snapshot_id, result.runtime_error });
-                // `.ok` cannot reach here: the executor sets `runtime_error`
-                // only on failure. Today only `tnew` and the string helpers
-                // fail (`out_of_memory`); doc 63's host call adds the rest.
-                const err: Error = table_runtime.toError(@enumFromInt(result.runtime_error));
-                self.trace.dbg("precise-error: trace={d} exit={d} snap={d} raise_pc={d} status={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, result.runtime_error });
-                self.trace.precise_errors +|= 1;
-                wctx.dead.retire(&self.trace);
-                return .{ .raise_at = .{ .pc = @intCast(snap.resume_pc), .err = err } };
-            }
-            if (result.exit_reason == .precise_resume) {
-                // Doc 45 D6: both executors — same validation grammar as the
-                // `.precise_error` arm above.
-                std.debug.assert(final == ct);
-                if (ran_native) {
-                    std.debug.assert(result.ledger_len == 1);
-                    std.debug.assert(result.silent_active == 0);
-                    std.debug.assert(result.pushed_frames == 0 and result.popped_frames == 0);
-                    std.debug.assert(self.trace.ledger_scratch[0].kind == .precise_deopt);
-                    std.debug.assert(self.trace.ledger_scratch[0].outcome == .normal);
-                    std.debug.assert(self.trace.ledger_scratch[0].id == result.final_trace_id);
-                    std.debug.assert(self.trace.ledger_scratch[0].exit == result.exit_instr);
-                }
-                std.debug.assert(ct.code.deopt_mode == .precise);
-                std.debug.assert(result.activation_base == 0 and result.activation_depth == 0);
-                // D6 dispatcher validation — internal invariant failures,
-                // never a replay fallback.
-                std.debug.assert(result.snapshot_id >= 1 and result.snapshot_id <= ct.code.snapshots.len);
-                const snap = ct.code.snapshots[result.snapshot_id - 1];
-                std.debug.assert(snap.register_count == proto.num_registers);
-                std.debug.assert(snap.resume_pc < proto.code.len);
-                const done: usize = result.completed;
-                self.trace.dbg("precise-resume: trace={d} exit={d} snap={d} resume_pc={d} completed={d}", .{ ct.id, result.exit_instr, result.snapshot_id, snap.resume_pc, done });
-                self.trace.precise_resumes +|= 1;
-                self.trace.onSideExitReceipt(ct, done, result.exit_instr, done, .deferred, .entered);
-                // Doc 63 §5.9: a `guard_native` exit whose native has
-                // disturbed retires the trace (logically; the entry lease
-                // defers the physical half), so it stops paying an entry and
-                // an exit per iteration. The re-recording declines the native.
-                if (nativeBlacklisted(ct, result.exit_instr) and !wctx.dead.full() and !wctx.dead.has(ct)) {
-                    self.trace.dbg("host-blacklist: trace={d} exit={d}", .{ ct.id, result.exit_instr });
-                    self.trace.host_blacklists +|= 1;
-                    wctx.dead.add(ct);
-                }
-                wctx.dead.retire(&self.trace);
-                if (mode == .full and self.runFastPath()) {
-                    return .{ .switch_mode_at = @intCast(snap.resume_pc) };
-                }
-                return .{ .resume_tier0 = @intCast(snap.resume_pc) };
-            }
-            // Doc 56 Phases 3–4: an exit-side exit (tier-1a, or a native exit
-            // adapter). The slab is coherent at the exit's resume pc, so none
-            // of the anchor-coherent grammar below applies (no sibling trial,
-            // no anchor chain, no deopt replay). This arm owns only the
-            // scalar case, the entered trace's own adapter as the only row
-            // (doc 56 Phase 5): a longer native ledger ending in an adapter
-            // row (a yield at the adapter, or an unarmed exit reached after
-            // chained rows) must replay its prefix, so it flows to
-            // `driveDispatcherLedger` below.
-            if (result.exit_reason == .exit_side and (!ran_native or result.ledger_len <= 1)) {
-                std.debug.assert(final == ct);
-                if (ran_native) std.debug.assert(result.ledger_len == 1 and
-                    self.trace.ledger_scratch[0].kind == .exit_side and
-                    self.trace.ledger_scratch[0].id == ct.id and
-                    result.local_completed == result.completed);
-                const d = if (ran_native)
-                    self.consumeExitSide(mode, .native_only, ct, result, proto, trace_regs, base, safe_to_arm)
-                else
-                    self.consumeExitSide(mode, .ir, ct, result, proto, trace_regs, base, safe_to_arm);
-                wctx.dead.retire(&self.trace);
-                return d;
-            }
-            // Doc 44 P0/D12b: a one-shot trace's (head or cont) guard-fail
-            // exit — deopt to its entry pc (regs untouched since entry). The
-            // loop-anchor grammar below (hot-exit wants, continuations,
-            // prime sides, chains) reasons about back-edge anchors; none of
-            // it applies to a sentinel/tagged anchor, and `noteTakenExit`'s
-            // side-trace want would only UNPATCH the sole entry. Charge the
-            // ordinary zero receipt — the thrash gate stays live, so a
-            // one-shot page that keeps failing its guards still retires —
-            // and fall to `.next_candidate`: the patch arm then runs the
-            // canonical instruction (returning `.resume_tier0(entry)` here
-            // would re-dispatch the patch and spin).
-            if (trace.anchorKind(final.code.anchor.pc) != .loop) {
-                self.trace.dbg("head zero-exit: trace={d} native={} reason={s} exit={d} completed={d}", .{ final.id, ran_native, @tagName(result.exit_reason), result.exit_instr, result.completed });
-                // Doc 44 D10: a REAL native guard deopt records the walk-local
-                // handoff evidence (native-only, matching Part S — evidence
-                // from a tier-1a run would memo-reject on the uncompiled
-                // parent; prologue-fail carries no branch information).
-                if (ran_native and result.exit_instr != std.math.maxInt(u32))
-                    self.trace.head_walk_fail = .{ .trace_id = final.id, .exit_instr = result.exit_instr };
-                // Doc 44 D8: head guard fails DO accrue hot-exit hotness now —
-                // `noteTakenExit`'s head route raises the sibling want without
-                // ever unpatching (the pc-0 patch is the sole entry). A
-                // prologue-fail exit (`exit_instr == maxInt`) is bounds-refused
-                // inside, exactly like the loop arms.
-                self.trace.noteTakenExit(final, result.exit_instr, local_done, .legacy);
-                self.trace.onSideExitReceipt(
-                    final,
-                    local_done,
-                    result.exit_instr,
-                    local_done,
-                    .deferred,
-                    if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
-                );
-                wctx.dead.retire(&self.trace);
-                return .next_candidate;
-            }
-            // Doc 45 D6: a PRECISE loop trace's remaining `.normal` exits are
-            // PROLOGUE failures (`IrInstr.snap == 0` — the per-iteration
-            // `slot_load`s and eager `guard_gc` re-execute each pass on the
-            // dupe path, so a fail here is iteration-entry coherent: regs
-            // untouched since the last φ flush). The ordinary ENTRY contract
-            // applies, minus everything D6 suppresses for precise pages — no
-            // side-trace wants (`noteTakenExit` below is skipped), no
-            // continuation arms, no prime sides, no chains. (It does take
-            // the widen-eviction probe, below.) Productive → receipt + tier-0 at the
-            // anchor (`pc` is unadvanced here); zero → penalty receipt +
-            // next candidate (regs entry-coherent, so the sibling trial walk
-            // stays sound). One-shot precise prologue exits took the head
-            // zero-exit arm above — same entry contract, same soundness.
-            if (ct.code.deopt_mode == .precise) {
-                std.debug.assert(final == ct);
-                if (ran_native) {
-                    // Doc 45 D6: a NATIVE precise page's remaining exits are
-                    // the eager guard_gc's snap==0 exit (`.normal` through
-                    // the ordinary carried-home flush — iteration-entry
-                    // coherent, exactly this arm's contract, even after
-                    // completed iterations) and the hoisted-guard
-                    // `.prologue_fail` (pre-entry, regs untouched). Single
-                    // terminal non-yielded row, no silent/frame motion.
-                    std.debug.assert(result.exit_reason == .normal or result.exit_reason == .prologue_fail);
-                    std.debug.assert(result.ledger_len == 1);
-                    std.debug.assert(result.silent_active == 0);
-                    std.debug.assert(result.pushed_frames == 0 and result.popped_frames == 0);
-                }
-                self.trace.dbg("precise prologue-exit: trace={d} exit={d} completed={d}", .{ ct.id, result.exit_instr, local_done });
-                self.trace.onSideExitReceipt(ct, local_done, result.exit_instr, local_done, .deferred, .entered);
-                // Widen-eviction, as for an ordinary zero exit below: a
-                // precise trace has no side traces to grow past a lane its
-                // array widened beyond, so without it the trace fails its
-                // entry check until the anchor gates, and never re-records.
-                // Zero iterations only: the regs are then entry-coherent.
-                if (local_done == 0 and !wctx.dead.full() and !wctx.dead.has(ct) and self.trace.laneWidenedPast(ct, regs)) {
-                    wctx.dead.add(ct);
-                }
-                wctx.dead.retire(&self.trace);
-                if (local_done > 0) {
-                    if (mode == .full and self.runFastPath()) {
-                        return .{ .switch_mode_at = pc };
-                    }
-                    return .{ .resume_tier0 = pc };
-                }
-                return .next_candidate;
-            }
-            if (ran_native) self.trace.dbg("receipt: pc={d} t={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.code.anchor.pc, ct.id, ran_native_link_mode, local_done, result.exit_instr, result.ledger_len, result.completed });
-            const linked_one_trip = ran_native and ran_native_link_mode and
-                local_done == 0 and
-                result.exit_reason == .normal and
-                result.exit_instr != std.math.maxInt(u32) and
-                result.exit_instr < final.code.instrs.len and
-                trace.isLoopDoneGuardIndex(final, result.exit_instr);
-
-            // 2.3c-1 (M1 half-fusion, doc 17): fused top-level
-            // `.link` consumer. When `driveChain` armed `ct`'s
-            // source-branch guard slot → a prime-side ramp's
-            // `ordinary_entry`, a native run of `ct` (the skip
-            // trace) can fuse straight into that ramp under the
-            // shared frame: skip commits its composites, hits the
-            // armed guard, jumps into the ramp, which runs to its
-            // `.link` terminal committing ZERO of its OWN
-            // iterations. The receipt is then `final = ramp`,
-            // `result.completed == entry_rbx ==` skip's own count
-            // (so `local_done == 0`), and regs are coherent at the
-            // ramp's INNER-loop PC — NOT the outer header. The plain
-            // dispatcher below would misread `local_done == 0` as a
-            // skip zero-exit, call `onSideExit(final, 0)`, and drive
-            // `.ordinary_header` off `final.code.anchor.pc` (the outer
-            // header) — a semantic misresume from the wrong coherent
-            // PC (doc 17 §Increment 2.3c). Through 2.3c-1 a bespoke
-            // scalar recognizer (armed-edge provenance) handled it
-            // here; 2.3c-2d folds that steering into `replayLedger`.
-            //
-            // 2.3c-2d (D2b-ii, doc 17): a dispatcher native entry that
-            // fused forward through an armed slot returns a MULTI-ENTRY
-            // per-transition ledger (`ledger_len > 1`) describing the
-            // whole fused span. Drain it through the authoritative
-            // `replayLedger` graph-walk (origin `.dispatcher_root`) —
-            // the same drain the in-burst continuation call uses —
-            // instead of the bespoke scalar M1 recognizer this
-            // replaces. `replayLedger`'s `.deopt` non-last arm
-            // reproduces the old `onSideExit(ct, skip_local)` +
-            // sub-case (a)/(b) steering byte-for-byte.
-            //
-            // 2c-E: gated on bare `ledger_len > 1` — a fused span that
-            // TERMINATED in `.prologue_fail` must also drain (the
-            // scalar code below only knows the final body: it would
-            // read `local_done == 0` off the failing successor, drop
-            // the span's committed prefix on the floor, and misroute
-            // the zero-exit path). `replayLedger` models both
-            // prologue-fail-terminated grammars: `[skip.deopt(M1),
-            // ramp.prologue_fail]` (sub-case (c): `onSideExit(skip,
-            // local)` + `onSideExit(ramp, 0)` + resume at the skip's
-            // anchor — exactly the unarmed native steering) and
-            // `[I.loop_done_linked, C.prologue_fail]` (the committed
-            // loop-done accounts, the fail breaks the burst at the
-            // post-loop PC).
-            //
-            // Doc 22 §B.2 (B-iv): fused SEED-DECLINE terminals drain
-            // here too — the direct handlers above are gated to
-            // `ledger_len <= 1`, so a span like `[T.link_terminal,
-            // U.seed_hash_decline]` reaches `replayLedger`'s decline
-            // arms, which walk the committed prefix and resume
-            // deterministic selection at the DECLINER's coherent
-            // anchor (no strike, no receipt — a decline is an
-            // entry-condition mismatch, not a guard failure). The
-            // hash rerun/downgrade happens on re-selection via the
-            // direct-entry H1 path, never in-drain.
-            if (ran_native and result.ledger_len > 1) {
-                const chain = self.trace.driveDispatcherLedger(ct, self.trace.ledger_scratch[0..result.ledger_len], proto, regs, safe_to_arm);
-                if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                // Doc 56 Phase 5: the span ended on an unarmed exit
-                // adapter; the slab is coherent at `pc` (its resume pc).
-                if (chain.exit_side) |es| {
-                    const d = self.consumeExitSideTerminal(mode, es, proto, regs, base, safe_to_arm);
-                    wctx.dead.retire(&self.trace);
-                    return d;
-                }
-                // Side-trace precision: if this burst's terminal
-                // crossed the hotguard threshold, arm the recording
-                // AT the resume so it captures the failing
-                // iteration's re-run — the back-edge consumption is
-                // one iteration late and records the wrong shape on
-                // alternating loops (see the fn doc). Armed via the
-                // replay-side pending anchor, which the `.full`
-                // prologue consumes at the anchor pc — so a `.fast`
-                // dispatch must switch up, exactly as the
-                // `wants_prime_side` consumption below does.
-                const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
-                wctx.dead.retire(&self.trace);
-                if (armed_side and mode == .fast) {
-                    return .{ .switch_mode_at = pc }; // → .full
-                }
-                return .{ .resume_tier0 = pc };
-            }
-
-            // --- hot-exit counting (step 4) ---
-            // Pall's `trace_hotside` (lj_trace.c:798): EVERY
-            // taken side exit — productive or not — charges
-            // its own per-(trace, exit) counter; crossing
-            // `hotexit` wants a side trace for the alternate
-            // path.
-            //
-            // A numeric-`for` loop-done exit is a productive completion owned
-            // by the continuation machinery (`maybeArmContinuation` below), so
-            // it is not counted (`linked_one_trip` exits are loop-done by
-            // construction and fall out of the same check).
-            //
-            // Doc 58 B2 review, blocker 2: a `while`/`repeat` loop's OWN test
-            // (`isOwnLoopTest`) IS counted. Its post-loop continuation has no
-            // `maybeArmContinuation` leg any more — doc 56's exit-side route
-            // is what records it, and that route is fed only from here.
-            // `noteTakenExit` routes it to exit-side first and stops it
-            // before every legacy route (§4.3, review r3 finding 1: a legacy
-            // want would unpatch the entry and record a pass that can only
-            // end in LLEAVE). Excluding it here starved exit-side completely.
-            //
-            // Classify ONCE — this is the per-completion hot path (2M+
-            // entries/run on scimark-lu) and each classifier walks trace instrs
-            // + proto code.
-            const exit_ok = result.exit_instr != std.math.maxInt(u32) and
-                result.exit_instr < final.code.instrs.len;
-            const numeric_for_done = exit_ok and
-                trace.isLoopDoneGuardIndex(final, result.exit_instr);
-            const any_loop_done = exit_ok and
-                (numeric_for_done or trace.isOwnLoopTestIndex(final, result.exit_instr));
-            const count_exit = exit_ok and !numeric_for_done;
-            if (exit_ok and local_done == 0 and !linked_one_trip and
-                final.code.isSteadyRegionExit(result.exit_instr))
-                self.trace.peeled_steady_zero_exits +|= 1;
-            if (count_exit) {
-                // Doc 56 Phases 3–4: a direct run may take the exit-side
-                // route — tier-1a always (its executor honours the exit-side
-                // state), native when its page carries exit adapters and the
-                // exit is the entered trace's own.
-                const route: trace.TraceState.ExitRoute = if (!ran_native)
-                    .tier1a_direct
-                else if (self.trace.exitSideNative() and final == ct)
-                    .native_direct
-                else
-                    .legacy;
-                self.trace.noteTakenExit(final, result.exit_instr, local_done, route);
-            }
-
-            if (local_done > 0 or linked_one_trip) {
-                // This trace did useful work — keep its result.
-                // (`linked_one_trip`: the committed loop-done IS one
-                // enclosing iteration, replayLedger's `max(local, 1)`.)
-                self.trace.onSideExitReceipt(
-                    final,
-                    if (linked_one_trip) 1 else local_done,
-                    result.exit_instr,
-                    if (linked_one_trip or any_loop_done) 1 else local_done,
-                    .deferred,
-                    .entered,
-                );
-                // Nested-loop linking (Phase 1): if this is an
-                // inner numeric-`for` running to completion (its
-                // terminal loop guard failed) and the exit lands
-                // on an enclosing loop, arm a continuation
-                // recording at the post-loop pc. Records the
-                // outer body forward; Phase 2 links it back here.
-                // Output-neutral (the recording aborts at the
-                // inner `for_prep` until Phase 2).
-                self.trace.maybeArmContinuation(final, result.exit_instr, proto);
-                // Coherent-state chaining (doc 16, Phase 2): the
-                // prime-side arm counter now lives in the unified
-                // hotexit charge above (`noteTakenExit` routes
-                // source-branch guard exits to `wants_prime_side`
-                // at the `hotexit` threshold), so no separate
-                // `countProductiveBranchExit` charge remains — one
-                // counter per exit, Pall's `snap->count`.
-                // Retire any dead-marked traces before leaving the
-                // walk so a stale narrow-lane trace doesn't linger
-                // in a slot just because a later trace succeeded.
-                // Safe: `continue :outer` abandons the walk, so the
-                // freed `*Trace`s are never revisited.
-                wctx.dead.retire(&self.trace);
-                // Nested-loop linking (Phase 1): a continuation
-                // recording just armed (pending at the post-loop
-                // pc). Its dispatch-prologue activation hook is
-                // `.full`-only, so the inner loop's final-iteration
-                // deopt-replay — which walks tier-0 from the inner
-                // anchor up to that post-loop pc — must run in
-                // `.full`. In `.fast` (the steady state of a hot
-                // inner loop) switch up; in `.full` just stay.
-                if (self.trace.pending_exit_anchor != null) {
-                    if (mode == .fast) {
-                        return .{ .switch_mode_at = pc }; // → .full
-                    }
-                    return .{ .resume_tier0 = pc }; // already `.full`
-                }
-                // Coherent-state chaining (doc 16, Phase 2): the
-                // productive branch-guard exit just crossed the arm
-                // threshold (`wants_prime_side` set for THIS anchor).
-                // Record the current prime iteration as a `.side`
-                // trace anchored at this outer header — regs are
-                // already coherent here, so tier-0 re-enters at the
-                // anchor with no deopt-replay and records
-                // `guard_true(p[i]) → inner for_prep → link`. Force
-                // `.full` so the replay-side prologue hook fires; do
-                // NOT advance pc (regs coherent at `ct.code.anchor`).
-                // Self-limiting: `countTracesAt >= 2` (in
-                // `noteTakenExit`'s branch route) stops re-arming
-                // once the prime side-trace exists, and the commit
-                // DONE-latches the parent exit.
-                if (self.trace.wants_prime_side) |want| {
-                    if (want.proto == final.code.anchor.proto and want.pc == final.code.anchor.pc and
-                        !self.trace.isRecording() and
-                        self.trace.pending_replay_anchor == null and
-                        !self.trace.isGated(final.code.anchor))
-                    {
-                        self.trace.setPendingReplayAnchor(final.code.anchor);
-                        // Hotexit provenance rides into the replay
-                        // recording for the commit's DONE latch.
-                        self.trace.pending_replay_src = self.trace.prime_want_src;
-                        self.trace.prime_want_src = null;
-                        self.trace.wants_prime_side = null;
-                        self.trace.prime_side_arms +|= 1;
-                        wctx.dead.retire(&self.trace);
-                        if (mode == .fast) {
-                            return .{ .switch_mode_at = pc }; // → .full
-                        }
-                        return .{ .resume_tier0 = pc }; // already `.full`
-                    }
-                }
-                // Nested-loop linking (Phase 3): once the
-                // continuation trace exists, a productive
-                // inner loop-done exit can chain to it. The
-                // chainer commits the final inner iteration
-                // from `buf`, runs continuation ⇄ inner-root
-                // for a bounded burst, and tells us where
-                // tier-0 should resume when it yields.
-                // Doc 58: only a numeric `for` loop-done chains here. A
-                // `while`/`repeat` condition guard is an ordinary exit — its
-                // continuation at the post-loop pc is reached through the
-                // exit-side route, not through a loop-done materialization.
-                if (ran_native and ran_native_link_mode) {
-                    if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
-                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                        wctx.dead.retire(&self.trace);
-                        return .{ .resume_tier0 = pc };
-                    }
-                } else if (!ran_native) {
-                    if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
-                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                        wctx.dead.retire(&self.trace);
-                        return .{ .resume_tier0 = pc };
-                    }
-                }
-                // Coherent-state chaining (doc 16, Phase 2): a
-                // productive *source-level branch-guard* exit
-                // (nsieve's `guard_false(p[i])` firing on a prime
-                // after committing composite iterations) leaves regs
-                // coherent at the outer header — the same loop-header
-                // re-entry deopt discipline as the zero-exit path
-                // below. Chain to a same-anchor sibling the cold walk
-                // didn't run — the prime side-trace armed by 2D — so
-                // the prime iteration + following composites run in
-                // the linked burst instead of dropping to tier-0.
-                // Seed `initially_excluded` with the walk's `visited`
-                // set (don't re-run the skip trace or a sibling
-                // already tried this back-edge). Native tier when the
-                // failed trace ran native (chain native→native),
-                // tier-1a otherwise. Null (no prime side-trace yet, or
-                // its inner guards failed) falls through to the T3
-                // handoff → tier-0 at the header, unchanged: the skip
-                // trace already committed its composites, so `i` has
-                // advanced and tier-0 runs the prime iteration and
-                // makes progress (no spin).
-                //
-                // `regs` (the live tier-0 register file) is
-                // passed, not a trace-local `trace_regs`, and
-                // that is intentional. NOT because the entered
-                // traces are input-free — since B-iii/B-iv
-                // (doc 22 §B.3/§B.5) `findLinkTrace` admits
-                // SEEDED continuations, so `t.code.inputs.len` is
-                // routinely nonzero. The reason is that a
-                // trace's `inputs` are non-register state
-                // (upvalues, globals, hash cells) resolved
-                // through the seed path into its own slab —
-                // never a remapping OF registers. Loop/link
-                // roots still read their register state
-                // directly from the coherent file at their
-                // anchor, so there is nothing to thread and
-                // the live regs remain exactly what each
-                // entered trace expects.
-                // Doc 58 §4.3: a loop's own test has the SHAPE of a source-branch
-                // guard (`guard_true` from a `jmp_if_false`) but it is a
-                // COMPLETION — chaining to a same-anchor sibling could only
-                // re-check a finished loop. `isSourceBranchGuardExit` excludes
-                // it, so no test is needed here.
-                if (self.trace.isSourceBranchGuardExit(final, result.exit_instr)) {
-                    const excl = ChainExclusion.of(final, ct, wctx.visited);
-                    if (ran_native) {
-                        if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
-                            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                            wctx.dead.retire(&self.trace);
-                            return .{ .resume_tier0 = pc };
-                        }
-                    } else {
-                        if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
-                            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                            wctx.dead.retire(&self.trace);
-                            return .{ .resume_tier0 = pc };
-                        }
-                    }
-                }
-                // T3 drop-to-fast on the productive-trace path.
-                // The handoff at the bottom of the back-edge
-                // block is bypassed by this `continue :outer`,
-                // so without this a loop that just finished
-                // recording and now enters its native trace
-                // every iteration would stay in `.full` forever
-                // (correct, but it keeps the elided prologue
-                // hooks on the tier-0 deopt iterations). Once
-                // recording is done and no other hook is live,
-                // park `pc` and re-enter `.fast`. Taken once at
-                // the transition; in `.fast` this is compiled
-                // out, so steady-state native entry is unbranched.
+            wctx.dead.retire(&self.trace);
+            if (local_done > 0) {
                 if (mode == .full and self.runFastPath()) {
                     return .{ .switch_mode_at = pc };
                 }
                 return .{ .resume_tier0 = pc };
             }
-            // Zero iterations: apply the penalty, then try
-            // the next trace at this anchor.
+            return .next_candidate;
+        }
+        if (ran_native) self.trace.dbg("receipt: pc={d} t={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.code.anchor.pc, ct.id, ran_native_link_mode, local_done, result.exit_instr, result.ledger_len, result.completed });
+        const linked_one_trip = ran_native and ran_native_link_mode and
+            local_done == 0 and
+            result.exit_reason == .normal and
+            result.exit_instr != std.math.maxInt(u32) and
+            result.exit_instr < final.code.instrs.len and
+            trace.isLoopDoneGuardIndex(final, result.exit_instr);
+
+        // 2.3c-1 (M1 half-fusion, doc 17): fused top-level
+        // `.link` consumer. When `driveChain` armed `ct`'s
+        // source-branch guard slot → a prime-side ramp's
+        // `ordinary_entry`, a native run of `ct` (the skip
+        // trace) can fuse straight into that ramp under the
+        // shared frame: skip commits its composites, hits the
+        // armed guard, jumps into the ramp, which runs to its
+        // `.link` terminal committing ZERO of its OWN
+        // iterations. The receipt is then `final = ramp`,
+        // `result.completed == entry_rbx ==` skip's own count
+        // (so `local_done == 0`), and regs are coherent at the
+        // ramp's INNER-loop PC — NOT the outer header. The plain
+        // dispatcher below would misread `local_done == 0` as a
+        // skip zero-exit, call `onSideExit(final, 0)`, and drive
+        // `.ordinary_header` off `final.code.anchor.pc` (the outer
+        // header) — a semantic misresume from the wrong coherent
+        // PC (doc 17 §Increment 2.3c). Through 2.3c-1 a bespoke
+        // scalar recognizer (armed-edge provenance) handled it
+        // here; 2.3c-2d folds that steering into `replayLedger`.
+        //
+        // 2.3c-2d (D2b-ii, doc 17): a dispatcher native entry that
+        // fused forward through an armed slot returns a MULTI-ENTRY
+        // per-transition ledger (`ledger_len > 1`) describing the
+        // whole fused span. Drain it through the authoritative
+        // `replayLedger` graph-walk (origin `.dispatcher_root`) —
+        // the same drain the in-burst continuation call uses —
+        // instead of the bespoke scalar M1 recognizer this
+        // replaces. `replayLedger`'s `.deopt` non-last arm
+        // reproduces the old `onSideExit(ct, skip_local)` +
+        // sub-case (a)/(b) steering byte-for-byte.
+        //
+        // 2c-E: gated on bare `ledger_len > 1` — a fused span that
+        // TERMINATED in `.prologue_fail` must also drain (the
+        // scalar code below only knows the final body: it would
+        // read `local_done == 0` off the failing successor, drop
+        // the span's committed prefix on the floor, and misroute
+        // the zero-exit path). `replayLedger` models both
+        // prologue-fail-terminated grammars: `[skip.deopt(M1),
+        // ramp.prologue_fail]` (sub-case (c): `onSideExit(skip,
+        // local)` + `onSideExit(ramp, 0)` + resume at the skip's
+        // anchor — exactly the unarmed native steering) and
+        // `[I.loop_done_linked, C.prologue_fail]` (the committed
+        // loop-done accounts, the fail breaks the burst at the
+        // post-loop PC).
+        //
+        // Doc 22 §B.2 (B-iv): fused SEED-DECLINE terminals drain
+        // here too — the direct handlers above are gated to
+        // `ledger_len <= 1`, so a span like `[T.link_terminal,
+        // U.seed_hash_decline]` reaches `replayLedger`'s decline
+        // arms, which walk the committed prefix and resume
+        // deterministic selection at the DECLINER's coherent
+        // anchor (no strike, no receipt — a decline is an
+        // entry-condition mismatch, not a guard failure). The
+        // hash rerun/downgrade happens on re-selection via the
+        // direct-entry H1 path, never in-drain.
+        if (ran_native and result.ledger_len > 1) {
+            const chain = self.trace.driveDispatcherLedger(ct, self.trace.ledger_scratch[0..result.ledger_len], proto, regs, safe_to_arm);
+            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+            // Doc 56 Phase 5: the span ended on an unarmed exit
+            // adapter; the slab is coherent at `pc` (its resume pc).
+            if (chain.exit_side) |es| {
+                const d = self.consumeExitSideTerminal(mode, es, proto, regs, base, safe_to_arm);
+                wctx.dead.retire(&self.trace);
+                return d;
+            }
+            // Side-trace precision: if this burst's terminal
+            // crossed the hotguard threshold, arm the recording
+            // AT the resume so it captures the failing
+            // iteration's re-run — the back-edge consumption is
+            // one iteration late and records the wrong shape on
+            // alternating loops (see the fn doc). Armed via the
+            // replay-side pending anchor, which the `.full`
+            // prologue consumes at the anchor pc — so a `.fast`
+            // dispatch must switch up, exactly as the
+            // `wants_prime_side` consumption below does.
+            const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
+            wctx.dead.retire(&self.trace);
+            if (armed_side and mode == .fast) {
+                return .{ .switch_mode_at = pc }; // → .full
+            }
+            return .{ .resume_tier0 = pc };
+        }
+
+        // --- hot-exit counting (step 4) ---
+        // Pall's `trace_hotside` (lj_trace.c:798): EVERY
+        // taken side exit — productive or not — charges
+        // its own per-(trace, exit) counter; crossing
+        // `hotexit` wants a side trace for the alternate
+        // path.
+        //
+        // A numeric-`for` loop-done exit is a productive completion owned
+        // by the continuation machinery (`maybeArmContinuation` below), so
+        // it is not counted (`linked_one_trip` exits are loop-done by
+        // construction and fall out of the same check).
+        //
+        // Doc 58 B2 review, blocker 2: a `while`/`repeat` loop's OWN test
+        // (`isOwnLoopTest`) IS counted. Its post-loop continuation has no
+        // `maybeArmContinuation` leg any more — doc 56's exit-side route
+        // is what records it, and that route is fed only from here.
+        // `noteTakenExit` routes it to exit-side first and stops it
+        // before every legacy route (§4.3, review r3 finding 1: a legacy
+        // want would unpatch the entry and record a pass that can only
+        // end in LLEAVE). Excluding it here starved exit-side completely.
+        //
+        // Classify ONCE — this is the per-completion hot path (2M+
+        // entries/run on scimark-lu) and each classifier walks trace instrs
+        // + proto code.
+        const exit_ok = result.exit_instr != std.math.maxInt(u32) and
+            result.exit_instr < final.code.instrs.len;
+        const numeric_for_done = exit_ok and
+            trace.isLoopDoneGuardIndex(final, result.exit_instr);
+        const any_loop_done = exit_ok and
+            (numeric_for_done or trace.isOwnLoopTestIndex(final, result.exit_instr));
+        const count_exit = exit_ok and !numeric_for_done;
+        if (exit_ok and local_done == 0 and !linked_one_trip and
+            final.code.isSteadyRegionExit(result.exit_instr))
+            self.trace.peeled_steady_zero_exits +|= 1;
+        if (count_exit) {
+            // Doc 56 Phases 3–4: a direct run may take the exit-side
+            // route — tier-1a always (its executor honours the exit-side
+            // state), native when its page carries exit adapters and the
+            // exit is the entered trace's own.
+            const route: trace.TraceState.ExitRoute = if (!ran_native)
+                .tier1a_direct
+            else if (self.trace.exitSideNative() and final == ct)
+                .native_direct
+            else
+                .legacy;
+            self.trace.noteTakenExit(final, result.exit_instr, local_done, route);
+        }
+
+        if (local_done > 0 or linked_one_trip) {
+            // This trace did useful work — keep its result.
+            // (`linked_one_trip`: the committed loop-done IS one
+            // enclosing iteration, replayLedger's `max(local, 1)`.)
             self.trace.onSideExitReceipt(
                 final,
-                0,
+                if (linked_one_trip) 1 else local_done,
                 result.exit_instr,
-                0,
+                if (linked_one_trip or any_loop_done) 1 else local_done,
                 .deferred,
-                if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
+                .entered,
             );
-
-            // Widen-eviction: if this trace's array lane guard
-            // can never pass again (the live array widened past
-            // it, monotonically), mark it for retirement so its
-            // anchor slot frees for the stabilised wider-lane
-            // trace. Deferred to after the walk (see `dead`).
-            //
-            // 2.3c-0d (doc 17): eviction retires the trace we ENTERED at
-            // this anchor (`ct`). `dead ⊆ visited` (both capped at 8), and
-            // a fused child (`final != ct`) is not a member of this
-            // anchor's walk — it lives at its own anchor and widen-evicts
-            // itself there (P-E then resets `ct`'s arm). So eviction stays
-            // a `ct`-slot question even though the failing lane-guard shape
-            // is a `final` fact; gate on `final == ct` to keep a fused
-            // child out of this anchor's `dead` list. Byte-identical now
-            // (`final == ct` always).
-            if (final == ct and !wctx.dead.full() and self.trace.laneWidenedPast(ct, regs)) {
-                wctx.dead.add(ct);
+            // Nested-loop linking (Phase 1): if this is an
+            // inner numeric-`for` running to completion (its
+            // terminal loop guard failed) and the exit lands
+            // on an enclosing loop, arm a continuation
+            // recording at the post-loop pc. Records the
+            // outer body forward; Phase 2 links it back here.
+            // Output-neutral (the recording aborts at the
+            // inner `for_prep` until Phase 2).
+            self.trace.maybeArmContinuation(final, result.exit_instr, proto);
+            // Coherent-state chaining (doc 16, Phase 2): the
+            // prime-side arm counter now lives in the unified
+            // hotexit charge above (`noteTakenExit` routes
+            // source-branch guard exits to `wants_prime_side`
+            // at the `hotexit` threshold), so no separate
+            // `countProductiveBranchExit` charge remains — one
+            // counter per exit, Pall's `snap->count`.
+            // Retire any dead-marked traces before leaving the
+            // walk so a stale narrow-lane trace doesn't linger
+            // in a slot just because a later trace succeeded.
+            // Safe: `continue :outer` abandons the walk, so the
+            // freed `*Trace`s are never revisited.
+            wctx.dead.retire(&self.trace);
+            // Nested-loop linking (Phase 1): a continuation
+            // recording just armed (pending at the post-loop
+            // pc). Its dispatch-prologue activation hook is
+            // `.full`-only, so the inner loop's final-iteration
+            // deopt-replay — which walks tier-0 from the inner
+            // anchor up to that post-loop pc — must run in
+            // `.full`. In `.fast` (the steady state of a hot
+            // inner loop) switch up; in `.full` just stay.
+            if (self.trace.pending_exit_anchor != null) {
+                if (mode == .fast) {
+                    return .{ .switch_mode_at = pc }; // → .full
+                }
+                return .{ .resume_tier0 = pc }; // already `.full`
             }
-
-            // --- coherent-anchor chaining (doc 16) ---
-            // After this zero-exit the registers are coherent at
-            // `ct.code.anchor`, so chain to a same-anchor sibling the
-            // cold walk hasn't run (e.g. an outer-header prime
-            // side-trace). Seed `initially_excluded` with the
-            // walk's `visited` set so we neither re-run the trace
-            // that just failed nor re-penalize a sibling already
-            // tried this back-edge.
+            // Coherent-state chaining (doc 16, Phase 2): the
+            // productive branch-guard exit just crossed the arm
+            // threshold (`wants_prime_side` set for THIS anchor).
+            // Record the current prime iteration as a `.side`
+            // trace anchored at this outer header — regs are
+            // already coherent here, so tier-0 re-enters at the
+            // anchor with no deopt-replay and records
+            // `guard_true(p[i]) → inner for_prep → link`. Force
+            // `.full` so the replay-side prologue hook fires; do
+            // NOT advance pc (regs coherent at `ct.code.anchor`).
+            // Self-limiting: `countTracesAt >= 2` (in
+            // `noteTakenExit`'s branch route) stops re-arming
+            // once the prime side-trace exists, and the commit
+            // DONE-latches the parent exit.
+            if (self.trace.wants_prime_side) |want| {
+                if (want.proto == final.code.anchor.proto and want.pc == final.code.anchor.pc and
+                    !self.trace.isRecording() and
+                    self.trace.pending_replay_anchor == null and
+                    !self.trace.isGated(final.code.anchor))
+                {
+                    self.trace.setPendingReplayAnchor(final.code.anchor);
+                    // Hotexit provenance rides into the replay
+                    // recording for the commit's DONE latch.
+                    self.trace.pending_replay_src = self.trace.prime_want_src;
+                    self.trace.prime_want_src = null;
+                    self.trace.wants_prime_side = null;
+                    self.trace.prime_side_arms +|= 1;
+                    wctx.dead.retire(&self.trace);
+                    if (mode == .fast) {
+                        return .{ .switch_mode_at = pc }; // → .full
+                    }
+                    return .{ .resume_tier0 = pc }; // already `.full`
+                }
+            }
+            // Nested-loop linking (Phase 3): once the
+            // continuation trace exists, a productive
+            // inner loop-done exit can chain to it. The
+            // chainer commits the final inner iteration
+            // from `buf`, runs continuation ⇄ inner-root
+            // for a bounded burst, and tells us where
+            // tier-0 should resume when it yields.
+            // Doc 58: only a numeric `for` loop-done chains here. A
+            // `while`/`repeat` condition guard is an ordinary exit — its
+            // continuation at the post-loop pc is reached through the
+            // exit-side route, not through a loop-done materialization.
+            if (ran_native and ran_native_link_mode) {
+                if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
+                    if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                    wctx.dead.retire(&self.trace);
+                    return .{ .resume_tier0 = pc };
+                }
+            } else if (!ran_native) {
+                if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
+                    if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                    wctx.dead.retire(&self.trace);
+                    return .{ .resume_tier0 = pc };
+                }
+            }
+            // Coherent-state chaining (doc 16, Phase 2): a
+            // productive *source-level branch-guard* exit
+            // (nsieve's `guard_false(p[i])` firing on a prime
+            // after committing composite iterations) leaves regs
+            // coherent at the outer header — the same loop-header
+            // re-entry deopt discipline as the zero-exit path
+            // below. Chain to a same-anchor sibling the cold walk
+            // didn't run — the prime side-trace armed by 2D — so
+            // the prime iteration + following composites run in
+            // the linked burst instead of dropping to tier-0.
+            // Seed `initially_excluded` with the walk's `visited`
+            // set (don't re-run the skip trace or a sibling
+            // already tried this back-edge). Native tier when the
+            // failed trace ran native (chain native→native),
+            // tier-1a otherwise. Null (no prime side-trace yet, or
+            // its inner guards failed) falls through to the T3
+            // handoff → tier-0 at the header, unchanged: the skip
+            // trace already committed its composites, so `i` has
+            // advanced and tier-0 runs the prime iteration and
+            // makes progress (no spin).
             //
-            // Tier selection mirrors the productive branch-guard
-            // site above: chain native→native when the failed
-            // trace ran native (`ran_native`, set at trace entry),
-            // tier-1a otherwise. Previously this site hardcoded
-            // `.ir` even under `--jit-native`, so a native
-            // zero-exit that chained a same-anchor sibling dropped
-            // that sibling to tier-1a — the coherent regs are
-            // identical, so it was inert at the default
-            // `min_useful`, but latent once chaining fires. Keying
-            // off `ran_native` (a mode-invariant fact — the trace
-            // either has native code or it doesn't) preserves C5.
-            // `tier` is a comptime param, so branch on `ran_native`
-            // into two literal-tier calls (as the branch-guard site
-            // above does) rather than a runtime tier value.
-            const excl = ChainExclusion.of(final, ct, wctx.visited);
-            if (ran_native) {
-                if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
-                    if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                    wctx.dead.retire(&self.trace);
-                    return .{ .resume_tier0 = pc };
+            // `regs` (the live tier-0 register file) is
+            // passed, not a trace-local `trace_regs`, and
+            // that is intentional. NOT because the entered
+            // traces are input-free — since B-iii/B-iv
+            // (doc 22 §B.3/§B.5) `findLinkTrace` admits
+            // SEEDED continuations, so `t.code.inputs.len` is
+            // routinely nonzero. The reason is that a
+            // trace's `inputs` are non-register state
+            // (upvalues, globals, hash cells) resolved
+            // through the seed path into its own slab —
+            // never a remapping OF registers. Loop/link
+            // roots still read their register state
+            // directly from the coherent file at their
+            // anchor, so there is nothing to thread and
+            // the live regs remain exactly what each
+            // entered trace expects.
+            // Doc 58 §4.3: a loop's own test has the SHAPE of a source-branch
+            // guard (`guard_true` from a `jmp_if_false`) but it is a
+            // COMPLETION — chaining to a same-anchor sibling could only
+            // re-check a finished loop. `isSourceBranchGuardExit` excludes
+            // it, so no test is needed here.
+            if (self.trace.isSourceBranchGuardExit(final, result.exit_instr)) {
+                const excl = ChainExclusion.of(final, ct, wctx.visited);
+                if (ran_native) {
+                    if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
+                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                        wctx.dead.retire(&self.trace);
+                        return .{ .resume_tier0 = pc };
+                    }
+                } else {
+                    if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
+                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                        wctx.dead.retire(&self.trace);
+                        return .{ .resume_tier0 = pc };
+                    }
                 }
-            } else {
-                if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
-                    if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                    wctx.dead.retire(&self.trace);
-                    return .{ .resume_tier0 = pc };
-                }
+            }
+            // T3 drop-to-fast on the productive-trace path.
+            // The handoff at the bottom of the back-edge
+            // block is bypassed by this `continue :outer`,
+            // so without this a loop that just finished
+            // recording and now enters its native trace
+            // every iteration would stay in `.full` forever
+            // (correct, but it keeps the elided prologue
+            // hooks on the tier-0 deopt iterations). Once
+            // recording is done and no other hook is live,
+            // park `pc` and re-enter `.fast`. Taken once at
+            // the transition; in `.fast` this is compiled
+            // out, so steady-state native entry is unbranched.
+            if (mode == .full and self.runFastPath()) {
+                return .{ .switch_mode_at = pc };
+            }
+            return .{ .resume_tier0 = pc };
+        }
+        // Zero iterations: apply the penalty, then try
+        // the next trace at this anchor.
+        self.trace.onSideExitReceipt(
+            final,
+            0,
+            result.exit_instr,
+            0,
+            .deferred,
+            if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
+        );
+
+        // Widen-eviction: if this trace's array lane guard
+        // can never pass again (the live array widened past
+        // it, monotonically), mark it for retirement so its
+        // anchor slot frees for the stabilised wider-lane
+        // trace. Deferred to after the walk (see `dead`).
+        //
+        // 2.3c-0d (doc 17): eviction retires the trace we ENTERED at
+        // this anchor (`ct`). `dead ⊆ visited` (both capped at 8), and
+        // a fused child (`final != ct`) is not a member of this
+        // anchor's walk — it lives at its own anchor and widen-evicts
+        // itself there (P-E then resets `ct`'s arm). So eviction stays
+        // a `ct`-slot question even though the failing lane-guard shape
+        // is a `final` fact; gate on `final == ct` to keep a fused
+        // child out of this anchor's `dead` list. Byte-identical now
+        // (`final == ct` always).
+        if (final == ct and !wctx.dead.full() and self.trace.laneWidenedPast(ct, regs)) {
+            wctx.dead.add(ct);
+        }
+
+        // --- coherent-anchor chaining (doc 16) ---
+        // After this zero-exit the registers are coherent at
+        // `ct.code.anchor`, so chain to a same-anchor sibling the
+        // cold walk hasn't run (e.g. an outer-header prime
+        // side-trace). Seed `initially_excluded` with the
+        // walk's `visited` set so we neither re-run the trace
+        // that just failed nor re-penalize a sibling already
+        // tried this back-edge.
+        //
+        // Tier selection mirrors the productive branch-guard
+        // site above: chain native→native when the failed
+        // trace ran native (`ran_native`, set at trace entry),
+        // tier-1a otherwise. Previously this site hardcoded
+        // `.ir` even under `--jit-native`, so a native
+        // zero-exit that chained a same-anchor sibling dropped
+        // that sibling to tier-1a — the coherent regs are
+        // identical, so it was inert at the default
+        // `min_useful`, but latent once chaining fires. Keying
+        // off `ran_native` (a mode-invariant fact — the trace
+        // either has native code or it doesn't) preserves C5.
+        // `tier` is a comptime param, so branch on `ran_native`
+        // into two literal-tier calls (as the branch-guard site
+        // above does) rather than a runtime tier value.
+        const excl = ChainExclusion.of(final, ct, wctx.visited);
+        if (ran_native) {
+            if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
+                if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                wctx.dead.retire(&self.trace);
+                return .{ .resume_tier0 = pc };
+            }
+        } else {
+            if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
+                if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                wctx.dead.retire(&self.trace);
+                return .{ .resume_tier0 = pc };
             }
         }
         return .next_candidate;
