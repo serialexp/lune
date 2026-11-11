@@ -976,3 +976,107 @@ test "doc 77 Phase 4: a vararg or native __index, and a handler that allocates, 
         \\print(s, made.n)
     , "90600\t300\n");
 }
+
+// ---- Phase 4: operator metamethods (doc 77 §6.4) ----
+
+test "doc 77 Phase 4: every arithmetic and bitwise operator, __unm and __bnot call their handler on the trace" {
+    // Each handler sees its operands in source order (`val(a) * 10 -
+    // val(b)`), constants included, and the unary ones get the operand
+    // twice. `1.5 & v` asks `v`'s handler: a float has no integer form.
+    try expectProgramTuned(
+        \\local function val(x) if type(x) == "table" then return x.x end return x end
+        \\local V = {}
+        \\for _, n in ipairs({ "add", "sub", "mul", "div", "mod", "pow", "idiv", "band", "bor", "bxor", "shl", "shr", "sar" }) do
+        \\  local w = #n
+        \\  V["__" .. n] = function(a, b) return val(a) * 10 - val(b) + w end
+        \\end
+        \\V.__unm = function(a, b) return val(a) * 100 + val(b) end
+        \\V.__bnot = function(a, b) return val(a) - val(b) + 1 end
+        \\local v = setmetatable({ x = 3 }, V)
+        \\local w = setmetatable({ x = 4 }, V)
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  local k = i % 7
+        \\  s = s + (v + w) + (v - k) + (k * w) + (v / 2) + (5 % w) + (v ^ w) + (k // v)
+        \\  s = s + (v & w) + (k | v) + (w ~ 1) + (v << k) + (k >> w) + (v ~>> 2)
+        \\  s = s + (-v) + (~w) + (1.5 & v)
+        \\end
+        \\print(s)
+    , "148124\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 Phase 4: the first operand's handler wins, and a change to which one applies exits" {
+    // `l` first has no metatable, then one without `__add` (both: `b`'s
+    // handler, from either side), then one with it (`l`'s, on its side);
+    // `B.__add` is replaced last.
+    try expectProgramTuned(
+        \\local A = { __add = function(a, b) return 1 end }
+        \\local B = { __add = function(a, b) return 100 end }
+        \\local plain = {}
+        \\local nomm = setmetatable({}, { __sub = function() return 0 end })
+        \\local b = setmetatable({}, B)
+        \\local function run(l)
+        \\  local s = 0
+        \\  for i = 1, 100 do s = s + (l + b) + (b + l) end
+        \\  return s
+        \\end
+        \\local r1 = run(plain)
+        \\local r2 = run(nomm)
+        \\setmetatable(plain, A)
+        \\local r3 = run(plain)
+        \\getmetatable(nomm).__add = function(a, b) return 7 end
+        \\local r4 = run(nomm)
+        \\B.__add = function(a, b) return 2 end
+        \\local r5 = run(nomm)
+        \\print(r1, r2, r3, r4, r5)
+    , "20000\t20000\t10100\t10700\t900\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 Phase 4: a function __len is called with the table twice; rawlen and a removed __len read the border" {
+    try expectProgramTuned(
+        \\local L = { __len = function(t, u) return rawlen(t) * 10 + rawlen(u) end }
+        \\local t = setmetatable({ 1, 2, 3 }, L)
+        \\local function run()
+        \\  local s = 0
+        \\  for i = 1, 100 do s = s + #t + rawlen(t) end
+        \\  return s
+        \\end
+        \\local r1 = run()
+        \\L.__len = nil
+        \\local r2 = run()
+        \\L.__len = function(t) return 5 end
+        \\local r3 = run()
+        \\print(r1, r2, r3)
+    , "3600\t600\t800\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 §7: an exit inside an arithmetic handler runs it once per iteration" {
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, function(a, b)
+        \\    c.n = c.n + 1
+        \\    if b > 150 then return 10 end
+        \\    return 1
+        \\  end
+        \\end
+        \\local c, h = mk()
+        \\local o = setmetatable({}, { __add = h })
+        \\local s = 0
+        \\for i = 1, 300 do s = s + (o + i) end
+        \\print(s, c.n)
+    , "1650\t300\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 Phase 4: a native operator handler, and an operand with no handler, stay with tier 0" {
+    try expectProgram(
+        \\local N = setmetatable({ 1, 2 }, { __unm = rawlen, __add = math.max })
+        \\local s = 0
+        \\for i = 1, 200 do s = s + -N end
+        \\local ok = pcall(function()
+        \\  local p = setmetatable({}, {})
+        \\  for i = 1, 100 do s = s + (p + i) end
+        \\end)
+        \\print(s, ok)
+    , "400\tfalse\n");
+}

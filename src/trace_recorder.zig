@@ -1765,9 +1765,9 @@ pub const RecordingSession = struct {
             .add_kr, .sub_kr, .mul_kr, .div_kr, .mod_kr, .idiv_kr, .pow_kr,
             .band_rk, .bor_rk, .bxor_rk, .shl_rk, .shr_rk,
             => try self.recArithInstr(instr, regs, proto),
-            .neg => try self.recNeg(instr, regs),
+            .neg => try self.recNeg(instr, regs, proto),
             .not => try self.recNot(instr, regs),
-            .bnot => try self.recBnot(instr, regs),
+            .bnot => try self.recBnot(instr, regs, proto),
 
             // comparisons (gt/ge normalise to lt/le with swapped operands).
             .eq, .ne, .eq_p, .ne_p, .eq_s, .ne_s, .eq_n, .ne_n => try self.recEq(if (bytecode.eqFormOf(instr.op).?.negate) .ne else .eq, eqFrameOf(instr, proto), regs),
@@ -1842,7 +1842,7 @@ pub const RecordingSession = struct {
             .len => {
                 const v = regs.get(instr.b);
                 if (v.isHeap() and v.heapType() == .table) {
-                    try self.recAlenShape(instr.a, instr.b, .b, regs, false);
+                    try self.recAlenShape(instr.a, instr.b, .b, regs, false, proto);
                 } else if (v.isHeap() and v.heapType() == .string) {
                     const rstr = try self.refOf(instr.b);
                     if (self.konstValueOf(rstr)) |kv| {
@@ -2451,6 +2451,11 @@ pub const RecordingSession = struct {
         rhs: Operand,
         lhs_od: OperandDesig,
         rhs_od: OperandDesig,
+        /// The proto of the frame running the instruction, when it is one
+        /// tier 0 finishes with a `.finish_op` frame (arithmetic and
+        /// bitwise): the frame a metamethod handler is inlined above
+        /// (`recBinaryMeta`, doc 77 Phase 4). Null for the other users.
+        frame_proto: ?*const Proto = null,
     };
 
     pub fn arithFrameOf(instr: Instr, proto: *const Proto, shape: bytecode.ArithShape) BinaryFrame {
@@ -2471,7 +2476,8 @@ pub const RecordingSession = struct {
     /// Record an arithmetic or bitwise instruction, any shape.
     fn recArithInstr(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
         const f = bytecode.arithFormOf(instr.op).?;
-        const fr = arithFrameOf(instr, proto, f.shape);
+        var fr = arithFrameOf(instr, proto, f.shape);
+        fr.frame_proto = proto;
         switch (f.base) {
             .add => try self.recArith(.add, fr, regs),
             .sub => try self.recArith(.sub, fr, regs),
@@ -2493,7 +2499,7 @@ pub const RecordingSession = struct {
     pub fn recArith(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow) !void {
         const vb = operandValue(regs, f.lhs);
         const vc = operandValue(regs, f.rhs);
-        if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
+        if (!vb.isNumber() or !vc.isNumber()) return self.recBinaryMeta(arithMetaName(op), f, vb, vc);
         const rb = try self.operandRef(f.lhs);
         const rc = try self.operandRef(f.rhs);
         try self.guardNum(rb, vb, .operand_type, f.lhs_od);
@@ -2505,6 +2511,7 @@ pub const RecordingSession = struct {
     pub fn recBitwise(self: *RecordingSession, op: IrOp, f: BinaryFrame, regs: RegWindow) !void {
         const vb = operandValue(regs, f.lhs);
         const vc = operandValue(regs, f.rhs);
+        if (isTableValue(vb) or isTableValue(vc)) return self.recBinaryMeta(arithMetaName(op), f, vb, vc);
         if (!vb.isInt() or !vc.isInt()) return self.abort(.bad_type);
         const rb = try self.operandRef(f.lhs);
         const rc = try self.operandRef(f.rhs);
@@ -2514,8 +2521,93 @@ pub const RecordingSession = struct {
         self.setReg(f.dst, r);
     }
 
-    pub fn recNeg(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+    /// The metamethod tier 0 calls for IR arithmetic or bitwise `op` on a
+    /// non-number operand: `"__" ++` the operator's name
+    /// (`arithGeneric`).
+    fn arithMetaName(op: IrOp) []const u8 {
+        return switch (op) {
+            .add => "__add",
+            .sub => "__sub",
+            .mul => "__mul",
+            .div => "__div",
+            .idiv => "__idiv",
+            .mod => "__mod",
+            .pow => "__pow",
+            .band => "__band",
+            .bor => "__bor",
+            .bxor => "__bxor",
+            .shl => "__shl",
+            .shr => "__shr",
+            .sar => "__sar",
+            else => unreachable,
+        };
+    }
+
+    fn isTableValue(v: Value) bool {
+        return v.isHeap() and v.heapType() == .table;
+    }
+
+    /// Doc 77 Phase 4: a binary operator tier 0 hands to metamethod `name`
+    /// (`binMeta`): the first operand's handler, else the second's, called
+    /// as `h(a, b)` in source order, its first result to `f.dst`. Recorded
+    /// when each operand is a number or a table and the handler is a Lua
+    /// function (`recMetaCall`), so the instruction has a frame. The first
+    /// operand's choice is proved either way: a table's handler is loaded
+    /// and pinned, or its absence proved (`guard_table` with no metatable
+    /// allowed, or `guardNoMetamethod`); a number is pinned a number, since
+    /// a table there would be asked first. Anything else stays with tier 0:
+    /// a string operand (its metatable is the string library's), a native
+    /// or callable-table handler, or no handler at all (tier 0 raises).
+    fn recBinaryMeta(self: *RecordingSession, name: []const u8, f: BinaryFrame, vb: Value, vc: Value) !void {
+        const fp = f.frame_proto orelse return self.abort(.bad_type);
+        if (!(vb.isNumber() or isTableValue(vb)) or !(vc.isNumber() or isTableValue(vc))) return self.abort(.bad_type);
+        const rb = try self.operandRef(f.lhs);
+        const rc = try self.operandRef(f.rhs);
+        const args = [_]Ref{ rb, rc };
+        if (isTableValue(vb)) {
+            if (try self.metaReceiver(rb, vb, name, f.lhs_od, f.dst)) |mt|
+                return self.recMetaCall(fp, rb, mt, name, &args, f.dst, 1, f.lhs_od);
+            if (!self.active) return;
+        } else try self.guardNum(rb, vb, .operand_type, f.lhs_od);
+        if (isTableValue(vc)) {
+            if (try self.metaReceiver(rc, vc, name, f.rhs_od, f.dst)) |mt|
+                return self.recMetaCall(fp, rc, mt, name, &args, f.dst, 1, f.rhs_od);
+            if (!self.active) return;
+        }
+        // Neither operand has the handler: tier 0 raises.
+        return self.abort(.bad_type);
+    }
+
+    /// Doc 77 Phase 4: the table `v` (ref `r`) as the receiver of
+    /// metamethod `name`: `guard_table`, then its metatable when that holds
+    /// `name` as a Lua function (the caller inlines it). Null when it does
+    /// not, with the absence proved (no metatable: `guard_table` allows
+    /// none; else `guardNoMetamethod`), or with the recording stopped (a
+    /// present `name` that is not a Lua function aborts `has_metatable`).
+    fn metaReceiver(self: *RecordingSession, r: Ref, v: Value, name: []const u8, od: OperandDesig, dst: u16) !?*table_mod.Table {
+        const tbl = table_mod.Table.fromHeader(v.asHeap());
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = r, .aux = metaAux(tbl) }), .container_type, od, .neutral);
+        const mt = tbl.metatable orelse return null;
+        if (try self.metamethodIsClosure(mt, name)) return mt;
+        _ = try self.guardNoMetamethod(r, mt, name, od, dst);
+        return null;
+    }
+
+    /// Doc 77 Phase 4: a unary operator on a table, which tier 0 hands to
+    /// metamethod `name` as `h(v, v)` (`unMeta`; `lenValue` for `__len`),
+    /// its first result to `dst`. Recorded when the handler is a Lua
+    /// function; anything else stays with tier 0 (`metaReceiver`).
+    fn recUnaryMeta(self: *RecordingSession, name: []const u8, frame_proto: *const Proto, dst: u16, src: u16, regs: RegWindow) !void {
+        const v = regs.get(src);
+        const r = try self.refOf(src);
+        // No handler: tier 0 raises (`abort` keeps an earlier reason).
+        const mt = (try self.metaReceiver(r, v, name, .b, dst)) orelse return self.abort(.bad_type);
+        return self.recMetaCall(frame_proto, r, mt, name, &.{ r, r }, dst, 1, .b);
+    }
+
+    pub fn recNeg(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
         const vb = regs.get(instr.b);
+        if (isTableValue(vb)) return self.recUnaryMeta("__unm", proto, instr.a, instr.b, regs);
         if (!vb.isNumber()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         try self.guardNum(rb, vb, .operand_type, .b);
@@ -2540,8 +2632,9 @@ pub const RecordingSession = struct {
         self.setReg(instr.a, r);
     }
 
-    pub fn recBnot(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+    pub fn recBnot(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
         const vb = regs.get(instr.b);
+        if (isTableValue(vb)) return self.recUnaryMeta("__bnot", proto, instr.a, instr.b, regs);
         if (!vb.isInt()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         try self.guardInt(rb, .operand_type, .b);
@@ -6123,7 +6216,7 @@ pub const RecordingSession = struct {
         const argv = regs.get(arg_slot);
         if (argv.isHeap() and argv.heapType() == .table) {
             try self.guardBuiltinCallee(instr.a, .rawlen);
-            return self.recAlenShape(instr.a, arg_slot, .a1, regs, true);
+            return self.recAlenShape(instr.a, arg_slot, .a1, regs, true, null);
         }
         const arg_ref = try self.refOf(arg_slot);
         const kv = self.konstValueOf(arg_ref) orelse return self.abort(.bad_type);
@@ -6222,10 +6315,15 @@ pub const RecordingSession = struct {
     ///     a different table cannot alias this one's header fields.
     /// So: no pending-store abort. Gate: the rawset-then-`#t` differential in
     /// trace_record_test.zig plus scalar's end-to-end run (doc 24 D7).
-    pub fn recAlenShape(self: *RecordingSession, dst: u16, tab_slot: u16, tab_od: OperandDesig, regs: RegWindow, raw: bool) !void {
+    pub fn recAlenShape(self: *RecordingSession, dst: u16, tab_slot: u16, tab_od: OperandDesig, regs: RegWindow, raw: bool, frame_proto: ?*const Proto) !void {
         const vtab = regs.get(tab_slot);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        // Doc 77 Phase 4: a Lua function `__len` is called as `h(t, t)`
+        // (`lenValue`), whatever the raw length would be. `rawlen` gives no
+        // frame.
+        if (tbl.metatable) |mt| if (!raw) if (frame_proto) |fp| if (try self.metamethodIsClosure(mt, "__len"))
+            return self.recUnaryMeta("__len", fp, dst, tab_slot, regs);
         // Record only what the op can answer: tier 0's own fast case, on a
         // lane the op has a probe for (a grid has none).
         const probe = trace_ir.AlenProbe.ofLane(tbl.array.lane) orelse return self.abort(.bad_type);
@@ -6233,8 +6331,8 @@ pub const RecordingSession = struct {
         const rtab = try self.refOf(tab_slot);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = metaAux(tbl) }), .container_type, tab_od, .neutral);
         // Doc 77 §5.4: `#t` on a table with a metatable is the raw border
-        // only while it has no `__len` (calling one is Phase 4); `rawlen`
-        // never asks.
+        // only while it has no `__len` (a Lua function one is called
+        // above); `rawlen` never asks.
         if (tbl.metatable) |mt| if (!raw) {
             if (!try self.guardNoMetamethod(rtab, mt, "__len", tab_od, dst)) return;
         };

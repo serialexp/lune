@@ -3,7 +3,8 @@
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
 decided; Phases 0–3 landed (2026-11-11); Phase 4 started (computed-callee
 upvalue reads and the anchor-window alias, §6.6; `__index`/`__newindex`
-functions, §6.1); the rest of
+functions, §6.1; arithmetic, bitwise, unary and `__len` handlers, §6.4);
+the rest of
 Phases 4–7 outstanding (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-11
@@ -187,6 +188,32 @@ land; move whole phases to Done once everything inside them is checked.
     and the retry reads it through `uvload`; the `meta_proxy` shape with
     the loop changing a local the handlers read.
   - [x] measured (§10.9).
+- [x] **Phase 4, fourth part — arithmetic, bitwise, `__unm`, `__bnot` and
+  `__len` handlers** (§6.4, 2026-11-11). An operator tier 0 hands to a
+  metamethod records as an inlined call (`recBinaryMeta`/`recUnaryMeta` in
+  `trace_recorder.zig`, through `recMetaCall`) when each operand is a
+  number or a table and the handler is a Lua function. All thirteen
+  binary operators and their constant forms, as `binMeta` makes them:
+  `h(a, b)` in source order, the first operand's handler, else the
+  second's. The choice is proved on trace: a first operand that is a
+  table gets `guard_table` and either its handler loaded and pinned
+  (`guard_func`) or its absence proved (`guard_table` allowing no
+  metatable, or `guardNoMetamethod`); a first operand that is a number is
+  pinned a number. `__unm`, `__bnot` and `__len` are called as `h(v, v)`
+  (`unMeta`, `lenValue`). `finishOp` stores the first result in `R[a]` for
+  all of these, which `recReturn` does, so no pending-instruction stage.
+  - [x] a float operand of a bitwise operator beside a table asks the
+    table's handler, as tier 0 does (no float has an integer form there).
+  - [x] stays with tier 0: a string operand (`bad_type`; its metatable is
+    the string library's), a native handler (`has_metatable`), no handler
+    on either operand (`bad_type`; tier 0 raises), `rawlen`.
+  - [x] gated in `src/interp_meta_trace_test.zig`, all ten legs: every
+    operator and form with order-revealing handlers; which operand's
+    handler applies, changed between entries (a metatable set on a plain
+    table, `__add` added to a metatable, a handler replaced); `__len`
+    removed and replaced between entries beside `rawlen`; a guard inside an
+    arithmetic handler that exits; the tier-0 cases above.
+  - [x] measured (§10.10).
 
 ### Outstanding
 
@@ -205,8 +232,7 @@ land; move whole phases to Done once everything inside them is checked.
   - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
     of a cell with an alias class, through a computed callee still abort
     `.cross_frame`
-  - [ ] arithmetic, `__unm`, bitwise, `__bnot`
-  - [ ] `__len`, `__eq`, `__lt`, `__le`, the compare-and-branch forms (§6.4)
+  - [ ] `__eq`, `__lt`, `__le`, the compare-and-branch forms (§6.4)
   - [ ] `__call` (§6.7)
 - [ ] **Phase 5 — `__close`** (§8): doc 76's Phase 3b, with the
   "closes done, return only" completion.
@@ -554,7 +580,8 @@ As tier 0 makes them, so the 8-mode equivalence holds:
   the second's;
 - unary `__unm`/`__bnot`: `h(v, v)` (`unMeta`, `interp.zig` ~11411);
 - `__len`: `h(t)` as tier 0 does today (one argument; 5.4 passes two,
-  TODO.md);
+  TODO.md); amended (2026-11-11): tier 0 now passes `h(t, t)`
+  (`lenValue`), and the recording passes the same;
 - `__lt`/`__le`: the relation is normalised first: `a > b` is `b < a` and
   `a >= b` is `b <= a`, swapping the arguments (`interp.zig` ~8856; the
   recorder already normalises value comparisons, ~1729). The branch
@@ -910,6 +937,20 @@ is unchanged: `main`'s recordings now get past `get_upval` and stop at
 trace entries at ~426 cycles per traced iteration against ~212 on tier 0,
 so its gap is entry cost, not metamethods (§10.8's host barriers remain
 too).
+
+### 10.10 After arithmetic, unary and `__len` handlers (2026-11-11)
+
+ReleaseFast build of the working tree, load ~9. A probe with four handler
+calls per iteration (`(v + w) + -v + #w + (w + v)`, handlers reading a
+field of their operands), 2M iterations:
+
+| | t0 s | jit s |
+|---|---|---|
+| probe 2000000 | 0.26, 0.27 | < 0.01, < 0.01 |
+
+`--jit-stats`: ~5.8 cycles per traced iteration, no aborts; the handler
+loads are hoisted with their metatables (§5.5). `bench/meta_ops.lua` still
+stops at its comparisons (`__lt`, `__le`, `__eq`), the next part.
 
 ## 11. Open questions for review
 
