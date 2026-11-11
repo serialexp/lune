@@ -1,6 +1,6 @@
 # Time-travel debugger over DAP — Design
 
-Status: partial — P0 landed; P1–P7 outstanding
+Status: partial — P0 and P1 landed; P2–P7 outstanding
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -23,20 +23,35 @@ everything inside them is checked.
   names a function expression from its call site; the viz replay labels
   registers with local names and lists folded `<const>`s
   (`wasm_entry.zig` `encodeLocals`, `viz/src/snapshot.ts`).
+- [x] **P1 — exact resume from a keyframe** (§6.1). Landed 2026-11-11
+  (ff05bca, 9af2266, 8156b59, 852e0e7, 3b825a7, a36c910, 824e821). How it
+  differs from the plan is in §6.1's follow-up.
+  - [x] The keyframe carries `VmState` (v22, v24): the Xoshiro state,
+    `safepoint_seq`, `committed_effect_seq`, the effect cursor (the log's
+    length in record mode), `warn_enabled`, `io_errors`, both pins, the
+    system groups and `exit_status` (`keyframeser.zig` `restoreVmState`).
+    The pins are stored, so the log-prefix scan is gone.
+  - [x] Restore resumes inside the prologue without counting the step
+    again (`Vm.resume_at`, `resumeEntry`).
+  - [x] The host-ref table, its free list and the park are captured
+    (`HostRoots`, v23).
+  - [x] The `Vm` and `Heap` field audit. It found `exit_status`; the
+    other fields are transient within an instruction, supplied by the
+    host, rebuilt at init, or already carried.
+  - [x] The effect log holds bytes and scalars only, a VM can record into
+    and replay from a log it does not own (`Vm.shareEffectLog`), and a
+    replay interns a string entry when it consumes it (`loggedValue`). The
+    encoded-size count lives on the log (`EffectLog.encoded`).
+  - [x] Gate: `src/keyframeser_corpus_test.zig`. Every `.lua`/`.mah`
+    under `tests/` (embedded by `build.zig` as `program_corpus`) is
+    recorded against a fake clock, seed and environment. Then, at nine
+    cuts, the gate replays to the cut, restores, replays on, and compares
+    the output, the final snapshot bytes and the effect cursor. It asserts
+    that some program collects. `tests/programs/` holds the eight corpus
+    programs.
 
 ### Outstanding
 
-- [ ] **P1 — exact resume from a keyframe** (§6.1).
-  - A keyframe carries everything listed in §6.1.
-  - It resumes inside the prologue where it was taken, without counting
-    the step again.
-  - Typed arrays and the host-ref table are captured.
-  - The effect log is owned by the session, and its entries are turned
-    back into values only when they are consumed.
-
-  Gate: for every program in `tests/` and several values of k, restoring
-  at step k and running to the end gives the same output, final state hash
-  and effect sequence as the run that was never stopped.
 - [ ] **P2 — the debugger core, forward only** (§3, §5, §7). `src/debug/`
   covers:
   - the session and its live VM;
@@ -80,6 +95,12 @@ everything inside them is checked.
 - [ ] **Defer — JIT in debug sessions** (§5.6). When a breakpoint is set,
   invalidate the traces whose span covers it. Until then a session runs
   tier 0.
+- [ ] **Defer — typed arrays in keyframes** (§6.1). P1 planned to
+  capture them, but no runtime path makes one: `object.TypedArray` has no
+  constructor and the heap never allocates one (`gc.zig`, "Phase 9b"). So
+  no keyframe can contain one, and a keyframe variant would have nothing to
+  test it against. `keyframeser.zig` still refuses them with
+  `UnsupportedObject`. Add the variant together with their constructor.
 - [ ] **Defer — `setVariable` and side-effecting `evaluate`** (§7.3).
 - [ ] **Defer — logpoints and function breakpoints** (§5.2).
 - [ ] **Defer — `runInTerminal`** (§8.2). Interactive stdin for the
@@ -512,6 +533,38 @@ and so shift allocation ids (`effectser.zig:234`). So:
   when it first produced the value.
 
 The P1 gate checks both halves.
+
+**As built (P1, 2026-11-11).** The design held, with these differences:
+
+- Restore has no `resume_counted` flag. It sets `Vm.resume_at` to the top
+  frame's activation (`call_seq`) and pc. The stop at the suspend check
+  sets the same point. `execImpl` matches that point against the frame it
+  enters, clears it, and enters through `resumeEntry`. That function runs
+  the prologue from the step after the suspend check (the region
+  observer), so the stopped step's GC check, step count, line record and
+  suspend check are not repeated. A stale point cannot misfire, because it
+  matches only the frame and pc it was taken at.
+- `safepoint_seq` depends on the tier. Native traces do not pass the
+  prologue, so the step counts of a JIT run and a tier-0 run differ.
+  Tests that compare snapshots across tiers mask that one field
+  (`keyframeser_testutil.expectSameStateAcrossTiers`), and every
+  same-tier comparison keeps it. A debug session runs tier 0 (§5.6), so
+  positions stay exact.
+- The effect-size count moved from `Vm` onto the log
+  (`EffectLog.encoded`), so it is not keyframe state. Its value is a
+  function of the log, so a recording and a replay of one log agree.
+- Restore numbers the restored frames' activations from 0, so the
+  activation ids after a restore differ from the original run's. They are
+  identities only: nothing observable and no snapshot byte depends on
+  them.
+- The host's clock epoch (`Vm.clock`) is host state and not in the
+  keyframe. A restored VM that records again counts `os.clock` from its
+  own clock, not from the original epoch. History never does this,
+  because scratch VMs replay and the live VM is never restored (§6.4).
+  An embedder that restores and keeps recording has to supply a clock
+  with the original epoch.
+- Typed arrays are deferred (Implementation status): nothing can make
+  one yet.
 
 ### 6.2 Recording and output
 

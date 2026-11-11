@@ -2789,6 +2789,14 @@ not as a per-effect patch. Out of scope for S-C — noted so it isn't lost.
 state, the cursor, both pins, the step and commit counters), the effect log is
 session-owned (`Vm.shareEffectLog`), and the prefix scan is gone.
 
+- [ ] **Two stale comments in `src/interp.zig` after doc 86 P1** (coral-raven;
+      waiting for coral-marten's interp.zig window, 2026-11-11). The
+      `host_refs` field doc still says "keyframes do not carry them" (v23 does,
+      `HostRoots`). Above `pinSessionConstant`, a four-line doc fragment for
+      the removed `alreadyConsumed` ("Has an effect of `kind` already been
+      consumed…") is fused into the function's own doc comment. Delete the
+      fragment, and reword the `host_refs` sentence.
+
 **S-E LANDED (June 2026) — the `u8` (unsigned-byte) array lane.** Byte arrays
 (integers in `[0,255]`) now pack at **1 byte/slot** instead of `i16`'s two (a byte
 overflows signed `i8`'s 127 ceiling). `u8` is the final rung appended to the
