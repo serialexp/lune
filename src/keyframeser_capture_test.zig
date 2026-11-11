@@ -110,6 +110,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
             .aio_ops_id = 0,
             .aio_next_id = 1,
             .vm_state = keyframeser.fresh_vm_state,
+            .host_roots = keyframeser.no_host_roots,
         },
     };
 

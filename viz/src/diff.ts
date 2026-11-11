@@ -171,6 +171,13 @@ export function keyframeSansArg(bytes: Uint8Array): string {
     // Doc 86 §6.1: the VM state outside the heap (the PRNG, the step and
     // effect counters, the cursor, the pins and the installed groups).
     vm_state: kf.vm_state,
+    // Doc 86 §6.1: what an embedding host holds, its objects relabelled as
+    // every other root's are.
+    host_roots: {
+      refs: kf.host_roots.refs.map((r: any) => ({ value: canonSv(r.value), generation: r.generation })),
+      free: kf.host_roots.free,
+      parked: kf.host_roots.parked.map(canonSv),
+    },
   };
 
   const objects: any[] = [];

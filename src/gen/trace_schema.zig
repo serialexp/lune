@@ -1385,6 +1385,7 @@ pub const Keyframe = struct {
     aio_ops_id: u32,
     aio_next_id: u64,
     vm_state: VmState,
+    host_roots: HostRoots,
 
     pub fn encode(self: Keyframe, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -1433,6 +1434,7 @@ pub const Keyframe = struct {
         try enc.writeUint32(self.aio_ops_id, .little_endian);
         try enc.writeUint64(self.aio_next_id, .little_endian);
         try self.vm_state.encodeInto(enc, ctx);
+        try self.host_roots.encodeInto(enc, ctx);
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!Keyframe {
@@ -1497,6 +1499,99 @@ pub const Keyframe = struct {
         result.aio_ops_id = try dec.readUint32(.little_endian);
         result.aio_next_id = try dec.readUint64(.little_endian);
         result.vm_state = try VmState.decodeWith(allocator, dec, root);
+        result.host_roots = try HostRoots.decodeWith(allocator, dec, root);
+        return result;
+    }
+};
+
+pub const HostRef = struct {
+    value: SnapValue,
+    generation: u32,
+
+    pub fn encode(self: HostRef, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HostRef, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try self.value.encodeInto(enc, ctx);
+        try enc.writeUint32(self.generation, .little_endian);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HostRef {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HostRef {
+        var result: HostRef = undefined;
+        result.value = try SnapValue.decodeWith(allocator, dec, root);
+        result.generation = try dec.readUint32(.little_endian);
+        return result;
+    }
+};
+
+pub const HostRoots = struct {
+    refs: []const HostRef,
+    free: []const u32,
+    parked: []const SnapValue,
+
+    pub fn encode(self: HostRoots, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HostRoots, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(@intCast(self.refs.len), .little_endian);
+        for (self.refs) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
+        try enc.writeUint32(@intCast(self.free.len), .little_endian);
+        for (self.free) |_item_1| {
+            try enc.writeUint32(_item_1, .little_endian);
+        }
+        try enc.writeUint32(@intCast(self.parked.len), .little_endian);
+        for (self.parked) |_item_2| {
+            try _item_2.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HostRoots {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HostRoots {
+        var result: HostRoots = undefined;
+        const _len_6 = try dec.readUint32(.little_endian);
+        const _buf_7 = try allocator.alloc(HostRef, @as(usize, _len_6));
+        errdefer allocator.free(_buf_7);
+        for (0.._buf_7.len) |_i_4| {
+            _buf_7[_i_4] = try HostRef.decodeWith(allocator, dec, root);
+        }
+        result.refs = _buf_7;
+        const _len_11 = try dec.readUint32(.little_endian);
+        const _buf_12 = try allocator.alloc(u32, @as(usize, _len_11));
+        errdefer allocator.free(_buf_12);
+        for (0.._buf_12.len) |_i_9| {
+            _buf_12[_i_9] = try dec.readUint32(.little_endian);
+        }
+        result.free = _buf_12;
+        const _len_16 = try dec.readUint32(.little_endian);
+        const _buf_17 = try allocator.alloc(SnapValue, @as(usize, _len_16));
+        errdefer allocator.free(_buf_17);
+        for (0.._buf_17.len) |_i_14| {
+            _buf_17[_i_14] = try SnapValue.decodeWith(allocator, dec, root);
+        }
+        result.parked = _buf_17;
         return result;
     }
 };

@@ -1141,6 +1141,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
             .aio_ops_id = 0,
             .aio_next_id = 1,
             .vm_state = keyframeser.fresh_vm_state,
+            .host_roots = keyframeser.no_host_roots,
         },
     };
 
@@ -1221,6 +1222,7 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.ArrayResidentKeyInHash);
 
     // Float-spelled 0.0 normalizes to integer 0 → same rejection.
@@ -1252,6 +1254,7 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.ArrayResidentKeyInHash);
 
     // A key just past the extent (== asize) is a legitimate hash resident.
@@ -1285,6 +1288,7 @@ test "v7 validation: an array-covered hash key (int or float-spelled) is rejecte
             .aio_ops_id = 0,
             .aio_next_id = 1,
             .vm_state = keyframeser.fresh_vm_state,
+            .host_roots = keyframeser.no_host_roots,
         } }, .{ .image = &rootp }, NativeRegistry.base());
         defer {
             vm.deinit();
@@ -1320,6 +1324,7 @@ fn oneTableFile(obj: *[1]schema.HeapObject, ht: schema.HeapTable) schema.Snapsho
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } };
 }
 
@@ -1354,6 +1359,7 @@ fn tableInGlobalsFile(obj: *[2]schema.HeapObject, ht: schema.HeapTable) schema.S
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } };
 }
 
@@ -1515,6 +1521,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.UnresolvedHeapRef);
 
     // A closure naming a proto id the program image does not contain.
@@ -1538,6 +1545,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.UnknownProto);
 
     // A native whose name is not in the registry.
@@ -1561,6 +1569,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.UnknownNative);
 
     // globals_id resolves to a string, not a table.
@@ -1584,6 +1593,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.GlobalsNotATable);
 
     // Two objects sharing an id.
@@ -1610,6 +1620,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.DuplicateId);
 
     // A wrong-version file is rejected outright.
@@ -1633,6 +1644,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.UnsupportedVersion);
 
     // L-2: two HeapStrings carrying identical bytes under distinct ids. A valid
@@ -1661,6 +1673,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.DuplicateInternedString);
 
     // L-2: the restored id space is exhausted (an object names the top id) AND
@@ -1695,6 +1708,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.IdSpaceExhausted);
 
     // H-2 (v5): `next_obj_id` at/below a restored id is corrupt — a live object
@@ -1729,6 +1743,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .aio_ops_id = 0,
         .aio_next_id = 1,
         .vm_state = keyframeser.fresh_vm_state,
+        .host_roots = keyframeser.no_host_roots,
     } }, .{ .image = &rootp }, error.NextObjIdBelowObjects);
 }
 
@@ -2122,4 +2137,92 @@ test "doc 73: a keyframe inside nested coroutines rejects a broken resumer chain
         }
         try expectRestoreError(s, .of(source), error.InvalidThread);
     }
+}
+
+test "doc 86 §6.1: the host's refs, their free list and the park survive a restore, and root what they rooted" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 =
+        \\local t = {}
+        \\for i = 1, 4 do t[i] = i end
+        \\return t
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    // Objects only the host holds: a string behind a live ref, one behind a
+    // freed-and-reused slot's predecessor (gone), and a parked table.
+    const held = try vm.heap.internValue("held by the host");
+    const parked = Value.heap(&(try vm.heap.newTable()).header);
+    try vm.host_refs.append(gpa, .{ .value = held, .generation = 0 });
+    try vm.host_refs.append(gpa, .{ .value = Value.nil(), .generation = 3 });
+    try vm.host_refs.append(gpa, .{ .value = Value.int(7), .generation = 1 });
+    try vm.host_ref_free_list.append(gpa, 1);
+    vm.parked_inline[0] = parked;
+    vm.parked_inline_len = 1;
+    vm.setSuspendCtl(.{ .after_safepoints = 4 });
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    const mid = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(mid);
+
+    const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+    {
+        const again = try encodeSnapshot(gpa, vm_r);
+        defer gpa.free(again);
+        try testing.expectEqualSlices(u8, mid, again);
+    }
+    try testing.expectEqual(@as(usize, 3), vm_r.host_refs.items.len);
+    try testing.expectEqual(@as(u32, 3), vm_r.host_refs.items[1].generation);
+    try testing.expectEqual(@as(i64, 7), vm_r.host_refs.items[2].value.asInt());
+    try testing.expectEqualSlices(u32, &.{1}, vm_r.host_ref_free_list.items);
+    try testing.expectEqual(@as(u32, 1), vm_r.parked_inline_len);
+    const held_r = vm_r.host_refs.items[0].value;
+    try testing.expectEqualStrings("held by the host", string.String.fromHeader(held_r.asHeap()).bytes());
+    try testing.expectEqual(held.asHeap().id, held_r.asHeap().id);
+    try testing.expectEqual(parked.asHeap().id, vm_r.parked_inline[0].asHeap().id);
+    // Both objects stay rooted through a collection in the restored VM.
+    vm_r.collect();
+    try testing.expectEqualStrings("held by the host", string.String.fromHeader(vm_r.host_refs.items[0].value.asHeap()).bytes());
+    const after = try encodeSnapshot(gpa, vm_r);
+    defer gpa.free(after);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const kf = (try schema.SnapshotFile.decode(arena.allocator(), after)).keyframe;
+    var found: usize = 0;
+    for (kf.objects) |o| {
+        if (o.id == held.asHeap().id or o.id == parked.asHeap().id) found += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), found);
+}
+
+test "doc 86 §6.1: a host-ref free list that names a live slot, one past the table, or one twice is refused" {
+    var rootp = Proto{ .code = &.{}, .name = "root", .id = 0 };
+    var obj: [1]schema.HeapObject = undefined;
+    const base = oneTableFile(&obj, .{ .array = &.{}, .entries = &.{}, .metatable_id = 0, .lane = 0, .flags = 0, .rehash_threshold = 4, .grid = &.{} });
+    const live = [_]schema.HostRef{ .{ .value = sInt(1), .generation = 0 }, .{ .value = sNil(), .generation = 2 } };
+    const cases = [_][]const u32{ &.{0}, &.{2}, &.{ 1, 1 } };
+    for (cases) |free| {
+        var s = base;
+        s.keyframe.host_roots = .{ .refs = &live, .free = free, .parked = &.{} };
+        try expectRestoreError(s, .{ .image = &rootp }, error.InvalidHostRoots);
+    }
+    // The well-formed table restores.
+    var ok = base;
+    ok.keyframe.host_roots = .{ .refs = &live, .free = &.{1}, .parked = &.{} };
+    const vm = try restoreSnapshot(testing.allocator, ok, .{ .image = &rootp }, NativeRegistry.base());
+    defer {
+        vm.deinit();
+        testing.allocator.destroy(vm);
+    }
+    try testing.expectEqual(@as(usize, 2), vm.host_refs.items.len);
 }

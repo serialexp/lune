@@ -160,7 +160,12 @@ pub const schema = @import("gen/trace_schema.zig");
 /// the host passing it alongside: the PRNG state, `safepoint_seq`,
 /// `committed_effect_seq`, `effect_cursor`, `warn_enabled`, `io_errors` and its pin, the Unicode pin, and
 /// `system_groups`.
-pub const snapshot_format_version: u32 = 22;
+///
+/// v23 (doc 86 §6.1): `Keyframe.host_roots`, the values an embedding host
+/// holds across the C boundary: the `mh_ref` table with its generations and
+/// free list, and the parked results. They root objects, so a restored VM
+/// collects what the original did.
+pub const snapshot_format_version: u32 = 23;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -565,6 +570,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
 
     // Doc 86 §6.1: the PRNG's state, empty until the first `random()`.
     const rng: []const u64 = if (vm.rng) |*r| &r.s else &.{};
+    const host_roots = try captureHostRoots(a, vm);
 
     const file: schema.SnapshotFile = .{
         .version = snapshot_format_version,
@@ -614,9 +620,22 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
                 .unicode_version_pinned = @intFromBool(vm.unicode_version_pinned),
                 .system_groups = @bitCast(vm.system_groups),
             },
+            .host_roots = host_roots,
         },
     };
     return file.encode(gpa);
+}
+
+/// Doc 86 §6.1: the values an embedding host holds (`Vm.host_refs`, its
+/// free list, and the parked results, inline slots first).
+fn captureHostRoots(a: std.mem.Allocator, vm: *const Vm) !schema.HostRoots {
+    const refs = try a.alloc(schema.HostRef, vm.host_refs.items.len);
+    for (vm.host_refs.items, refs) |slot, *r| r.* = .{ .value = toSchemaValue(slot.value), .generation = slot.generation };
+    const inline_park = vm.parked_inline[0..vm.parked_inline_len];
+    const parked = try a.alloc(schema.SnapValue, inline_park.len + vm.parked_results.items.len);
+    for (inline_park, parked[0..inline_park.len]) |v, *p| p.* = toSchemaValue(v);
+    for (vm.parked_results.items, parked[inline_park.len..]) |v, *p| p.* = toSchemaValue(v);
+    return .{ .refs = refs, .free = vm.host_ref_free_list.items, .parked = parked };
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +691,7 @@ pub const RestoreError = error{
     NextFileIdBelowFiles, // next_file_id is at or below a restored file's id, or below the standard streams' 3
     InvalidThread, // a coroutine record no capture writes: an unknown kind or status, a stack that doesn't match the status, a running coroutine or a resumer (v13 captures only with none running), a second main thread, a non-function body
     UpvalueOpenTwice, // an open upvalue cell appears in two open lists
+    InvalidHostRoots, // a host-ref free list naming a slot past the table, twice, or one that still holds a value
     InvalidVmState, // a v22 envelope field no capture writes: an rng that is not 0 or 4 words (or all zero), a flag byte past 1, an unknown io_errors mode or group bit
 } || std.mem.Allocator.Error || SchemaDecodeError // + the codec's own decode errors
 || table.Table.Error; // a corrupt snapshot could carry a nil/NaN table key
@@ -1534,8 +1554,32 @@ pub fn restoreSnapshot(
     try stdaio.restoreOps(vm, kf.aio_next_id);
 
     try restoreVmState(vm, kf.vm_state);
+    try restoreHostRoots(vm, kf.host_roots, &idmap);
 
     return vm;
+}
+
+/// Doc 86 §6.1: the embedding host's roots. A freed slot holds nil, which
+/// is what keeps the root walk from marking through it, and each free slot
+/// is listed once, so a reuse never hands out a slot twice.
+fn restoreHostRoots(vm: *Vm, hr: schema.HostRoots, idmap: *const IdMap) RestoreError!void {
+    try vm.host_refs.ensureTotalCapacityPrecise(vm.gpa, hr.refs.len);
+    for (hr.refs) |r| vm.host_refs.appendAssumeCapacity(.{ .value = try fromSchemaValue(r.value, idmap), .generation = r.generation });
+    const seen = try vm.gpa.alloc(bool, hr.refs.len);
+    defer vm.gpa.free(seen);
+    @memset(seen, false);
+    for (hr.free) |idx| {
+        if (idx >= hr.refs.len or seen[idx] or vm.host_refs.items[idx].value.tag != .nil) return error.InvalidHostRoots;
+        seen[idx] = true;
+    }
+    try vm.host_ref_free_list.appendSlice(vm.gpa, hr.free);
+    for (hr.parked) |sv| {
+        const v = try fromSchemaValue(sv, idmap);
+        if (vm.parked_inline_len < vm.parked_inline.len) {
+            vm.parked_inline[vm.parked_inline_len] = v;
+            vm.parked_inline_len += 1;
+        } else try vm.parked_results.append(vm.gpa, v);
+    }
 }
 
 /// Doc 86 §6.1: apply the keyframe's VM state outside the heap. A capture
@@ -1576,6 +1620,10 @@ fn restoreVmState(vm: *Vm, kf: schema.VmState) RestoreError!void {
         vm.resume_at = .{ .call_seq = top.call_seq, .pc = top.pc };
     }
 }
+
+/// The `HostRoots` of a VM no host has handed a value: what a hand-built
+/// test keyframe carries.
+pub const no_host_roots: schema.HostRoots = .{ .refs = &.{}, .free = &.{}, .parked = &.{} };
 
 /// The `VmState` of a VM that has run nothing: what a hand-built test
 /// keyframe carries.

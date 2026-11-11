@@ -683,6 +683,7 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue)
             .aio_ops_id = 0,
             .aio_next_id = 1,
             .vm_state = keyframeser.fresh_vm_state,
+            .host_roots = keyframeser.no_host_roots,
         },
     };
     try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);
@@ -774,6 +775,7 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             .aio_ops_id = 0,
             .aio_next_id = 1,
             .vm_state = keyframeser.fresh_vm_state,
+            .host_roots = keyframeser.no_host_roots,
         },
     };
     try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);
