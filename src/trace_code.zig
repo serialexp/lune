@@ -326,11 +326,13 @@ pub const NativeSeedCtx = struct {
     host_call_fn: ?*const fn (ctx: *const NativeSeedCtx, site: u32) callconv(.c) u32 = null,
     /// Doc 54 P0: the per-episode descent gate byte — 1 iff the episode may
     /// perform inline native frame motion. Published by
-    /// `Vm.prepareNativeEpisode` from `receiptsInert() and !reg_top_pending
-    /// and final_cut == null`; all three conjuncts are episode-invariant
-    /// (verified codex round 1: `reg_top_pending` is written only by tier-0
-    /// multret paths, `final_cut` only after a top-level return, and nothing
-    /// mutates region policy between an episode's pushes), so the byte
+    /// `Vm.prepareNativeEpisode` from `noOpenActivation() and
+    /// !reg_top_pending and final_cut == null`; all three conjuncts are
+    /// episode-invariant (verified codex round 1: `reg_top_pending` is
+    /// written only by tier-0 multret paths, `final_cut` only after a
+    /// top-level return, and nothing mutates region policy between an
+    /// episode's pushes; the region conjunct was `receiptsInert()` until
+    /// 2026-11-11, see `RegionPolicy.noOpenActivation`), so the byte
     /// written at episode start describes every push in the episode. The
     /// inline push sequence checks it with one `cmp byte` — the whole
     /// runtime residue of the helper's per-push preflight.

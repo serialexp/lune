@@ -19,6 +19,10 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Done
 
+- [x] **An admitted region no longer takes one-shot traces off the lane**
+  (§3.1 follow-up, 2026-11-11). The region term of `headEpisodeQuiet` was
+  `receiptsInert()`; it is `noOpenActivation()` now. Landed with the same
+  fix to the frame-motion descent gate (doc 54).
 - [x] **A strike on an abandoned gate no longer retires the bar memo and
   the settled bits** (§4.5 follow-up, 2026-11-11). Found on
   `records_script`, where two anchors were struck once a round each, for good:
@@ -335,6 +339,16 @@ know whether this anchor's gate reads are unaffected. One thrashing loop
 elsewhere in the program makes the global answer "no" for every head and
 continuation, for the rest of the run. binary-trees (§2.2) is exactly
 that case.
+
+*Follow-up (2026-11-11): a third term was global the same way.*
+`region_policy.receiptsInert()` is false from the moment a region is
+admitted until its traces die, so one linked loop nest took every head
+and continuation off the lane for the rest of the run. The term is now
+`noOpenActivation()`, plus `receiptInertFor(trace.id)` for a
+loop-anchored trace (doc 54, "Episode descent gate"). For §4.2's blocker
+word this term needs one bit, "an activation is open", whose funnels are
+`openRegion` and the activation closes; the physical index no longer
+feeds it for one-shot traces.
 
 ### 3.2 The completion is an exit receipt
 

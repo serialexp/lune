@@ -6844,17 +6844,20 @@ test "fail-closed compilation (doc 54 P0): absent frame_abi emits no push epilog
 
 test "descent gate publication (doc 54 P0): prepareNativeEpisode computes descent_ok from all three conjuncts" {
     // The descent-gate half of the sabotage protocol. The inline sequence
-    // replaced the helper's per-push `receiptsInert()`/`reg_top_pending`/
-    // `final_cut` re-derivation with the per-episode `descent_ok` byte, so
-    // break each replaced conjunct and prove the publication bites. This
-    // is deliberately a UNIT matrix over `prepareNativeEpisode`: at
-    // integration level a healthy single run can never see `descent_ok=0`
-    // (that is exactly the episode-invariance the design leans on — the
-    // top-level epoch resets region receipts before any episode, verified
-    // the hard way: a planted receipt before `run()` was wiped and 743
-    // pushes happened anyway). The emitted `cmp byte` CONSUMING the gate
-    // is pinned by the inline-push formation test (pushes require the
-    // published 1) plus the comptime `@offsetOf` the emission bakes.
+    // replaced the helper's per-push region/`reg_top_pending`/`final_cut`
+    // re-derivation with the per-episode `descent_ok` byte, so break each
+    // replaced conjunct and prove the publication bites. This is a UNIT
+    // matrix over `prepareNativeEpisode` because a receipt planted before
+    // `run()` is wiped by the top-level epoch (743 pushes happened
+    // anyway). The region conjunct is `noOpenActivation()` — an open
+    // `region_profit` row, which is what this plants. Until 2026-11-11 it
+    // was `receiptsInert()`, which an admitted region's physical maps
+    // alone turned false for the rest of the program; the integration
+    // half of that is "frame motion: recursion after a linked loop nest
+    // still pushes and pops natively" in `interp_native_test.zig`. The
+    // emitted `cmp byte` CONSUMING the gate is pinned by the inline-push
+    // formation test (pushes require the published 1) plus the comptime
+    // `@offsetOf` the emission bakes.
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();

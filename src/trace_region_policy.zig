@@ -316,6 +316,52 @@ pub const RegionPolicy = struct {
             self.arrival_entry_regions.count() == 0;
     }
 
+    /// True iff no region activation is open anywhere in the VM.
+    ///
+    /// This is the premise tier 0 itself runs a call and a return under when
+    /// it does no region work for them: the per-instruction observer and
+    /// `opRet`'s `dropRegionActivation` are both behind
+    /// `region_profit.count() != 0`, and all that is left is the context
+    /// set and clear. It is therefore the premise inline native frame motion
+    /// needs (the descent gate, `NativeSeedCtx.descent_ok`), and it holds for
+    /// a whole native episode once it holds at its start: `region_profit`
+    /// grows only in `openRegion`, which the receipt pipeline reaches from
+    /// the dispatcher, and guest code a trace's host call runs is run with
+    /// the JIT suspended (doc 63 §5.9).
+    ///
+    /// It is deliberately narrower than `receiptsInert`. An admitted region
+    /// keeps the two physical maps populated for as long as its traces
+    /// live, so `receiptsInert` is false for the rest of the program once
+    /// one nest has linked, whether or not that nest is running. A consumer
+    /// that only handles one-shot traces does not need the maps empty:
+    /// see `receiptInertFor`.
+    pub fn noOpenActivation(self: *const RegionPolicy) bool {
+        return self.region_profit.count() == 0;
+    }
+
+    /// True iff a receipt whose source is trace `trace_id` leaves the region
+    /// machine untouched and unconsumed, whatever region context it is filed
+    /// under, provided its destination is `.deferred`, no trace, or a trace
+    /// this predicate also holds for.
+    ///
+    /// No activation is open, so `chooseSource` and the member-unclassified
+    /// path find nothing to keep, credit, close or charge (`minOpenRegion`
+    /// is null). The trace is in no admitted region's physical group, so its
+    /// exits classify to nothing and landing in it opens nothing:
+    /// `arrival_entry_regions` is the widest of the three indices (every
+    /// member of an admitted region and every same-anchor sibling linked to
+    /// one), and `source_exit_regions` keys only exits of members.
+    ///
+    /// A one-shot trace (a function head or a continuation after a return)
+    /// is never in that index: `resolveSuccessorAnchor` gives it no
+    /// structural edge, so it is in no cycle, and a member's linked siblings
+    /// share the member's loop anchor. For those the first conjunct alone
+    /// decides.
+    pub fn receiptInertFor(self: *const RegionPolicy, trace_id: u32) bool {
+        return self.region_profit.count() == 0 and
+            (self.arrival_entry_regions.count() == 0 or !self.arrival_entry_regions.contains(trace_id));
+    }
+
     /// Resolved logical membership, with no registry or physical trace reference.
     /// The single consumed bit is the exclusive legacy profitability boundary.
     pub const Receipt = struct { selected: ?RegionKey, unclassified_member: ?RegionKey, work: usize };

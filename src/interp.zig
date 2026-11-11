@@ -2112,7 +2112,7 @@ pub const Vm = struct {
     /// terminators), so with net > 0 the top frame is one THIS episode
     /// pushed (step 6 of the inline push), and its identity/adjacency hold
     /// by construction. The final two asserts pin the descent gate's
-    /// region premise: receipts stay inert for the whole episode, so
+    /// region premise: no activation is open for the whole episode, so
     /// `dropRegionActivation` can close nothing and reduces to the emitted
     /// context-clear replica.
     fn nativeFrameMotionAssert(ctx: *const trace.NativeSeedCtx, nreg: u64) callconv(.c) void {
@@ -2128,7 +2128,7 @@ pub const Vm = struct {
         std.debug.assert(frame.base == parent.base + nreg);
         std.debug.assert(!self.reg_top_pending);
         std.debug.assert(self.final_cut == null);
-        std.debug.assert(self.trace.region_policy.receiptsInert());
+        std.debug.assert(self.trace.region_policy.noOpenActivation());
         std.debug.assert(self.trace.region_policy.activeRegionFor(frame.call_seq) == null);
     }
 
@@ -2176,7 +2176,18 @@ pub const Vm = struct {
         // all conjuncts are episode-invariant (see
         // `NativeSeedCtx.descent_ok`), so the byte published here holds for
         // every inline push in the episode.
-        ctx.descent_ok = @intFromBool(self.trace.region_policy.receiptsInert() and
+        //
+        // The region conjunct is "no activation is open", not "no region is
+        // admitted" (`receiptsInert`, which it was until 2026-11-11): the
+        // second stays false for the rest of the program once one loop nest
+        // has linked, and recursion then paid a dispatcher entry per call
+        // (fib(30) after a 300x300 nest: 10,092 M instructions against
+        // 1,016 M). What frame motion needs is that a pop closes no
+        // activation and that the receipts a row-free episode skips are
+        // no-ops; both follow from an empty `region_profit` for the one-shot
+        // pages frame motion is confined to (`RegionPolicy.noOpenActivation`,
+        // `receiptInertFor`).
+        ctx.descent_ok = @intFromBool(self.trace.region_policy.noOpenActivation() and
             !self.reg_top_pending and self.final_cut == null and
             ctx.episode_gen != std.math.maxInt(u64));
     }
@@ -6141,8 +6152,17 @@ pub const Vm = struct {
         if (ts.pending_sibling_arm != null or ts.pending_bridge_arm != null) return null;
         // Frame-link requests are consumed only by the full entry path.
         if (ts.pending_ret_cont_arm != null or ts.pending_call_head_arm != null) return null;
-        // `accountRegionProfit` returns false ⇒ legacy receipt.
-        if (!ts.region_policy.receiptsInert()) return null;
+        // `accountRegionProfit` returns false with nothing mutated ⇒ legacy
+        // receipt. Asked of this trace, not of the program: an admitted
+        // region elsewhere does not touch a receipt of a trace outside it
+        // (`RegionPolicy.receiptInertFor`). A one-shot trace is outside
+        // every region, so only the stitched loop root pays the lookup.
+        if (!ts.region_policy.noOpenActivation()) return null;
+        if (trace.anchorKind(ct.code.anchor.pc) == .loop) {
+            if (!ts.region_policy.receiptInertFor(ct.id)) return null;
+        } else if (std.debug.runtime_safety) {
+            std.debug.assert(ts.region_policy.receiptInertFor(ct.id));
+        }
         // The legacy productive receipt's two removals are keyed on THIS
         // anchor, so they no-op exactly when the anchor is in neither map
         // (doc 84 §4.1: per anchor, not "both maps empty" program-wide).
@@ -6389,7 +6409,7 @@ pub const Vm = struct {
         // D12c: a borrowed pop (a frame the episode did not push) credits
         // `pushed_frames` as it pops, so `popped <= pushed` still holds.
         std.debug.assert(result.popped_frames <= result.pushed_frames);
-        // The push sequence declines while region receipts are live (the
+        // The push sequence declines while a region activation is open (the
         // `descent_ok` gate), and heads never enter promoted silent cycles —
         // a silent descent result means native ran a shape the registry
         // never armed.
@@ -6796,7 +6816,7 @@ pub const Vm = struct {
             // `onSideExitReceipt(ct, 1, exit, 1, .deferred, .entered)` reduced
             // under the predicate: the while-probe rejects on op (terminal is
             // not `guard_true`), the region machine returns false
-            // (`receiptsInert`), and the legacy productive path's two map
+            // (`receiptInertFor`), and the legacy productive path's two map
             // removals no-op on empty maps — leaving exactly these two calls.
             // Doc 84 §4.3: the three notes after them test their own first
             // condition inline, so a completion with nothing to file, no

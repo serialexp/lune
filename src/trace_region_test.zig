@@ -2487,3 +2487,90 @@ test "inc-B null-effective receipt attribution: minOpenRegion picks the smallest
     try state.region_policy.region_profit.put(gpa, .{ .region_id = @enumFromInt(6), .activation = 3 }, .{ .root_frame_depth = 0, .root_call_seq = 3 });
     try testing.expectEqual(@as(RegionId, @enumFromInt(4)), state.minOpenRegion().?);
 }
+
+test "receiptInertFor: an admitted region leaves a one-shot trace's receipts untouched until an activation opens" {
+    // The descent gate and the quiet one-shot entry both asked
+    // `receiptsInert()`, which is false for the whole program once any
+    // region is admitted. What they need is narrower, and this pins it:
+    // with a region admitted and no activation open, a receipt of a trace
+    // outside the region mutates nothing and is not consumed.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.registry.detachAll();
+
+    const P_ID: u32 = 31;
+    var code: [41]Instr = undefined;
+    loopDoneCode(&code);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // root@7 <-> cont@2, entered from outside by `ext`@30: the primary tier
+    // elects, so the region is admitted (not dormant) and in the maps.
+    var root_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var root_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var root: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 7, .proto_id = proto.id }, .instrs = &root_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &root_p },
+        .id = 1,
+    };
+    var cont_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = P_ID, .source_pc = 1, .inline_depth = 0 } } }};
+    var cont: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 2, .proto_id = proto.id }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p },
+        .id = 2,
+    };
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = 30, .proto_id = proto.id }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p },
+        .id = 3,
+    };
+    // A function-head trace of the same proto, with a guard exit: one-shot.
+    var head_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 7 }, .{ .op = .terminal } };
+    var head_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }};
+    var head: Trace = .{
+        .code = .{ .anchor = .{ .proto = &proto, .pc = trace.FUNC_HEAD_PC, .proto_id = proto.id }, .instrs = &head_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &head_p },
+        .id = 4,
+    };
+    try state.registry.attach(&root);
+    try state.registry.attach(&cont);
+    try state.registry.attach(&ext);
+    try state.registry.attach(&head);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    const pol = &state.region_policy;
+    try testing.expectEqual(@as(usize, 1), pol.region_defs.count());
+    var kit = pol.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    try testing.expect(pol.region_defs.get(rid).?.armable);
+    try testing.expect(!pol.region_defs.get(rid).?.dormant);
+
+    // Admitted: the program-wide predicate is false, the narrow ones hold
+    // for the traces outside the region and fail for its members.
+    try testing.expect(!pol.receiptsInert());
+    try testing.expect(pol.noOpenActivation());
+    try testing.expect(!pol.receiptInertFor(root.id));
+    try testing.expect(!pol.receiptInertFor(cont.id));
+    try testing.expect(pol.receiptInertFor(head.id));
+    try testing.expect(pol.receiptInertFor(ext.id));
+    // A trace id nothing carries is in no region either.
+    try testing.expect(pol.receiptInertFor(99));
+
+    // The head's receipts, filed under any context: not consumed, nothing
+    // opened, whether the destination is deferred or the head itself.
+    const head_key: trace.ExitKey = .{ .trace_id = head.id, .exit_instr = 0 };
+    for ([_]u64{ 1, 2 }) |seq| {
+        state.setRegionContext(1, seq);
+        try testing.expect(!state.accountRegionProfit(head_key, 1, .deferred));
+        try testing.expect(!state.accountRegionProfit(head_key, 0, .{ .known_trace = head.id }));
+        try testing.expect(!state.accountRegionProfit(head_key, 1, .terminal_outside));
+    }
+    try testing.expect(pol.noOpenActivation());
+    try testing.expect(!pol.region_defs.get(rid).?.tombstoned);
+
+    // The proviso on the destination: landing in a member opens the region,
+    // and from then on no receipt is inert.
+    try testing.expect(!state.accountRegionProfit(.{ .trace_id = ext.id, .exit_instr = 0 }, 0, .{ .known_trace = root.id }));
+    try testing.expect(!pol.noOpenActivation());
+    try testing.expect(!pol.receiptInertFor(head.id));
+    try testing.expect(!pol.receiptInertFor(ext.id));
+}

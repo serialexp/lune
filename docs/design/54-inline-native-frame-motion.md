@@ -5,7 +5,7 @@
 ~81-87 ms, 24.7× → ~10× LJ; episodes 925k → 2.3k); P3 outstanding. Base
 design codex-approved ×7 rounds; amendment codex-approved ×3 rounds.
 **Owner:** claude (campaign: every benchmark ≤1.2× LuaJIT; weakest-bench arc)
-**Last updated:** 2026-09-19
+**Last updated:** 2026-11-11
 
 ## Implementation status
 
@@ -44,6 +44,22 @@ design codex-approved ×7 rounds; amendment codex-approved ×3 rounds.
     the publication matrix over `prepareNativeEpisode` breaks each
     conjunct directly, and the emitted `cmp byte` consumer is pinned by
     the helper-removed formation test.
+    *Follow-up (2026-11-11): the unreachability claim was false, and the
+    gate was too wide.* The epoch wipes `region_profit`, but
+    `receiptsInert()` also reads the two physical maps
+    (`source_exit_regions`, `arrival_entry_regions`), and those stay
+    populated for as long as an admitted region's traces live. So one
+    linked loop nest anywhere in the program published `descent_ok = 0`
+    for every later episode: no inline push, so no pop, no `.ret_pop`
+    miss rows, no ret-cont arm, and a dispatcher entry per recursive
+    call. `fib(30)` after a 300×300 nest ran 10,092 M instructions
+    against 1,017 M with the gate narrowed (tier 0: 1,296 M; `fib(30)`
+    alone: 1,013 M). The region conjunct is now `noOpenActivation()`
+    (`region_profit.count() == 0`); the argument is under "Episode
+    descent gate" below. Integration tests now exist ("frame motion: …"
+    in `interp_native_test.zig`): recursion after a linked nest, between
+    the rounds of a nest that reopens its region, and a five-program
+    matrix on every leg.
   - **P0 measurement** (interleaved A/B vs `a0e66ae` shadow, quiet
     machine): recursive-fib ≈−5% wall, 27.2× → 25.2× LJ; binary-trees
     flat at 9.8×. Small by design: `--jit-stats`/perf show ~60% of
@@ -242,6 +258,38 @@ and `final_cut` are only written by tier-0/host boundaries the episode
 cannot cross). Inline: `cmp byte, jne decline`. The gate byte is
 re-published on every ctx refresh, so it can never describe a stale
 episode.
+
+*Follow-up (2026-11-11): the region conjunct is `noOpenActivation()`.*
+`receiptsInert()` is "no region is admitted anywhere". What frame motion
+needs is narrower, and has two halves:
+
+- **Tier 0's own region work at a call or a return is conditioned on
+  `region_profit` only.** The per-instruction observer
+  (`regionTrampoline`) and `opRet`'s `dropRegionActivation` both do
+  nothing while no activation is open. What remains is setting and
+  clearing the region context, which the inline push and pop replicate.
+  `nativeFrameMotionAssert` checks exactly this.
+- **A receipt from a one-shot trace mutates nothing while no activation
+  is open** (`RegionPolicy.receiptInertFor`). One-shot traces are in no
+  physical map: `resolveSuccessorAnchor` returns null for a non-loop
+  anchor, so they have no structural edges and never join an SCC, and
+  all three maps are built over members (plus same-anchor siblings of
+  members, which are loop-anchored). With the source outside
+  `arrival_entry_regions` and `region_profit` empty,
+  `accountRegionProfit` classifies no candidate, chooses no source,
+  finds no open region to charge and opens none — whatever context the
+  row is filed under. That answers doc 44 round 5 change 2's concern
+  (rows re-paired with the wrong activation) for exactly the pages frame
+  motion is confined to.
+
+Episode invariance holds as before: `region_profit` grows only in
+`openRegion`, which the receipt pipeline reaches from the dispatcher, and
+guest code run by a trace's host call runs with the JIT suspended (doc 63
+§5.9). **What still declines:** an activation open anywhere. A non-member
+receipt then charges the open region's payoff
+(`chargePayoffReceipt(minOpenRegion)`), so recursion called from inside a
+linked nest whose region is open pays the callout path. Doc 87 owns that
+case.
 
 **Inline push sequence** (head pages, `anchorKind == .head`, replacing
 the callout between the terminal flush and the lane shift):

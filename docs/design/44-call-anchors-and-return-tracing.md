@@ -13,7 +13,7 @@ Remaining P1/P2/P4 work below is not claimed complete.
 Codex-reviewed ×6 (gpt-5.6-sol, all sound-with-changes, every required change
 folded; ledger at bottom)
 Owner: Bart
-Last updated: 2026-10-28
+Last updated: 2026-11-11
 
 Prerequisite reading: doc 10 (cross-frame tracing, inline frames, `guard_func`),
 doc 16 (coherent state chaining — the seam-cost lesson that shapes this arc's
@@ -856,6 +856,15 @@ emptiness-over-counter rule):
 - `!config.coverage` (coverage runs want the tsc stamps; `--jit-stats`
   keeps full-path attribution)
 
+*Follow-up (2026-11-11): the region line is per trace.*
+`receiptsInert()` turned the quiet path off for the rest of the program
+once any region was admitted, because its two physical maps stay
+populated while the region's traces live. The line is now
+`noOpenActivation()` plus, for a loop-anchored trace (the stitched
+terminal-closed root), `receiptInertFor(trace.id)`; a one-shot trace is
+never in the maps, which a Safe build asserts. The argument is in doc 54
+("Episode descent gate", follow-up of the same date).
+
 Recording/suspend/exec-log/pending-anchor states need no predicate bits:
 the `jfunc_head` §R1-5 bypass set already routes those to the canonical
 instruction before any entry runs (debug-asserted in the quiet path).
@@ -1123,6 +1132,12 @@ re-executes the call generically, including raising the proper errors):
   V1 disables descents while region receipts are live (mirroring the
   quiet predicate's own line); the larger per-row-activation-identity
   alternative is recorded as a non-goal.
+  *Follow-up (2026-11-11):* "region receipts are live" was implemented
+  as `receiptsInert()`, which is false whenever a region is merely
+  admitted. It is now `noOpenActivation()`: descents are disabled while
+  an activation is open. Rows from one-shot pages attach to no
+  activation when none is open, under any context (doc 54, "Episode
+  descent gate").
 
 **Piece 2 — the helper is `opCall` verbatim, plus the episode ctx.**
 `nativeSelfCallPush` (C-ABI callout, absolute `mov rax,imm64; call` like

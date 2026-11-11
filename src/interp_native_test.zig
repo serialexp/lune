@@ -2611,3 +2611,175 @@ test "for alias: a body that may write the index or the visible variable binds n
         try testing.expect(RS.forBodyKeepsAlias(&code, 0));
     }
 }
+
+const fm_fib =
+    \\local function fib(n)
+    \\  if n < 2 then return n end
+    \\  return fib(n - 1) + fib(n - 2)
+    \\end
+    \\
+;
+
+/// Run `source` natively with head traces on a low threshold and leave `vm`
+/// inspectable, as `runNativeForTrace` does.
+fn runFrameMotion(vm: *Vm, source: [:0]const u8, sink: *io.Writer) !compiler.Chunk {
+    vm.trace.config.hotcall = 4;
+    return runNativeForTrace(vm, testing.allocator, source, sink);
+}
+
+test "frame motion: recursion after a linked loop nest still pushes and pops natively" {
+    // An admitted region keeps the two receipt maps populated for as long
+    // as its traces live. The descent gate used to ask for those maps to be
+    // empty (`receiptsInert`), so one nest that linked anywhere in a program
+    // left every later recursion with `descent_ok = 0`: no push, so no pop,
+    // so no ret-cont link ever armed, and each call paid a dispatcher entry
+    // (fib(30) after a 300x300 nest: 10,092 M instructions against 1,016 M).
+    // The gate now asks only that no activation is open. Output equality
+    // cannot tell the two apart, so the witnesses are asserted.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runFrameMotion(&vm, fm_fib ++
+        \\local acc = 0
+        \\for i = 1, 60 do
+        \\  for j = 1, 60 do acc = acc + (i ~ j) % 7 end
+        \\end
+        \\print(acc)
+        \\print(fib(20))
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("10618\n6765\n", sink.buffered());
+    // The premise: the nest's region is admitted and still in the maps, and
+    // its activation closed when the loop ended.
+    const pol = &vm.trace.region_policy;
+    try testing.expect(!pol.receiptsInert());
+    try testing.expect(pol.noOpenActivation());
+    try testing.expect(vm.trace.self_call_pushes >= 100);
+    try testing.expect(vm.trace.self_ret_pops >= 100);
+    try testing.expect(vm.trace.ret_cont_link_hits >= 100);
+}
+
+test "frame motion: recursion between the rounds of a nest that reopens its region each round" {
+    // The same premise, alternating: the region opens for each round's nest
+    // and closes when that nest ends, and the recursion after it runs with
+    // the region admitted and no activation open.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runFrameMotion(&vm, fm_fib ++
+        \\local total = 0
+        \\for round = 1, 8 do
+        \\  local acc = 0
+        \\  for i = 1, 40 do
+        \\    for j = 1, 40 do acc = acc + (i ~ j) % 7 end
+        \\  end
+        \\  total = total + acc + fib(12 + round % 3)
+        \\end
+        \\print(total)
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("39190\n", sink.buffered());
+    try testing.expect(!vm.trace.region_policy.receiptsInert());
+    try testing.expect(vm.trace.self_call_pushes >= 100);
+    try testing.expect(vm.trace.self_ret_pops >= 100);
+}
+
+test "frame motion: recursion and loop nests in one program print the same on every leg" {
+    // Recursion from a nest's outer body, from its inner body, in a function
+    // that runs a nest in every activation, and around a function that runs
+    // one. The jit-debug gate runs the pop's region asserts on all of them.
+    try expectProgram(fm_fib ++
+        \\local total = 0
+        \\for round = 1, 8 do
+        \\  local acc = 0
+        \\  for i = 1, 40 do
+        \\    for j = 1, 40 do acc = acc + (i ~ j) % 7 end
+        \\  end
+        \\  total = total + acc + fib(12 + round % 3)
+        \\end
+        \\print(total)
+    , "39190\n");
+    try expectProgram(fm_fib ++
+        \\local acc = 0
+        \\for i = 1, 60 do
+        \\  for j = 1, 60 do acc = acc + (i ~ j) % 7 end
+        \\  acc = acc + fib(10)
+        \\end
+        \\print(acc)
+    , "13918\n");
+    try expectProgram(fm_fib ++
+        \\local acc = 0
+        \\for i = 1, 40 do
+        \\  for j = 1, 40 do
+        \\    acc = acc + (i ~ j) % 7
+        \\    if j == i then acc = acc + fib(8) end
+        \\  end
+        \\  acc = acc + fib(6)
+        \\end
+        \\print(acc)
+    , "5794\n");
+    try expectProgram(
+        \\local function walk(n)
+        \\  local s = 0
+        \\  for i = 1, 12 do
+        \\    for j = 1, 12 do s = s + (i ~ j) % 5 end
+        \\  end
+        \\  if n == 0 then return s end
+        \\  return s + walk(n - 1) + walk(n - 1)
+        \\end
+        \\print(walk(6))
+    , "33782\n");
+    try expectProgram(
+        \\local function nest(k)
+        \\  local s = 0
+        \\  for i = 1, 20 do
+        \\    for j = 1, 20 do s = s + (i ~ j) % 5 end
+        \\  end
+        \\  return s + k
+        \\end
+        \\local function rec(n)
+        \\  if n == 0 then return nest(0) end
+        \\  return rec(n - 1) + rec(n - 1) + nest(n)
+        \\end
+        \\print(rec(6))
+    , "95116\n");
+}
+
+test "one-shot lane: a small call still takes the lane after a loop nest has linked" {
+    // The quiet predicate asked `receiptsInert()` too, so an admitted
+    // region anywhere sent every head entry in the program down the long
+    // form. It now asks whether THIS trace's receipt can touch the region
+    // machine. The loop around the call cannot trace (`a ~= b` compares two
+    // tables), so `f` is entered from tier 0 on every round; the lane's own
+    // counter is the witness, as in the doc 84 §4.2 test.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runFrameMotion(&vm,
+        \\local function f(n)
+        \\  local x = (n * 16809) % 2147483647
+        \\  return x % 7
+        \\end
+        \\local nest = 0
+        \\for i = 1, 60 do
+        \\  for j = 1, 60 do nest = nest + (i ~ j) % 7 end
+        \\end
+        \\local a, b = {}, {}
+        \\local acc = 0
+        \\for i = 1, 400 do
+        \\  if a ~= b then acc = acc + f(i) end
+        \\end
+        \\print(nest, acc)
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("10618\t1199\n", sink.buffered());
+    try testing.expect(!vm.trace.region_policy.receiptsInert());
+    try testing.expect(vm.trace.region_policy.noOpenActivation());
+    if (std.debug.runtime_safety) try testing.expect(vm.trace.one_shot_lane_entries >= 350);
+}
