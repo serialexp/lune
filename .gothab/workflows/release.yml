@@ -39,7 +39,7 @@ permissions:
 env:
   # Pinned by .zig-version (the same pin as ci.yml); the digest is
   # ziglang.org/download/index.json's shasum for the x86_64-linux tarball.
-  # .github/actions/install-zig fetches it from the community mirrors.
+  # tools/install-zig.sh fetches it from the community mirrors.
   ZIG_VERSION: 0.17.0
   ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
 
@@ -50,10 +50,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: ./.github/actions/install-zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
-          sha256: ${{ env.ZIG_SHA256 }}
+      - name: Install Zig
+        run: bash tools/install-zig.sh
 
       - name: Build the bundle
         run: bash tools/mahina-bundle.sh "$RUNNER_TEMP/mahina-bundle"
@@ -85,9 +83,14 @@ jobs:
           name: mahina-bundle
           path: mahina-bundle
 
-      - name: Install the Rust targets
+      - name: Install Rust and the targets
         run: |
           set -eu
+          if ! command -v rustup >/dev/null; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
@@ -107,13 +110,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: ./.github/actions/install-zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
-          sha256: ${{ env.ZIG_SHA256 }}
+      - name: Install Zig
+        run: bash tools/install-zig.sh
 
-      # The web UI's toolchain (Node >= 22.13 and the pnpm viz/package.json
-      # pins) comes with the runner image, as in ci.yml's viz leg.
+      # The web UI's toolchain: the pnpm viz/package.json pins
+      # (`packageManager`), on the Node it needs (>= 22.13).
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: viz/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - name: Build the CLI
         run: bash tools/mahina-cli.sh "$RUNNER_TEMP/mahina-cli"
 
@@ -166,6 +174,13 @@ jobs:
         with:
           name: mahina-cli
           path: mahina-cli
+
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: viz/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
 
       - name: Drive mahina viz in Chrome
         run: |
