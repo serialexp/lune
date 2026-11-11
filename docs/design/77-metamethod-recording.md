@@ -8,7 +8,8 @@ computed-callee upvalue reads and the anchor-window alias, §6.6;
 forms, §6.4; `__call`, §6.7; function `__index` under fused reads and
 stores, §6.3), its computed-callee upvalue writes deferred; Phase 5's
 `__close` recording landed (2026-11-12), its "closes done, return only"
-completion outstanding; Phase 6 landed (2026-11-12); Phase 7 outstanding
+completion outstanding; Phase 6 landed (2026-11-12); Phase 7 measured on
+the pinned pool (§10.15, 2026-11-12)
 Owner: Bart
 Last updated: 2026-11-12
 
@@ -403,6 +404,9 @@ land; move whole phases to Done once everything inside them is checked.
   `src/interp_native_test.zig` ("fused index: a store …", four tests; the
   `no_grid` guard and the `gridPlan` refusal were each removed by hand and
   a test failed).
+- [x] **Phase 7 — measured** (§10): the Phase 0 programs after each phase
+  (§10.2–§10.14, local), and the pinned-pool board at dd1444d and d35cca2
+  (§10.15, 2026-11-12), which also gives Phase 0's numbers on the board.
 - [x] **Phase 4 — function metamethods as inlined calls** (§6, closed
   2026-11-12; its parts are the bullets above). Computed-callee upvalue
   writes are deferred (Outstanding).
@@ -416,8 +420,6 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Phase 0 numbers on the board** (the pinned pool): needs a push, then
-  `gt profile`.
 - [ ] **Defer — hoisting array-part reads** (§5.5 follow-up): an
   `__index` hop ending in an array read (`aref`/`guard_bounds`/
   `guard_present`/`aload`) keeps that read in the body. The native
@@ -427,8 +429,6 @@ land; move whole phases to Done once everything inside them is checked.
   its closes (the interim §8 allows; see the first part under Done). The
   completion both executors share would let the trace run them and
   return.
-- [ ] **Phase 7 — measured** (§10): the Phase 0 programs after each phase,
-  and `just bench` on the pinned pool.
 - [ ] **Defer — computed-callee upvalue writes** (§6.6, second follow-up):
   a `set_upval`, and a read of a cell with an alias class, through a
   computed callee still abort `.cross_frame`. No bench or board program
@@ -1297,6 +1297,48 @@ ReleaseFast builds of 32cc089 and with Phase 5's first part, load ~14
 `bench/stdlib/meta_close.lua` is unchanged: its loop aborts before the
 `tbc`, at the fields of the table it allocates each iteration
 (`needs_precise` at `new_table`, then `bad_type` at `set_field`).
+
+### 10.15 Phase 7: the board (2026-11-12)
+
+The pinned pool (`gt profile`, pt-default, Xeon 6975P-C, 2 cores, reps=5)
+at dd1444d (Phase 0's programs, before any of this doc) and d35cca2 (Phases
+1–4 and 6, Phase 5's first part). Both runs reported one failed step: the
+board's correctness flag on `tostring_meta`, whose LuaJIT column errors
+(ok/ERR), in both. The rows below are from the runs' logs (typed profile
+ingestion timed out on both). Times in ms; LuaJIT from the d35cca2 run.
+
+| program | t0 | jit | res% | LuaJIT | what stops it now |
+|---|---|---|---|---|---|
+| meta_proxy | 360.4 → 356.0 | 363.5 → 12.4 | 0.0 → 98.0 | 19.5 | — |
+| meta_ops | 530.0 → 517.1 | 533.5 → 25.9 | 0.0 → 95.4 | 7.1 | — |
+| meta_close_reused | 519.6 → 522.1 | 534.7 → 26.6 | 0.0 → 99.3 | n/a | — |
+| meta_fields | 528.6 → 528.7 | 608.4 → 73.8 | 0.0 → 91.0 | 28.0 | — |
+| ray | 620.2 → 628.5 | 1677.2 → 1629.1 | 24.6 → 17.5 | 50.4 | `nyi_opcode` at `set_index`/`set_field` in `add`/`new` (allocating handlers, doc 78), `host_barrier` calls in `ray_trace`/`intersect`, `set_list` in `create` |
+| meta_calls | 59.7 → 59.1 | 59.7 → 60.1 | 0.0 → 0.0 | 1.2 | `nyi_opcode` at `concat` (deferred) |
+| meta_close | 31.6 → 32.1 | 32.2 → 32.4 | 0.0 → 0.0 | n/a | `needs_precise` at `new_table`, then `bad_type` at `set_field` (hash insertion, deferred) |
+| tostring_meta | 58.7 → 59.4 | 60.3 → 60.4 | 0.0 → 0.0 | 0.7 | `bad_type` at `call` (`__tostring`, doc 23, deferred) |
+
+Four of the five Phase 0 programs now run native at 91–99% residency and
+8–29x faster than before with the JIT; `meta_proxy` is faster than
+LuaJIT's 19.5 ms. `ray` is still 2.6x slower with the JIT than on tier 0:
+its constructors allocate (doc 78), so the head traces of its leaf
+functions keep paying doc 84's entry cost around tier-0 callers.
+
+The rest of the board moves with 60 other commits in the same range. The
+traced rows that use no metatable (array3d, nbody, nsieve, scimark,
+spectral-norm, binary-trees and the others) move by at most 6%, all
+faster or flat; `euler14-bit` jit 48.6 → 39.9, `globals_script` jit
+236.2 → 217.9 and `call_small_fn` jit 73.9 → 5.8 moved too, not
+attributed. The regressions are not doc 77's: `pcall_faults` t0 106.4 → 155.8 was
+bisected to 6406e6d (Protos carry local names, doc 86 P0; +33%
+instructions, all in `bc_names`), TODO.md; `str_sort` t0 39.9 → 44.4 and
+`co_many` t0 42.4 → 48.7 have flat instruction counts across the range,
+unexplained, also TODO.md.
+
+The alias fix after it (8f65f78 and its entry-flag follow-up) moves the
+doc 77 programs by under 0.1% in instructions (`perf stat`, ReleaseFast,
+`--jit-native`); `binary-trees` +0.35% (layout; its traces have at most
+one input, so the seed path pays one flag test), `records_script` +0.14%.
 
 ## 11. Open questions for review
 

@@ -115,6 +115,26 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       (2026-11-11): their identity, or their `__eq` as an inlined call.
       Strings and the rest not started.
 
+## `pcall_faults` runs 33% more instructions since Protos carry local names (noted 2026-11-12)
+
+The pinned board (doc 77 §10.15) has `pcall_faults` at t0 106.4 → 155.8 ms
+and jit 153.1 → 179.8 ms between dd1444d and d35cca2. Bisected by hand
+(ReleaseFast builds, `perf stat -e instructions:u`, `pcall_faults.lua
+300000`): 1662.6M through e2ad86a, 2192.1M at 6406e6d ("every Proto
+carries its local and upvalue names", doc 86 P0), 2205.6M at af52402
+("a traceback names a function expression from its call site"); nothing
+else in the range moves it. The cost is fault naming: `bc_names.successors`
+goes from 25% to 47% of the profile (`bc_names.proven` appears at ~6%),
+and `successors` + `origin` were already ~42% before. Each raised fault
+walks the faulting function's whole bytecode (`bc_names.proven`, once per
+naming query, and `origin` recurses through `move`), so a caught error
+costs time in proportion to the function's size. Not doc 77's; doc 86's owner should
+look at whether the naming analysis can run once per proto (memoized on
+the proto) instead of per fault. The same board's `str_sort` (t0 +11%)
+and `co_many` (+15%) are not this: their instruction counts are flat across
+the range (533 → 525M, 38.9M), so their t0 moved by something an
+instruction count does not see; unexplained.
+
 ## `v == nil` on a table value stops the recording (noted 2026-11-11)
 
 Fixed for tables (doc 77 Phase 4, fifth part, 2026-11-11): a table
