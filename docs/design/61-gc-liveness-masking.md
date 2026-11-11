@@ -6,7 +6,7 @@ tombstones, whole heap, physical arrays, §9a; Codex APPROVE in round 3)
 landed, then Phase 3 (allocating traces take the dead-φ filter, §9b);
 open for Bart: keyframes and garbage closures (TODO.md)
 Owner: Bart + agents (amber-badger)
-Last updated: 2026-10-11
+Last updated: 2026-11-12
 
 ## Implementation status
 
@@ -533,6 +533,17 @@ Findings:
   by exiting at `guard_gc`. So `in_flight` has no JIT-side marking site, and
   native self-push/ret-pop frames match `opCall`/`opRet` (the self-push
   initialises the flag, pinned by a test).
+
+  Amendment (2026-11-12, doc 77 Phase 6): since doc 77 a trace runs
+  metamethods, so "never calls" is the wording that still holds, not
+  "aborts on". A handler on a trace is an inlined copy of its body,
+  recorded as tier 0 ran it, with every guard inside it exiting coarse to
+  tier 0, which makes the real call (doc 77 §7). No trace calls
+  `callValue`, a native through the dispatch arm, or a metamethod; the raw
+  lookups are gated on `metatable == null` or on a `guard_table` that
+  allows one (`GUARD_TABLE_ANY_META`, doc 77 §4.1) with every metamethod
+  the access could consult proved absent or inlined. `in_flight` gains no
+  JIT site.
 - **Open question (not a Phase 0 blocker): the armed native bridge flushes
   only E.** It never reaches `deopt_exit`'s carried-home flush. A carried
   slot updated after the guard is in neither E nor the snapshot, so
@@ -1324,6 +1335,10 @@ tier roots today. That is why it did not diverge.) This is the Phase Q test.
   - traces never call host code or metamethods;
   - callouts allocate but never collect;
   - replay walks run no tier-0.
+
+  Amendment (2026-11-12, doc 77 Phase 6): a trace may now contain an
+  inlined metamethod body (doc 77 §6), but it still calls none: the
+  inlined body is trace code under the same rules, so F3 holds as written.
 - **F4. Interned strings are already weak.** The intern table is not a root,
   and `sweep` unlinks dead strings. A string that is unreachable but not yet
   swept is still found by `internedLookup`. So a trace that hands a pooled

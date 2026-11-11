@@ -9,7 +9,7 @@ library) are **arc B**, behind a deterministic on-trace-allocation design
 (future doc). scalar's loop contains `#tostring(i)`, so **scalar does not move
 in arc A**; partialsums and every loop using the arc-A builtins do.
 Owner: Bart
-Last updated: 2026-08-27
+Last updated: 2026-11-12
 
 Prerequisite reading: `12-pure-builtin-tracing.md` (the identity mechanism this
 generalizes), `02-determinism.md`, `03-gc-memory.md` (non-moving GC,
@@ -213,6 +213,16 @@ recorders already abort on *any* metatable (`.has_metatable`) with
 `guard_table` re-proving absence at runtime. On a metatable-free table, raw
 and non-raw access are the same operation, so the recorders are reusable
 verbatim; their guards make the equivalence sound rather than assumed.
+
+Amendment (2026-11-12, doc 77 Phase 6): the index recorders no longer
+abort on any metatable. Doc 77 records a table with one under
+`GUARD_TABLE_ANY_META` (§4.1): a present key reads or overwrites raw, an
+absent one proves the metamethod absent or records it (a table chain or
+an inlined handler). The shapes take a `raw` flag, so `rawget`/`rawset`
+on such a table skip the metamethods and record under the same guard
+(doc 77 §5.4). `has_metatable` is now the reason for what stays with
+tier 0: a handler that is not a Lua function, or a shape doc 77 does not
+model.
 
 Refactor: extract the cores of `recArrayGet`/`recArraySet`/`recHashGet`/
 `recHashSet` from their `get_index`/`set_index` instruction framing into shape

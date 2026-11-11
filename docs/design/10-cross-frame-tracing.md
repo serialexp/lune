@@ -6,7 +6,7 @@ speedup) landed & green; all 8 modes byte-identical + replay. **spectral-norm's
 inner loop now runs native (~2×: jit 51 ms vs tier-0 104 ms).** Phases 2–3 and the
 method/iterator cluster levers outstanding.
 Owner: Bart
-Last updated: 2026-06-23
+Last updated: 2026-11-12
 
 Prerequisite reading: `00-architecture.md` (the tier model and the single-window
 execution invariant), `01-trace-lifecycle.md` (record → optimize → execute →
@@ -192,6 +192,11 @@ S1–S3 rails are what *enforce* this rather than assume it.
   an abort (Phase 0). **Updated:** reaching a callee through an upvalue/global is now
   in scope via Sub-lever 1 (U0 records it; U1 lowers it native). A callee whose *own
   body* reads upvalues, and method/iterator dispatch, remain out of scope.
+  **Updated (2026-11-12, doc 77 Phase 6):** metatable inlining is lifted.
+  Doc 77 records metamethod handlers that are Lua functions as inlined
+  calls (`__index`/`__newindex`, operators, compares, `__len`, `__call`,
+  `__close`), and a callee's own upvalue reads through a computed callee
+  (doc 77 §6.6). Upvalue writes through a computed callee still abort.
 - Native callees — they cross the embedding boundary (`host_barrier`), correctly
   never inlined.
 - Native-codegen *quality* (the residual vs LuaJIT on already-traced loops).

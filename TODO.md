@@ -3058,6 +3058,10 @@ under `interp.zig` tests.
 keep tracing metatable-*free* tables across a polymorphic site instead of the
 current whole-trace abort. Not needed for correctness — only to recover JIT
 coverage on code that mixes plain and metatable'd tables.
+**Subsumed (2026-11-12, doc 77 Phase 6):** `guard_table` already proves a
+table has no metatable unless it carries `GUARD_TABLE_ANY_META`, and a
+table with one records under that bit (doc 77 §4.1), so no separate op is
+needed.
 
 ## `zig build wasm` is broken (wasm32 `usize` overflow in trace.zig hotIndex) — PRE-EXISTING
 

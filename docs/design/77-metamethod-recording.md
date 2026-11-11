@@ -7,8 +7,9 @@ functions, §6.1; arithmetic, bitwise, unary and `__len` handlers, §6.4;
 `__lt`/`__le`/`__eq` and the compare-and-branch forms, §6.4; `__call`,
 §6.7; a function `__index` under a fused read, §6.3; the fused store
 into a plain table); Phase 5's `__close` recording landed (2026-11-12),
-its "closes done, return only" completion outstanding; the rest of
-Phases 4–7 outstanding (doc 68 P2, which Phase 4 waits on, has landed)
+its "closes done, return only" completion outstanding; Phase 6 landed
+(2026-11-12); the rest of Phases 4, 5 and 7 outstanding (doc 68 P2, which
+Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-12
 
@@ -340,6 +341,16 @@ land; move whole phases to Done once everything inside them is checked.
   - [x] the test catches a violation: a boundary opened at the instruction
     inside `finishIndex2Mid` made a second-lookup guard attachable, and the
     test failed (checked by hand, then removed).
+- [x] **Phase 6 — doc amendments** (§9.3, 2026-11-12), each a dated
+  follow-up beside the text it amends. Doc 61 §2 ("No JIT path runs other
+  code inside an instruction": never calls, and the raw lookups' gate now
+  includes `GUARD_TABLE_ANY_META`) and F3 (an inlined body is trace code);
+  doc 68 §4.6 (several §3 sites now record, as inlined calls that push no
+  `.finish_op` frame); doc 10's non-goal on metatable inlining lifted; doc
+  23 D3 (the index recorders no longer abort on any metatable); TODO.md's
+  `guard_no_metatable` entry marked subsumed by `GUARD_TABLE_ANY_META`. The
+  `nativegen.zig` prologue comment already gave doc 77's argument (§4.1,
+  §4.2) and is unchanged.
 - [x] **Phase 5, first part — `__close` as inlined handlers** (§8,
   2026-11-12). `tbc` (and `tfor_prep`'s closing value) on a closable
   value aborted `nyi_opcode`; now a table whose metatable holds `__close`
@@ -404,9 +415,6 @@ land; move whole phases to Done once everything inside them is checked.
   its closes (the interim §8 allows; see the first part under Done). The
   completion both executors share would let the trace run them and
   return.
-- [ ] **Phase 6 — doc amendments** (§9.3): doc 61 §2 and F3, the
-  `nativegen.zig` prologue argument, doc 10's non-goal, doc 68 §4.6, doc 23,
-  TODO.md's `guard_no_metatable` entry.
 - [ ] **Phase 7 — measured** (§10): the Phase 0 programs after each phase,
   and `just bench` on the pinned pool.
 - [ ] **Defer — allocating handlers** (Q5, §2.1): doc 78 (allocation in

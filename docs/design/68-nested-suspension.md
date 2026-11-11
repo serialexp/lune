@@ -7,7 +7,7 @@ Round-1 review by codex and antigravity is folded in (§11). Q2 and Q3 are
 decided: the reviewers split on both, and Bart asked the author to break the
 tie (2026-10-22).
 Owner: claude (coral-raven)
-Last updated: 2026-10-23
+Last updated: 2026-11-12
 
 ## Implementation status
 
@@ -363,6 +363,18 @@ boundary is live" (§8).
 
 **4.6 The JIT.** None of the sites in §3 is recorded, and this design keeps
 it that way. Two places still touch the JIT:
+
+> Amendment (2026-11-12, doc 77 Phase 6): doc 77 records several of §3's
+> sites. A metamethod handler (`__index`/`__newindex` functions, the
+> arithmetic, bitwise, unary, `__len` and compare handlers, `__call`, a
+> fused read's first lookup, `__close`) records as an inlined call that
+> mirrors the `.finish_op` frame tier 0 pushes, its finish stage included
+> (doc 77 §6.3's `MetaFinish`). The trace makes no call: every guard in
+> the handler, and every guard of the instruction after the handler
+> returns, exits coarse to tier 0, which pushes the real frame (doc 77
+> §7). So "none of the sites is recorded" no longer holds, and what this
+> section relies on still does: a trace never pushes or pops a
+> `.finish_op` frame, and the two places below are unchanged.
 
 - `opRet` calls `trace.onRetResume` on the parent's `pc` after every pop, to
   arm `.cont` recordings after calls. It must only do so when the popped
