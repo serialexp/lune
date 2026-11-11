@@ -1911,13 +1911,14 @@ pub const RecordingSession = struct {
             .get_field => try self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .konst = proto.constants[instr.c] }, .tab_od = .b, .key_od = .c, .frame_proto = proto }),
             .set_field => try self.hashSetShape(regs, .{ .tab = instr.a, .key = .{ .konst = proto.constants[instr.b] }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c, .frame_proto = proto }),
 
-            // Fused two-level access `a[i][j]` / `a[i][j]=v` (doc 14, Phase 8). We
-            // record ONLY when the container is already a flattened grid with an
-            // int element lane and the access is a present, in-bounds, in-lane cell
-            // — exactly the shape the grid native/oracle path models. Everything
-            // else (nested tables not yet inflated, a grow/widen store, an f64 grid)
-            // aborts to tier-0, which inflates / reshapes / runs the slow path.
-            .get_index2 => try self.recGridGet(instr, regs),
+            // Fused two-level access `a[i][j]` / `a[i][j]=v` (doc 14, Phase 8). A
+            // grid records as a cell access ONLY when it has an int or f64
+            // element lane and the access is a present, in-bounds, in-lane cell
+            // — exactly the shape the grid native/oracle path models; a
+            // grow/widen store aborts to tier-0, which reshapes. A read of a
+            // plain nested table records as the two reads it is
+            // (`recIndex2Get`); a store into one still aborts (`recGridSet`).
+            .get_index2 => try self.recIndex2Get(instr, regs),
             .set_index2 => try self.recGridSet(instr, regs),
 
             // Cluster sub-lever 1: a callee (or any loop-invariant value) reached
@@ -3747,6 +3748,56 @@ pub const RecordingSession = struct {
         } else {
             _ = try self.emit(.{ .op = .astore, .a = ref, .b = rval, .aux = lane_ord });
         }
+    }
+
+    /// Record `a[i][j]` (`get_index2`, `dst=a tab=b key1=c key2=aux`). On a
+    /// grid it is a cell read (`recGridGet`). On any other table tier 0 runs
+    /// two index operations (`fusedGetOp`), and the recording does the same
+    /// with the read shapes: `b[c]` into `R[a]`, then that value indexed by
+    /// `R[aux]` into `R[a]`, its table given as the first read's ref and
+    /// observed value (`tab_in`, as an `__index` hop gives its next table).
+    /// The first read's guards prove the container is not a grid (an array
+    /// read's `guard_lane`; a grid holds no hash entries, so a hash read's
+    /// presence guard). Neither read gets a frame proto, so a function
+    /// `__index` on either stops the recording (doc 77 §6.3, the
+    /// pending-instruction stack, owns that). A second read's guard that
+    /// fails exits to the instruction, which tier 0 runs whole.
+    fn recIndex2Get(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+        const vtab = regs.get(instr.b);
+        if (isTableValue(vtab) and table_mod.Table.fromHeader(vtab.asHeap()).array.isGrid())
+            return self.recGridGet(instr, regs);
+        const key2: u16 = @intCast(instr.aux);
+        // The first read lands in `R[a]`; the second reads its key after.
+        if (instr.a == key2) return self.abort(.nyi_opcode);
+        const mid = (try self.observedIndex(vtab, regs.get(instr.c))) orelse return self.abort(.has_metatable);
+        // A grid row read by one key is a row view, which no shape models.
+        if (isTableValue(mid) and table_mod.Table.fromHeader(mid.asHeap()).array.isGrid()) return self.abort(.nyi_opcode);
+        try self.getShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c });
+        if (!self.active) return;
+        const rmid = try self.refOf(instr.a);
+        return self.getShape(regs, .{ .dst = instr.a, .tab_in = .{ .ref = rmid, .value = mid }, .key = .{ .reg = key2 }, .tab_od = .loaded, .key_od = .aux });
+    }
+
+    /// What `tbl[key]` reads for an index operation (`indexGet`): the raw
+    /// value, else through a table `__index` chain of at most
+    /// `MAX_INDEX_CHAIN` hops. Null when the chain reaches a handler that is
+    /// not a table (tier 0 would call it) or is too long; nil when `v` is no
+    /// table at all, which the shape then refuses.
+    fn observedIndex(self: *RecordingSession, v: Value, key: Value) !?Value {
+        var cur = v;
+        var hops: u8 = 0;
+        while (isTableValue(cur)) {
+            const tbl = table_mod.Table.fromHeader(cur.asHeap());
+            const raw = tbl.get(key);
+            if (!raw.isNil()) return raw;
+            const mt = tbl.metatable orelse return raw;
+            const h = try self.metamethodValue(mt, "__index");
+            if (h.isNil()) return raw;
+            if (!isTableValue(h) or hops >= MAX_INDEX_CHAIN) return null;
+            hops += 1;
+            cur = h;
+        }
+        return Value.nil();
     }
 
     /// Record `a[i][j]` (`get_index2`, `dst=a tab=b row=c col=aux`) as a flattened-

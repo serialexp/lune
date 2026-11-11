@@ -361,6 +361,17 @@ correctness into the actual speedup. The build stays green at every phase
 (inflation round-trip, deflation-on-escape identity, `a[i]==a[i]`,
 alias-through-`RowView`, jagged bounding box, GC of escaped-orphan rows).
 
+**Follow-up (2026-11-11): plain nested reads record.** Until now a fused
+read of a nested table that is not a grid aborted the recording
+(`nyi_opcode get_index2`; scimark-lu's `lu_factor`, whose row swaps keep
+its matrix plain). `recIndex2Get` records it as the two reads tier 0 runs
+(`fusedGetOp`): `b[c]` with the read shapes, then the result indexed by the
+second key, its table given as the first read's ref (`tab_in`). The first
+read's guards prove the container is not a grid; a grid reached as the
+row, whose bare read would deflate it, aborts. A fused store into a plain
+table still aborts: tier 0 first tries `inflateToGrid` on a table not yet
+marked `no_grid`, and the trace would need to prove that mark (TODO.md).
+
 ## Escape detection — the gate decision (2026-06-26, Bart)
 
 **Resolved: option (a) — gate grids behind fused indexing.** A bare `get_index`

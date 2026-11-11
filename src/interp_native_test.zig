@@ -1748,6 +1748,78 @@ test "fused index: evaluation order is Lua's, target keys before the value" {
     );
 }
 
+/// The loop's trace ran and no recording stopped at a fused read.
+fn assertIndex2Recorded(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (mode == .off) return;
+    for (vm.trace.abort_log.items) |r| try testing.expect(r.op != .get_index2);
+    if (mode != .record_only) try testing.expect(vm.trace.entries > 0);
+}
+
+test "fused index: a read of plain nested tables records as two reads" {
+    // Rows of mixed values (no grid), a row swap, constant string keys (a
+    // key that is not a constant aborts in any read, TODO.md), and a table
+    // `__index` chain at both levels.
+    try expectProgramTuned(
+        \\local rows = {}
+        \\for i = 1, 8 do rows[i] = { i, i * 2, "x", i + 0.5 } end
+        \\rows[1], rows[2] = rows[2], rows[1]
+        \\local cfg = { a = { w = 3 } }
+        \\local P = { __index = { w = 9 } }
+        \\local o = setmetatable({}, { __index = { a = setmetatable({}, P) } })
+        \\local s = 0
+        \\for k = 1, 300 do
+        \\  local i = k % 8 + 1
+        \\  s = s + rows[i][1] + rows[i][4] + cfg["a"]["w"] + o["a"]["w"]
+        \\end
+        \\print(s)
+    , "6440\n", .{ .record_aborts = true, .inspect = assertIndex2Recorded });
+}
+
+test "fused index: a nested read whose row or element changes exits to tier 0" {
+    // An element turns float, a row is replaced, the container inflates to
+    // a grid under a fused store, and a row turns nil, so tier 0 raises.
+    try expectProgramTuned(
+        \\local rows = {}
+        \\for i = 1, 4 do rows[i] = { i, i * 2 } end
+        \\local s = 0
+        \\for k = 1, 300 do
+        \\  local i = k % 4 + 1
+        \\  if k == 150 then rows[3][2] = 0.25 end
+        \\  if k == 200 then rows[4] = { 7, 8 } end
+        \\  s = s + rows[i][2]
+        \\end
+        \\local g = {}
+        \\for i = 1, 3 do g[i] = { 1, 2, 3 } end
+        \\local t = 0
+        \\for k = 1, 300 do
+        \\  if k == 100 then g[1][1] = 5 end
+        \\  t = t + g[k % 3 + 1][2]
+        \\end
+        \\local ok, err = pcall(function()
+        \\  local z = 0
+        \\  local m = { { 1 }, { 2 } }
+        \\  for k = 1, 300 do
+        \\    if k == 250 then m[2] = nil end
+        \\    z = z + m[k % 2 + 1][1]
+        \\  end
+        \\  return z
+        \\end)
+        \\print(s, t, ok, (string.find(err, "attempt to index a nil value", 1, true)) ~= nil)
+    , "1281.5\t600\tfalse\ttrue\n", .{ .record_aborts = true, .inspect = assertIndex2Recorded });
+}
+
+test "fused index: a function __index at either level stays with tier 0" {
+    // Tier 0 gives the handler a frame with a phase bit; the recording's
+    // pending-instruction stack (doc 77 §6.3) does not model it yet.
+    try expectProgram(
+        \\local F = setmetatable({}, { __index = function(_, k) return { k, k } end })
+        \\local R = { setmetatable({}, { __index = function(_, k) return k * 3 end }) }
+        \\local u = 0
+        \\for k = 1, 300 do u = u + F[k][1] + R[1][k] end
+        \\print(u)
+    , "180600\n");
+}
+
 // --- Phase 4b/4c: grids end-to-end from Lua (8-mode byte-identical) -----------
 // A grid is logically transparent: every program below must print exactly what
 // the equivalent nested-table program would, in all 8 execution modes. That the

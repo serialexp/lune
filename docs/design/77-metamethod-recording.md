@@ -282,6 +282,15 @@ land; move whole phases to Done once everything inside them is checked.
     `__call` removed, so tier 0 raises; the tier-0 cases, and a callable
     table as a generic-`for` iterator.
   - [x] measured (§10.12).
+- [x] **Beyond the plan — the fused read of plain nested tables**
+  (2026-11-11), the base the §6.3 stack's fused stages build on. A
+  `get_index2` on a table that is not a grid aborted `nyi_opcode`,
+  metatable or not. It now records as two reads (`recIndex2Get`, doc 14's
+  follow-up), table `__index` chains included at both levels. A function
+  `__index` at either level still aborts `has_metatable`: that is the
+  phase-bit stage this list's stack bullet covers. `set_index2` on a plain
+  table still aborts (doc 14, TODO.md). Gated in
+  `src/interp_native_test.zig` ("fused index: …").
 
 ### Outstanding
 
