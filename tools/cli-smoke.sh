@@ -184,7 +184,7 @@ EOF
 
     local reply origin=${base}
     reply=$(curl -fsS -H 'Content-Type: application/json' -H "Origin: $origin" \
-        --data '{"source":"local s = 0\nfor i = 1, 100000 do s = s + i end\nprint(s)\n","args":[]}' \
+        --data '{"files":[{"path":"main.mah","text":"local s = 0\nfor i = 1, 100000 do s = s + i end\nprint(s)\n"}],"entry":"main.mah","args":[]}' \
         "$base/run") || fail "POST /run"
     [[ $reply == *'"status":0,'* ]] || fail "POST /run status: $reply"
     [[ $reply == *'"stdout":"5000050000\n"'* ]] || fail "POST /run stdout: $reply"
@@ -193,7 +193,7 @@ EOF
 
     local code
     code=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
-        -H 'Origin: http://evil.example' --data '{"source":"print(1)"}' "$base/run")
+        -H 'Origin: http://evil.example' --data '{"files":[{"path":"main.mah","text":"print(1)"}],"entry":"main.mah","args":[]}' "$base/run")
     expect_eq "cross-site POST /run" "$code" 403
 
     stop_server
