@@ -165,7 +165,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// holds across the C boundary: the `mh_ref` table with its generations and
 /// free list, and the parked results. They root objects, so a restored VM
 /// collects what the original did.
-pub const snapshot_format_version: u32 = 23;
+///
+/// v24 (doc 86 §6.1, the `Vm` field audit): `VmState.exit_status`, the code
+/// `os.exit` ended the run with. The run unwinds and leaves the VM reusable,
+/// so a host can snapshot it before it reads the status.
+pub const snapshot_format_version: u32 = 24;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -619,6 +623,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
                 .io_errors_pinned = @intFromBool(vm.io_errors_pinned),
                 .unicode_version_pinned = @intFromBool(vm.unicode_version_pinned),
                 .system_groups = @bitCast(vm.system_groups),
+                .exit_status = vm.exit_status,
             },
             .host_roots = host_roots,
         },
@@ -1612,6 +1617,7 @@ fn restoreVmState(vm: *Vm, kf: schema.VmState) RestoreError!void {
     const groups: system.Groups = @bitCast(kf.system_groups);
     if (groups._pad != 0) return error.InvalidVmState;
     vm.system_groups = groups;
+    vm.exit_status = kf.exit_status;
     vm.effect_cursor = std.math.cast(usize, kf.effect_cursor) orelse return error.InvalidVmState;
     vm.safepoint_seq = kf.safepoint_seq;
     vm.committed_effect_seq = kf.committed_effect_seq;
@@ -1637,6 +1643,7 @@ pub const fresh_vm_state: schema.VmState = .{
     .io_errors_pinned = 0,
     .unicode_version_pinned = 0,
     .system_groups = 0,
+    .exit_status = 0,
 };
 
 // ---------------------------------------------------------------------------

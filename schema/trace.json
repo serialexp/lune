@@ -338,7 +338,7 @@
     },
 
     "VmState": {
-      "description": "Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits.",
+      "description": "Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits; `exit_status` (v24) the code `os.exit` ended the run with, which a host reads after the run and may snapshot first (0 when it never ran).",
       "sequence": [
         { "name": "rng",           "type": "array", "kind": "length_prefixed", "length_type": "uint8", "items": { "type": "uint64" } },
         { "name": "safepoint_seq", "type": "uint64" },
@@ -348,7 +348,8 @@
         { "name": "io_errors",     "type": "uint8" },
         { "name": "io_errors_pinned", "type": "uint8" },
         { "name": "unicode_version_pinned", "type": "uint8" },
-        { "name": "system_groups", "type": "uint8" }
+        { "name": "system_groups", "type": "uint8" },
+        { "name": "exit_status",   "type": "int32" }
       ]
     },
 

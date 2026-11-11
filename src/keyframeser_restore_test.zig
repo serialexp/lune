@@ -2226,3 +2226,33 @@ test "doc 86 §6.1: a host-ref free list that names a live slot, one past the ta
     }
     try testing.expectEqual(@as(usize, 2), vm.host_refs.items.len);
 }
+
+test "doc 86 §6.1: a VM snapshotted after os.exit restores with the code it exited with" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 = "local t = {1, 2}\nos.exit(#t + 1)\n";
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    try vm.enableSystem(.{ .env = true }); // `os.exit`'s group
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    try testing.expectError(error.Exit, vm.run(chunk.proto));
+    try testing.expectEqual(@as(i32, 3), vm.exit_status);
+    const snap = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(snap);
+
+    const vm_r = try restore(gpa, snap, .of(source), NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+    try testing.expectEqual(@as(i32, 3), vm_r.exit_status);
+    const again = try encodeSnapshot(gpa, vm_r);
+    defer gpa.free(again);
+    try testing.expectEqualSlices(u8, snap, again);
+}

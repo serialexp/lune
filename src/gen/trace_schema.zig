@@ -1606,6 +1606,7 @@ pub const VmState = struct {
     io_errors_pinned: u8,
     unicode_version_pinned: u8,
     system_groups: u8,
+    exit_status: i32,
 
     pub fn encode(self: VmState, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -1630,6 +1631,7 @@ pub const VmState = struct {
         try enc.writeUint8(self.io_errors_pinned);
         try enc.writeUint8(self.unicode_version_pinned);
         try enc.writeUint8(self.system_groups);
+        try enc.writeInt32(self.exit_status, .little_endian);
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!VmState {
@@ -1655,6 +1657,7 @@ pub const VmState = struct {
         result.io_errors_pinned = try dec.readUint8();
         result.unicode_version_pinned = try dec.readUint8();
         result.system_groups = try dec.readUint8();
+        result.exit_status = try dec.readInt32(.little_endian);
         return result;
     }
 };
