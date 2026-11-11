@@ -46,6 +46,8 @@ pub const Seen = struct {
     hit: u32 = 0,
     /// How many breakpoint ids it names.
     hits: usize = 0,
+    /// The running coroutine's header id, 0 for the main stack.
+    co: u32 = 0,
 };
 
 /// A scripted driver: it logs every stop, and for each one asks `decide`
@@ -63,6 +65,9 @@ pub const Script = struct {
     changed: std.ArrayList(session_mod.Breakpoint) = .empty,
     /// When set, `driver` returns it (a test that adds callbacks).
     driver_override: ?session_mod.Driver = null,
+    /// What `followPlan` answers, one entry per stop; `continue` once it
+    /// runs out.
+    plan: []const Resume = &.{},
 
     pub fn driver(self: *Script) session_mod.Driver {
         if (self.driver_override) |d| return d;
@@ -95,6 +100,7 @@ pub const Script = struct {
             .reentry = s.vm.native_reentry_depth,
             .hit = if (stop.hits.len > 0) stop.hits[0] else 0,
             .hits = stop.hits.len,
+            .co = if (s.vm.current) |t| t.header.id else 0,
         }) catch @panic("OOM in a test driver");
         return self.decide(self, s, stop);
     }
@@ -115,3 +121,9 @@ pub fn alwaysContinue(_: *Script, _: *Session, _: Stop) Resume {
     return .@"continue";
 }
 
+/// Answer each stop with the next entry of `Script.plan`.
+pub fn followPlan(self: *Script, _: *Session, stop: Stop) Resume {
+    if (stop.reason == .ended or self.n >= self.plan.len) return .@"continue";
+    defer self.n += 1;
+    return self.plan[self.n];
+}

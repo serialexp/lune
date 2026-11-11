@@ -12,6 +12,7 @@ test {
     _ = breakpoints;
     _ = eval;
     _ = @import("debug/eval_test.zig");
+    _ = @import("debug/step_test.zig");
     _ = @import("debug/session_test.zig");
     _ = @import("debug/breakpoints_test.zig");
 }

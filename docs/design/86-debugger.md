@@ -80,8 +80,10 @@ everything inside them is checked.
   - [ ] Evaluate reads a folded `<const>` (§4 `literal` rows). It needs
     the chunk's source text, which the session does not hold yet, so for
     now it refuses.
+  - [x] Step in, over and out (`Resume.step`, `Session.stepDone`), with
+    `granularity: "instruction"` as well as lines. How it differs from the
+    plan is in §5.3's follow-up. Tests are in `src/debug/step_test.zig`.
   - [ ] Evaluate in any frame (`frameId`), with the stack (below).
-  - [ ] Step in, over and out.
   - [ ] Error stops at every site where an error is raised (§5.4).
   - [ ] Threads, the stack, scopes, and variables with slot-order paging.
 - [ ] **P3 — `mahina dap`** (§8). The DAP server on stdio, with the full
@@ -479,6 +481,40 @@ Three transitions need defining:
   silent continue.
 - **Errors.** If an error unwinds past `D`, the step stops at the
   handler's next stoppable pc, or at the uncaught-error stop.
+
+**As built (P2, 2026-11-12).** The driver answers a stop with
+`Resume.step` (`kind` in, over or out; `granularity` line or instruction),
+and `Flags.step` keeps the check running at every prologue until the step
+stops. Where it goes past the text above:
+
+- **Leaving the frame, for every kind.** Once `D`'s frame is gone,
+  whether it returned or an error unwound it, any step stops at the first
+  stoppable pc in `C` below it. This is the rule for errors above, applied
+  to returns and to step in as well, so step in on a `return` stops in the
+  caller as step over does. That pc is on the line of the call when code
+  is left there (`f(1) * 1`), and on the next line when nothing is
+  (`local a = f(1)`).
+- **Leaving the coroutine, for every kind.** `C` is named by its header
+  id (0 for the main stack), never by a pointer, so a coroutine that dies
+  and is collected during the step cannot dangle. `C` has left when it is
+  no longer on the running chain (the running coroutine and its `resumer`
+  links). While `C` is `normal`, waiting on a coroutine it resumed, that
+  coroutine counts as a call deeper down: step in stops in it, and step
+  over and step out do not.
+- **"A call has returned into the frame"** is not a visit start of its
+  own. A call that returns into `D`'s frame goes on with the visit it was
+  made in, which is what `LineVisits` does for breakpoints. Otherwise,
+  step over on `x = f() + g()` would stop on the same line after each call.
+- **Tail calls.** mahina has no tail-call instruction: `return f(x)` is a
+  `call` then a `ret`, so the frame at `D` is never replaced in place. The
+  tracker would still treat a proto change at the same activation as a
+  new visit.
+- **Precedence.** Any stop ends the step. A breakpoint at the pc where
+  the step would stop reports `breakpoint`, and so does one reached
+  first. A pause that comes first reports `pause`.
+- **Instruction granularity** stops at the next stoppable pc under the
+  same coroutine and depth rules. Step in by instruction from entry makes
+  as many stops as pausing at every stop does.
 
 ### 5.4 Error stops (D8)
 

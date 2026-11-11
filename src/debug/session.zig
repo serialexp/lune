@@ -42,6 +42,8 @@ pub const Flags = struct {
     /// Some breakpoint is set, bound or pending: test every prologue's pc,
     /// and watch for chunks loading.
     pub const breakpoints: u32 = 1 << 3;
+    /// A step is under way (`Session.stepping`).
+    pub const step: u32 = 1 << 4;
 };
 
 /// Why the program stopped: DAP's `stopped` reasons the session produces.
@@ -52,6 +54,8 @@ pub const Reason = enum {
     pause,
     /// A line breakpoint (§5.2); `Stop.hits` names it.
     breakpoint,
+    /// A step finished (§5.3).
+    step,
     /// The program has returned, exited or died of an uncaught error
     /// (§5.5). The VM is idle; nothing runs after this stop.
     ended,
@@ -67,10 +71,29 @@ pub const Stop = struct {
 };
 
 /// What the driver says to do when a stop returns.
-pub const Resume = enum {
+pub const Resume = union(enum) {
     @"continue",
+    /// Run until the step stops (§5.3). A breakpoint or a pause that comes
+    /// first stops instead, and ends the step.
+    step: Step,
     /// End the program, as `terminate` or `disconnect` does.
     terminate,
+};
+
+/// DAP's `stepIn`, `next` and `stepOut`.
+pub const StepKind = enum { in, over, out };
+
+/// DAP's `granularity`. A statement is a line here.
+pub const Granularity = enum {
+    /// Stop where a line visit begins (`LineVisits`).
+    line,
+    /// Stop at the next stoppable instruction, under the same rules.
+    instruction,
+};
+
+pub const Step = struct {
+    kind: StepKind,
+    granularity: Granularity = .line,
 };
 
 /// The transport's side of the session.
@@ -180,6 +203,18 @@ pub const Session = struct {
     eval_arena: std.heap.ArenaAllocator,
     /// The ids of the breakpoints that stop at this pc.
     passing: std.ArrayList(u32) = .empty,
+    /// The step under way, while `Flags.step` is set.
+    stepping: ?Stepping = null,
+
+    /// Where a step started (§5.3): the coroutine `C` and the depth `D` of
+    /// its frame. `C` is named by its header id, 0 for the main stack, so
+    /// the step never holds a pointer to a coroutine that may die and be
+    /// collected before the step ends.
+    const Stepping = struct {
+        step: Step,
+        co: u32,
+        depth: usize,
+    };
 
     /// Attach to `vm`, which must be idle and not already debugged. The
     /// session must stay where it is until `detach` (the VM points at it).
@@ -291,9 +326,10 @@ pub const Session = struct {
     }
 
     fn stopAtEnd(self: *Session, err: ?Error) Resume {
-        // The run is over, so a pause or terminate asked for late has
-        // nothing left to act on.
+        // The run is over, so a pause, terminate or step asked for late
+        // has nothing left to act on.
         self.hooks.flags.store(0, .release);
+        self.stepping = null;
         return self.driver.stopped(self.driver.ctx, self, .{ .reason = .ended, .err = err });
     }
 
@@ -315,7 +351,10 @@ pub const Session = struct {
             if (self.driver.requests) |take| take(self.driver.ctx, self);
             f = self.hooks.flags.load(.acquire);
         }
-        if (f & Flags.terminate != 0) return Error.DebugTerminated;
+        if (f & Flags.terminate != 0) {
+            self.stepping = null;
+            return Error.DebugTerminated;
+        }
         defer if (self.hooks.flags.load(.acquire) == 0) self.visits.reset();
         std.debug.assert(vm.depth > 0 and vm.frames[vm.depth - 1].closure.proto == proto);
         const fresh = self.visits.observe(vm.frames[vm.depth - 1].call_seq, proto, pc);
@@ -327,13 +366,60 @@ pub const Session = struct {
                 hits = try self.admit(ids);
             };
         }
-        // One stop per prologue: a breakpoint here also answers a pause.
-        if (hits != null or f & Flags.pause != 0) {
+        const stepped = f & Flags.step != 0 and self.stepDone(fresh);
+        // One stop per prologue: a breakpoint here also answers a pause or
+        // ends a step, and a pause ends a step.
+        if (hits != null or f & Flags.pause != 0 or stepped) {
             if (f & Flags.pause != 0) _ = self.hooks.flags.fetchAnd(~Flags.pause, .acq_rel);
-            const reason: Reason = if (hits != null) .breakpoint else if (self.entry_pending) .entry else .pause;
+            const reason: Reason = if (hits != null)
+                .breakpoint
+            else if (f & Flags.pause != 0)
+                (if (self.entry_pending) .entry else .pause)
+            else
+                .step;
             self.entry_pending = false;
             try self.stop(.{ .reason = reason, .hits = hits orelse &.{} }, .{ .proto = proto, .pc = pc });
         }
+    }
+
+    /// The header id of the running coroutine, 0 for the main stack.
+    fn runningId(vm: *const Vm) u32 {
+        return if (vm.current) |t| t.header.id else 0;
+    }
+
+    /// Whether coroutine `id` is on the running chain: it runs, or it is
+    /// `normal`, waiting on a coroutine it resumed. Walks the live chain
+    /// only, so it never touches a coroutine that has died.
+    fn onChain(vm: *const Vm, id: u32) bool {
+        if (id == 0) return true; // the main stack is the chain's root
+        var t = vm.current;
+        while (t) |th| : (t = th.resumer) {
+            if (th.header.id == id) return true;
+        }
+        return false;
+    }
+
+    /// Whether the step under way stops at this stoppable pc (§5.3).
+    /// `fresh` says whether the pc starts a line visit.
+    fn stepDone(self: *Session, fresh: bool) bool {
+        const s = self.stepping orelse return false;
+        const vm = self.vm;
+        const visit = fresh or s.step.granularity == .instruction;
+        if (runningId(vm) != s.co) {
+            // C yielded, finished or died out to its resumer: stop at the
+            // first stoppable pc, so a step never turns into a continue.
+            if (!onChain(vm, s.co)) return true;
+            // C waits on a coroutine it resumed, as a call deeper down.
+            return s.step.kind == .in and visit;
+        }
+        // The step's frame returned, or an error unwound past it: stop at
+        // the first stoppable pc in the frame below.
+        if (vm.depth < s.depth) return true;
+        return switch (s.step.kind) {
+            .in => visit,
+            .over => visit and vm.depth == s.depth,
+            .out => false,
+        };
     }
 
     /// The breakpoints among `ids` that stop: those whose condition holds
@@ -367,11 +453,18 @@ pub const Session = struct {
     }
 
     fn stop(self: *Session, s: Stop, at: Location) Error!void {
+        // Any stop ends the step under way.
+        self.stepping = null;
+        _ = self.hooks.flags.fetchAnd(~Flags.step, .acq_rel);
         self.stopped_at = at;
         const r = self.driver.stopped(self.driver.ctx, self, s);
         self.stopped_at = null;
         switch (r) {
             .@"continue" => {},
+            .step => |st| {
+                self.stepping = .{ .step = st, .co = runningId(self.vm), .depth = self.vm.depth };
+                _ = self.hooks.flags.fetchOr(Flags.step, .acq_rel);
+            },
             .terminate => return Error.DebugTerminated,
         }
     }
