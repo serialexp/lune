@@ -192,6 +192,10 @@ land; move whole phases to Done once everything inside them is checked.
     sorted tokens instead of searching per token (`position.Cursor` now steps
     over lines too).
 
+- [x] **Time-travel debugging over DAP** (§7.7): the design doc is doc 86
+  (`86-debugger.md`, 2026-11-11). It was planned here as "doc 75", a number
+  that went to process spawn.
+
 ### Outstanding
 
 - [ ] **Bench follow-ups:** the 100k-line budget miss (check dominates).
@@ -346,8 +350,6 @@ land; move whole phases to Done once everything inside them is checked.
   running the file and inlay hints from the result. The viz already shades
   loop headers from its own run's coverage (`MahinaEditor.tsx`
   `coverageField`); P7 adds abort reasons there.
-- [ ] **Doc 75 — time-travel debugging over DAP** (§7.7): write the
-  design doc.
 - [ ] **Defer — inference (tier 5)** (§7.5): table shapes and
   annotation-driven types. Not before P5 ships and the annotations (doc 00)
   have a semantics.
