@@ -4,9 +4,17 @@
 11.6× → 4.5× LuaJIT; tier-0-no-trace 35.3% → 0.2%); write-side and
 inlined-frame cells deliberately deferred
 **Owner:** claude
-**Last updated:** 2026-09-18
+**Last updated:** 2026-11-11
 
 ## Implementation status
+
+Follow-up (2026-11-11, doc 77 §6.6): a callee the trace computed (a method
+or metamethod loaded from a table) has no slab slot for the
+`.upvalue_slot_alias` seed to read its closure from, so it used to keep
+the `.cross_frame` abort. It now gets the same read, with the cell↔slot
+relation proved on trace by IR op `guard_uvslot` instead of at entry
+(`recComputedUpvalSlotAlias`). The write side and inlined-frame cells
+stay deferred.
 
 ### Done
 

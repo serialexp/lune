@@ -1868,6 +1868,20 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     try regToPlace(a, placeOfRef(alloc, i), .rax);
                 }
             },
+            // guard_uvslot (doc 77 §6.6): the closure's cell is open over anchor
+            // slot `slot`: its payload pointer minus the payloads base is
+            // exactly that slot's byte offset.
+            .guard_uvslot => {
+                const ua = trace.UvslotAux.decode(ins.aux);
+                const freg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.movRegMem(.rax, freg, layout.CLOSURE_CELLS_OFF + @as(i32, ua.index) * 8);
+                try a.movRegMem(.rax, .rax, layout.UPVALUE_PAYLOAD_PTR_OFF);
+                if (alloc.abiDisp(.payloads)) |d| {
+                    try a.subRegMem(.rax, .rsp, d);
+                } else try a.subRegReg(.rax, .rsi);
+                try a.cmpRegImm32(.rax, @as(i32, ua.slot) * 8);
+                try jccNativeExit(a, exit_labels, i, .ne); // not that slot's cell
+            },
             // --- closed-upvalue-cell path (doc 43 P5) ---------------------------
             // The u-family shares the hash-cell machinery: the seeded slab slot
             // holds a `*Value` (here `&cell.loc.closed`, resolved + alias-verified

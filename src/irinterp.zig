@@ -811,6 +811,19 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     values[i] = fv;
                     if (record) rec.value(i, values[i]);
                 },
+                // Doc 77 §6.6 `guard_uvslot`: the closure's cell is open over
+                // anchor slot `slot` of this activation (native checks the
+                // same pointer).
+                .guard_uvslot => {
+                    const ua = trace_ir.UvslotAux.decode(ins.aux);
+                    const cl = function.Closure.fromHeader(values[ins.a].asHeap());
+                    const cell = cl.upvalue(ua.index);
+                    const want = @intFromPtr(regs.payloads) + @as(usize, ua.slot) * @sizeOf(u64);
+                    if (@intFromPtr(cell.payload) != want) {
+                        if (record) rec.exit(i, .guard, values[ins.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
                 // `ustore`: overwrite the closed cell's Value in place. The
                 // value ref is scalar-pinned by the recorder (guardNum /
                 // static bool proof), so no write barrier is needed (it is a

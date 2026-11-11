@@ -6663,14 +6663,15 @@ pub const RecordingSession = struct {
     /// a cell over an INLINED frame's window (`rel >= anchor_num_registers` —
     /// unreachable today without on-trace closures, doc 24), and depth 0
     /// (lexically impossible: a function cannot capture its own locals as
-    /// upvalues). An unresolvable callee path (computed callee) keeps
-    /// `recCalleeUpval`'s `.cross_frame`.
+    /// upvalues). A computed callee, which has no slab slot for the seed,
+    /// proves the alias on trace instead (`recComputedUpvalSlotAlias`, doc 77
+    /// §6.6).
     fn recUpvalSlotAlias(self: *RecordingSession, dest: u16, source: u16, open_idx: usize) !void {
         const rel_usize = open_idx - self.anchor_abs_base;
         if (rel_usize >= self.anchor_num_registers) return self.abort(.aliased_input);
         if (self.inline_depth == 0) return self.abort(.aliased_input);
         const rel: u16 = @intCast(rel_usize);
-        const path_slot = self.upvalAccessPathSlot() orelse return self.abort(.cross_frame);
+        const path_slot = self.upvalAccessPathSlot() orelse return self.recComputedUpvalSlotAlias(dest, source, rel);
         // path_slot is a real slab slot here — the depth-0 sentinel case was
         // excluded above.
         std.debug.assert(path_slot != UPVALUE_CELL_ANCHOR);
@@ -6709,6 +6710,26 @@ pub const RecordingSession = struct {
         }
         const ref = try self.refOfAbs(rel);
         self.setReg(dest, ref);
+    }
+
+    /// Doc 77 §6.6: `recUpvalSlotAlias` for a callee the trace computed (a
+    /// method or a metamethod loaded from a table), which has no slab slot
+    /// for an entry seed to re-prove the alias from. The trace proves it
+    /// itself: `guard_uvslot` exits unless the closure's cell is open over
+    /// anchor slot `rel` of the running activation, once per (callee,
+    /// upvalue). The read is then that slot's current SSA value, as in doc
+    /// 53, so it sees the anchor frame's stores in order.
+    fn recComputedUpvalSlotAlias(self: *RecordingSession, dest: u16, source: u16, rel: u16) !void {
+        const callee_ref = self.frames[self.inline_depth - 1].callee orelse return self.abort(.cross_frame);
+        if (rel > std.math.maxInt(u15)) return self.abort(.input_cap);
+        // The `uvload` map, tagged so a guard key never meets a load's.
+        const key = (@as(u64, 1) << 48) | (@as(u64, @intCast(callee_ref)) << 16) | source;
+        if (!self.uvload_dedup.contains(key)) {
+            const aux: trace_ir.UvslotAux = .{ .index = source, .slot = @intCast(rel) };
+            self.stampProv(try self.emit(.{ .op = .guard_uvslot, .a = callee_ref, .aux = aux.encode() }), .callee_identity, .loaded, .neutral);
+            try self.uvload_dedup.put(self.gpa, key, callee_ref);
+        }
+        self.setReg(dest, try self.refOfAbs(rel));
     }
 
     /// Record a `get_upval` inside an inlined callee. A callee reachable as a
@@ -7116,6 +7137,7 @@ pub const RecordingSession = struct {
             .hload,
             .load_meta,
             .uvload,
+            .guard_uvslot,
             .alen,
             .guard_table,
             .guard_lane,

@@ -125,6 +125,7 @@ export const IR_OP_NAMES = [
   "guard_tostring", // 103 table a's metatable __tostring (key konst b) is a closure of proto aux (doc 82)
   "load_meta", // 104 table a's metatable (heap); exits when it has none (doc 77)
   "uvload", // 105 upvalue aux.index of closure a, through its cell; exits on a tag change or an anchor-window cell (doc 77)
+  "guard_uvslot", // 106 closure a's upvalue aux.index is open over anchor slot aux.slot; read as that slot (doc 77)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];

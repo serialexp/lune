@@ -882,6 +882,16 @@ pub const IrOp = enum(u8) {
     /// read). A memory load (tropt's `.aload` class): a `ustore` to a shared
     /// cell changes it. Wire ordinal 105.
     uvload,
+    /// `guard_uvslot` (doc 77 §6.6): an inlined callee's upvalue cell is open
+    /// over anchor slot `UvslotAux.slot`. `a` = the callee ref (a closure,
+    /// its proto pinned by a `guard_func`); `aux` = `UvslotAux`. Exits unless
+    /// `closure.upvalue(index)`'s payload pointer is that slot of the running
+    /// anchor activation. While it holds, the cell IS the slot, so the
+    /// recorder reads it as the slot's SSA value (doc 53's alias, for a
+    /// callee the trace computed and so cannot validate at entry). Depends
+    /// only on where the cell lives, which no trace op changes, so it hoists
+    /// with its closure. Produces no value. Wire ordinal 106.
+    guard_uvslot,
 };
 
 /// Doc 63 §5.1: one host call site of a precise trace, indexed by
@@ -1082,6 +1092,28 @@ pub const UvloadAux = struct {
     }
 };
 
+/// `guard_uvslot`'s `aux` (doc 77 §6.6): the cell index in the low half,
+/// the anchor slot the cell must be open over in the high.
+pub const UvslotAux = struct {
+    index: u16,
+    slot: u15,
+
+    pub fn encode(self: UvslotAux) i32 {
+        return @as(i32, self.slot) << 16 | self.index;
+    }
+
+    pub fn decode(aux: i32) UvslotAux {
+        const bits: u32 = @bitCast(aux);
+        return .{ .index = @truncate(bits), .slot = @intCast(bits >> 16) };
+    }
+};
+
+test "UvslotAux round-trips" {
+    const x: UvslotAux = .{ .index = 0xfffe, .slot = 0x7fff };
+    try std.testing.expectEqual(x, UvslotAux.decode(x.encode()));
+    try std.testing.expect(x.encode() > 0);
+}
+
 test "UvloadAux round-trips" {
     const x: UvloadAux = .{ .index = 0xfffe, .window = 0x7fff };
     try std.testing.expectEqual(x, UvloadAux.decode(x.encode()));
@@ -1094,7 +1126,7 @@ test "UvloadAux round-trips" {
 /// is side-trace evidence, not thrash.
 pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
-        .guard_absent, .guard_tostring, .load_meta => true,
+        .guard_absent, .guard_tostring, .load_meta, .guard_uvslot => true,
         .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => true,
         .guard_step_up, .guard_step_down, .guard_for_nov => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
@@ -1205,7 +1237,7 @@ pub fn requiresPreciseSnapshot(op: IrOp) bool {
         .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar => true,
         .neg, .not, .bnot, .eq, .ne, .lt, .le => true,
         .fsqrt, .fsin, .fcos, .ffloor, .fceil => true,
-        .aload, .href, .hload, .uload, .load_meta, .uvload => true,
+        .aload, .href, .hload, .uload, .load_meta, .uvload, .guard_uvslot => true,
         .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2, .supper, .slower, .sjpart, .sjoin => true,
         .scp, .sfindp, .smatch, .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f, .sgm_setpos => true,
         .tnew, .tset => true,
@@ -1310,6 +1342,10 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .uvload => {
             const ua = UvloadAux.decode(ins.aux);
             try w.print("%{d}  upval={d}  window={d}", .{ ins.a, ua.index, ua.window });
+        },
+        .guard_uvslot => {
+            const ua = UvslotAux.decode(ins.aux);
+            try w.print("%{d}  upval={d}  slot=r{d}", .{ ins.a, ua.index, ua.slot });
         },
         // guard_sid: operand + the expected string's konst id.
         .guard_sid => try w.print("%{d}  sid=k{d}", .{ ins.a, ins.aux }),

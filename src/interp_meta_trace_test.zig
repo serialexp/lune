@@ -736,9 +736,19 @@ fn expectNoUvload(vm: *Vm, mode: TraceMode) anyerror!void {
     try testing.expectEqual(@as(usize, 0), countOps(vm, .uvload));
 }
 
-test "doc 77 §6.6: a method's cell open over the anchor's own window stops the recording" {
-    // `k` lives in the loop's frame, which the trace keeps in registers;
-    // tier 0 runs the loop, and sees the store at i == 150.
+/// A computed callee's cell open over the anchor's window was read as
+/// the slot (`guard_uvslot`), not through the cell (`uvload`).
+fn expectSlotAliasRead(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectNoUvload(vm, mode);
+    if (!recorded(mode)) return;
+    try testing.expect(countOps(vm, .guard_uvslot) > 0);
+    if (executed(mode)) try testing.expect(vm.trace.entries > 0);
+}
+
+test "doc 77 §6.6: a method's cell open over the anchor's own window reads the slot, with its stores" {
+    // `k` lives in the loop's frame, which the trace keeps in registers:
+    // the method reads the slot's value on the trace, so it sees the store
+    // at i == 150 in order.
     try expectProgramTuned(
         \\local k = 2
         \\local C = {}
@@ -751,7 +761,67 @@ test "doc 77 §6.6: a method's cell open over the anchor's own window stops the 
         \\  s = s + o:get()
         \\end
         \\print(s)
-    , "3755\n", .{ .inspect = expectNoUvload });
+    , "3755\n", .{ .inspect = expectSlotAliasRead });
+}
+
+/// The first run's trace read the cell as its slot. Where traces run, the
+/// second run fails that guard and its recording reads the closed cell
+/// through the closure.
+fn expectSlotAliasThenUvload(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    try testing.expect(countOps(vm, .guard_uvslot) > 0);
+    if (executed(mode)) try testing.expect(countOps(vm, .uvload) > 0);
+}
+
+test "doc 77 §6.6: a method over an earlier activation's closed cell fails the slot guard" {
+    // `C.get` closes over `run`'s `k`. The second call keeps the first
+    // call's closure, whose cell closed when that call returned: the same
+    // proto, so `guard_func` passes, and `guard_uvslot` sends it to tier 0.
+    try expectProgramTuned(
+        \\local C = {}
+        \\C.__index = C
+        \\local function run(o, k, redefine)
+        \\  if redefine then
+        \\    function C.get(self) return self.v * k end
+        \\  end
+        \\  local s = 0
+        \\  for i = 1, 200 do
+        \\    if i == 100 then k = k + 1 end
+        \\    s = s + o:get()
+        \\  end
+        \\  return s
+        \\end
+        \\local o = setmetatable({ v = 5 }, C)
+        \\local r1 = run(o, 2, true)
+        \\local r2 = run(o, 7, false)
+        \\local r3 = run(o, 4, true)
+        \\print(r1, r2, r3)
+    , "2505\t3000\t4505\n", .{ .inspect = expectSlotAliasThenUvload });
+}
+
+test "doc 77 §6.6: a proxy whose __index and __newindex functions close over the loop's locals" {
+    // The `bench/meta_proxy.lua` shape: the handlers read the loop frame's
+    // `store`, `defaults` and `scale`, which the loop changes at i == 200.
+    try expectProgramTuned(
+        \\local store = { count = 0 }
+        \\local defaults = { step = 3 }
+        \\local scale = 1
+        \\local proxy = setmetatable({}, {
+        \\  __index = function(_, k)
+        \\    local v = store[k]
+        \\    if v == nil then v = defaults[k] end
+        \\    return v * scale
+        \\  end,
+        \\  __newindex = function(_, k, v) store[k] = v end,
+        \\})
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  if i == 200 then scale = 2 end
+        \\  proxy.count = (proxy.count + proxy.step) % 997
+        \\  s = s + proxy.count
+        \\end
+        \\print(s, store.count)
+    , "162290\t127\n", .{ .inspect = expectSlotAliasRead });
 }
 
 test "doc 77 §6.6: table, string and native upvalues of a method, across collections" {

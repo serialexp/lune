@@ -2,7 +2,8 @@
 
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
 decided; Phases 0–3 landed (2026-11-11); Phase 4 started (computed-callee
-upvalue reads, §6.6; `__index`/`__newindex` functions, §6.1); the rest of
+upvalue reads and the anchor-window alias, §6.6; `__index`/`__newindex`
+functions, §6.1); the rest of
 Phases 4–7 outstanding (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-11
@@ -171,6 +172,21 @@ land; move whole phases to Done once everything inside them is checked.
     `__newindex` calls per iteration, plus a chain ending in a function)
     runs ~10 cycles per iteration natively against ~10.8k on tier 0, with
     the metatable loads hoisted.
+- [x] **Phase 4, third part — the anchor-window alias for computed callees**
+  (§6.6 amendment below, 2026-11-11). A computed callee's cell open over the
+  anchor frame's own window (a method or handler closing over the loop's
+  locals: `bench/meta_proxy.lua`, ray's `main`) used to abort
+  `.cross_frame`. It now reads as that slot's SSA value, as doc 53 does for
+  a slot callee, behind IR op 106 `guard_uvslot`, which checks on trace
+  what doc 53's entry seed checks at entry: the closure's cell is open over
+  exactly that slot of the running activation. Tier-1a and native; LICM
+  hoists it with its closure.
+  - [x] gated in `src/interp_meta_trace_test.zig`: the method read sees the
+    loop's store in order (the former abort test, now recording); a closure
+    whose cell closed when an earlier activation returned fails the guard,
+    and the retry reads it through `uvload`; the `meta_proxy` shape with
+    the loop changing a local the handlers read.
+  - [x] measured (§10.9).
 
 ### Outstanding
 
@@ -189,9 +205,6 @@ land; move whole phases to Done once everything inside them is checked.
   - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
     of a cell with an alias class, through a computed callee still abort
     `.cross_frame`
-  - [ ] the anchor-window alias for computed callees: a method's cell open
-    over the anchor frame (ray's `main`) aborts; doc 53's SSA redirect
-    needs an access path a computed callee lacks
   - [ ] arithmetic, `__unm`, bitwise, `__bnot`
   - [ ] `__len`, `__eq`, `__lt`, `__le`, the compare-and-branch forms (§6.4)
   - [ ] `__call` (§6.7)
@@ -610,6 +623,24 @@ to the closure's `GcHeader.id`. Writes through a computed callee still
 abort; the pending-store forwarding they need keys on alias classes, which
 a computed callee does not have.
 
+**Follow-up (2026-11-11): the anchor-window alias.** The last bullet's
+exit left every handler that closes over the loop's own locals on tier 0,
+which is the usual shape (a proxy over a local store, a method reading a
+local constant). Doc 53 already reads such a cell, for a callee in a slot,
+as the anchor slot's SSA value: within an iteration the cell is the slot,
+and an entry seed proves the closure's cell is open over that slot of the
+running activation. A computed callee has no slot for the seed to read the
+closure from, so the trace proves the same relation itself:
+`guard_uvslot(closure, {index, slot})` exits unless
+`closure.upvalue(index)`'s payload pointer is that slot. The read then
+takes the slot's current SSA value, so it sees the anchor frame's stores
+in order. A cell open over an inlined frame's window still aborts
+`.aliased_input`, as in doc 53. The guard depends only on where the cell
+lives, which nothing on a trace changes: cells close when their scope
+ends, and a scope a trace runs to its end that has a captured local also
+makes the closure that captured it, which no recording admits. So LICM
+hoists it with its closure, and a run checks it once per entry.
+
 ### 6.7 `__call`
 
 `recCall`'s non-function arm looks up `__call` (§5.2), shifts the arguments
@@ -859,6 +890,26 @@ are gone: those recordings now run to a `host_barrier` (an `itern` in
 `get_upval`: its methods read cells open over `main`'s own window, the
 anchor-window alias case (Outstanding). The next blockers for `ray` are
 those host barriers and that alias, not upvalue access.
+
+### 10.9 After the anchor-window alias and function `__index`/`__newindex` (2026-11-11)
+
+Side-prefix ReleaseFast build of the working tree (it also carried other
+agents' uncommitted edits to the region and chaining code), interleaved
+runs, load ~4:
+
+| | t0 s | jit s |
+|---|---|---|
+| `meta_proxy` 2000000 | 0.33, 0.35 | < 0.01, < 0.01 |
+| `ray` 6 64 | 0.47, 0.46, 0.46 | 1.25, 1.26, 1.27 |
+
+`meta_proxy` was 290.5 ms on tier 0 and 292.9 ms with the JIT after Phase
+3 (§10.4; its handlers aborted). It now records with no aborts, and its
+output matches tier 0. `ray`
+is unchanged: `main`'s recordings now get past `get_upval` and stop at
+`too_deep` (a call at inline depth 3) and `cont_backedge`. It runs 7.5M
+trace entries at ~426 cycles per traced iteration against ~212 on tier 0,
+so its gap is entry cost, not metamethods (§10.8's host barriers remain
+too).
 
 ## 11. Open questions for review
 

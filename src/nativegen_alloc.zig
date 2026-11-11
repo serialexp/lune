@@ -2363,7 +2363,8 @@ const HomeReads = struct {
 /// iteration) for the same per-entry store and per-exit load. rdi/rsi stay
 /// when the back-edge flushes a write-only slot (it writes through both).
 /// rsi stays when a body `href`/`uref` loads a seeded cell from the slab, or
-/// a body `uvload` checks its cell against the window: it could load rsi's
+/// a body `uvload` or `guard_uvslot` checks its cell against the window:
+/// it could load rsi's
 /// cell first (`emit.abiBase`, which a run-once one does), but that is a
 /// load per iteration. Precise traces
 /// flush mid-iteration snapshots at their exits and keep all three. Empty
@@ -2395,7 +2396,7 @@ const AbiEvict = struct {
                 ok &= ~regBit(.rsi);
             },
             // Doc 77 §6.6: a body uvload compares its cell against rsi.
-            .uref, .uvload => ok &= ~regBit(.rsi),
+            .uref, .uvload, .guard_uvslot => ok &= ~regBit(.rsi),
             .mod, .idiv => if (ins.ty == .int) {
                 divides = true;
             },
@@ -2732,8 +2733,10 @@ pub fn opMayExitInBody(
         .uload,
         // Doc 77 §5.1: the fused no-metatable exit.
         .load_meta,
-        // Doc 77 §6.6: the fused tag and anchor-window exits.
+        // Doc 77 §6.6: the fused tag and anchor-window exits, and the
+        // anchor-slot guard.
         .uvload,
+        .guard_uvslot,
         .guard_gcol,
         .guard_gpresent,
         .alen,

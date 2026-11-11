@@ -113,6 +113,8 @@ fn kindOf(op: IrOp) OpKind {
         // `Proto.id`. A side-effecting (side-exiting) root, deduped by (op, callee
         // ref), never folded away — `guardConstPasses` defaults to keep. Reads `a`.
         .guard_func => .guard,
+        // Doc 77 §6.6: where a closure's cell lives; hoists with the closure.
+        .guard_uvslot => .guard,
         // Array-access guards reuse the guard machinery: kept as side-effecting
         // roots, deduped by (op, operand-ref), operand marked/remapped via `a`.
         // `guard_append` is the grow analogue of `guard_bounds`; it reads `len`/`cap`
@@ -416,6 +418,10 @@ fn hoistableRead(
         },
         .uvload => hoist[canon[ins.a]] and !writes.upvalue,
         .guard_table, .guard_func, .guard_int, .guard_float, .guard_number, .guard_bool, .guard_string, .guard_builtin => hoist[canon[ins.a]],
+        // Doc 77 §6.6: a cell open over an anchor slot at entry stays that
+        // slot for the run: no trace op closes or moves a cell (closing one
+        // needs a closure made inside the loop, which no recording admits).
+        .guard_uvslot => hoist[canon[ins.a]],
         else => false,
     };
 }
@@ -528,7 +534,7 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
         // deduplicated: doc 30 round-2 M01), so it joins the dedup-key auxes.
         // `guard_table` dedups per table instead (`table_guard`): its aux
         // merges into the first guard on the table (`mergeTableGuardAux`).
-        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_sid => aux,
+        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_sid, .guard_uvslot => aux,
         else => 0,
     };
 }

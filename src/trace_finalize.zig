@@ -772,7 +772,7 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             // Doc 77 §5.1: `load_meta` reads its table (`a`).
             .load_meta => std.debug.assert(ins.a < i),
             // Doc 77 §6.6: `uvload` reads its closure (`a`).
-            .uvload => std.debug.assert(ins.a < i),
+            .uvload, .guard_uvslot => std.debug.assert(ins.a < i),
             // `guard_bounds` carries producer-dispatched semantics (doc 18 D3):
             // tier-1a selects the bounds rule from the producer op, so the
             // producer must be one of exactly two memory ops — `aref` (scalar
@@ -853,7 +853,7 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
         // Doc 77 §6.6: a `uvload` indexes its closure's cells, so the
         // closure's proto (which fixes the cell count) is pinned first.
         for (instrs, 0..) |ins, i| {
-            if (ins.op == .uvload) std.debug.assert(funcGuardedBefore(instrs, i, ins.a));
+            if (ins.op == .uvload or ins.op == .guard_uvslot) std.debug.assert(funcGuardedBefore(instrs, i, ins.a));
         }
     }
 }

@@ -185,6 +185,7 @@ pub fn resumeClass(op: IrOp) ResumeClass {
         .guard_fits,
         .guard_append,
         .guard_func,
+        .guard_uvslot,
         .guard_hash,
         .guard_builtin,
         .guard_grid,
