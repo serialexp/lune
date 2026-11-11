@@ -4560,7 +4560,7 @@ export interface KeyframeInput {
    */
   aio_next_id: bigint;
   /**
-   * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits; `exit_status` (v24) the code `os.exit` ended the run with, which a host reads after the run and may snapshot first (0 when it never ran).
+   * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits; `exit_status` (v24) the code `os.exit` ended the run with, which a host reads after the run and may snapshot first (0 when it never ran); `clock_last_ns` (v25) the last clock value the program got, in nanoseconds since its zero, so a restored VM that records continues the clock from there.
    */
   vm_state: VmStateInput;
   /**
@@ -4694,7 +4694,7 @@ export interface KeyframeOutput {
    */
   aio_next_id: bigint;
   /**
-   * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits; `exit_status` (v24) the code `os.exit` ended the run with, which a host reads after the run and may snapshot first (0 when it never ran).
+   * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits; `exit_status` (v24) the code `os.exit` ended the run with, which a host reads after the run and may snapshot first (0 when it never ran); `clock_last_ns` (v25) the last clock value the program got, in nanoseconds since its zero, so a restored VM that records continues the clock from there.
    */
   vm_state: VmStateOutput;
   /**
@@ -5113,6 +5113,7 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
     value.vm_state.unicode_version_pinned = this.readUint8();
     value.vm_state.system_groups = this.readUint8();
     value.vm_state.exit_status = this.readInt32("little_endian");
+    value.vm_state.clock_last_ns = this.readInt64("little_endian");
     value.host_roots = {};
     value.host_roots.refs = [];
     const host_roots_refs_length = this.readUint32("little_endian");
@@ -5562,7 +5563,7 @@ export class HostRootsDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits; `exit_status` (v24) the code `os.exit` ended the run with, which a host reads after the run and may snapshot first (0 when it never ran).
+ * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits; `exit_status` (v24) the code `os.exit` ended the run with, which a host reads after the run and may snapshot first (0 when it never ran); `clock_last_ns` (v25) the last clock value the program got, in nanoseconds since its zero, so a restored VM that records continues the clock from there.
  */
 export interface VmStateInput {
   /**
@@ -5620,10 +5621,15 @@ export interface VmStateInput {
    * Fixed-width 32-bit signed integer (-2147483648 to 2147483647). Respects endianness configuration.
    */
   exit_status: number;
+  /**
+   * 64-bit Signed Integer
+   * Fixed-width 64-bit signed integer (-9223372036854775808 to 9223372036854775807). Respects endianness configuration.
+   */
+  clock_last_ns: bigint;
 }
 
 /**
- * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits; `exit_status` (v24) the code `os.exit` ended the run with, which a host reads after the run and may snapshot first (0 when it never ran).
+ * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits; `exit_status` (v24) the code `os.exit` ended the run with, which a host reads after the run and may snapshot first (0 when it never ran); `clock_last_ns` (v25) the last clock value the program got, in nanoseconds since its zero, so a restored VM that records continues the clock from there.
  */
 export interface VmStateOutput {
   /**
@@ -5681,6 +5687,11 @@ export interface VmStateOutput {
    * Fixed-width 32-bit signed integer (-2147483648 to 2147483647). Respects endianness configuration.
    */
   exit_status: number;
+  /**
+   * 64-bit Signed Integer
+   * Fixed-width 64-bit signed integer (-9223372036854775808 to 9223372036854775807). Respects endianness configuration.
+   */
+  clock_last_ns: bigint;
 }
 
 export type VmState = VmStateOutput;
@@ -5710,6 +5721,7 @@ export class VmStateEncoder extends BitStreamEncoder {
     this.writeUint8(value.unicode_version_pinned);
     this.writeUint8(value.system_groups);
     this.writeInt32(value.exit_status, "little_endian");
+    this.writeInt64(value.clock_last_ns, "little_endian");
     return this.finish();
   }
 
@@ -5723,7 +5735,7 @@ export class VmStateEncoder extends BitStreamEncoder {
     for (const item of value.rng) {
       size += 8;
     }
-    size += 34; // length prefix (uint8) + safepoint_seq + committed_effect_seq + effect_cursor + warn_enabled + io_errors + io_errors_pinned + unicode_version_pinned + system_groups + exit_status
+    size += 42; // length prefix (uint8) + safepoint_seq + committed_effect_seq + effect_cursor + warn_enabled + io_errors + io_errors_pinned + unicode_version_pinned + system_groups + exit_status + clock_last_ns
     return size;
   }
 }
@@ -5753,6 +5765,7 @@ export class VmStateDecoder extends SeekableBitStreamDecoder {
     value.unicode_version_pinned = this.readUint8();
     value.system_groups = this.readUint8();
     value.exit_status = this.readInt32("little_endian");
+    value.clock_last_ns = this.readInt64("little_endian");
     return value;
   }
 }
@@ -6090,6 +6103,7 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
     value.keyframe.vm_state.unicode_version_pinned = this.readUint8();
     value.keyframe.vm_state.system_groups = this.readUint8();
     value.keyframe.vm_state.exit_status = this.readInt32("little_endian");
+    value.keyframe.vm_state.clock_last_ns = this.readInt64("little_endian");
     value.keyframe.host_roots = {};
     value.keyframe.host_roots.refs = [];
     const keyframe_host_roots_refs_length = this.readUint32("little_endian");

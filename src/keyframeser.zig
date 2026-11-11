@@ -169,7 +169,12 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v24 (doc 86 §6.1, the `Vm` field audit): `VmState.exit_status`, the code
 /// `os.exit` ended the run with. The run unwinds and leaves the VM reusable,
 /// so a host can snapshot it before it reads the status.
-pub const snapshot_format_version: u32 = 24;
+///
+/// v25 (doc 86 §6.1): `VmState.clock_last_ns`, the last clock value the
+/// program got. It is taken from the logged result, so a recording and its
+/// replay carry the same value, and a restored VM that records again counts
+/// on from it (`Vm.setClockSource`) instead of from a fresh zero.
+pub const snapshot_format_version: u32 = 25;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -624,6 +629,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
                 .unicode_version_pinned = @intFromBool(vm.unicode_version_pinned),
                 .system_groups = @bitCast(vm.system_groups),
                 .exit_status = vm.exit_status,
+                .clock_last_ns = vm.clock_last_ns,
             },
             .host_roots = host_roots,
         },
@@ -1618,6 +1624,7 @@ fn restoreVmState(vm: *Vm, kf: schema.VmState) RestoreError!void {
     if (groups._pad != 0) return error.InvalidVmState;
     vm.system_groups = groups;
     vm.exit_status = kf.exit_status;
+    vm.clock_last_ns = kf.clock_last_ns;
     vm.effect_cursor = std.math.cast(usize, kf.effect_cursor) orelse return error.InvalidVmState;
     vm.safepoint_seq = kf.safepoint_seq;
     vm.committed_effect_seq = kf.committed_effect_seq;
@@ -1644,6 +1651,7 @@ pub const fresh_vm_state: schema.VmState = .{
     .unicode_version_pinned = 0,
     .system_groups = 0,
     .exit_status = 0,
+    .clock_last_ns = 0,
 };
 
 // ---------------------------------------------------------------------------

@@ -29,7 +29,8 @@ everything inside them is checked.
   - [x] The keyframe carries `VmState` (v22, v24): the Xoshiro state,
     `safepoint_seq`, `committed_effect_seq`, the effect cursor (the log's
     length in record mode), `warn_enabled`, `io_errors`, both pins, the
-    system groups and `exit_status` (`keyframeser.zig` `restoreVmState`).
+    system groups, `exit_status` and the last clock value
+    (`keyframeser.zig` `restoreVmState`; v25 for the clock).
     The pins are stored, so the log-prefix scan is gone.
   - [x] Restore resumes inside the prologue without counting the step
     again (`Vm.resume_at`, `resumeEntry`).
@@ -92,6 +93,9 @@ everything inside them is checked.
 - [ ] **Defer — delta keyframes** (§6.7). Periodic full keyframes plus
   deltas of the objects written since the last one, found through a dirty
   bit. Build only once measured sessions show they are needed.
+- [ ] **Equal step counts across tiers** (§6.1, Critical in TODO.md).
+  Native and tier-1a code count steps as tier 0 does, and the cross-tier
+  mask goes. It must land before the JIT runs in a debug session.
 - [ ] **Defer — JIT in debug sessions** (§5.6). When a breakpoint is set,
   invalidate the traces whose span covers it. Until then a session runs
   tier 0.
@@ -549,7 +553,10 @@ The P1 gate checks both halves.
   Tests that compare snapshots across tiers mask that one field
   (`keyframeser_testutil.expectSameStateAcrossTiers`), and every
   same-tier comparison keeps it. A debug session runs tier 0 (§5.6), so
-  positions stay exact.
+  positions stay exact. Bart, 2026-11-12: the mask can hide other
+  divergence, so the tiers must count steps alike. That is the Critical
+  item at the top of TODO.md, and it must land before the JIT runs in a
+  session.
 - The effect-size count moved from `Vm` onto the log
   (`EffectLog.encoded`), so it is not keyframe state. Its value is a
   function of the log, so a recording and a replay of one log agree.
@@ -557,12 +564,15 @@ The P1 gate checks both halves.
   activation ids after a restore differ from the original run's. They are
   identities only: nothing observable and no snapshot byte depends on
   them.
-- The host's clock epoch (`Vm.clock`) is host state and not in the
-  keyframe. A restored VM that records again counts `os.clock` from its
-  own clock, not from the original epoch. History never does this,
-  because scratch VMs replay and the live VM is never restored (§6.4).
-  An embedder that restores and keeps recording has to supply a clock
-  with the original epoch.
+- The host's clock epoch (`Vm.clock`) is host state, a reading of a clock
+  that means nothing in another process, so the keyframe does not carry
+  it. It carries the last clock value the program got instead
+  (`clock_last_ns`, v25), taken from the logged result so a recording and
+  its replay agree. `setClockSource` places the zero that far before its
+  own reading, so a restored VM that records again goes on from where
+  the program's clock left off rather than starting at 0. (First built
+  as an embedder's job; Bart, 2026-11-12: the restored VM continues from
+  the last recorded value.)
 - Typed arrays are deferred (Implementation status): nothing can make
   one yet.
 

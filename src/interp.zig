@@ -1119,6 +1119,12 @@ pub const Vm = struct {
     /// tests). A clock read in `off`/`record` mode with none set fails with
     /// `ClockUnavailable`; `replay` never reads it.
     clock: ?Clock = null,
+    /// The last clock value the program got, in nanoseconds since its zero
+    /// (0 before the first read). Set from each committed `.clock` result
+    /// in every mode, so a recording and its replay agree. A keyframe
+    /// carries it (doc 86 §6.1), and `setClockSource` puts the zero so a
+    /// restored VM that records goes on counting from it.
+    clock_last_ns: i64 = 0,
     /// Embedder-supplied entropy for `random()`'s seed (null = none injected).
     /// Read once, lazily, on the first `random()` in `off`/`record`; `replay`
     /// reads the seed from the log instead. No source set ⇒ the fixed
@@ -2301,10 +2307,13 @@ pub const Vm = struct {
         try stdpackage.installPackageRuntime(self);
     }
 
-    /// Give the VM its clock. The reading taken here is the zero `os.clock`
-    /// and `os.nsclock` count from, so install it when the VM starts.
+    /// Give the VM its clock. `os.clock` and `os.nsclock` count from a zero
+    /// placed `clock_last_ns` before the reading taken here: the moment of
+    /// the call for a VM that has not read the clock, and for a restored one
+    /// the point where the program's last reading left off. So install it
+    /// when the VM starts, or after a restore.
     pub fn setClockSource(self: *Vm, source: ClockSource) void {
-        self.clock = .{ .source = source, .epoch_ns = source.nowNs(source.ctx) };
+        self.clock = .{ .source = source, .epoch_ns = source.nowNs(source.ctx) -% self.clock_last_ns };
     }
 
     /// Install the natives of `groups` (doc 65 §5.2): the host's switch for
@@ -13685,8 +13694,19 @@ fn performEffect(self: *Vm, kind: EffectKind, nat: *const function.Native, args:
     // both modes hold the identical bytes here and raise (or pass) identically.
     // `clock`/`argc`/`random_seed` return ints → `validateHostText` no-ops.
     try self.validateHostText(result);
+    if (kind == .clock) self.clock_last_ns = clockNs(result);
     onEffectCommitted(self);
     return result;
+}
+
+/// A `.clock` result in nanoseconds: `os.nsclock`'s integer as it is,
+/// `os.clock`'s float seconds rounded. It reads the result, not the clock, so
+/// a replay derives what the recording did. A value no clock gives (one from
+/// a log this binary did not write) saturates rather than trapping.
+fn clockNs(v: Value) i64 {
+    if (v.isInt()) return v.asInt();
+    if (v.isFloat()) return std.math.lossyCast(i64, @round(v.asFloat() * 1e9));
+    return 0;
 }
 
 /// The single definition of a successfully committed host effect. Every effect

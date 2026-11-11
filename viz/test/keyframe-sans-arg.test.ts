@@ -76,6 +76,7 @@ class Kf {
           unicode_version_pinned: 0,
           system_groups: 0,
           exit_status: 0,
+          clock_last_ns: 0n,
         },
         host_roots: { refs: [], free: [], parked: [] },
       },

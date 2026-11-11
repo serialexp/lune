@@ -2256,3 +2256,82 @@ test "doc 86 §6.1: a VM snapshotted after os.exit restores with the code it exi
     defer gpa.free(again);
     try testing.expectEqualSlices(u8, snap, again);
 }
+
+/// A host clock that starts at `next` and advances `step` per reading.
+const StepClock = struct {
+    next: i64,
+    step: i64,
+    fn nowNs(ctx: *anyopaque) i64 {
+        const self: *StepClock = @ptrCast(@alignCast(ctx));
+        const v = self.next;
+        self.next += self.step;
+        return v;
+    }
+    fn source(self: *StepClock) interp.ClockSource {
+        return .{ .ctx = self, .nowNs = &StepClock.nowNs };
+    }
+};
+
+test "doc 86 §6.1: a restored VM's clock goes on from the program's last reading" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 = "t1 = os.nsclock()\nt2 = os.nsclock()\n";
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    try vm.enableSystem(.{ .clock = true });
+    // The zero is the first reading (1000); the program then reads 1010
+    // and 1020, so its clock says 10 and 20.
+    var clock: StepClock = .{ .next = 1000, .step = 10 };
+    vm.setClockSource(clock.source());
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqual(@as(i64, 20), vm.clock_last_ns);
+    const snap = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(snap);
+
+    const vm_r = try restore(gpa, snap, .of(source), NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+    try testing.expectEqual(@as(i64, 20), vm_r.clock_last_ns);
+    // Another host, whose clock reads something else entirely: the
+    // program's clock still goes on from 20, by the new clock's step.
+    var later: StepClock = .{ .next = 9_000_000, .step = 7 };
+    vm_r.setClockSource(later.source());
+    const more: [:0]const u8 = "return os.nsclock()";
+    var tree2 = try mahina_parser.parse(gpa, more, &diags);
+    defer tree2.deinit();
+    var chunk2 = try mahina_compiler.compile(gpa, vm_r.heap, more, tree2.root, &diags);
+    defer chunk2.deinit();
+    try testing.expect(!diags.hasErrors());
+    const t3 = try vm_r.run(chunk2.proto);
+    try testing.expectEqual(@as(i64, 27), t3.asInt());
+    try testing.expectEqual(@as(i64, 27), vm_r.clock_last_ns);
+}
+
+test "doc 86 §6.1: the last clock value is taken from the result, so os.clock's float seconds round to nanoseconds" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 = "t = os.clock()\n";
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try mahina_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    try vm.enableSystem(.{ .clock = true });
+    var clock: StepClock = .{ .next = 0, .step = 1_500_000_001 };
+    vm.setClockSource(clock.source());
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqual(@as(i64, 1_500_000_001), vm.clock_last_ns);
+}
