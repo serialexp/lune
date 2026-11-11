@@ -341,6 +341,17 @@ land; move whole phases to Done once everything inside them is checked.
   - [x] the test catches a violation: a boundary opened at the instruction
     inside `finishIndex2Mid` made a second-lookup guard attachable, and the
     test failed (checked by hand, then removed).
+- [x] **Phase 4, tenth part — a function `__index` under a fused store**
+  (§6.3, 2026-11-12). The first lookup's handler is inlined with finish
+  `.index2_set_mid`; its return records the store into its result by the
+  second key (`finishIndex2SetMid`), reading the instruction's operands in
+  the caller's window (`RegWindow.below`) as tier 0's `finishOp` does, so
+  `meta_keys` keeps only the proto. A function `__newindex` on the row is
+  the store shape's inlined call, a second handler. Gated in
+  `src/interp_native_test.zig` ("fused index: a function __index on a
+  store's first lookup …"), whose row turns to a float lane mid-run; a
+  boundary at the instruction's successor after the handler fails it
+  (checked by hand, then removed).
 - [x] **Phase 6 — doc amendments** (§9.3, 2026-11-12), each a dated
   follow-up beside the text it amends. Doc 61 §2 ("No JIT path runs other
   code inside an instruction": never calls, and the raw lookups' gate now
@@ -383,9 +394,9 @@ land; move whole phases to Done once everything inside them is checked.
   `__newindex` on the row). The container's guard proves it is marked
   `no_grid` (`GUARD_TABLE_NO_GRID`), since tier 0 tries to inflate a table
   not yet marked; a container tier 0 is about to inflate (`Heap.gridPlan`)
-  is not recorded. A function `__index` on the first lookup still aborts
-  `has_metatable`: a fused store has no frame finish yet (it would be a
-  second `MetaFinish` stage, the row's store). Gated in
+  is not recorded. A function `__index` on the first lookup still aborted
+  `has_metatable` (a fused store had no frame finish yet); the tenth part
+  adds it. Gated in
   `src/interp_native_test.zig` ("fused index: a store …", four tests; the
   `no_grid` guard and the `gridPlan` refusal were each removed by hand and
   a test failed).
@@ -400,13 +411,13 @@ land; move whole phases to Done once everything inside them is checked.
   preheader cannot home an `aref`.
 - [ ] **Phase 4 — function metamethods as inlined calls** (§6). Starts
   after doc 68 P2 (Q1).
-  - [ ] doc 68 P2 landed: tier 0 runs metamethods as continuation frames,
+  - [x] doc 68 P2 landed: tier 0 runs metamethods as continuation frames,
     and §6.3's pending-instruction stages mirror its `finish_op` stages
-  - [ ] the pending-instruction stack (§6.3) and its stage transitions:
+  - [x] the pending-instruction stack (§6.3) and its stage transitions:
     the fused read's handler stage landed as a frame finish (seventh part,
-    §6.3 second amendment); the fused store records without a handler
-    stage (ninth part), so a function `__index` on its first lookup still
-    aborts; that stage and `__close` (Phase 5) remain
+    §6.3 second amendment); the fused store's (tenth part) and
+    `__close`'s (Phase 5, first part) landed too. The "closes done, return
+    only" completion is Phase 5's bullet below.
   - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
     of a cell with an alias class, through a computed callee still abort
     `.cross_frame`

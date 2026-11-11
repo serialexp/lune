@@ -569,18 +569,23 @@ pub const InlineFrame = struct {
 /// when it fails. `.index2_mid` is the first lookup of a fused `get_index2`
 /// (tier 0's phase 0): the result is the table the second lookup reads,
 /// with the key `RecordingSession.meta_keys` saved for this frame.
+/// `.index2_set_mid` is the first lookup of a fused `set_index2` (tier 0's
+/// phase 0): the result is the table the store writes, by the second key.
 /// `.close` is one `__close` of a `close` or `ret_close` (doc 77 §8,
 /// `closeStep`): the result is dropped, and the variables below
 /// `ret_dest` are closed next, then a `ret_close` returns.
-pub const MetaFinish = enum(u8) { result, truthy, truthy_not, branch_true, branch_false, index2_mid, close };
+pub const MetaFinish = enum(u8) { result, truthy, truthy_not, branch_true, branch_false, index2_mid, index2_set_mid, close };
 
 /// Doc 77 §6.3: what a pending instruction keeps while a handler it called
 /// runs, besides the frame's own fields: the proto of the frame running the
 /// instruction, and a register. For a fused `get_index2`, the second key's
 /// register and observed value: the handler's frame cannot read the
 /// caller's registers, and the key's value is fixed for the instruction (a
-/// handler writes no register of its caller). For a `close` (§8), the
-/// lowest register it closes (`value` unused).
+/// handler writes no register of its caller). For a fused `set_index2`,
+/// nothing else (`value` and `reg` unused): its operands are read in the
+/// caller's window once the handler returns, as tier 0's `finishOp` reads
+/// them. For a `close` (§8), the lowest register it closes (`value`
+/// unused).
 pub const MetaKey = struct { value: Value, reg: u16, proto: *const Proto };
 
 /// Build a guard's ordered inline-path prefix (doc 17, A-i.2) from the recorder's
@@ -2749,7 +2754,7 @@ pub const RecordingSession = struct {
         self.cur_proto_id = fr.caller_proto_id;
         const t = (try self.truthRef(r, v)) orelse return self.abort(.bad_type);
         switch (fr.finish) {
-            .result, .index2_mid, .close => unreachable,
+            .result, .index2_mid, .index2_set_mid, .close => unreachable,
             .truthy => self.setReg(fr.ret_dest, t),
             .truthy_not => self.setReg(fr.ret_dest, if (self.konstValueOf(t)) |kv|
                 try self.konst(Value.boolean(!kv.isTruthy()))
@@ -3890,6 +3895,28 @@ pub const RecordingSession = struct {
         return self.index2Second(regs, mk.proto, fr.ret_dest, mk.reg, .{ .ref = r, .value = v }, mk.value);
     }
 
+    /// Doc 77 §6.3: the handler answering a fused store's first lookup
+    /// returned `v` (ref `r`): the store into it by the second key, in the
+    /// frame running the instruction (window `regs`), whose operands tier
+    /// 0's `finishOp` reads there too. Its guards follow the handler's
+    /// return with no boundary of their own, so they exit coarse (§7 route
+    /// 2).
+    fn finishIndex2SetMid(self: *RecordingSession, fr: InlineFrame, r: Ref, v: Value, regs: RegWindow) !void {
+        const saved_pc = self.cur_pc;
+        const saved_proto = self.cur_proto_id;
+        defer {
+            self.cur_pc = saved_pc;
+            self.cur_proto_id = saved_proto;
+        }
+        self.cur_pc = fr.call_pc + 1;
+        self.cur_proto_id = fr.caller_proto_id;
+        const proto = self.meta_keys[self.inline_depth].proto;
+        const ins = proto.code[fr.call_pc];
+        if (!isTableValue(v)) return self.abort(.bad_type);
+        if (table_mod.Table.fromHeader(v.asHeap()).array.isGrid()) return self.abort(.nyi_opcode);
+        return self.setShape(regs, .{ .tab_in = .{ .ref = r, .value = v }, .key = .{ .reg = ins.c }, .val = @intCast(ins.aux), .tab_od = .loaded, .key_od = .c, .val_od = .aux, .frame_proto = proto });
+    }
+
     /// What `tbl[key]` reads for an index operation (`indexGet`): the raw
     /// value, else through a table `__index` chain of at most
     /// `MAX_INDEX_CHAIN` hops. Null when the chain reaches a handler that is
@@ -3978,9 +4005,11 @@ pub const RecordingSession = struct {
     /// a table not yet marked `no_grid` (`fusedStoreGrid`), so the trace
     /// proves the mark (`GUARD_TABLE_NO_GRID`); a table that would inflate
     /// (`Heap.gridPlan`) stays with tier 0. The row is held in no
-    /// register (`GetFrame.out`). Stays with tier 0: a row that is absent,
-    /// not a table or a grid; a function `__index` on the first lookup (a
-    /// function `__newindex` on the row is the store shape's, inlined).
+    /// register (`GetFrame.out`). A function `__index` on the first lookup
+    /// is inlined with finish `.index2_set_mid`, and its return makes the
+    /// store (`finishIndex2SetMid`); a function `__newindex` on the row is
+    /// the store shape's, inlined. Stays with tier 0: a row that is absent,
+    /// not a table or a grid.
     fn recIndex2Set(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
         const vtab = regs.get(instr.a);
         if (!isTableValue(vtab)) return self.abort(.bad_type);
@@ -3994,12 +4023,24 @@ pub const RecordingSession = struct {
             return self.abort(.nyi_opcode);
         }
         const val_reg: u16 = @intCast(instr.aux);
-        const mid = (try self.observedIndex(vtab, regs.get(instr.b))) orelse return self.abort(.has_metatable);
-        if (!isTableValue(mid)) return self.abort(.bad_type);
-        // A grid row stored to by one key would deflate its grid.
-        if (table_mod.Table.fromHeader(mid.asHeap()).array.isGrid()) return self.abort(.nyi_opcode);
+        const observed = try self.observedIndex(vtab, regs.get(instr.b));
+        if (observed) |mid| {
+            if (!isTableValue(mid)) return self.abort(.bad_type);
+            // A grid row stored to by one key would deflate its grid.
+            if (table_mod.Table.fromHeader(mid.asHeap()).array.isGrid()) return self.abort(.nyi_opcode);
+        }
         const rtab = try self.refOf(instr.a);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_NO_GRID | GUARD_TABLE_ANY_META }), .container_type, .a, .neutral);
+        const mid = observed orelse {
+            // A handler answers the first lookup (tier 0's phase 0): it is
+            // inlined, and its return makes the store.
+            const depth = self.inline_depth;
+            try self.getShape(regs, .{ .dst = instr.a, .tab = instr.a, .key = .{ .reg = instr.b }, .tab_od = .a, .key_od = .b, .frame_proto = proto, .finish = .index2_set_mid });
+            if (!self.active) return;
+            if (self.inline_depth != depth + 1 or self.frames[depth].finish != .index2_set_mid) return self.abort(.has_metatable);
+            self.meta_keys[depth] = .{ .value = Value.nil(), .reg = 0, .proto = proto };
+            return;
+        };
         var held: ?Ref = null;
         try self.getShape(regs, .{ .dst = instr.a, .tab = instr.a, .key = .{ .reg = instr.b }, .tab_od = .a, .key_od = .b, .out = &held });
         if (!self.active) return;
@@ -4696,16 +4737,23 @@ pub const RecordingSession = struct {
                 if (!self.active) return;
             }
             if (fr.finish != .result) {
-                // Doc 77 §6.3: a compare handler, or a fused read's first
-                // lookup. Its first result is read in its own frame, which
-                // `recReturn` (`ret_count` 0) pops.
+                // Doc 77 §6.3: a compare handler, or a fused read's or
+                // store's first lookup. Its first result is read in its own
+                // frame, which `recReturn` (`ret_count` 0) pops.
                 if (instr.b == bytecode.all_results) return self.abort(.cross_frame);
                 const v = if (instr.b == 0) Value.nil() else regs.get(instr.a);
                 const r = if (instr.b == 0) try self.konst(Value.nil()) else try self.refOf(instr.a);
+                const below = self.base_off - fr.base_off;
                 try self.recReturn(instr, multret);
                 if (!self.active) return;
-                if (fr.finish == .index2_mid) return self.finishIndex2Mid(fr, r, v, regs);
-                return self.finishMetaCompare(fr, r, v);
+                switch (fr.finish) {
+                    .index2_mid => return self.finishIndex2Mid(fr, r, v, regs),
+                    .index2_set_mid => {
+                        const caller = regs.below(below, self.meta_keys[self.inline_depth].proto.num_registers);
+                        return self.finishIndex2SetMid(fr, r, v, caller);
+                    },
+                    else => return self.finishMetaCompare(fr, r, v),
+                }
             }
             return self.recReturn(instr, multret);
         }

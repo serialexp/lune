@@ -337,10 +337,6 @@ more than tier 0. Four causes, by pass:
       slot never consults `__newindex`, but the `.value` lane has no
       presence guard (nil is in-band), so the trace cannot prove the slot
       stays present; it needs one (a nil check on the loaded slot).
-- [ ] **A function `__index` on a fused store's first lookup aborts**
-      (`has_metatable`, `recIndex2Set`, noted 2026-11-12). The fused read
-      finishes such a handler with `MetaFinish.index2_mid`; the store
-      needs the same stage ending in the row's store (doc 77 §6.3).
 - [ ] **`bench/stdlib/meta_close.lua`'s loop never records** (noted
       2026-11-12, doc 77 §10.14). `setmetatable({ w = i % 7 }, C)`
       allocates a table per iteration: `needs_precise` at `new_table`,

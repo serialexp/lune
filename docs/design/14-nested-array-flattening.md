@@ -391,7 +391,9 @@ is about to inflate it: if so the store stays with tier 0, otherwise tier
 Still with tier 0: a row that is absent, not a table, or a grid (its
 grid would deflate), and a function `__index` on the first lookup. A
 function `__newindex` on the row records as the store shape's inlined
-call.
+call. Follow-up (2026-11-12): a function `__index` on the first lookup
+records too, as an inlined call whose return makes the store (doc 77
+Phase 4, tenth part).
 
 ## Escape detection — the gate decision (2026-06-26, Bart)
 

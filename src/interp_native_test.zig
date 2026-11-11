@@ -1949,6 +1949,33 @@ test "fused index: a store into a container not yet marked no_grid leaves it to 
     , "45750\n", .{ .record_aborts = true, .inspect = assertFreshContainersInflated });
 }
 
+test "fused index: a function __index on a store's first lookup records as an inlined call" {
+    // `F`'s handler answers the first lookup with a row; the store into it
+    // follows the handler's return. At k == 200 row 2 turns into a float
+    // row, so the store's guards fail after the handler ran (doc 77 §7
+    // route 2: coarse, the handler runs once). `G`'s handler answers with
+    // a row whose own `__newindex` function takes the store.
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0, w = 0 }
+        \\  local rows = {}
+        \\  for i = 1, 4 do rows[i] = { i, 0 } end
+        \\  local F = setmetatable({}, { __index = function(_, k)
+        \\    c.n = c.n + 1
+        \\    if c.n == 200 then rows[2] = { 0.5, 0.5 } end
+        \\    return rows[k]
+        \\  end })
+        \\  local P = setmetatable({}, { __newindex = function(r, k, v) c.w = c.w + v end })
+        \\  local G = setmetatable({}, { __index = function() return P end })
+        \\  return c, rows, F, G
+        \\end
+        \\local c, rows, F, G = mk()
+        \\for k = 1, 300 do F[k % 4 + 1][2] = k end
+        \\for k = 1, 300 do G[k]["y"] = 2 end
+        \\print(rows[1][2], rows[2][2], rows[3][2], rows[4][2], rows[2][1], c.n, c.w)
+    , "300\t297\t298\t299\t0.5\t300\t600\n", .{ .record_aborts = true, .inspect = assertIndex2SetRecorded });
+}
+
 fn assertInflatingStoreLeftToTier0(vm: *Vm, mode: TraceMode) anyerror!void {
     if (mode != .off) {
         var refused = false;
