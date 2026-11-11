@@ -987,6 +987,10 @@ pub const RecordingSession = struct {
     /// the seeding `slot_load` ref. Interned strings are VM-deduped, so two
     /// callee protos naming one global share the identity (and the seed).
     callee_global_dedup: std.AutoHashMapUnmanaged(ObjIdentity, Ref) = .empty,
+    /// Dedup for doc 77 §6.6 `uvload`s: `(callee ref << 16) | upvalue index`
+    /// → the load's ref. Keyed on IR refs, not addresses, so no identity
+    /// question arises.
+    uvload_dedup: std.AutoHashMapUnmanaged(u64, Ref) = .empty,
     /// Next synthetic input slab slot to hand out. Initialised to
     /// `anchor_num_registers` in `reset` (inputs live *above* the anchor window);
     /// bumped once per unique input. The slot is only ever a `slot_load` `aux` and
@@ -3515,8 +3519,9 @@ pub const RecordingSession = struct {
             // decision: a store following it is a read-modify-write whose
             // write must defer below every guard.
             // `load_meta` (doc 77) too, fail-closed: no trace store writes
-            // the metatable field, but it reads the table's state.
-            if (ins.op == .aload or ins.op == .hload or ins.op == .gload or ins.op == .uload or ins.op == .guard_absent or ins.op == .guard_tostring or ins.op == .load_meta) return true;
+            // the metatable field, but it reads the table's state. And
+            // `uvload` (doc 77 §6.6), `uload`'s computed-callee twin.
+            if (ins.op == .aload or ins.op == .hload or ins.op == .gload or ins.op == .uload or ins.op == .guard_absent or ins.op == .guard_tostring or ins.op == .load_meta or ins.op == .uvload) return true;
         }
         return false;
     }
@@ -3783,11 +3788,14 @@ pub const RecordingSession = struct {
         // dispatch) records as `hload ty=.heap` + an immediate `guard_func`
         // pinning the closure's `Proto.id` (doc 02: a stable id, never a pointer
         // — survives keyframe restore). Proto-id identity — not closure identity
-        // — is sound because an inlined callee's upvalue read requires a
-        // `slot_load` callee ref (`recCalleeUpval`) and an `hload` ref is not
-        // one: it aborts `.cross_frame` fail-closed. HARD INVARIANT (doc 43 §5):
-        // any future path letting an hload-loaded callee reach upvalue access
-        // must first tighten `guard_func` to closure `GcHeader.id`.
+        // — is sound because nothing about a computed callee's cells is baked:
+        // its upvalue reads are `uvload`s through the loaded closure itself
+        // (doc 77 §6.6, `recComputedCalleeUpval`), so two closures of one proto
+        // each read their own cells, and the proto fixes the cell count. Writes
+        // and alias-class reads through a computed callee still abort
+        // `.cross_frame`. INVARIANT (doc 43 §5, as amended by doc 77 §6.6): a
+        // path that seeds or bakes anything about a computed callee's cells at
+        // entry must tighten `guard_func` to closure `GcHeader.id` first.
         // A TABLE field (doc 43 P3 — `local image = self.image` inside a loop
         // body, the array3d shape) records as `hload ty=.heap` + an immediate
         // `guard_table` — the exact mirror of the `.value`-lane array-of-structs
@@ -6360,8 +6368,12 @@ pub const RecordingSession = struct {
         if (kind == .upvalue) {
             if (self.context.upval_cell) |cell| {
                 const scalar = resolved.isInt() or resolved.isFloat() or resolved.isBool();
+                // A computed callee (no access path) reads per iteration
+                // anyway (`recComputedCalleeUpval`), so the memo has nothing
+                // to route for it; a cell with a class still goes to
+                // `recUpvalLoad`, which aborts it.
                 if (self.upvalue_cell_classes.contains(objIdentity(&cell.header)) or
-                    (self.route_upvalue_reads and scalar and !cell.isOpen()))
+                    (self.route_upvalue_reads and scalar and !cell.isOpen() and self.upvalAccessPathSlot() != null))
                     return self.recUpvalLoad(dest, source, cell, resolved);
             }
         }
@@ -6597,11 +6609,11 @@ pub const RecordingSession = struct {
         self.setReg(dest, ref);
     }
 
-    /// Record a `get_upval` inside an inlined callee. The callee's closure
-    /// must be reachable as a `slot_load` in the anchor slab (i.e. the callee was
-    /// loaded from an upvalue/global/local of the anchor frame). If the callee was
-    /// computed on-trace (not a `slot_load`), we abort — on-trace closure creation
-    /// is future work (doc 24).
+    /// Record a `get_upval` inside an inlined callee. A callee reachable as a
+    /// `slot_load` in the anchor slab (loaded from an upvalue/global/local of
+    /// the anchor frame) gets a per-entry `callee_upvalue` seed, below. A
+    /// computed callee (an `hload`ed method, doc 77 §6.6) reads the cell per
+    /// iteration instead (`recComputedCalleeUpval`).
     ///
     /// The seed resolves at entry by reading the callee closure from its slab slot
     /// and then resolving `closure.upvalues[source]` through `upvalGet`. The
@@ -6618,11 +6630,12 @@ pub const RecordingSession = struct {
         if (callee_entry.state == .undef) return self.abort(.cross_frame);
         const callee_ref = callee_entry.ref;
 
-        // The callee ref must be a `slot_load` — that means the callee's closure
-        // is in a known slab slot at entry time. A computed callee (aload, hload,
-        // etc.) can't be re-resolved at entry, so we abort.
+        // A `slot_load` callee's closure is in a known slab slot at entry
+        // time, so the cell resolves once per entry. A computed callee (aload,
+        // hload, etc.) can't be re-resolved at entry: it loads through the
+        // closure the trace holds.
         const callee_ir = self.instrs.items[callee_ref];
-        if (callee_ir.op != .slot_load) return self.abort(.cross_frame);
+        if (callee_ir.op != .slot_load) return self.recComputedCalleeUpval(dest, source, callee_ref, resolved);
         const callee_slot: u16 = @intCast(callee_ir.aux);
 
         // Dedup: (callee_upvalue << 32) | (callee_slot << 16) | source.
@@ -6666,6 +6679,62 @@ pub const RecordingSession = struct {
             try self.guardNum(ref, resolved, .operand_type, .a);
         }
         self.setReg(dest, ref);
+    }
+
+    /// Doc 77 §6.6: a `get_upval` in an inlined callee the trace computed (a
+    /// method an `__index` chain or a field load returned). `uvload` reads
+    /// the cell through the callee ref every time it runs, so nothing about
+    /// the cell is seeded or baked, and the callee's `guard_func` pins only
+    /// its proto (which fixes the cell count): two closures of one proto read
+    /// their own cells. Bart decided proto-only (2026-11-11); doc 77 §6.6
+    /// has the soundness argument.
+    ///
+    /// Aborts:
+    ///   * the cell is open over the trace's window (the anchor's or an
+    ///     inlined frame's; normally caught earlier by the doc 53 route) →
+    ///     `.aliased_input`. A cell open below the anchor stays live and
+    ///     unwritten for the whole run, so it reads like a closed one;
+    ///   * nil, userdata or another untraced value → `.bad_type`;
+    ///   * an anchor window wider than `UvloadAux` holds → `.input_cap`.
+    /// A cell that already has an alias class (a recorded store) never
+    /// reaches here: `recInputGet` sends it to `recUpvalLoad`, which aborts a
+    /// computed callee `.cross_frame`, as does a `set_upval` through one.
+    fn recComputedCalleeUpval(self: *RecordingSession, dest: u16, source: u16, callee_ref: Ref, resolved: Value) !void {
+        if (self.context.upval_cell == null) return self.abort(.nyi_opcode);
+        if (self.context.upval_open) |open_idx| {
+            if (open_idx >= self.anchor_abs_base) return self.abort(.aliased_input);
+        }
+        if (self.anchor_num_registers > std.math.maxInt(u15)) return self.abort(.input_cap);
+        const key = (@as(u64, @intCast(callee_ref)) << 16) | source;
+        if (self.uvload_dedup.get(key)) |ref| {
+            self.setReg(dest, ref);
+            return;
+        }
+        const heap_type: ?object.ObjectType = if (resolved.isHeap()) resolved.heapType() else null;
+        if (heap_type) |ht| switch (ht) {
+            .function, .table, .string, .native => {},
+            else => return self.abort(.bad_type),
+        } else if (!(resolved.isInt() or resolved.isFloat() or resolved.isBool())) return self.abort(.bad_type);
+        const aux: trace_ir.UvloadAux = .{ .index = source, .window = @intCast(self.anchor_num_registers) };
+        const rload = try self.emit(.{ .op = .uvload, .a = callee_ref, .aux = aux.encode(), .ty = obsTypeOf(resolved) });
+        // The fused tag exit, like `hload`'s; the subtype pin follows.
+        self.stampProv(rload, .field_type, .loaded, .neutral);
+        try self.uvload_dedup.put(self.gpa, key, rload);
+        self.setReg(dest, rload);
+        if (heap_type) |ht| switch (ht) {
+            .function => {
+                const cl = function.Closure.fromHeader(resolved.asHeap());
+                self.stampProv(try self.emit(.{ .op = .guard_func, .a = rload, .aux = @bitCast(cl.proto.id) }), .callee_identity, .loaded, .neutral);
+            },
+            .table => {
+                const tbl = table_mod.Table.fromHeader(resolved.asHeap());
+                self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload, .aux = metaAux(tbl) }), .field_type, .loaded, .neutral);
+            },
+            .string => self.stampProv(try self.emit(.{ .op = .guard_string, .a = rload }), .field_type, .loaded, .neutral),
+            // Pinned by its consumer, as for an `hload`ed native.
+            .native => {},
+            else => unreachable,
+        } else if (!resolved.isBool()) try self.guardNum(rload, resolved, .field_type, .loaded);
     }
 
     /// Record a `get_global` inside an inlined callee (doc 43 P4 — unblocks
@@ -6955,6 +7024,7 @@ pub const RecordingSession = struct {
             .href,
             .hload,
             .load_meta,
+            .uvload,
             .alen,
             .guard_table,
             .guard_lane,
@@ -7237,6 +7307,7 @@ pub const RecordingSession = struct {
         self.input_dedup.deinit(gpa);
         self.hash_cell_dedup.deinit(gpa);
         self.callee_global_dedup.deinit(gpa);
+        self.uvload_dedup.deinit(gpa);
         self.upvalue_cell_classes.deinit(gpa);
         self.upvalue_path_dedup.deinit(gpa);
         self.snapshot_read_cells.deinit(gpa);
@@ -7306,6 +7377,7 @@ pub const RecordingSession = struct {
         self.input_dedup.clearRetainingCapacity();
         self.hash_cell_dedup.clearRetainingCapacity();
         self.callee_global_dedup.clearRetainingCapacity();
+        self.uvload_dedup.clearRetainingCapacity();
         self.upvalue_cell_classes.clearRetainingCapacity();
         self.upvalue_path_dedup.clearRetainingCapacity();
         self.snapshot_read_cells.clearRetainingCapacity();

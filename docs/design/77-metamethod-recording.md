@@ -1,8 +1,9 @@
 # 77 — Recording metamethods — Design
 
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
-decided; Phases 0–3 landed (2026-11-11); Phases 4–7 outstanding
-(doc 68 P2, which Phase 4 waits on, has landed)
+decided; Phases 0–3 landed (2026-11-11); Phase 4 started (computed-callee
+upvalue reads, §6.6); Phases 4–7 outstanding (doc 68 P2, which Phase 4
+waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -120,6 +121,24 @@ land; move whole phases to Done once everything inside them is checked.
     key; a chain replaced between entries; an integer-key absence beside an
     array store; collections inside the loop). With the key check removed,
     the store-to-key program's traced run prints 9747 instead of 19900.
+- [x] **Phase 4, first part — computed-callee upvalue reads** (§6.6,
+  2026-11-11). A `get_upval` in an inlined callee the trace computed (a
+  method from an `__index` chain or a field) records as `uvload`, IR op 105,
+  which reads the cell through the closure the trace holds, in tier-1a and
+  native. The guard stays the proto-id `guard_func` (Bart, 2026-11-11;
+  amendment in §6.6).
+  - [x] fused exits on a tag change and on a cell open over the anchor
+    window; the recorder aborts a cell open over the trace's window
+    (`.aliased_input`) and nil or untraced values (`.bad_type`);
+  - [x] LICM hoists a `uvload` of a hoisted closure when the trace has no
+    `ustore`;
+  - [x] gated in `src/interp_meta_trace_test.zig` (closed cell, hoisted; a
+    `ustore` keeps it in the body; a cell open below the anchor, changed
+    between entries; the anchor-window alias aborts; table, string and
+    native values under collections) and `src/interp_trace_test.zig`
+    (same-proto closure swap, per-object closures of one proto with mixed
+    value types, a cell tier 0 writes between runs);
+  - [x] measured (§10.8).
 
 ### Outstanding
 
@@ -135,7 +154,12 @@ land; move whole phases to Done once everything inside them is checked.
     and §6.3's pending-instruction stages mirror its `finish_op` stages
   - [ ] the pending-instruction stack (§6.3) and its stage transitions
   - [ ] the per-route exit contract (§7), with its exclusions tested
-  - [ ] computed-callee upvalue access (§6.6)
+  - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
+    of a cell with an alias class, through a computed callee still abort
+    `.cross_frame`
+  - [ ] the anchor-window alias for computed callees: a method's cell open
+    over the anchor frame (ray's `main`) aborts; doc 53's SSA redirect
+    needs an access path a computed callee lacks
   - [ ] `__index`/`__newindex` functions
   - [ ] arithmetic, `__unm`, bitwise, `__bnot`
   - [ ] `__len`, `__eq`, `__lt`, `__le`, the compare-and-branch forms (§6.4)
@@ -516,6 +540,35 @@ Phase 4 adds computed-callee upvalue access:
 The access-path rule (Q3, decided) chooses between them: a callee in a slot
 keeps the slot route; any other callee takes this one.
 
+**Amended (Bart, 2026-11-11): proto guard only.** The closure-identity
+guard in the first bullet is dropped; the computed callee keeps the
+proto-id `guard_func` it already had. The upvalue read is `uvload`, which
+loads `closure.upvalue(i)`'s value through the cell's lane pointers every
+time it runs. This is sound with the proto pin alone because nothing about
+the cell is baked or seeded:
+
+- the proto fixes the cell count, so index `i` is in range for any closure
+  the guard admits;
+- two closures of one proto read their own cells, since the read goes
+  through the closure ref the trace loaded, not through anything recorded
+  from the first one;
+- the value's type is pinned by the load's fused tag exit, and its subtype
+  by the guard after it (`guard_func`, `guard_table`, `guard_string`, or
+  the consumer's for a native), as for an `hload`;
+- the location is checked, not assumed: a cell open over the anchor's
+  window (slots the trace keeps in registers and writes back only at exit)
+  exits. A cell open below the anchor is over a frame that stays live and
+  that the trace never writes, and a cell over a deeper frame cannot exist
+  while the trace runs (those frames are gone, so their cells are closed).
+
+A closure-identity guard would have exited whenever a same-proto closure
+came by (per-object closures, a replaced method), for no soundness gain.
+The doc 43 §5 invariant now reads: a path that seeds or bakes anything
+about a computed callee's cells at entry must first tighten `guard_func`
+to the closure's `GcHeader.id`. Writes through a computed callee still
+abort; the pending-store forwarding they need keys on alias classes, which
+a computed callee does not have.
+
 ### 6.7 `__call`
 
 `recCall`'s non-function arm looks up `__call` (§5.2), shifts the arguments
@@ -748,6 +801,23 @@ row of the 64 moved by more than the spread except those at 0% residency.
   metatable, and a field it was read from is not stored to (or it would
   not be hoisted). The test with `tostring` allocating every iteration runs
   it under the collector's stress legs.
+
+### 10.8 After §6.6, computed-callee upvalue reads (2026-11-11)
+
+`ray`, two interleaved `bench/run.py` runs per binary (baseline 6f34c37
+from `git archive`, verified by dumping a `uvload` program's IR; load ~7.7):
+
+| | t0 ms | jit ms | res% |
+|---|---|---|---|
+| before | 468.5, 463.5 | 1208.7, 1216.4 | 27.4 |
+| after | 472.1, 473.8 | 1210.2, 1231.7 | 24.4, 24.2 |
+
+No change in time. The `get_upval` aborts in `intersect` and `ray_trace`
+are gone: those recordings now run to a `host_barrier` (an `itern` in
+`intersect`, a `call` in `ray_trace`). `main` still aborts `cross_frame` on
+`get_upval`: its methods read cells open over `main`'s own window, the
+anchor-window alias case (Outstanding). The next blockers for `ray` are
+those host barriers and that alias, not upvalue access.
 
 ## 11. Open questions for review
 

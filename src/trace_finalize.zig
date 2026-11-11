@@ -771,6 +771,8 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             },
             // Doc 77 §5.1: `load_meta` reads its table (`a`).
             .load_meta => std.debug.assert(ins.a < i),
+            // Doc 77 §6.6: `uvload` reads its closure (`a`).
+            .uvload => std.debug.assert(ins.a < i),
             // `guard_bounds` carries producer-dispatched semantics (doc 18 D3):
             // tier-1a selects the bounds rule from the producer op, so the
             // producer must be one of exactly two memory ops — `aref` (scalar
@@ -848,7 +850,20 @@ fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: u
             };
             if (tab) |r| std.debug.assert(tableGuardedBefore(instrs, i, r));
         }
+        // Doc 77 §6.6: a `uvload` indexes its closure's cells, so the
+        // closure's proto (which fixes the cell count) is pinned first.
+        for (instrs, 0..) |ins, i| {
+            if (ins.op == .uvload) std.debug.assert(funcGuardedBefore(instrs, i, ins.a));
+        }
     }
+}
+
+/// Is `f` pinned to a proto by a `guard_func` before instruction `at`?
+fn funcGuardedBefore(instrs: []const IrInstr, at: usize, f: Ref) bool {
+    for (instrs[0..at]) |g| {
+        if (g.op == .guard_func and g.a == f) return true;
+    }
+    return false;
 }
 
 /// Is `tab` a table by the time instruction `at` runs: a `load_meta`

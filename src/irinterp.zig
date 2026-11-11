@@ -783,6 +783,34 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     values[i] = fv;
                     if (record) rec.value(i, values[i]);
                 },
+                // Doc 77 §6.6 `uvload`: the closure's upvalue, read through
+                // its cell's lane pointers (an open and a closed cell alike).
+                // Exits when the cell is open over the anchor window, whose
+                // slots this trace holds in `values` (native: registers) and
+                // writes back only at exit — native checks the same range —
+                // or when the value's tag is not the recorded type's.
+                .uvload => {
+                    const ua = trace_ir.UvloadAux.decode(ins.aux);
+                    const cl = function.Closure.fromHeader(values[ins.a].asHeap());
+                    const cell = cl.upvalue(ua.index);
+                    const off = @intFromPtr(cell.payload) -% @intFromPtr(regs.payloads);
+                    const fv = cell.get();
+                    const type_ok = switch (ins.ty) {
+                        .int => fv.isInt(),
+                        .float => fv.isFloat(),
+                        .boolean => fv.isBool(),
+                        // The subtype pin is the guard the recorder emits
+                        // after the load, as for `hload`.
+                        .heap => fv.isHeap(),
+                        else => false,
+                    };
+                    if (off < @as(usize, ua.window) * @sizeOf(u64) or !type_ok) {
+                        if (record) rec.exit(i, .guard, values[ins.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                    values[i] = fv;
+                    if (record) rec.value(i, values[i]);
+                },
                 // `ustore`: overwrite the closed cell's Value in place. The
                 // value ref is scalar-pinned by the recorder (guardNum /
                 // static bool proof), so no write barrier is needed (it is a
@@ -871,8 +899,7 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // not a pointer — survives keyframe restore). Fails *closed*: any
                 // non-closure / wrong-proto callee side-exits to tier-0, which really
                 // pushes the call frame and re-runs the iteration. Proto-id identity is
-                // sound while in-callee upvalue access still aborts (two closures over
-                // one proto are trace-identical when no upvalue is read).
+                // sound because no trace bakes a closure's cells (`IrOp.guard_func`).
                 .guard_func => if (values[ins.a].isHeap() and values[ins.a].heapType() == .function and
                     function.Closure.fromHeader(values[ins.a].asHeap()).proto.id == @as(u32, @bitCast(ins.aux)))
                 {

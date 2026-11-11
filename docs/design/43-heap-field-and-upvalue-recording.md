@@ -11,7 +11,7 @@ review rounds folded in (codex + technical-architect; ledger at bottom).
 The adversarial sweep (a01–a20) is permanent in `trace_p0_alias_test.zig`,
 green on all ten legs.**
 Owner: Bart
-Last updated: 2026-09-08
+Last updated: 2026-11-11
 
 Prerequisite reading: doc 10 (cross-frame tracing, input seeds, `guard_func`),
 doc 11 (hash-field tracing), doc 32 (value-lane scalar access — the exec-log
@@ -445,6 +445,15 @@ field.
   with different cells alias under an instance-blind guard and reopen a
   P0-class miscompile. The existing warning at `trace_ir.zig:220-224` says
   exactly this; the doc elevates it to a landing condition.
+  **Amended by doc 77 §6.6 (Bart, 2026-11-11).** An `hload`-loaded callee
+  now reaches upvalue reads, with the proto guard unchanged: the read is a
+  `uvload` through the loaded closure itself, so two closures over one
+  proto read their own cells and nothing instance-specific is baked. The
+  miscompile this bullet guards against needs a cell resolved from the
+  recorded closure; the invariant now reads "a path that seeds or bakes a
+  computed callee's cells at entry must first tighten `guard_func` to
+  `GcHeader.id`". Writes through a computed callee still abort
+  `.cross_frame`.
 - **Tier-1a**: `type_ok` gains `.heap => fv.isHeap()`; the existing
   `guard_func` arm does the function+proto-id check next instruction.
 - **Native — four named pieces** (review round 1 added the fourth):

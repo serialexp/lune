@@ -165,6 +165,9 @@ fn kindOf(op: IrOp) OpKind {
         // when dead (its fused tag exit protects nothing then — deopt replay
         // re-reads the cell in tier-0).
         .aload, .hload, .uload => .aload,
+        // `uvload` (doc 77 §6.6) reads a closure's upvalue cell: the load
+        // class, like `uload`. LICM may hoist it (`hoistableRead`).
+        .uvload => .aload,
         // `load_meta` (doc 77 §5.1) reads the table's metatable field: the
         // load class, never folded/CSE'd/hoisted, DCE'd when dead (its
         // fused exit then protects nothing — no live use reads the result).
@@ -305,13 +308,16 @@ const TableWrites = struct {
     hash_any: bool = false,
     /// Any array-part or grid store.
     array: bool = false,
+    /// A `ustore`: an upvalue cell changes. Cells are not tables, but
+    /// `uvload` hoisting (doc 77 §6.6) asks the same question of them.
+    upvalue: bool = false,
 
     fn deinit(self: *TableWrites, gpa: std.mem.Allocator) void {
         self.hash_keys.deinit(gpa);
     }
 };
 
-const TableWrite = enum { none, hash, array };
+const TableWrite = enum { none, hash, array, upvalue };
 
 /// Which part of a table `op` writes. Only the `.astore` kind writes table
 /// memory; a new op there must say what it writes.
@@ -320,8 +326,9 @@ fn tableWriteOf(op: IrOp) TableWrite {
         .astore => switch (op) {
             .hstore => .hash,
             .astore, .astore_append, .gstore => .array,
-            // A closed-upvalue cell, and three read-only memory guards.
-            .ustore, .guard_absent, .guard_gcol, .guard_tostring => .none,
+            .ustore => .upvalue,
+            // Three read-only memory guards.
+            .guard_absent, .guard_gcol, .guard_tostring => .none,
             else => unreachable,
         },
         else => .none,
@@ -334,6 +341,7 @@ fn tableWrites(gpa: std.mem.Allocator, instrs: []const IrInstr, canon: []const R
     for (instrs) |ins| switch (tableWriteOf(ins.op)) {
         .none => {},
         .array => w.array = true,
+        .upvalue => w.upvalue = true,
         .hash => {
             const href = instrs[canon[ins.a]];
             std.debug.assert(href.op == .href);
@@ -370,6 +378,12 @@ fn readsTableOperand(op: IrOp) bool {
 /// - `guard_absent` of an invariant table and key: a string key always (no
 ///   store inserts or deletes); another key only when the trace stores to
 ///   no array part.
+/// - `uvload` (doc 77 §6.6) of a hoisted closure, when the trace has no
+///   `ustore`. The cell a closure holds never changes, and neither does
+///   where it lives during a run: a closed cell stays closed, and an open
+///   one is over a frame below the anchor, which stays live and which the
+///   trace never writes (a cell over the anchor window exits). An optimized
+///   trace calls no host code that could set the cell.
 /// - a type guard on a hoisted value.
 ///
 /// Nothing a trace runs can free a table or the value a hoisted read
@@ -400,6 +414,7 @@ fn hoistableRead(
             const string_key = if (key) |k| k.isHeap() and k.heapType() == .string else false;
             break :blk string_key or !writes.array;
         },
+        .uvload => hoist[canon[ins.a]] and !writes.upvalue,
         .guard_table, .guard_func, .guard_int, .guard_float, .guard_number, .guard_bool, .guard_string, .guard_builtin => hoist[canon[ins.a]],
         else => false,
     };

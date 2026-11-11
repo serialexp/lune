@@ -628,3 +628,138 @@ test "doc 77 §5.5: a hoisted heap value outlives collections inside the loop" {
         \\print(n)
     , "1692\n");
 }
+
+// ---- Phase 4: a method's upvalues (doc 77 §6.6) ----
+
+/// The traces read a method's upvalue with `uvload`.
+fn expectUvload(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    try testing.expect(countOps(vm, .uvload) > 0);
+    if (mode == .record_execute_native) try testing.expect(vm.trace.native_entries > 0);
+}
+
+/// As `expectUvload`, with every `uvload` before the loop.
+fn expectUvloadHoisted(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectUvload(vm, mode);
+    if (!optimized(mode)) return;
+    const pl = placementOf(vm, .uvload);
+    try testing.expect(pl.pre > 0);
+    try testing.expectEqual(@as(usize, 0), pl.body);
+}
+
+/// As `expectUvload`, with a `uvload` in the loop.
+fn expectUvloadInBody(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectUvload(vm, mode);
+    if (optimized(mode)) try testing.expect(placementOf(vm, .uvload).body > 0);
+}
+
+test "doc 77 §6.6: a method found through __index reads its closed upvalue once per entry" {
+    try expectProgramTuned(
+        \\local function factory()
+        \\  local k = 3
+        \\  local C = {}
+        \\  C.__index = C
+        \\  function C.get(self) return self.v + k end
+        \\  local function run(o, n)
+        \\    local s = 0
+        \\    for i = 1, n do s = s + o:get() end
+        \\    return s
+        \\  end
+        \\  return run, setmetatable({ v = 1 }, C)
+        \\end
+        \\local run, o = factory()
+        \\print(run(o, 300), run(o, 10))
+    , "1200\t40\n", .{ .inspect = expectUvloadHoisted });
+}
+
+test "doc 77 §6.6: an upvalue store in the loop keeps the method's upvalue read in it" {
+    // `acc` is `run`'s own cell, stored every iteration (`ustore`); the
+    // method's `k` is another cell, but a store to any cell keeps every
+    // `uvload` in the loop.
+    try expectProgramTuned(
+        \\local function factory()
+        \\  local k = 3
+        \\  local acc = 0
+        \\  local C = {}
+        \\  C.__index = C
+        \\  function C.get(self) return self.v + k end
+        \\  local function run(o, n)
+        \\    for i = 1, n do acc = acc + o:get() end
+        \\    return acc
+        \\  end
+        \\  return run, setmetatable({ v = 1 }, C)
+        \\end
+        \\local run, o = factory()
+        \\print(run(o, 300))
+    , "1200\n", .{ .inspect = expectUvloadInBody });
+}
+
+test "doc 77 §6.6: a cell open below the anchor is read in place, and again at the next entry" {
+    // `k` is main's local, open while `run` loops; main changes it between
+    // the two calls.
+    try expectProgramTuned(
+        \\local k = 2
+        \\local C = {}
+        \\C.__index = C
+        \\function C.get(self) return self.v * k end
+        \\local function run(o)
+        \\  local s = 0
+        \\  for i = 1, 300 do s = s + o:get() end
+        \\  return s
+        \\end
+        \\local o = setmetatable({ v = 5 }, C)
+        \\local a = run(o)
+        \\k = 7
+        \\local b = run(o)
+        \\print(a, b)
+    , "3000\t10500\n", .{ .inspect = expectUvloadHoisted });
+}
+
+/// No trace read an upvalue with `uvload`.
+fn expectNoUvload(vm: *Vm, mode: TraceMode) anyerror!void {
+    _ = mode;
+    try testing.expectEqual(@as(usize, 0), countOps(vm, .uvload));
+}
+
+test "doc 77 §6.6: a method's cell open over the anchor's own window stops the recording" {
+    // `k` lives in the loop's frame, which the trace keeps in registers;
+    // tier 0 runs the loop, and sees the store at i == 150.
+    try expectProgramTuned(
+        \\local k = 2
+        \\local C = {}
+        \\C.__index = C
+        \\function C.get(self) return self.v * k end
+        \\local o = setmetatable({ v = 5 }, C)
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  if i == 150 then k = 3 end
+        \\  s = s + o:get()
+        \\end
+        \\print(s)
+    , "3755\n", .{ .inspect = expectNoUvload });
+}
+
+test "doc 77 §6.6: table, string and native upvalues of a method, across collections" {
+    // `tostring` allocates every iteration, so the stress legs collect
+    // inside the loop. Main stores into `cfg` between the two runs.
+    try expectProgramTuned(
+        \\local function factory()
+        \\  local cfg = { scale = 2 }
+        \\  local name = "abc"
+        \\  local floor = math.floor
+        \\  local C = {}
+        \\  C.__index = C
+        \\  function C.get(self) return floor(self.v / 2) * cfg.scale + #name end
+        \\  local function run(o, n)
+        \\    local s = 0
+        \\    for i = 1, n do s = s + o:get() + #tostring(i) end
+        \\    return s
+        \\  end
+        \\  return run, setmetatable({ v = 9 }, C), cfg
+        \\end
+        \\local run, o, cfg = factory()
+        \\local a = run(o, 300)
+        \\cfg.scale = 10
+        \\print(a, run(o, 300))
+    , "4092\t13692\n", .{ .inspect = expectUvloadHoisted });
+}

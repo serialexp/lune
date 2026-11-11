@@ -538,6 +538,8 @@ pub fn isTransient(op: trace_ir.IrOp) bool {
         // doc 77 §5.1: load_meta materializes the metatable's `*GcHeader`
         // in a GP home (kind `.heap`).
         .load_meta => true,
+        // doc 77 §6.6: uvload materializes the cell's value.
+        .uvload => true,
         // grid (doc 14): garow materializes the row base (row0, like aref), gcell the
         // flat cell index, gload the decoded int cell. gstore/the grid guards are
         // effects/value-less.
@@ -2360,9 +2362,10 @@ const HomeReads = struct {
 /// body divides, as that drops the park around each division (two moves per
 /// iteration) for the same per-entry store and per-exit load. rdi/rsi stay
 /// when the back-edge flushes a write-only slot (it writes through both).
-/// rsi stays when a body `href`/`uref` loads a seeded cell from the slab: it
-/// could load rsi's cell first (`emit.abiBase`, which a run-once one does),
-/// but that is a load per iteration. Precise traces
+/// rsi stays when a body `href`/`uref` loads a seeded cell from the slab, or
+/// a body `uvload` checks its cell against the window: it could load rsi's
+/// cell first (`emit.abiBase`, which a run-once one does), but that is a
+/// load per iteration. Precise traces
 /// flush mid-iteration snapshots at their exits and keep all three. Empty
 /// (and every method a no-op) when nothing may go.
 const AbiEvict = struct {
@@ -2391,7 +2394,8 @@ const AbiEvict = struct {
             .href => if (!isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) {
                 ok &= ~regBit(.rsi);
             },
-            .uref => ok &= ~regBit(.rsi),
+            // Doc 77 §6.6: a body uvload compares its cell against rsi.
+            .uref, .uvload => ok &= ~regBit(.rsi),
             .mod, .idiv => if (ins.ty == .int) {
                 divides = true;
             },
@@ -2728,6 +2732,8 @@ pub fn opMayExitInBody(
         .uload,
         // Doc 77 §5.1: the fused no-metatable exit.
         .load_meta,
+        // Doc 77 §6.6: the fused tag and anchor-window exits.
+        .uvload,
         .guard_gcol,
         .guard_gpresent,
         .alen,

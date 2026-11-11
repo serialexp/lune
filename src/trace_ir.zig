@@ -268,10 +268,12 @@ pub const IrOp = enum(u8) {
     /// native function, or a different proto all deopt, and tier-0 re-runs the
     /// iteration from the loop header — re-executing the real `.call`, which
     /// reconstructs the callee frame for free (the replay-from-header model, so
-    /// no multi-frame snapshot is needed). Proto-id identity is sound only while
-    /// in-callee upvalue access still aborts recording (two closures over one
-    /// proto are trace-identical when no upvalue is read); when upvalue inlining
-    /// lands this must tighten to the closure's `GcHeader.id`. Produces no value
+    /// no multi-frame snapshot is needed). Proto-id identity is sound because
+    /// nothing about a closure's cells is recorded from the closure the
+    /// recorder saw: a slab-slot callee's cells are seeded from the slot at
+    /// every entry, and a computed callee's are read through the closure itself
+    /// (`uvload`, doc 77 §6.6). A path that bakes a computed callee's cells must
+    /// first tighten this to the closure's `GcHeader.id`. Produces no value
     /// (`ty == .none`); never DCE'd (it is a `.guard` in `tropt.kindOf`).
     /// Appended last so every prior op's wire ordinal stays stable.
     guard_func,
@@ -866,6 +868,20 @@ pub const IrOp = enum(u8) {
     /// (doc 77 §4.2). A memory load (tropt's `.aload` class) and a heap read
     /// for the store-after-load rule. Wire ordinal 104.
     load_meta,
+    /// `uvload` (doc 77 §6.6): an inlined callee's upvalue, read through the
+    /// closure the trace holds. `a` = the callee ref (a closure, its proto
+    /// pinned by a `guard_func`, so the cell index is in range); `aux` =
+    /// `UvloadAux` (the cell index and the anchor's register count); `ty` =
+    /// the observed type. Loads `closure.upvalue(index)`'s value through the
+    /// cell's tag and payload pointers, so an open cell (the value in a
+    /// stack slot) and a closed one read alike, and nothing about the cell
+    /// is baked or seeded. Two fused exits: the value's tag is not `ty`'s
+    /// (the typed-load tag exit), or the cell's payload pointer lies in the
+    /// anchor's register window, whose slots the trace keeps in registers
+    /// and writes back only at exit (doc 53's alias, which this op cannot
+    /// read). A memory load (tropt's `.aload` class): a `ustore` to a shared
+    /// cell changes it. Wire ordinal 105.
+    uvload,
 };
 
 /// Doc 63 §5.1: one host call site of a precise trace, indexed by
@@ -1050,6 +1066,28 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
     };
 }
 
+/// `uvload`'s `aux` (doc 77 §6.6): the cell index in the low half, the
+/// anchor's register count (the window its alias exit covers) in the high.
+pub const UvloadAux = struct {
+    index: u16,
+    window: u15,
+
+    pub fn encode(self: UvloadAux) i32 {
+        return @as(i32, self.window) << 16 | self.index;
+    }
+
+    pub fn decode(aux: i32) UvloadAux {
+        const bits: u32 = @bitCast(aux);
+        return .{ .index = @truncate(bits), .window = @intCast(bits >> 16) };
+    }
+};
+
+test "UvloadAux round-trips" {
+    const x: UvloadAux = .{ .index = 0xfffe, .window = 0x7fff };
+    try std.testing.expectEqual(x, UvloadAux.decode(x.encode()));
+    try std.testing.expect(x.encode() > 0);
+}
+
 /// Every IR op whose runtime failure side-exits the trace — i.e. an exit that a
 /// SIDE TRACE could absorb by recording the alternate shape. This is the Option-A
 /// discriminator (see `accountLegacyThrash`): zero progress through one of these
@@ -1112,7 +1150,7 @@ pub const AlenProbe = enum(u8) {
 /// here and nowhere else (doc 85 §5.2).
 pub fn isTypedLoad(ins: IrInstr) bool {
     return switch (ins.op) {
-        .hload, .uload => true,
+        .hload, .uload, .uvload => true,
         .aload => ins.aux == @intFromEnum(array.Lane.value),
         else => false,
     };
@@ -1167,7 +1205,7 @@ pub fn requiresPreciseSnapshot(op: IrOp) bool {
         .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar => true,
         .neg, .not, .bnot, .eq, .ne, .lt, .le => true,
         .fsqrt, .fsin, .fcos, .ffloor, .fceil => true,
-        .aload, .href, .hload, .uload, .load_meta => true,
+        .aload, .href, .hload, .uload, .load_meta, .uvload => true,
         .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2, .supper, .slower, .sjpart, .sjoin => true,
         .scp, .sfindp, .smatch, .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f, .sgm_setpos => true,
         .tnew, .tset => true,
@@ -1269,6 +1307,10 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .uref => try w.print("r{d}", .{ins.aux}),
         .uload => try w.print("%{d}", .{ins.a}),
         .ustore => try w.print("%{d}  %{d}", .{ ins.a, ins.b }),
+        .uvload => {
+            const ua = UvloadAux.decode(ins.aux);
+            try w.print("%{d}  upval={d}  window={d}", .{ ins.a, ua.index, ua.window });
+        },
         // guard_sid: operand + the expected string's konst id.
         .guard_sid => try w.print("%{d}  sid=k{d}", .{ ins.a, ins.aux }),
         // href: decode which of the three aux modes (doc 49) this access uses,

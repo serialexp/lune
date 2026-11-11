@@ -773,6 +773,21 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
                 kinds[i] = .heap;
             },
+            // Doc 77 §6.6 `uvload`: a = a proto-pinned closure (an
+            // invariant `.func` home or a loaded `.heap` one). The result
+            // is the cell's value, of the recorded type (the fused tag exit
+            // keeps any other out).
+            .uvload => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .func and kinds[ins.a] != .heap) return false;
+                kinds[i] = switch (ins.ty) {
+                    .int => .int,
+                    .float => .float,
+                    .boolean => .bool,
+                    .heap => .heap,
+                    else => return false,
+                };
+            },
             // Doc 82 `guard_tostring`: a = the table value (a real runtime
             // heap value — the callout type-checks it), b = the interned key
             // string konst. Produces nothing.
@@ -1761,6 +1776,8 @@ pub fn operandReads(ins: trace_ir.IrInstr) struct { a: bool, b: bool } {
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
         // Doc 77: load_meta reads the table it loads the metatable from (a).
         .load_meta => .{ .a = true, .b = false },
+        // Doc 77 §6.6: uvload reads the closure whose cell it loads (a).
+        .uvload => .{ .a = true, .b = false },
         // guard_func reads the callee-snapshot value it identity-checks (a).
         .guard_func => .{ .a = true, .b = false },
         // guard_builtin reads the callee-snapshot native it identity-checks (a);

@@ -1827,6 +1827,47 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try jccNativeExit(a, exit_labels, i, .e); // no metatable → tier-0 decides
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
+            // uvload (doc 77 §6.6): the closure's upvalue through its cell's
+            // lane pointers. rax = the cell, rcx = its tag pointer, then its
+            // payload pointer. The anchor-window exit is one unsigned compare
+            // of (payload pointer − payloads base) against the window's bytes:
+            // a cell open over a slot this trace keeps in a register.
+            .uvload => {
+                const ua = trace.UvloadAux.decode(ins.aux);
+                const freg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.movRegMem(.rax, freg, layout.CLOSURE_CELLS_OFF + @as(i32, ua.index) * 8);
+                try a.movRegMem(.rcx, .rax, layout.UPVALUE_TAG_PTR_OFF);
+                const want_tag: u8 = switch (kinds[i]) {
+                    .float => TAG_FLOAT,
+                    .bool => TAG_BOOL,
+                    .heap => TAG_HEAP,
+                    else => TAG_INT, // proveKinds admits only int/float/bool/heap
+                };
+                try a.cmpByteMemImm(.rcx, 0, want_tag);
+                try jccNativeExit(a, exit_labels, i, .ne); // the value's type changed
+                try a.movRegMem(.rcx, .rax, layout.UPVALUE_PAYLOAD_PTR_OFF);
+                try a.movRegReg(.rax, .rcx);
+                if (alloc.abiDisp(.payloads)) |d| {
+                    try a.subRegMem(.rax, .rsp, d);
+                } else try a.subRegReg(.rax, .rsi);
+                try a.cmpRegImm32(.rax, @as(i32, ua.window) * 8);
+                try jccNativeExit(a, exit_labels, i, .b); // open over the anchor window
+                if (kinds[i] == .float) {
+                    switch (placeOfRef(alloc, i)) {
+                        .xmm => |x| try a.movsdRegMem(x, .rcx, 0),
+                        .mem => |m| {
+                            try a.movsdRegMem(XMM_SCRATCH0, .rcx, 0);
+                            try a.movsdMemReg(.rsp, m.frameDisp(), XMM_SCRATCH0);
+                        },
+                        .reg, .imm => unreachable, // a float never homes in a GP register
+                    }
+                } else {
+                    // int, bool or heap: the raw 8-byte payload (a bool's is
+                    // the canonical 0/1, a heap value's the *GcHeader).
+                    try a.movRegMem(.rax, .rcx, 0);
+                    try regToPlace(a, placeOfRef(alloc, i), .rax);
+                }
+            },
             // --- closed-upvalue-cell path (doc 43 P5) ---------------------------
             // The u-family shares the hash-cell machinery: the seeded slab slot
             // holds a `*Value` (here `&cell.loc.closed`, resolved + alias-verified

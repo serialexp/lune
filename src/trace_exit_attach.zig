@@ -198,7 +198,7 @@ pub fn resumeClass(op: IrOp) ResumeClass {
         .guard_tostring,
         => .neutral,
         .aref, .href, .garow, .gcell, .uref => .neutral,
-        .aload, .hload, .gload, .uload, .load_meta => .neutral,
+        .aload, .hload, .gload, .uload, .load_meta, .uvload => .neutral,
         .smatch, .sgmatch => .neutral,
         .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str, .sjpart, .sjoin => .neutral,
         .astore, .hstore, .gstore, .ustore => .flush_store,

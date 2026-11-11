@@ -184,8 +184,9 @@ fn detectDeadCarries(
                 uses[ins.a] += 1;
                 uses[ins.b] += 1;
             },
-            // Doc 43 P5: uload reads its uref token only.
-            .uload => {
+            // Doc 43 P5: uload reads its uref token only; doc 77 §6.6's
+            // uvload reads its closure.
+            .uload, .uvload => {
                 uses[ins.a] += 1;
             },
             .phi => {
@@ -333,7 +334,7 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             // Doc 43 P5: the closed-cell pair — ustore reads uref + value,
             // uload reads its uref token.
             .ustore => ins.a == idx or ins.b == idx,
-            .uload => ins.a == idx,
+            .uload, .uvload => ins.a == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,
             // Doc 45 D3: `tset` (reserved) declares table/key/value refs.
             .tset => ins.a == idx or ins.b == idx or @as(trace.Ref, @intCast(ins.aux)) == idx,

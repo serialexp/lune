@@ -3786,17 +3786,14 @@ test "recorder (hash field, P2): a function field records hload ty=.heap + guard
     try testing.expectEqual(@as(usize, 2), n_guard_func_on_load);
 }
 
-test "recorder (hash field, P2): an hload-loaded callee reading its OWN UPVALUE aborts (hard invariant)" {
+test "recorder (hash field, P2): an hload-loaded callee reads its own upvalue through the closure (doc 77 §6.6)" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // Doc 43 §5 HARD INVARIANT: guard_func pins the PROTO id, not closure
-    // identity — sound ONLY because an inlined callee's upvalue read requires a
-    // `slot_load` callee ref (`recCalleeUpval`) and an `hload` ref is not one.
-    // Two closures over one proto with different cells would otherwise alias
-    // under the instance-blind guard (a P0-class miscompile). This test pins
-    // the abort; if it ever starts tracing, guard_func must FIRST tighten to
-    // closure `GcHeader.id`.
+    // Doc 43 §5 as amended by doc 77 §6.6: guard_func pins the PROTO id, and
+    // the upvalue read is a `uvload` through the loaded closure itself, so
+    // nothing about the cell is baked and two same-proto closures read their
+    // own cells (the swap test below runs that on every leg).
     var chunk = try runForTrace(&vm, gpa,
         \\local function mk(n)
         \\  return function() return n end
@@ -3808,9 +3805,71 @@ test "recorder (hash field, P2): an hload-loaded callee reading its OWN UPVALUE 
     , true);
     defer chunk.deinit();
 
-    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
-    try testing.expect(vm.trace.record_gate.count() >= 1);
-    try testing.expect(!vm.trace.isRecording());
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var uvload_ref: ?usize = null;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op == .uvload) {
+            try testing.expect(uvload_ref == null);
+            uvload_ref = i;
+            const callee = t.code.instrs[ins.a];
+            try testing.expectEqual(trace_ir.IrOp.hload, callee.op);
+            try testing.expectEqual(@as(u16, 0), trace_ir.UvloadAux.decode(ins.aux).index);
+            try testing.expectEqual(trace_ir.ObsType.int, ins.ty);
+        }
+    }
+    try testing.expect(uvload_ref != null);
+}
+
+test "doc 77 §6.6 end-to-end: a same-proto closure swap reads the new closure's cell; all ten legs" {
+    try expectProgram(
+        \\local function mk(n)
+        \\  return function() return n end
+        \\end
+        \\local obj = { g = mk(10) }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if i == 100 then obj.g = mk(1000) end
+        \\  s = s + obj.g()
+        \\end
+        \\print(s)
+    , "101990\n");
+}
+
+test "doc 77 §6.6 end-to-end: per-object closures of one proto, mixed value types; all ten legs" {
+    // One proto, many closures, alternating per iteration: an int, a float
+    // and a string-valued cell. The tag exit takes the type changes.
+    try expectProgram(
+        \\local function mk(v)
+        \\  return function() return v end
+        \\end
+        \\local objs = { { g = mk(1) }, { g = mk(2) }, { g = mk(2.5) }, { g = mk(3) } }
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  local o = objs[i % 4 + 1]
+        \\  s = s + o.g()
+        \\end
+        \\print(s)
+    , "850\n");
+}
+
+test "doc 77 §6.6 end-to-end: an upvalue changed by the callee between calls is re-read; all ten legs" {
+    // `o.set` writes the shared cell on the 7th iterations, a path the
+    // trace leaves (a set_upval through a computed callee aborts), so the
+    // trace's `o.get` read must see each value tier-0 stored between runs.
+    try expectProgram(
+        \\local function mk()
+        \\  local n = 0
+        \\  return { get = function() return n end, set = function(v) n = v end }
+        \\end
+        \\local o = mk()
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  if i % 7 == 0 then o.set(i) end
+        \\  s = s + o.get()
+        \\end
+        \\print(s)
+    , "44247\n");
 }
 
 test "hash field P2 end-to-end: function-field call inlines; all ten legs" {

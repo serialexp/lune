@@ -100,6 +100,13 @@ comptime {
     // header IS the closure address. Pin it (Z-1).
     std.debug.assert(@offsetOf(function.Closure, "header") == 0);
 }
+/// Doc 77 §6.6 `uvload`: the offset of `Closure.upvalue(0)`'s cell pointer
+/// from a closure's `*GcHeader` (the cells follow the closure in its own
+/// allocation, one `*Upvalue` each), and the offsets of a cell's tag and
+/// payload lane pointers.
+pub const CLOSURE_CELLS_OFF: i32 = @sizeOf(function.Closure);
+pub const UPVALUE_TAG_PTR_OFF: i32 = @offsetOf(function.Upvalue, "tag");
+pub const UPVALUE_PAYLOAD_PTR_OFF: i32 = @offsetOf(function.Upvalue, "payload");
 /// Offset of `Proto.id` (a stable `u32` compile-time identity — NOT an address, so
 /// it survives keyframe restore/replay) from a `*const Proto`. `guard_func` compares
 /// the recorded id against `[closure.proto + PROTO_ID_OFF]`.
