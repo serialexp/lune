@@ -3,7 +3,8 @@
 Status: partial — Phase 0 (a tier-0 ordering bug in `math.max`/`math.min`,
 found while reading for Phase 3), Phase 1 (string and native hash fields),
 Phase 2 (string, native, closure and bool array elements) and the typed-load
-exit fix that Phase 2 turned up (§5.2, §5.3) landed. Phases 3 and 4 are not
+exit fix that Phase 2 turned up (§5.2, §5.3) landed, and `type()` of a
+string records (§5.3 follow-up). Phases 3 and 4 are not
 started; Q1, Q2 and Q3 (§8) are open. Bart has not picked this arc: it was
 started on 2026-11-11 under "continue using your best judgement" after four
 asks went unanswered. Phase 3 needs his answer to Q1.
@@ -524,6 +525,16 @@ mismatch now comes from a local that is an int on every seventh row.
   4,454 M). Q3.
 - **`type(v)` of a string** aborts `bad_type` (strings and ints mixed:
   1,502 M, 3,705 M). A recorder gap, noted in `TODO.md`.
+
+  *Follow-up, 2026-11-11:* closed. `recBType` and `recBMType` shared one
+  heap switch with arms for a table, a native and a closure; it is now
+  `pinHeapTypeOf`, with a string arm that pins `guard_string` (nothing
+  for a proven producer such as `tostr_int`; tropt's dedup drops the pin
+  behind a string load's own). The answer never consults a metatable, so
+  the heap-type check is the whole fact. The mixed probe runs 935 M: the
+  string rows are the root trace and the int rows leave through the
+  load's exit into a continuation (§5.3). Board unchanged (no row calls
+  `type` on a string in a hot loop).
 
 ## 6. Phase 3 — `math.abs`, `math.min`, `math.max`
 

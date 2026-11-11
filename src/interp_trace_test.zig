@@ -4398,6 +4398,45 @@ test "array element doc 85 end-to-end: strings and numbers mixed in one array st
     , "300\n");
 }
 
+test "type() of a string records: a loop over strings behind type(v) == \"string\" runs native" {
+    try expectNativeProgram(
+        \\local names = { "alpha", "be", "gamma" }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  local v = names[i % 3 + 1]
+        \\  if type(v) == "string" then s = s + #v end
+        \\end
+        \\print(s)
+    , "799\n");
+}
+
+test "type() of a string records: a string local, a string field and a tostring result" {
+    // An invariant local, a loaded field, and a proven producer, which needs
+    // no pin at all.
+    try expectNativeProgram(
+        \\local name = "delta"
+        \\local obj = { tag = "x" }
+        \\local n = 0
+        \\for i = 1, 200 do
+        \\  if type(name) == "string" then n = n + 1 end
+        \\  if type(obj.tag) == "string" then n = n + 1 end
+        \\  if type(tostring(i)) == "string" then n = n + 1 end
+        \\end
+        \\print(n)
+    , "600\n");
+}
+
+test "math.type() of a string records and answers nil" {
+    try expectNativeProgram(
+        \\local names = { "alpha", "be", "gamma" }
+        \\local n = 0
+        \\for i = 1, 200 do
+        \\  if math.type(names[i % 3 + 1]) == nil then n = n + 1 end
+        \\end
+        \\print(n)
+    , "200\n");
+}
+
 test "array element doc 85 end-to-end: a loaded string element carried in a local runs native" {
     try expectNativeProgram(
         \\local names = { "alpha", "be", "gamma" }

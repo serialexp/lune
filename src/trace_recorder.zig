@@ -5114,8 +5114,8 @@ pub const RecordingSession = struct {
     /// ride-along): a numeric argument's `guardNum` pin decides
     /// "integer"/"float" (the pin is exactly the query!), a pinned
     /// table/native/closure folds `nil` (Value.nil needs no interning), and
-    /// a nil/bool input is value-specialized (doc 57) and folds `nil` too, and
-    /// the pin-less observations (a non-konst string) abort as in `recBType`.
+    /// a string pins with `guard_string` and folds `nil`, and a nil/bool input
+    /// is value-specialized (doc 57) and folds `nil` too.
     /// Never allocates: string results via `foldInternedStr`.
     pub fn recBMType(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
         if (instr.b != 1) return self.abort(.cross_frame);
@@ -5131,23 +5131,8 @@ pub const RecordingSession = struct {
                 // Doc 57: a nil/bool input is value-specialized, and a typed
                 // bool producer is always a bool — either way the result is
                 // fixed.
-            } else if (argv.isHeap()) switch (argv.heapType()) {
-                // Doc 77 §5.4: the answer never consults a metatable.
-                .table => self.stampProv(try self.emit(.{ .op = .guard_table, .a = arg_ref, .aux = metaAux(table_mod.Table.fromHeader(argv.asHeap())) }), .operand_type, .a1, .neutral),
-                .native => {
-                    const nat = function.Native.fromHeader(argv.asHeap());
-                    const tag = nat.recorded orelse return self.abort(.bad_type);
-                    try self.guardBuiltinCallee(arg_slot, tag);
-                },
-                .function => {
-                    const cl = function.Closure.fromHeader(argv.asHeap());
-                    if (!self.guarded_refs.contains(arg_ref)) {
-                        const gref = try self.emit(.{ .op = .guard_func, .a = arg_ref, .aux = @bitCast(cl.proto.id) });
-                        try self.guarded_refs.put(self.gpa, arg_ref, @intCast(gref));
-                        self.stampProv(gref, .callee_identity, .a1, .neutral);
-                    }
-                },
-                else => return self.abort(.bad_type),
+            } else if (argv.isHeap()) {
+                try self.pinHeapTypeOf(arg_slot, arg_ref, argv);
             } else return self.abort(.bad_type);
         }
         if (!self.active) return;
@@ -5194,10 +5179,10 @@ pub const RecordingSession = struct {
     }
 
     /// `type(v)` — the result is a constant type-name string once the argument's
-    /// runtime type is pinned (doc 23 D2 table). Number/table/recorded-native/
-    /// closure observations pin with existing guards; string/nil/bool have no
-    /// guard vocabulary and abort (tier-0 owns them until a consumer justifies
-    /// new guards). The pins are deliberately *stronger* than `type()` needs
+    /// runtime type is pinned (doc 23 D2 table). Number/table/string/recorded-
+    /// native/closure observations pin with existing guards (`pinHeapTypeOf`
+    /// for the heap kinds); a nil/bool is value-specialized (doc 57). The
+    /// number, table and closure pins are deliberately *stronger* than `type()` needs
     /// (`guardNum` pins int-vs-float; `guard_table` also demands no metatable;
     /// `guard_func` pins the exact proto) — a drifting argument deopts and
     /// re-records, which is conservative, never wrong.
@@ -5215,27 +5200,43 @@ pub const RecordingSession = struct {
                 // Doc 57: a nil/bool input is value-specialized, and a typed
                 // bool producer is always a bool — either way the result is
                 // fixed.
-            } else if (argv.isHeap()) switch (argv.heapType()) {
-                // Doc 77 §5.4: the answer never consults a metatable.
-                .table => self.stampProv(try self.emit(.{ .op = .guard_table, .a = arg_ref, .aux = metaAux(table_mod.Table.fromHeader(argv.asHeap())) }), .operand_type, .a1, .neutral),
-                .native => {
-                    const nat = function.Native.fromHeader(argv.asHeap());
-                    const tag = nat.recorded orelse return self.abort(.bad_type);
-                    try self.guardBuiltinCallee(arg_slot, tag);
-                },
-                .function => {
-                    const cl = function.Closure.fromHeader(argv.asHeap());
-                    if (!self.guarded_refs.contains(arg_ref)) {
-                        const gref = try self.emit(.{ .op = .guard_func, .a = arg_ref, .aux = @bitCast(cl.proto.id) });
-                        try self.guarded_refs.put(self.gpa, arg_ref, @intCast(gref));
-                        self.stampProv(gref, .callee_identity, .a1, .neutral);
-                    }
-                },
-                else => return self.abort(.bad_type),
+            } else if (argv.isHeap()) {
+                try self.pinHeapTypeOf(arg_slot, arg_ref, argv);
             } else return self.abort(.bad_type);
         }
+        if (!self.active) return;
         const kref = (try self.foldInternedStr(argv.typeName())) orelse return self.abort(.bad_type);
         self.setReg(instr.a, kref);
+    }
+
+    /// Pin the heap type of a `type()`/`math.type()` argument, so the answer
+    /// is a trace constant. The answer never consults a metatable (doc 77
+    /// §5.4); the table, native and closure pins are the existing guards and
+    /// stronger than the query needs (see `recBType`). An unrecorded native
+    /// and the remaining heap kinds abort — check `active` after the call.
+    fn pinHeapTypeOf(self: *RecordingSession, arg_slot: u16, arg_ref: Ref, argv: Value) !void {
+        switch (argv.heapType()) {
+            .table => self.stampProv(try self.emit(.{ .op = .guard_table, .a = arg_ref, .aux = metaAux(table_mod.Table.fromHeader(argv.asHeap())) }), .operand_type, .a1, .neutral),
+            // A proven producer needs no pin, and tropt's GuardKey dedup
+            // drops the duplicate behind a string load's own pin.
+            .string => if (!self.isProvenStringRef(arg_ref)) {
+                self.stampProv(try self.emit(.{ .op = .guard_string, .a = arg_ref }), .operand_type, .a1, .neutral);
+            },
+            .native => {
+                const nat = function.Native.fromHeader(argv.asHeap());
+                const tag = nat.recorded orelse return self.abort(.bad_type);
+                try self.guardBuiltinCallee(arg_slot, tag);
+            },
+            .function => {
+                const cl = function.Closure.fromHeader(argv.asHeap());
+                if (!self.guarded_refs.contains(arg_ref)) {
+                    const gref = try self.emit(.{ .op = .guard_func, .a = arg_ref, .aux = @bitCast(cl.proto.id) });
+                    try self.guarded_refs.put(self.gpa, arg_ref, @intCast(gref));
+                    self.stampProv(gref, .callee_identity, .a1, .neutral);
+                }
+            },
+            else => return self.abort(.bad_type),
+        }
     }
 
     /// `tostring(v)` — two recorded shapes:

@@ -57,10 +57,12 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       answer: doc 30's review pinned it out). A `string.find` whose
       pattern alternates between two strings: 2,415 M on tier 0, 4,454 M
       with the JIT.
-- [ ] **`type(v)` of a string aborts the recording** (`bad_type call`;
+- [x] **`type(v)` of a string aborts the recording** (`bad_type call`;
       `recBType` has arms for a table, a native and a closure). A loop
       over strings and ints behind `type(v) == "string"`: 1,502 M on
-      tier 0, 3,705 M with the JIT.
+      tier 0, 3,705 M with the JIT. Fixed 2026-11-11: `pinHeapTypeOf`
+      (shared by `type` and `math.type`) pins a string with
+      `guard_string`; the probe runs 935 M.
 - [ ] **`tostring(v)` of an observed string is a tier-0 barrier** by
       doc 24's design (the shared string metatable could carry
       `__tostring`). Seen on a probe mixing strings and ints: 2,343 M on
