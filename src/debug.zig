@@ -3,9 +3,12 @@
 //! does no I/O; `mahina dap` and the C API are its transports (P3, P6).
 
 pub const session = @import("debug/session.zig");
+pub const breakpoints = @import("debug/breakpoints.zig");
 pub const Session = session.Session;
 
 test {
     _ = session;
+    _ = breakpoints;
     _ = @import("debug/session_test.zig");
+    _ = @import("debug/breakpoints_test.zig");
 }

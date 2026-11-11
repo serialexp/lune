@@ -67,7 +67,9 @@ everything inside them is checked.
     stop (§5.5). Tests are in `src/debug/session_test.zig`. They show one
     stop per program step, and that a session with stops leaves the same
     step count and final snapshot bytes as a plain tier-0 run.
-  - [ ] Line breakpoints, including pending ones.
+  - [x] Line breakpoints, including pending ones
+    (`src/debug/breakpoints.zig`; how it differs from the plan is in
+    §5.2's follow-up). Tests are in `src/debug/breakpoints_test.zig`.
   - [ ] Conditional breakpoints and hit counts, on the pure-read
     evaluator.
   - [ ] Step in, over and out.
@@ -401,6 +403,33 @@ breakpoint binds, the session sends a `breakpoint` event with reason
   session's counts (§6.5).
 - **System code.** `system` protos, including `task.lua`, never take
   breakpoints and are stepped over.
+
+**As built (P2, 2026-11-11).** `src/debug/breakpoints.zig`.
+
+- **Sources.** A source is named by its chunk name (`Proto.chunk`): the
+  main program's name, or `load`'s chunkname. Mapping a client's path to
+  that name belongs to the transport (P3).
+- **No load hook.** Every chunk the VM compiles at runtime, including a
+  restore's recompile, is appended through `Vm.appendLoadedChunk`, and
+  proto ids are unique per VM. So the session needs no binding hook in
+  `require`/`load` or the restore path. While any breakpoint is set, the
+  check runs at every prologue and compares `vm.loaded_chunks.len` with
+  the count it has indexed. A chunk is indexed before its first
+  instruction runs, because a call's prologue comes first.
+- **`loadedSource` events.** These cannot rely on that check, which runs
+  only while a flag is set. P3 should sync at every stop and every
+  request drain.
+- **Indexing.** A chunk is indexed once: the first pc of each line in each
+  proto, sorted by line, in O(code log code). Binding a breakpoint is a
+  binary search, and the dispatch-time test is one bitset probe in the
+  current proto, cached by proto.
+- **Ids.** A `setBreakpoints` that keeps a line keeps that breakpoint's id.
+- **Breakpoint and pause together.** When a breakpoint and a pause fall
+  on the same instruction, they make one stop, reported as the
+  breakpoint.
+- **One-line loops.** Binding to the first pc means a breakpoint on a
+  one-line loop (`for i = 1, 3 do f(i) end`) stops once, at the loop's
+  setup, not once per pass as a §5.3 line visit would.
 
 ### 5.3 Stepping
 

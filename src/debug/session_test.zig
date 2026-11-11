@@ -4,90 +4,19 @@
 const std = @import("std");
 const testing = std.testing;
 const session_mod = @import("session.zig");
+const testutil = @import("testutil.zig");
 const interp = @import("../interp.zig");
-const parser = @import("../parser.zig");
-const compiler = @import("../compiler.zig");
 const io = @import("../io.zig");
 const keyframeser = @import("../keyframeser.zig");
-const Diagnostics = @import("../diag.zig").Diagnostics;
 
 const Vm = interp.Vm;
 const Session = session_mod.Session;
 const Stop = session_mod.Stop;
 const Resume = session_mod.Resume;
+const Program = testutil.Program;
+const Script = testutil.Script;
 
-/// A compiled program, kept alive for the run.
-const Program = struct {
-    tree: @import("../ast.zig").Ast,
-    chunk: compiler.Chunk,
-
-    fn init(gpa: std.mem.Allocator, vm: *Vm, source: [:0]const u8) !Program {
-        var diags = Diagnostics.init(gpa);
-        defer diags.deinit();
-        var tree = try parser.parse(gpa, source, &diags);
-        errdefer tree.deinit();
-        try testing.expect(!diags.hasErrors());
-        const chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
-        try testing.expect(!diags.hasErrors());
-        return .{ .tree = tree, .chunk = chunk };
-    }
-
-    fn deinit(self: *Program) void {
-        self.chunk.deinit();
-        self.tree.deinit();
-    }
-};
-
-/// One stop as the driver saw it.
-const Seen = struct {
-    reason: session_mod.Reason,
-    line: u32,
-    depth: u32,
-    reentry: u16,
-};
-
-/// A scripted driver: it logs every stop, and for each one asks `decide`
-/// what to do next (which may also request a pause, to step by
-/// instruction).
-const Script = struct {
-    seen: std.ArrayList(Seen) = .empty,
-    gpa: std.mem.Allocator,
-    decide: *const fn (self: *Script, s: *Session, stop: Stop) Resume,
-    /// Free for `decide`'s use.
-    n: usize = 0,
-    requests_taken: usize = 0,
-    on_requests: ?*const fn (self: *Script, s: *Session) void = null,
-
-    fn driver(self: *Script) session_mod.Driver {
-        return .{ .ctx = self, .stopped = &stopped, .requests = &requests };
-    }
-
-    fn stopped(ctx: *anyopaque, s: *Session, stop: Stop) Resume {
-        const self: *Script = @ptrCast(@alignCast(ctx));
-        const line: u32 = if (s.stopped_at) |at| at.line() else 0;
-        self.seen.append(self.gpa, .{
-            .reason = stop.reason,
-            .line = line,
-            .depth = s.vm.depth,
-            .reentry = s.vm.native_reentry_depth,
-        }) catch @panic("OOM in a test driver");
-        return self.decide(self, s, stop);
-    }
-
-    fn requests(ctx: *anyopaque, s: *Session) void {
-        const self: *Script = @ptrCast(@alignCast(ctx));
-        self.requests_taken += 1;
-        if (self.on_requests) |f| f(self, s);
-    }
-
-    fn deinit(self: *Script) void {
-        self.seen.deinit(self.gpa);
-    }
-};
-
-fn alwaysContinue(_: *Script, _: *Session, _: Stop) Resume {
-    return .@"continue";
-}
+const alwaysContinue = testutil.alwaysContinue;
 
 /// Stop again at the next stoppable point after every stop: instruction
 /// stepping through the whole program.
@@ -109,7 +38,7 @@ test "doc 86 P2: stop on entry, continue, and the end stop after the program ret
     var script: Script = .{ .gpa = gpa, .decide = &alwaysContinue };
     defer script.deinit();
     var s: Session = undefined;
-    s.attach(&vm, script.driver(), .{ .stop_on_entry = true });
+    s.attach(gpa, &vm, script.driver(), .{ .stop_on_entry = true });
     defer s.detach();
     const result = try s.run(prog.chunk.proto);
 
@@ -131,7 +60,7 @@ test "doc 86 P2: without stop_on_entry the only stop is the end" {
     var script: Script = .{ .gpa = gpa, .decide = &alwaysContinue };
     defer script.deinit();
     var s: Session = undefined;
-    s.attach(&vm, script.driver(), .{});
+    s.attach(gpa, &vm, script.driver(), .{});
     defer s.detach();
     try testing.expectEqual(@as(i64, 55), (try s.run(prog.chunk.proto)).asInt());
     try testing.expectEqual(@as(usize, 1), script.seen.items.len);
@@ -155,7 +84,7 @@ test "doc 86 P2: a pause after every stop stops once per program step, inside ta
     var script: Script = .{ .gpa = gpa, .decide = &stepEverything };
     defer script.deinit();
     var s: Session = undefined;
-    s.attach(&vm, script.driver(), .{ .stop_on_entry = true });
+    s.attach(gpa, &vm, script.driver(), .{ .stop_on_entry = true });
     defer s.detach();
     const before = vm.safepoint_seq;
     try testing.expectEqual(@as(i64, 1), (try s.run(prog.chunk.proto)).asInt());
@@ -202,7 +131,7 @@ test "doc 86 P2: terminate ends the program through pcall, leaves the VM idle, a
     var script: Script = .{ .gpa = gpa, .decide = &terminateOnLineTwo };
     defer script.deinit();
     var s: Session = undefined;
-    s.attach(&vm, script.driver(), .{ .stop_on_entry = true });
+    s.attach(gpa, &vm, script.driver(), .{ .stop_on_entry = true });
     defer s.detach();
     try testing.expectError(error.DebugTerminated, s.run(prog.chunk.proto));
     try testing.expectEqualStrings("", sink.buffered());
@@ -230,7 +159,7 @@ test "doc 86 P2: requests taken while the program runs, and a terminate from the
     var script: Script = .{ .gpa = gpa, .decide = &alwaysContinue, .on_requests = &terminateAfterThreeRequests };
     defer script.deinit();
     var s: Session = undefined;
-    s.attach(&vm, script.driver(), .{});
+    s.attach(gpa, &vm, script.driver(), .{});
     defer s.detach();
     s.notifyRequests();
     try testing.expectError(error.DebugTerminated, s.run(prog.chunk.proto));
@@ -248,7 +177,7 @@ test "doc 86 P2: an uncaught error ends with the end stop, which carries it" {
     var script: Script = .{ .gpa = gpa, .decide = &alwaysContinue };
     defer script.deinit();
     var s: Session = undefined;
-    s.attach(&vm, script.driver(), .{});
+    s.attach(gpa, &vm, script.driver(), .{});
     defer s.detach();
     try testing.expectError(error.LuaError, s.run(prog.chunk.proto));
     try testing.expectEqual(@as(usize, 1), script.seen.items.len);
@@ -296,7 +225,7 @@ test "doc 86 P2: a session holds the JIT off, and stepping through it leaves the
     var script: Script = .{ .gpa = gpa, .decide = &stepFirstHundred };
     defer script.deinit();
     var s: Session = undefined;
-    s.attach(&vm, script.driver(), .{ .stop_on_entry = true });
+    s.attach(gpa, &vm, script.driver(), .{ .stop_on_entry = true });
     const got = try s.run(prog.chunk.proto);
     s.detach();
 
@@ -323,7 +252,7 @@ test "doc 86 P2: after detach the JIT runs again" {
     var script: Script = .{ .gpa = gpa, .decide = &alwaysContinue };
     defer script.deinit();
     var s: Session = undefined;
-    s.attach(&vm, script.driver(), .{});
+    s.attach(gpa, &vm, script.driver(), .{});
     s.detach();
     try testing.expect(vm.debug == null);
     try testing.expect(!vm.trace.suspended());
