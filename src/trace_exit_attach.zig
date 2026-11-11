@@ -17,7 +17,8 @@
 //! The rules, each fail-closed (an unknown shape is refused):
 //!   1. the trace is ordinary (not precise), not peeled, and loop-anchored
 //!      at a raw pc (one-shot head/cont anchors are refused);
-//!   2. the exit is a side-exit guard with an ordinal and a snapshot;
+//!   2. the exit is a side exit (`trace_ir.isSideExitInstr`: a side-exit
+//!      guard or a typed load) with an ordinal and a snapshot;
 //!   3. its provenance is a complete `.guard` entry at inline depth 0 in
 //!      the anchor proto, and it is not a numeric-for loop-done exit;
 //!   4. provenance, the guard's own pc and the snapshot name the same
@@ -60,7 +61,7 @@ pub const Verdict = enum(u8) {
     attachable,
     /// Rule 1: a precise or peeled trace, or a one-shot anchor.
     trace_shape,
-    /// Rule 2: not a side-exit guard, or no ordinal or snapshot.
+    /// Rule 2: not a side exit, or no ordinal or snapshot.
     no_snapshot,
     /// Rule 3: provenance incomplete, missing, or not a guard's.
     no_provenance,

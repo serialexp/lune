@@ -728,6 +728,16 @@ Snapshot and map memory are reported per trace in `--jit-stats`.
 LuaJIT's measured snapshot cost is about the size of the IR; ours must
 stay in that range.
 
+**Follow-up, 2026-11-11 (doc 85 §5.3).** "A guard" above meant an op of
+`trace_ir.isSideExitGuardOp`. A typed load (`hload`, `uload`, a
+`.value`-lane `aload`) checks its recorded type at the load and exits
+there, and it had an ordinal and provenance but no snapshot, so a slot
+whose type alternated left through an exit nothing could attach to. The
+question is now asked of the instruction (`trace_ir.isSideExitInstr`: a
+side-exit guard op or a typed load) at the snapshot commit, the two
+rooting sites in `tropt`, finalize's validation and `exitSnapIdx`.
+`guard_string` joined the guard ops in the same change.
+
 ### 4.3 Attachability and the resume pc (Phase 2)
 
 `exitAttachable(t, exit)` is true only when all of these hold:

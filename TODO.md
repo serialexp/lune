@@ -19,22 +19,53 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       board row in the script idiom; Q2 (hoisting the module-table load
       chain: a qualified `math.floor` is 70 instructions per iteration,
       the cached local 59).
-- [ ] **A typed load whose type alternates makes the JIT 2.5 to 3.4
+- [x] **A typed load whose type alternates made the JIT 2.5 to 3.4
       times slower than tier 0** (found 2026-11-11, present before doc
-      85). `acc = acc + mixed[i % 4 + 1]` over `{ 1, 2.5, 3, 4.5 }`: 897 M
-      instructions on tier 0, 3,030 M with `--trace --jit-native`; a field
-      that is an int in one record and a float in the next, 1,113 M
-      against 3,202 M. `--jit-stats`: one trace, 1.5 M native entries of
-      one iteration each, `exit side: wants=0`. The exit native code takes
-      is the load's own tag check (`aload` in the `.value` lane, `hload`),
-      and that instruction has no row in the trace's exit table: no
-      snapshot, not attachable, no exit-side state
-      (`TraceCode.exitSnapIdx` wants an `isSideExitGuardOp`). The guard
-      behind the load is attachable, and native code never exits there.
-      So `routeExitSide` never wants the exit and nothing records the
-      other type. A branch that alternates is fine (423 M against
-      1,157 M). Doc 85 §5.2 has the table, the `-Djit-debug` evidence and
-      the two shapes a fix can take. Needs a design choice; not started.
+      85; fixed the same day, doc 85 §5.2 and §5.3). The load's own tag
+      check was the exit native code took, and it had no snapshot, so
+      nothing could record the other type. A typed load (`hload`, `uload`,
+      `.value`-lane `aload`) is now a side exit with exit facts
+      (`trace_ir.isSideExitInstr`), and `guard_string` joined the
+      side-exit guards. `acc = acc + mixed[i % 4 + 1]` over
+      `{ 1, 2.5, 3, 4.5 }`: 3,030 M to 423 M instructions (tier 0 897 M).
+- [ ] **An exit whose resume pc is the loop header gets no trace for
+      the other shape when every entry completes an iteration** (found
+      2026-11-11 while fixing the item above; older than it and not
+      specific to loads). `for i = 1, n do acc = acc + x; x = vals[i % 2 + 1] end`
+      with `x` a closed upvalue alternating int and float: 993 M
+      instructions on tier 0, 3,305 M with `--trace --jit-native`. The
+      first bytecode's exit resumes at the header, which
+      `trace_exit_attach` rule 8 refuses (`resume_header`: the child
+      would be the loop's root), and `noteTakenExit` raises a sibling
+      want only for a zero-completion receipt; here each entry completes
+      one iteration and fails the next. The sibling-handoff arm exists
+      for such a pair once both siblings do. Needs a route to the second
+      sibling; not started.
+- [ ] **An exit-side continuation whose first recording aborts for a
+      retry never gets the retry** (found 2026-11-11). The same loop
+      with another statement before the read: the continuation at the
+      load reads the cell and then stores to it, aborts
+      `.upvalue_mutable` and memoizes its anchor for a retry; the record
+      gate bars the anchor for 256 ticks, and the exit gives up after
+      `tryside` (4) more firings, each of which was refused
+      ("record at pc=7 refused: anchor barred"). 927 M on tier 0,
+      3,287 M with the JIT. LuaJIT's `tryside` counts recording
+      attempts. Options seen: a firing refused by the bar does not count
+      against `tryside`; or a memoizing abort does not raise the gate.
+      Not started.
+- [ ] **`guard_sid` is not a side-exit guard** (doc 85 Q3, Bart's to
+      answer: doc 30's review pinned it out). A `string.find` whose
+      pattern alternates between two strings: 2,415 M on tier 0, 4,454 M
+      with the JIT.
+- [ ] **`type(v)` of a string aborts the recording** (`bad_type call`;
+      `recBType` has arms for a table, a native and a closure). A loop
+      over strings and ints behind `type(v) == "string"`: 1,502 M on
+      tier 0, 3,705 M with the JIT.
+- [ ] **`tostring(v)` of an observed string is a tier-0 barrier** by
+      doc 24's design (the shared string metatable could carry
+      `__tostring`). Seen on a probe mixing strings and ints: 2,343 M on
+      tier 0, 4,420 M with the JIT. Doc 77's metatable guards may now
+      be able to pin it; not looked at.
 - [ ] **A string stored into an array aborts the recording**
       (`nyi_opcode set_index`: str_sort, sort_cmp, co_garbage). Doc 85's
       deferred "heap values stored into tables"; with Phase 2 in, it is

@@ -2083,9 +2083,10 @@ pub const RecordingSession = struct {
         if (self.precise) ins_mut.snap = self.cur_snap;
         // Doc 56 §4.2: every op carries its bytecode's boundary ordinal
         // (dead metadata on ops that cannot exit); the bytecode's first
-        // side-exit guard commits the boundary snapshot it will resume from.
+        // side exit (a guard or a typed load) commits the boundary snapshot
+        // it will resume from.
         ins_mut.ord = self.cur_ord;
-        if (self.exit_snap_pending and trace_ir.isSideExitGuardOp(ins_mut.op)) try self.commitExitSnap();
+        if (self.exit_snap_pending and trace_ir.isSideExitInstr(ins_mut)) try self.commitExitSnap();
         const ref: Ref = @intCast(self.instrs.items.len);
         try self.instrs.append(self.gpa, ins_mut);
         // Grow the exit-provenance table in lockstep (A-i.1): one `null` per append,

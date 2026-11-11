@@ -44,7 +44,7 @@ const IrOp = trace_mod.IrOp;
 const IrInstr = trace_mod.IrInstr;
 const Ref = trace_mod.Ref;
 const guardExitPc = trace_mod.guardExitPc;
-const isSideExitGuardOp = trace_mod.isSideExitGuardOp;
+const isSideExitInstr = trace_mod.isSideExitInstr;
 const ProvenanceEdge = trace_mod.ProvenanceEdge;
 const ProvenanceAction = trace_mod.ProvenanceAction;
 const ProvenanceVerdict = trace_mod.ProvenanceVerdict;
@@ -161,7 +161,7 @@ pub inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize
     // exits creates an enter/exit runtime turnstile on variable loop shapes.
     const side_headroom = exit_instr != std.math.maxInt(u32) and
         exit_instr < t.code.instrs.len and
-        isSideExitGuardOp(t.code.instrs[exit_instr].op) and
+        isSideExitInstr(t.code.instrs[exit_instr]) and
         self.countTracesAt(key) < self.config.max_traces_per_anchor;
     const limit = if (side_headroom)
         self.config.max_penalty +| self.config.hotexit

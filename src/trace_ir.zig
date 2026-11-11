@@ -15,6 +15,7 @@ const io = @import("io.zig");
 const function = @import("function.zig");
 const value_mod = @import("value.zig");
 const arith = @import("arith.zig");
+const array = @import("array.zig");
 
 /// An SSA value reference: an index into a trace's `instrs` array. Every IR
 /// instruction defines exactly one value, named by its position.
@@ -516,7 +517,8 @@ pub const IrOp = enum(u8) {
     /// operand (a loaded slot) where the producer doesn't already prove it
     /// (`tostr_*`/future snew-class results are proven by construction and skip
     /// this). Produces no value; never DCE'd. Classified `.guard`; carries no
-    /// `aux` (NOT exit-PC-chaining — like `guard_table`). Wire ordinal 63.
+    /// `aux` (NOT exit-PC-chaining — like `guard_table`, and like it a member
+    /// of `isSideExitGuardOp`: doc 85 §5.2). Wire ordinal 63.
     guard_string,
     /// The doc 24 D3 allocation-budget entry guard; `aux` = the trace's static
     /// allocation bound `A` (each `.alloc` op performs at most one `Heap.link` —
@@ -1054,8 +1056,36 @@ pub fn isSideExitGuardOp(op: IrOp) bool {
         .guard_is_nil, .guard_is_false, .guard_is_true, .guard_bool => true,
         .guard_step_up, .guard_step_down, .guard_for_nov => true,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
+        // Doc 85 §5.2: the string twin of `guard_table` — the subtype pin
+        // behind a `.heap` load, which a table or a closure in the string's
+        // place fails.
+        .guard_string => true,
         else => false,
     };
+}
+
+/// A load whose recorded `ty` is checked AT THE LOAD in both executors (the
+/// fused tag exit): `hload` and `uload` always, `aload` out of a `.value`
+/// lane. A narrow lane's element type is structural (`guard_lane` pins it)
+/// and its load cannot fail. The type guard the recorder emits behind a
+/// typed load is then always satisfied, so a value of another type exits
+/// here and nowhere else (doc 85 §5.2).
+pub fn isTypedLoad(ins: IrInstr) bool {
+    return switch (ins.op) {
+        .hload, .uload => true,
+        .aload => ins.aux == @intFromEnum(array.Lane.value),
+        else => false,
+    };
+}
+
+/// Every instruction whose runtime failure side-exits the trace where a
+/// side trace could absorb the alternate shape: the ops of
+/// `isSideExitGuardOp` and the typed loads. This is the predicate for
+/// everything that reads one INSTRUCTION (the boundary-snapshot commit and
+/// rooting, `TraceCode.exitSnapIdx`, the thrash discriminators); the
+/// op-level one cannot tell a `.value`-lane `aload` from a narrow-lane one.
+pub fn isSideExitInstr(ins: IrInstr) bool {
+    return isSideExitGuardOp(ins.op) or isTypedLoad(ins);
 }
 
 /// Every IR op that changes guest-visible state: the heap stores (`astore`,
@@ -1093,7 +1123,7 @@ pub fn isStateEffectOp(op: IrOp) bool {
 /// error with `snap == 0` is a bug, never degraded to `.normal`.
 pub fn requiresPreciseSnapshot(op: IrOp) bool {
     return isSideExitGuardOp(op) or switch (op) {
-        .guard_string, .guard_sid => true,
+        .guard_sid => true,
         .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar => true,
         .neg, .not, .bnot, .eq, .ne, .lt, .le => true,
         .fsqrt, .fsin, .fcos, .ffloor, .fceil => true,
@@ -1325,6 +1355,27 @@ pub const HrefAux = struct {
         return .{ .slot = slot, .mask = mask };
     }
 };
+
+test "doc 85: the typed loads are side exits, a narrow-lane aload is not" {
+    const value_lane: i32 = @intFromEnum(array.Lane.value);
+    try std.testing.expect(isTypedLoad(.{ .op = .hload, .ty = .int }));
+    try std.testing.expect(isTypedLoad(.{ .op = .uload, .ty = .float }));
+    try std.testing.expect(isTypedLoad(.{ .op = .aload, .aux = value_lane, .ty = .heap }));
+    try std.testing.expect(isSideExitInstr(.{ .op = .aload, .aux = value_lane, .ty = .boolean }));
+    // A narrow lane's element type is structural: nothing to check, no exit.
+    inline for (.{ array.Lane.i64, array.Lane.f64, array.Lane.boolean }) |lane| {
+        const ins: IrInstr = .{ .op = .aload, .aux = @intFromEnum(lane) };
+        try std.testing.expect(!isTypedLoad(ins));
+        try std.testing.expect(!isSideExitInstr(ins));
+    }
+    // A grid cell's type is fixed by the grid; `gload` cannot fail either.
+    try std.testing.expect(!isSideExitInstr(.{ .op = .gload }));
+    // The guard ops keep their op-level membership, `guard_string` with them.
+    try std.testing.expect(isSideExitInstr(.{ .op = .guard_table }));
+    try std.testing.expect(isSideExitInstr(.{ .op = .guard_string }));
+    try std.testing.expect(!isSideExitInstr(.{ .op = .guard_sid }));
+    try std.testing.expect(!isSideExitInstr(.{ .op = .guard_gc }));
+}
 
 test "HrefAux round-trips, keeps domains disjoint, rejects malformed" {
     // Round-trip across the range.

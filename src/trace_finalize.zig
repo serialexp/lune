@@ -502,7 +502,7 @@ pub fn exitSnapshotsValid(
     }
     for (instrs, 0..) |ins, i| {
         if (ins.ord >= by_ord.len) return false;
-        if (!ir.isSideExitGuardOp(ins.op)) continue;
+        if (!ir.isSideExitInstr(ins)) continue;
         const si = by_ord[ins.ord];
         if (si == 0) continue;
         if (!trace_snapshot.refsDefinedAt(si, i, o.snapshots, o.snapshot_slots)) return false;

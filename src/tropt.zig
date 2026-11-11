@@ -808,7 +808,7 @@ pub fn optimize(
             if (fold_aux[i] != null) continue; // now a konst: no operands to keep alive
             // A hoisted side exit fails in the preheader, before any
             // boundary: it roots nothing (its ordinal is dropped below).
-            if (!dead[i] and !hoist[i] and ins.ord != 0 and ins.ord < exit.by_ord.len and !ord_rooted[ins.ord] and trace.isSideExitGuardOp(ins.op))
+            if (!dead[i] and !hoist[i] and ins.ord != 0 and ins.ord < exit.by_ord.len and !ord_rooted[ins.ord] and trace.isSideExitInstr(ins))
                 rootExitSnap(exit, ins.ord, i, canon, live, ord_rooted);
             switch (kindOf(ins.op)) {
                 .binary => {
@@ -962,7 +962,7 @@ pub fn optimize(
         if (in_pre[i]) out.ord = 0;
         // Doc 56 §4.2: an emitted, unfolded BODY side exit keeps its rooted
         // boundary snapshot.
-        if (!in_pre[i] and fold_aux[i] == null and ins.ord != 0 and ins.ord < ord_kept.len and ord_rooted[ins.ord] and trace.isSideExitGuardOp(ins.op))
+        if (!in_pre[i] and fold_aux[i] == null and ins.ord != 0 and ins.ord < ord_kept.len and ord_rooted[ins.ord] and trace.isSideExitInstr(ins))
             ord_kept[ins.ord] = true;
         if (fold_aux[i]) |aux| {
             out = .{ .op = .konst, .aux = aux, .ty = ins.ty };

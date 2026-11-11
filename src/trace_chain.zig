@@ -38,7 +38,7 @@ const IrOp = trace_mod.IrOp;
 const IrInstr = trace_mod.IrInstr;
 const Ref = trace_mod.Ref;
 const guardExitPc = trace_mod.guardExitPc;
-const isSideExitGuardOp = trace_mod.isSideExitGuardOp;
+const isSideExitInstr = trace_mod.isSideExitInstr;
 const isLoopDoneGuardIndex = trace_mod.isLoopDoneGuardIndex;
 const accountCandidateCharge = TraceState.accountCandidateCharge;
 const readCycles = trace_mod.readCycles;
@@ -642,7 +642,7 @@ fn candidateLeftEntryState(sct: *const Trace, r: trace_exec.ExecResult, comptime
     return switch (r.exit_reason) {
         .prologue_fail => true,
         .normal => r.exit_instr < sct.code.instrs.len and
-            isSideExitGuardOp(sct.code.instrs[r.exit_instr].op) and
+            isSideExitInstr(sct.code.instrs[r.exit_instr]) and
             TraceState.exitIsPreEffect(sct, r.exit_instr),
         else => false,
     };

@@ -2036,3 +2036,117 @@ test "doc 66 P4: a compare-and-branch is still a composite bridge candidate" {
         .inspect = Inspect.run,
     });
 }
+
+// ---- doc 85 §5.2: a typed load is a side exit in its own right -------------
+//
+// A `.value`-lane `aload`, an `hload` and a `uload` check their recorded
+// type at the load, in both executors, and exit THERE: the type guard the
+// recorder emits behind the load never fires. Before these loads had exit
+// facts, a slot whose type alternated left the trace at an exit nothing
+// could attach to, once per alternation, and the loop ran slower than
+// tier-0. Each program below alternates the type on every trip, so the
+// native leg must build an adapter at the load, bind a continuation and arm
+// it (`expectNativeAdapters`); all ten legs must agree on the output.
+
+test "doc 85: a .value-lane element alternating int and float binds a continuation at the load" {
+    try expectNativeAdapters(
+        \\local mixed = { 1, 2.5, 3, 4.5 }
+        \\local acc = 0
+        \\for i = 1, 300 do
+        \\  acc = acc + mixed[i % 4 + 1]
+        \\end
+        \\print(acc)
+    , "825\n");
+}
+
+test "doc 85: a hash field alternating int and float binds a continuation at the load" {
+    try expectNativeAdapters(
+        \\local objs = { { v = 1 }, { v = 2.5 } }
+        \\local acc = 0
+        \\for i = 1, 300 do
+        \\  acc = acc + objs[i % 2 + 1].v
+        \\end
+        \\print(acc)
+    , "525\n");
+}
+
+test "doc 85: a .value-lane element alternating bool and int binds a continuation at the load" {
+    // A bool load has no guard behind it at all: the load's own exit is the
+    // only place a non-bool can leave the trace.
+    try expectNativeAdapters(
+        \\local flags = { true, 1, false, 2 }
+        \\local acc = 0
+        \\for i = 1, 300 do
+        \\  local f = flags[i % 4 + 1]
+        \\  if f then acc = acc + 1 end
+        \\end
+        \\print(acc)
+    , "225\n");
+}
+
+test "doc 85: a .value-lane element alternating number and table binds a continuation at the load" {
+    try expectNativeAdapters(
+        \\local mixed = { 1, {}, 3, {} }
+        \\local acc = 0
+        \\for i = 1, 300 do
+        \\  local v = mixed[i % 4 + 1]
+        \\  if type(v) == "number" then acc = acc + v else acc = acc + 10 end
+        \\end
+        \\print(acc)
+    , "1800\n");
+}
+
+test "doc 85: a .value-lane element alternating string and table binds a continuation at guard_string" {
+    // Both are heap values, so the load passes and the subtype pin behind
+    // it fails: `guard_string` is a side exit like `guard_table`.
+    try expectNativeAdapters(
+        \\local mixed = { "ab", { 1 }, "c", { 1, 2 } }
+        \\local acc = 0
+        \\for i = 1, 300 do
+        \\  acc = acc + #mixed[i % 4 + 1]
+        \\end
+        \\print(acc)
+    , "450\n");
+}
+
+test "doc 85: a closed upvalue alternating int and float exits attachably at the load" {
+    // `x` is a CLOSED upvalue (its maker returned). The read sits behind
+    // another bytecode so its resume pc is not the loop header (rule 8).
+    // The load's exit is attachable and the native leg builds its adapter
+    // and hops through it. No continuation binds: the one recorded at the
+    // load reads the cell and then stores to it, which aborts
+    // `.upvalue_mutable` for a retry the exit does not wait for (TODO.md).
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            var loads: usize = 0;
+            for (vm.trace.registry.cache.items) |t| {
+                for (t.code.instrs, 0..) |ins, i| {
+                    if (ins.op != .uload) continue;
+                    loads += 1;
+                    try testing.expect(t.code.exitSnapIdx(i) != null);
+                    try testing.expect(t.code.exitAttachable(i));
+                }
+            }
+            try testing.expect(loads > 0);
+            try testing.expect(vm.trace.exit_adapter_builds > 0);
+            try testing.expect(vm.trace.exit_side_native_hops > 0);
+            for (vm.trace.exit_adapter_refusals) |n| try testing.expectEqual(@as(u64, 0), n);
+        }
+    };
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local x = 1
+        \\  return function(n, vals)
+        \\    local acc = 0
+        \\    for i = 1, n do
+        \\      local k = i % 2 + 1
+        \\      acc = acc + x
+        \\      x = vals[k]
+        \\    end
+        \\    return acc
+        \\  end
+        \\end
+        \\print(mk()(300, { 1, 2.5 }))
+    , "525\n", .{ .exit_side_native = true, .inspect = Inspect.run });
+}

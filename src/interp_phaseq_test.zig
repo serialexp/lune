@@ -779,7 +779,8 @@ test "phase Q: link peels end linked, one-trip, type-mismatched and rewound in e
         \\  for p = 1, cycles do
         \\    for r = 1, nn do
         \\      local sum = 0
-        \\      for i = row[r], row[r+1]-1 do sum = sum + x[col[i]] * v[i] end
+        \\      local w = (r % 7 == 0) and 2 or 0.25
+        \\      for i = row[r], row[r+1]-1 do sum = sum + x[col[i]] * w end
         \\      out[r] = sum
         \\    end
         \\  end
@@ -796,10 +797,11 @@ test "phase Q: link peels end linked, one-trip, type-mismatched and rewound in e
         \\run(f1, function() return 5 end, fx, quarter)
         \\-- one_trip: every other row has a single term.
         \\run(f2, function(r) return (r % 2 == 1) and 5 or 1 end, fx, quarter)
-        \\-- type_mismatch: every seventh row stays integer through its first term.
-        \\run(f3, function() return 5 end,
-        \\  function(k, r) return (r % 7 == 0) and k or k * 0.5 end,
-        \\  function(r) return (r % 7 == 0) and 2 or 0.25 end)
+        \\-- type_mismatch: every seventh row stays integer through its first
+        \\-- term. The integer comes from a local, not from an element: a typed
+        \\-- load that meets the other type leaves through its own exit and gets
+        \\-- a continuation there (doc 85 §5.3), so no peel ever sees it.
+        \\run(f3, function() return 5 end, function(k) return k end, quarter)
         \\-- rewound: the peeled body calls an upvalue function (spectral-norm).
         \\local function A(i, j)
         \\  local ij = i+j-1
@@ -816,7 +818,7 @@ test "phase Q: link peels end linked, one-trip, type-mismatched and rewound in e
         \\for i=1,12 do u[i] = 1 end
         \\for i=1,4 do Av(u, w, 12) Av(w, u, 12) end
         \\print(string.format("%0.6f", u[1]))
-    , "193.125\n25.125\n193.125\n11.822977\n", .{ .inspect = sumLinkPeels, .hotloop = (trace.TraceConfig{}).hotloop });
+    , "193.125\n25.125\n386.25\n11.822977\n", .{ .inspect = sumLinkPeels, .hotloop = (trace.TraceConfig{}).hotloop });
     inline for (.{ .linked, .one_trip, .type_mismatch, .rewound }) |e|
         try testing.expect(peel_ends.get(e) >= 1);
     // Every peel set up ended on one of the paths.

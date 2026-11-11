@@ -726,14 +726,15 @@ pub const TraceCode = struct {
 
     /// Doc 56 §4.2: the one-based exit snapshot of side-exit instruction
     /// `instr_idx`, found through its boundary ordinal, or null when it has
-    /// none (not a side-exit op, no ordinal, or its snapshot was dropped).
+    /// none (not a side exit by `trace_ir.isSideExitInstr`, no ordinal, or
+    /// its snapshot was dropped).
     /// Finalize validated every entry (`exitSnapshotsValid`); the range
     /// checks here only keep a hand-built trace from indexing out of bounds.
     pub fn exitSnapIdx(self: *const TraceCode, instr_idx: usize) ?trace_ir.SnapIdx {
         if (instr_idx >= self.instrs.len) return null;
         const ins = self.instrs[instr_idx];
         if (ins.ord == 0 or ins.ord >= self.exit_snap_by_ord.len) return null;
-        if (!trace_ir.isSideExitGuardOp(ins.op)) return null;
+        if (!trace_ir.isSideExitInstr(ins)) return null;
         const si = self.exit_snap_by_ord[ins.ord];
         if (si == 0 or si > self.exit_snapshots.len) return null;
         return si;

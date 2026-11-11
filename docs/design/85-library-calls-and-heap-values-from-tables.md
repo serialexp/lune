@@ -1,11 +1,12 @@
 # 85 — Library calls through their module table, and heap values read out of tables — Design
 
 Status: partial — Phase 0 (a tier-0 ordering bug in `math.max`/`math.min`,
-found while reading for Phase 3), Phase 1 (string and native hash fields) and
-Phase 2 (string, native, closure and bool array elements) landed. Phases 3
-and 4 are not started; Q1 and Q2 (§8) are open. Bart has not picked this arc:
-it was started on 2026-11-11 under "continue using your best judgement" after
-four asks went unanswered. Phase 3 needs his answer to Q1.
+found while reading for Phase 3), Phase 1 (string and native hash fields),
+Phase 2 (string, native, closure and bool array elements) and the typed-load
+exit fix that Phase 2 turned up (§5.2, §5.3) landed. Phases 3 and 4 are not
+started; Q1, Q2 and Q3 (§8) are open. Bart has not picked this arc: it was
+started on 2026-11-11 under "continue using your best judgement" after four
+asks went unanswered. Phase 3 needs his answer to Q1.
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -49,6 +50,15 @@ land; move whole phases to Done once everything inside them is checked.
   elements called 3,150 M to 127 M. The board is flat: str_sort's three
   `get_index` sites now record and its loops stop at the next thing they
   cannot do (a string stored into an array, `concat`).
+- [x] **A typed load is a side exit in its own right** (§5.2 for the
+  finding, §5.3 for what was built). A `.value`-lane `aload`, an `hload`
+  and a `uload` now have exit facts, and `guard_string` joined the
+  side-exit guards, so a slot whose type alternates gets an exit-started
+  side trace at the load. With the JIT on: an array alternating int and
+  float 3,030 M to 423 M instructions (tier 0: 897 M), a field alternating
+  int and float 3,202 M to 750 M (1,113 M), flags alternating bool and int
+  6,958 M to 536 M (904 M), elements alternating string and table 3,115 M
+  to 473 M (984 M). Board geomean +0.012%.
 
 ### Outstanding
 
@@ -64,11 +74,14 @@ land; move whole phases to Done once everything inside them is checked.
   string, closure or table decline native today; the recorder's
   `bad_type set_field` and `nyi_opcode set_index` rows are a separate
   census, §2.2).
-- [ ] **Defer — a typed load whose type alternates gets no sibling
-  trace.** Older than this doc and not specific to it (§5.2): an array
-  mixing ints and floats, or a field that is an int in one record and a
-  float in the next, runs 2.5 to 3.4 times slower with the JIT than on
-  tier 0. Phase 2 lets a few more arrays reach it. Noted in `TODO.md`.
+- [ ] **Q3 — whether `guard_sid` joins the side-exit guards** (§8). Doc
+  30 pinned it out; a pattern that alternates runs 1.8 times slower with
+  the JIT than on tier 0.
+- [ ] **Defer — an exit whose resume pc is the loop header gets no
+  trace for the other type** (§5.3). Not specific to loads: any exit of
+  the loop's first bytecode. Noted in `TODO.md`.
+- [ ] **Defer — a continuation whose first recording aborts for a retry
+  never gets the retry** (§5.3). Noted in `TODO.md`.
 - [ ] **Defer — a barred loop's back-edge cost.** A loop whose recording
   is abandoned pays about 30 instructions per iteration over tier 0 with
   the JIT on (§2.1's `math.floor` row). Noted in `TODO.md`.
@@ -406,6 +419,112 @@ load from a narrow-lane one, which never exits). Either way the other
 type then records as an exit-started side trace (doc 56), the machinery
 that serves the alternating branch.
 
+### 5.3 Implemented, 2026-11-11: a typed load is a side exit in its own right
+
+The second shape. It was already half there: the recorder stamps exit
+provenance on every typed load (`stampProv(rload, .element_type, …)`,
+`.field_type` for `hload` and `uload`; the role's own comment reads
+"fused native hload producer-exit"), every instruction carries its
+bytecode's boundary ordinal, and native code gives every exiting
+instruction a stub that writes its own index. The one missing piece was
+that `TraceCode.exitSnapIdx` refused anything that was not a side-exit
+guard op, so the load had provenance and an ordinal and no snapshot.
+
+**What changed.** `trace_ir.isTypedLoad(ins)` names the loads that check
+their recorded type at the load (`hload`, `uload`, and `aload` out of a
+`.value` lane), and `trace_ir.isSideExitInstr(ins)` is "a side-exit guard
+op or a typed load". Every place that asked the op-level question about
+one instruction now asks the instruction-level one: the recorder's
+boundary-snapshot commit, `tropt`'s two snapshot-rooting sites,
+finalize's snapshot validation, `exitSnapIdx`, and the two thrash
+discriminators (`accountLegacyThrash`'s side headroom,
+`candidateLeftEntryState`). Nothing downstream changed: attachability
+(`trace_exit_attach`), the native liveness extension, the exit adapter and
+tier 1a's materialization all go through `exitSnapIdx` and
+`exitAttachable`. `guard_string` joined `isSideExitGuardOp`: it is the
+string twin of `guard_table` (the subtype pin behind a `.heap` load), was
+left out when it only ever pinned loop-invariant slots, and a table in a
+string's place exits there.
+
+**Soundness.** An attachable exit resumes tier 0 (or a child) at its
+bytecode `B` from `B`'s boundary snapshot (doc 56 §4.1). For a load:
+
+- the snapshot is `B`'s boundary state whenever it is committed inside
+  `B` (`noteSlotWrite` saves a slot's boundary binding before the first
+  write), so letting the load commit it changes nothing it holds;
+- every ref it holds is bound before `B`'s first op, so before the load;
+  finalize's `refsDefinedAt` now checks that for loads as it does for
+  guards;
+- both executors check the tag before they write anything: native code
+  compares and branches before the payload move, in all three emitters,
+  and tier 1a tests before it sets `values[i]`. The trace state at the
+  exit is the state before the load;
+- rules 6 and 7 of `trace_exit_attach` (no effect of `B` before the exit,
+  only modelled stores of earlier bytecodes after it) are per exit and
+  apply unchanged;
+- a hoisted load loses its ordinal in `tropt` like any hoisted exit and
+  never looks attachable;
+- the rooting sites and `exitSnapIdx` use one predicate, so a snapshot an
+  exit can reach is always rooted and kept.
+
+**Progress.** The child starts at `B` with the other type in the slot
+and records its own typed load, which is a side exit in turn. A site that
+sees k types gets at most k − 1 continuations down the chain, bounded by
+the limits every exit has (`hotexit`, `tryside`, the per-anchor trace
+cap); a megamorphic site gives up like any exit that cannot be served.
+
+**Measured** (3 M iterations, instructions, before = Phase 2):
+
+| loop body | tier 0 | JIT before | JIT after |
+|---|---|---|---|
+| `acc = acc + mixed[i % 4 + 1]`, `{ 1, 2.5, 3, 4.5 }` | 897 M | 3,030 M | 423 M |
+| the same over `{ 1, {}, 3, {} }` behind `type(v) == "number"` | 1,431 M | 3,541 M | 944 M |
+| `acc = acc + objs[i % 2 + 1].v`, `v` an int or a float | 1,113 M | 3,202 M | 750 M |
+| `if flags[i % 4 + 1] then …`, `{ true, 1, false, 2 }` | 904 M | 6,958 M | 536 M |
+| `acc = acc + #mixed[i % 4 + 1]`, strings and tables | 984 M | 3,115 M | 473 M |
+
+`--jit-stats` on the first row now reads `exit side: wants=1 records=1
+binds=1`, all iterations traced.
+
+The board with the JIT on: geomean +0.012% over 61 rows, largest
+meta_fields +0.18% and ray +0.13%. No row has a load whose type
+alternates. The cost is not in the traces' bodies: a disassembly diff of
+meta_fields' seven traces is five more exit stubs and no body
+instruction. It comes to about six instructions per native entry, and it
+moves with the shape of the predicate (written as one switch it was
++0.29% on meta_fields), which points at the compiler's inlining around
+the dispatcher and not at work the change added.
+
+**Tier 1a alone got slower on these loops** (first row 5,658 M to
+7,562 M): it records the continuation and runs it at tier-1a speed. That
+is where it stood before Phase 2 (8,070 M), when it exited at the guard
+behind an element load.
+
+**A test changed.** "phase Q: link peels end linked, one-trip,
+type-mismatched and rewound" produced its type mismatch from rows whose
+elements were ints in a float array. Those rows now leave through the
+load's exit and get a continuation, so no peel ever sees them; the
+mismatch now comes from a local that is an int on every seventh row.
+
+**What it does not cover**, each measured the same way:
+
+- **The load is the loop's first bytecode** (`acc = acc + x`, `x` a
+  closed upvalue whose type alternates: tier 0 993 M, JIT 3,305 M). Its
+  resume pc is the loop header, which rule 8 refuses (the child would be
+  the loop's root), and every entry completes an iteration, so
+  `noteTakenExit` raises no sibling want either. The same holds for any
+  exit of a loop's first bytecode; loads are not special.
+- **The continuation's first recording aborts for a retry** (the same
+  loop with the read second: 927 M, 3,287 M). The continuation reads the
+  cell and then stores to it, which aborts `.upvalue_mutable` and
+  memoizes the anchor for a retry. The record gate bars the anchor for
+  256 ticks; the exit gives up after `tryside` (4) more firings. LuaJIT
+  counts attempts there, not firings.
+- **`guard_sid`** (`string.find(s, pats[i % 2 + 1], 1, true)`: 2,415 M,
+  4,454 M). Q3.
+- **`type(v)` of a string** aborts `bad_type` (strings and ints mixed:
+  1,502 M, 3,705 M). A recorder gap, noted in `TODO.md`.
+
 ## 6. Phase 3 — `math.abs`, `math.min`, `math.max`
 
 Tier-0 semantics (`src/stdlib/math.zig`): `abs` keeps the subtype, and
@@ -458,6 +577,19 @@ measures globals, and this row measures library calls and heap loads.
   optimiser.
 - Measure first: the per-iteration cost after Phase 1 against the hoisted
   local, on the probes in §2.1.
+
+**Q3 — does `guard_sid` join the side-exit guards?** It pins the identity
+of an observed pattern string (doc 30 §2a). Doc 30's review (M02) pinned
+it out of `isSideExitGuardOp`, with a test, on the grounds that its `aux`
+is a konst id and not a PC. That was the test for exit-PC chaining; doc
+56's exits resume from a snapshot and need no PC. Today a pattern that
+alternates between two strings exits at `guard_sid` on every other
+iteration with no way to get a second trace (§5.3: 4,454 M against
+2,415 M on tier 0).
+
+- (a) Leave it: the stance stays as reviewed.
+- (b) Add it, as §5.3 did for `guard_string`: the alternate pattern
+  records as a continuation. Costs a snapshot root at each such guard.
 
 ## 9. References
 

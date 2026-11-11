@@ -144,6 +144,7 @@ pub const GUARD_TABLE_WRITABLE = trace_ir.GUARD_TABLE_WRITABLE;
 pub const IrInstr = trace_ir.IrInstr;
 pub const guardExitPc = trace_ir.guardExitPc;
 pub const isSideExitGuardOp = trace_ir.isSideExitGuardOp;
+pub const isSideExitInstr = trace_ir.isSideExitInstr;
 pub const ChargeKind = trace_ir.ChargeKind;
 pub const guardSourcePc = trace_ir.guardSourcePc;
 
