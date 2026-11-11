@@ -115,7 +115,9 @@ jobs:
 
       # The web UI's toolchain: the pnpm viz/package.json pins
       # (`packageManager`), on the Node it needs (>= 22.13).
-      - uses: pnpm/action-setup@v6
+      # Pinned to the commit v6 peels to: gt resolves the annotated tag to the
+      # tag object's sha and then rejects its own checkout.
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
         with:
           package_json_file: viz/package.json
       - uses: actions/setup-node@v4
@@ -175,7 +177,9 @@ jobs:
           name: mahina-cli
           path: mahina-cli
 
-      - uses: pnpm/action-setup@v6
+      # Pinned to the commit v6 peels to: gt resolves the annotated tag to the
+      # tag object's sha and then rejects its own checkout.
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
         with:
           package_json_file: viz/package.json
       - uses: actions/setup-node@v4
