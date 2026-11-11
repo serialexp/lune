@@ -1067,8 +1067,12 @@ pub const Vm = struct {
     /// `replay` (do NOT call effects — feed back the logged result in call order).
     effect_mode: EffectMode = .off,
     /// The ordered nondeterministic-input log. In `record` it grows; in `replay`
-    /// it is consumed front-to-back via `effect_cursor`. Owned by the VM.
-    effect_log: EffectLog = .{},
+    /// it is consumed front-to-back via `effect_cursor`. The VM's own unless
+    /// `shareEffectLog` handed it another's: a debug session's VMs all use the
+    /// session's (doc 86 §6.1). It holds no heap value, so it outlives any VM.
+    effect_log: *EffectLog,
+    /// Whether `effect_log` is this VM's own, freed with it.
+    effect_log_owned: bool = true,
     /// Replay read position into `effect_log` (next effect to feed back).
     effect_cursor: usize = 0,
     /// Doc 65 §4.5: the cap on the encoded effect log in `record`, in bytes
@@ -1683,9 +1687,13 @@ pub const Vm = struct {
         errdefer gpa.destroy(heap);
         heap.* = gc.Heap.init(gpa);
         heap.thread_ops = &coroutine.thread_ops;
+        const effect_log = try gpa.create(EffectLog);
+        errdefer gpa.destroy(effect_log);
+        effect_log.* = .{};
         var vm = Vm{
             .gpa = gpa,
             .heap = heap,
+            .effect_log = effect_log,
             .globals = undefined,
             .main_stack = main_stack,
             .tags = main_stack.tags,
@@ -1713,6 +1721,20 @@ pub const Vm = struct {
         return vm;
     }
 
+    /// Record into and replay from `log` instead of this VM's own log, which
+    /// is freed (doc 86 §6.1: a debug session's live VM and its scratch VMs
+    /// share the session's log). `log` must outlive the VM, grows with this
+    /// VM's allocator, and is not freed with it. `effect_cursor` is left as
+    /// it is: a restore or the session sets it.
+    pub fn shareEffectLog(self: *Vm, log: *EffectLog) void {
+        if (self.effect_log_owned) {
+            self.effect_log.deinit(self.gpa);
+            self.gpa.destroy(self.effect_log);
+        }
+        self.effect_log = log;
+        self.effect_log_owned = false;
+    }
+
     /// Frees the heap (and every object on it, including globals) and the
     /// register stack. Any `Value` returned by `run` that is a heap reference
     /// dangles after this — inspect results first.
@@ -1727,7 +1749,10 @@ pub const Vm = struct {
         }
         self.trace.deinit();
         self.open_upvalues.deinit(self.gpa);
-        self.effect_log.deinit(self.gpa);
+        if (self.effect_log_owned) {
+            self.effect_log.deinit(self.gpa);
+            self.gpa.destroy(self.effect_log);
+        }
         self.io_scratch.deinit(self.gpa);
         self.safepoint_lines.deinit(self.gpa);
         for (self.loaded_chunks.items) |*lc| {

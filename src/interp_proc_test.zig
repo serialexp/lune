@@ -44,13 +44,13 @@ fn run(gpa: std.mem.Allocator, opts: RunOpts, source: [:0]const u8) !Run {
     try vm.enableSystem(opts.groups);
     if (opts.host) |h| vm.system = h.system();
     if (opts.limit) |l| vm.effect_log_limit = l;
-    if (opts.mode == .replay) try effectser.decodeInto(&vm.effect_log, gpa, opts.log);
+    if (opts.mode == .replay) try effectser.decodeInto(vm.effect_log, gpa, opts.log);
     vm.effect_mode = opts.mode;
     try compileRun(gpa, &vm, source);
     if (opts.mode == .replay) try testing.expectEqual(vm.effect_log.entries.items.len, vm.effect_cursor);
     return .{
         .out = try gpa.dupe(u8, out.buffered()),
-        .log = if (opts.mode == .record) try effectser.encodeFile(gpa, &vm.effect_log) else try gpa.dupe(u8, ""),
+        .log = if (opts.mode == .record) try effectser.encodeFile(gpa, vm.effect_log) else try gpa.dupe(u8, ""),
     };
 }
 

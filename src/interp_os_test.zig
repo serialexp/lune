@@ -56,7 +56,7 @@ fn run(gpa: std.mem.Allocator, opts: RunOpts, source: [:0]const u8) !Run {
     try vm.enableSystem(opts.groups);
     if (opts.host) |h| vm.system = h.system();
     vm.io_errors = opts.io_errors;
-    if (opts.mode == .replay) try effectser.decodeInto(&vm.effect_log, gpa, opts.log);
+    if (opts.mode == .replay) try effectser.decodeInto(vm.effect_log, gpa, opts.log);
     vm.effect_mode = opts.mode;
     var exit: ?i32 = null;
     compileRun(gpa, &vm, source) catch |e| {
@@ -71,7 +71,7 @@ fn run(gpa: std.mem.Allocator, opts: RunOpts, source: [:0]const u8) !Run {
     for (vm.effect_log.entries.items, kinds) |e, *k| k.* = e.kind;
     return .{
         .out = try gpa.dupe(u8, out.buffered()),
-        .log = if (opts.mode == .record) try effectser.encodeFile(gpa, &vm.effect_log) else try gpa.dupe(u8, ""),
+        .log = if (opts.mode == .record) try effectser.encodeFile(gpa, vm.effect_log) else try gpa.dupe(u8, ""),
         .kinds = kinds,
         .exit = exit,
     };

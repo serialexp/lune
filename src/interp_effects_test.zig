@@ -685,7 +685,7 @@ test "doc 86 §6.1: a replay allocates what the recording did, string results in
         try fenv.install(&vm);
         try compileRun(gpa, &vm, source);
         try testing.expectEqualStrings("3\t/home/bart3\ttrue\n", sink.buffered());
-        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        log_bytes = try effectser.encodeFile(gpa, vm.effect_log);
         recorded = try keyframeser.encodeSnapshot(gpa, &vm);
     }
     defer gpa.free(log_bytes);
@@ -697,13 +697,47 @@ test "doc 86 §6.1: a replay allocates what the recording did, string results in
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
     try vm.enableSystem(.{ .env = true });
-    try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
+    try effectser.decodeInto(vm.effect_log, gpa, log_bytes);
     vm.effect_mode = .replay;
     try compileRun(gpa, &vm, source);
     try testing.expectEqualStrings("3\t/home/bart3\ttrue\n", sink.buffered());
     const replayed = try keyframeser.encodeSnapshot(gpa, &vm);
     defer gpa.free(replayed);
     try testing.expectEqualSlices(u8, recorded, replayed);
+}
+
+test "doc 86 §6.1: a shared log outlives the VM that recorded into it, and another replays it" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 = "print(os.getenv(\"HOME\"), os.getenv(\"MISSING\"))";
+    var log: interp.EffectLog = .{};
+    defer log.deinit(gpa);
+    var fenv = FakeEnv{};
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.shareEffectLog(&log);
+        vm.effect_mode = .record;
+        try fenv.install(&vm);
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        try compileRun(gpa, &vm, source);
+        try testing.expectEqualStrings("/home/bart\tnil\n", sink.buffered());
+    }
+    try testing.expectEqual(@as(usize, 2), log.len());
+    for (0..2) |_| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.shareEffectLog(&log);
+        vm.effect_mode = .replay;
+        try vm.enableSystem(.{ .env = true });
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        try compileRun(gpa, &vm, source);
+        try testing.expectEqualStrings("/home/bart\tnil\n", sink.buffered());
+        try testing.expectEqual(@as(usize, 2), vm.effect_cursor);
+    }
 }
 
 test "[REQ-97.4] S-B: getenv of non-UTF-8 host bytes raises a catchable error" {
@@ -1081,7 +1115,7 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         try testing.expectEqual(EffectKind.random_seed, vm.effect_log.entries.items[1].kind);
         try testing.expectEqual(EffectKind.unicode_version, vm.effect_log.entries.items[2].kind);
         try testing.expectEqual(EffectKind.file_read, vm.effect_log.entries.items[3].kind);
-        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        log_bytes = try effectser.encodeFile(gpa, vm.effect_log);
     }
     defer gpa.free(log_bytes);
 
@@ -1095,7 +1129,7 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         var out_buf: [256]u8 = undefined;
         var sink = io.Writer.fixed(&out_buf);
         vm.out = &sink;
-        try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
+        try effectser.decodeInto(vm.effect_log, gpa, log_bytes);
         vm.effect_mode = .replay;
         try compileRun(gpa, &vm, source);
         try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
@@ -1240,7 +1274,7 @@ test "L-3: record→serialize→replay reproduces output with the FS detached" {
         try testing.expectEqual(@as(usize, 2), vm.effect_log.entries.items.len);
         try testing.expectEqual(EffectKind.file_read, vm.effect_log.entries.items[0].kind);
         try testing.expectEqual(EffectKind.file_read, vm.effect_log.entries.items[1].kind);
-        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        log_bytes = try effectser.encodeFile(gpa, vm.effect_log);
     }
     defer gpa.free(log_bytes);
 
@@ -1253,7 +1287,7 @@ test "L-3: record→serialize→replay reproduces output with the FS detached" {
         defer vm.deinit();
         var sink = io.Writer.fixed(&rep_out_buf);
         vm.out = &sink;
-        try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
+        try effectser.decodeInto(vm.effect_log, gpa, log_bytes);
         vm.effect_mode = .replay;
         // No fs_source set on purpose.
         try compileRun(gpa, &vm, driver);
@@ -1403,7 +1437,7 @@ test "[REQ-76.2] doc 65 §4.5: the cap counts what encodeFile writes, and 0 or o
         vm.effect_log_limit = 0;
         try compileRun(gpa, &vm, src);
         try testing.expectEqual(@as(usize, 50), vm.effect_log.len());
-        const bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        const bytes = try effectser.encodeFile(gpa, vm.effect_log);
         defer gpa.free(bytes);
         try testing.expectEqual(bytes.len, vm.effect_log_encoded);
     }
@@ -1485,13 +1519,13 @@ test "[REQ-75.1] doc 65 §4.2: host results — values, failures and bytes — r
         try interp.recordHost(&vm, .file_read_op, .{ .value = try vm.heap.internValue("línea") });
         try interp.recordHost(&vm, .file_write, .{ .value = Value.nil() });
         try testing.expectEqual(@as(u64, 6), vm.committed_effect_seq);
-        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        log_bytes = try effectser.encodeFile(gpa, vm.effect_log);
         try testing.expectEqual(log_bytes.len, vm.effect_log_encoded);
     }
     defer gpa.free(log_bytes);
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
+    try effectser.decodeInto(vm.effect_log, gpa, log_bytes);
     vm.effect_mode = .replay;
     try interp.noteIoErrorMode(&vm);
     try testing.expectEqual(@as(i64, 3), (try interp.replayHost(&vm, .file_open)).value.asInt());

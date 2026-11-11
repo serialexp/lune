@@ -216,7 +216,7 @@ test "doc 68 §9: every cut through dofile, require and sort after committed eff
         _ = try vm.run(chunk.proto);
         ref_len = sink.buffered().len;
         safepoints = vm.safepoint_seq;
-        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        log_bytes = try effectser.encodeFile(gpa, vm.effect_log);
     }
     defer gpa.free(log_bytes);
     const ref_out = ref_buf[0..ref_len];
@@ -230,7 +230,7 @@ test "doc 68 §9: every cut through dofile, require and sort after committed eff
         var buf2: [256]u8 = undefined;
         var sink2 = io.Writer.fixed(&buf2);
         vm2.out = &sink2;
-        try effectser.decodeInto(&vm2.effect_log, gpa, log_bytes);
+        try effectser.decodeInto(vm2.effect_log, gpa, log_bytes);
         vm2.effect_mode = .replay;
         var chunk2 = try mahina_compiler.compile(gpa, vm2.heap, source, tree.root, &diags);
         defer chunk2.deinit();
@@ -255,7 +255,7 @@ test "doc 68 §9: every cut through dofile, require and sort after committed eff
         var buf_r: [256]u8 = undefined;
         var sink_r = io.Writer.fixed(&buf_r);
         vm_r.out = &sink_r;
-        try effectser.decodeInto(&vm_r.effect_log, gpa, log_bytes);
+        try effectser.decodeInto(vm_r.effect_log, gpa, log_bytes);
         vm_r.effect_mode = .replay;
         vm_r.effect_cursor = vm2.effect_cursor;
         vm_r.rng = vm2.rng;
@@ -334,7 +334,7 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
     };
     return .{
         .keyframe = try encodeSnapshot(gpa, &vm),
-        .effects = try effectser.encodeFile(gpa, &vm.effect_log),
+        .effects = try effectser.encodeFile(gpa, vm.effect_log),
         .output_prefix = try gpa.dupe(u8, sink.buffered()),
         .rng_state = vm.rng.?.s,
         .effect_cursor = vm.effect_cursor,
@@ -457,7 +457,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     const mid = try encodeSnapshot(gpa, &cut_vm);
     defer gpa.free(mid);
     try testing.expectEqualSlices(u8, native.keyframe, mid);
-    const cut_effects = try effectser.encodeFile(gpa, &cut_vm.effect_log);
+    const cut_effects = try effectser.encodeFile(gpa, cut_vm.effect_log);
     defer gpa.free(cut_effects);
 
     const resumed = try restore(gpa, mid, .of(source), NativeRegistry.base());
@@ -466,7 +466,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
         gpa.destroy(resumed);
     }
     try testing.expectEqual(@as(usize, 0), resumed.trace.registry.cache.items.len);
-    try effectser.decodeInto(&resumed.effect_log, gpa, cut_effects);
+    try effectser.decodeInto(resumed.effect_log, gpa, cut_effects);
     resumed.effect_mode = .record;
     resumed.effect_cursor = cut_vm.effect_cursor;
     resumed.committed_effect_seq = cut_vm.committed_effect_seq;

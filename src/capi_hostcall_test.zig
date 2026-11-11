@@ -292,7 +292,7 @@ fn snap(gpa: std.mem.Allocator, box: *capi.VmBox, status: Status, results: []con
     try d.p("\ncall_seq={d} safepoint_seq={d} committed_effects={d} effect_cursor={d}\n", .{ vm.next_call_seq, vm.safepoint_seq, vm.committed_effect_seq, vm.effect_cursor });
     // The replay driver's line index (filled only while it is switched on).
     try d.p("safepoint_lines: {any}\n", .{vm.safepoint_lines.items});
-    try d.blob(&blobs, "effect_log", try mahina.effectser.encodeFile(gpa, &vm.effect_log));
+    try d.blob(&blobs, "effect_log", try mahina.effectser.encodeFile(gpa, vm.effect_log));
     const pol = &vm.trace.region_policy;
     try d.p("region: valid={} depth={d} seq={d}\nregion activations:", .{ pol.region_context_valid, pol.region_context.depth, pol.region_context.call_seq });
     {
@@ -467,7 +467,7 @@ const Pair = struct {
             vm.system = .{ .ctx = &det_ctx, .vtable = &det_vtable };
             vm.effect_mode = mode;
             if (log) |bytes| {
-                try mahina.effectser.decodeInto(&vm.effect_log, vm.gpa, bytes);
+                try mahina.effectser.decodeInto(vm.effect_log, vm.gpa, bytes);
             }
             if (tier == .tier1) vm.trace.config.native_codegen = false;
             if (tier != .off) {
@@ -641,7 +641,7 @@ fn eachTier(comptime body: fn (*Pair) anyerror!void) !void {
             try body(&pair);
             switch (mode) {
                 .off => {},
-                .record => log = try mahina.effectser.encodeFile(testing.allocator, &pair.box[0].vm.effect_log),
+                .record => log = try mahina.effectser.encodeFile(testing.allocator, pair.box[0].vm.effect_log),
                 .replay => for (pair.box) |b| try testing.expectEqual(b.vm.effect_log.entries.items.len, b.vm.effect_cursor),
             }
         }
@@ -1461,7 +1461,7 @@ test "hostcall diff: a replay that runs out of log fails identically" {
         const first = rec.box[0].vm.effect_log.entries.items.len;
         try rec.callGlobal("eff", &.{.{ .int = 2 }});
         try testing.expect(rec.box[0].vm.effect_log.entries.items.len > first);
-        const log = try mahina.effectser.encodePrefix(testing.allocator, &rec.box[0].vm.effect_log, first);
+        const log = try mahina.effectser.encodePrefix(testing.allocator, rec.box[0].vm.effect_log, first);
         defer testing.allocator.free(log);
 
         var rp: Pair = undefined;

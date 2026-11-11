@@ -281,7 +281,7 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         // before the hit on `./greeter.lua`. The misses are part of the recording
         // and must replay identically, which is what this test then proves.
         try testing.expectEqual(@as(usize, 3), vm.effect_log.entries.items.len);
-        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        log_bytes = try effectser.encodeFile(gpa, vm.effect_log);
     }
     defer gpa.free(log_bytes);
 
@@ -291,7 +291,7 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         defer vm.deinit();
         var sink = io.Writer.fixed(&rep_out_buf);
         vm.out = &sink;
-        try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
+        try effectser.decodeInto(vm.effect_log, gpa, log_bytes);
         vm.effect_mode = .replay; // NO host system — content must come from the log
         try compileRun(gpa, &vm, driver);
         try testing.expectEqualStrings("hi mahina\n", sink.buffered());

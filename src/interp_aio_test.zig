@@ -168,7 +168,7 @@ fn run(gpa: std.mem.Allocator, opts: RunOpts, source: [:0]const u8) !Run {
     try vm.enableSystem(opts.groups);
     if (opts.install) try vm.enableAio(if (opts.aio) |a| a.host() else null);
     vm.io_errors = opts.io_errors;
-    if (opts.mode == .replay) try effectser.decodeInto(&vm.effect_log, gpa, opts.log);
+    if (opts.mode == .replay) try effectser.decodeInto(vm.effect_log, gpa, opts.log);
     vm.effect_mode = opts.mode;
     try util.compileRun(gpa, &vm, source);
     if (opts.mode == .replay) try testing.expectEqual(vm.effect_log.entries.items.len, vm.effect_cursor);
@@ -178,7 +178,7 @@ fn run(gpa: std.mem.Allocator, opts: RunOpts, source: [:0]const u8) !Run {
     for (vm.effect_log.entries.items, kinds) |e, *k| k.* = e.kind;
     return .{
         .out = try gpa.dupe(u8, out.buffered()),
-        .log = if (opts.mode == .record) try effectser.encodeFile(gpa, &vm.effect_log) else try gpa.dupe(u8, ""),
+        .log = if (opts.mode == .record) try effectser.encodeFile(gpa, vm.effect_log) else try gpa.dupe(u8, ""),
         .kinds = kinds,
     };
 }
@@ -374,7 +374,7 @@ fn kfVm(gpa: std.mem.Allocator, sink: *io.Writer, host: ?AsyncHost, log: ?[]cons
     try vm.enableSystem(.{ .files = true, .clock = true });
     try vm.enableAio(host);
     if (log) |l| {
-        try effectser.decodeInto(&vm.effect_log, gpa, l);
+        try effectser.decodeInto(vm.effect_log, gpa, l);
         vm.effect_mode = .replay;
     } else vm.effect_mode = .record;
     return vm;
@@ -397,7 +397,7 @@ fn kfRecord(gpa: std.mem.Allocator, tree: *const @import("ast.zig").Ast) !KfRef 
     _ = try vm.run(chunk.proto);
     const out = try gpa.dupe(u8, sink.buffered());
     errdefer gpa.free(out);
-    return .{ .out = out, .log = try effectser.encodeFile(gpa, &vm.effect_log), .safepoints = vm.safepoint_seq };
+    return .{ .out = out, .log = try effectser.encodeFile(gpa, vm.effect_log), .safepoints = vm.safepoint_seq };
 }
 
 test "aio: a replay restored at any cut settles the operations in flight from the log" {
@@ -441,7 +441,7 @@ test "aio: a replay restored at any cut settles the operations in flight from th
         var buf_r: [512]u8 = undefined;
         var sink_r = io.Writer.fixed(&buf_r);
         vm_r.out = &sink_r;
-        try effectser.decodeInto(&vm_r.effect_log, gpa, ref.log);
+        try effectser.decodeInto(vm_r.effect_log, gpa, ref.log);
         vm_r.effect_cursor = vm.effect_cursor;
         vm_r.effect_mode = .replay;
         try testing.expect((try vm_r.exec()) == .finished);

@@ -58,7 +58,7 @@ fn run(gpa: std.mem.Allocator, opts: RunOpts, source: [:0]const u8) !Run {
     try vm.enableSystem(.{ .files = true, .stdio = true });
     if (opts.host) |h| vm.system = h.system();
     vm.io_errors = opts.io_errors;
-    if (opts.mode == .replay) try effectser.decodeInto(&vm.effect_log, gpa, opts.log);
+    if (opts.mode == .replay) try effectser.decodeInto(vm.effect_log, gpa, opts.log);
     vm.effect_mode = opts.mode;
     try compileRun(gpa, &vm, source);
     if (opts.mode == .replay) try testing.expectEqual(vm.effect_log.entries.items.len, vm.effect_cursor);
@@ -68,7 +68,7 @@ fn run(gpa: std.mem.Allocator, opts: RunOpts, source: [:0]const u8) !Run {
     return .{
         .out = try gpa.dupe(u8, out.buffered()),
         .err = try gpa.dupe(u8, err.buffered()),
-        .log = if (opts.mode == .record) try effectser.encodeFile(gpa, &vm.effect_log) else try gpa.dupe(u8, ""),
+        .log = if (opts.mode == .record) try effectser.encodeFile(gpa, vm.effect_log) else try gpa.dupe(u8, ""),
         .kinds = kinds,
     };
 }

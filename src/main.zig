@@ -912,7 +912,7 @@ fn emitKeyframe(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: 
 /// Serialize the recorded nondeterministic-input effect log to `path` (binschema
 /// wire format). Mirrors `emitKeyframe`; the VM must have run in `record` mode.
 fn emitEffects(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: *mahina.interp.Vm) !void {
-    const bytes = try mahina.effectser.encodeFile(gpa, &vm.effect_log);
+    const bytes = try mahina.effectser.encodeFile(gpa, vm.effect_log);
     defer gpa.free(bytes);
     try mahina.io.writeFile(io, path, bytes);
     mahina.io.eprint("mahina: wrote effect log, {d} effect(s), {d} bytes → {s}\n", .{ vm.effect_log.len(), bytes.len, path });
