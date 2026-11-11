@@ -302,3 +302,172 @@ test "doc 77 §4.2: setmetatable is not a recorded builtin, so no trace sets a m
     }
     try testing.expect(found);
 }
+
+// ---- Phase 3: `__index` and `__newindex` tables (doc 77 §6.2) ----
+
+test "doc 77 §6.2: method and field lookups through a two-level class chain record and run" {
+    try expectProgramTuned(
+        \\local Base = {}
+        \\Base.__index = Base
+        \\function Base.get(self) return self.v end
+        \\Base.scale = 3
+        \\local Mid = setmetatable({}, Base)
+        \\Mid.__index = Mid
+        \\local o = setmetatable({ v = 2 }, Mid)
+        \\local arr = setmetatable({}, { __index = { 10, 20, 30 } })
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  s = s + o:get() * o.scale + arr[2]
+        \\end
+        \\print(s)
+    , "7800\n", .{ .inspect = expectMetaMissTraceRan });
+}
+
+test "doc 77 §6.2: replacing, removing and shadowing the __index table between entries" {
+    try expectProgramTuned(
+        \\local A = { k = 1 }
+        \\local B = { k = 2 }
+        \\local mt = { __index = A }
+        \\local o = setmetatable({}, mt)
+        \\local function run()
+        \\  local s = 0
+        \\  for i = 1, 100 do
+        \\    local v = o.k
+        \\    if v == nil then s = s + 100 else s = s + v end
+        \\  end
+        \\  return s
+        \\end
+        \\local r1 = run()
+        \\mt.__index = B
+        \\local r2 = run()
+        \\A.k = 5
+        \\mt.__index = A
+        \\local r3 = run()
+        \\o.k = 7
+        \\local r4 = run()
+        \\o.k = nil
+        \\mt.__index = nil
+        \\local r5 = run()
+        \\mt.__index = function() return 9 end
+        \\local r6 = run()
+        \\print(r1, r2, r3, r4, r5, r6)
+    , "100\t200\t500\t700\t10000\t900\n", .{ .inspect = expectMetaMissTraceRan });
+}
+
+test "doc 77 §6.2: a store into the __index table inside the loop is seen by the next lookup" {
+    // The `Base.n` store sinks below the read of `Base.n` through the
+    // chain; the hop's read goes through the pending-store forwarding.
+    try expectProgramTuned(
+        \\local Base = { n = 0 }
+        \\Base.__index = Base
+        \\local o = setmetatable({}, Base)
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  Base.n = Base.n + 1
+        \\  s = s + o.n
+        \\end
+        \\print(s, Base.n, rawget(o, "n"))
+    , "20100\t200\tnil\n", .{ .inspect = expectMetaMissTraceRan });
+}
+
+test "doc 77 §6.2: a function __index at the end of a table chain stops the recording, tier 0 calls it" {
+    try expectProgram(
+        \\local calls = 0
+        \\local Top = setmetatable({}, { __index = function(_, k) calls = calls + 1; return 4 end })
+        \\local o = setmetatable({}, { __index = Top })
+        \\local s = 0
+        \\for i = 1, 100 do s = s + o.z end
+        \\print(s, calls)
+    , "400\t100\n");
+}
+
+/// A chain of `n` tables, each the `__index` of the one before, the last
+/// holding `k = 1`; the loop reads `k` through all of them.
+fn chainProgram(comptime n: usize) [:0]const u8 {
+    return std.fmt.comptimePrint(
+        \\local last = {{ k = 1 }}
+        \\local cur = last
+        \\for i = 1, {d} do cur = setmetatable({{}}, {{ __index = cur }}) end
+        \\local s = 0
+        \\for i = 1, 50 do s = s + cur.k end
+        \\print(s)
+    , .{n});
+}
+
+fn expectNoIndexChainAbort(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    for (vm.trace.abort_log.items) |r| try testing.expect(r.reason != .index_chain);
+    try testing.expect(countOps(vm, .load_meta) >= MAX_INDEX_CHAIN);
+}
+
+fn expectIndexChainAbort(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    var seen = false;
+    for (vm.trace.abort_log.items) |r| {
+        if (r.reason == .index_chain) seen = true;
+    }
+    try testing.expect(seen);
+}
+
+const MAX_INDEX_CHAIN = @import("trace_recorder.zig").RecordingSession.MAX_INDEX_CHAIN;
+
+test "doc 77 Q2: a chain of MAX_INDEX_CHAIN hops records; one more aborts index_chain" {
+    try expectProgramTuned(chainProgram(MAX_INDEX_CHAIN), "50\n", .{ .record_aborts = true, .inspect = expectNoIndexChainAbort });
+    try expectProgramTuned(chainProgram(MAX_INDEX_CHAIN + 1), "50\n", .{ .record_aborts = true, .inspect = expectIndexChainAbort });
+}
+
+test "doc 77 §6.2: an absent key stores through a __newindex table, a present one overwrites in place" {
+    try expectProgramTuned(
+        \\local sink = { x = 0, [1] = 0 }
+        \\local w = setmetatable({ y = 0 }, { __newindex = sink })
+        \\for i = 1, 200 do
+        \\  w.x = i
+        \\  w[1] = i * 2
+        \\  w.y = i
+        \\end
+        \\print(sink.x, sink[1], rawget(w, "x"), rawget(w, 1), w.y, sink.y)
+    , "200\t400\tnil\tnil\t200\tnil\n", .{ .inspect = expectMetaMissTraceRan });
+}
+
+test "doc 77 §6.2: a __newindex chain into a table without the key inserts on tier 0" {
+    try expectProgram(
+        \\local sink = {}
+        \\local w = setmetatable({}, { __newindex = sink })
+        \\local n = 0
+        \\for i = 1, 100 do
+        \\  w["k" .. (i % 3)] = i
+        \\  n = n + 1
+        \\end
+        \\print(n, sink.k0, sink.k1, sink.k2, rawget(w, "k0"))
+    , "100\t99\t100\t98\tnil\n");
+}
+
+test "doc 77 §6.2: a frozen receiver still stores through its __newindex table; a frozen target refuses" {
+    try expectProgram(
+        \\local sink = { x = 0 }
+        \\local w = table.freeze(setmetatable({}, { __newindex = sink }))
+        \\for i = 1, 100 do w.x = i end
+        \\table.freeze(sink)
+        \\local ok = pcall(function()
+        \\  for i = 1, 100 do w.x = i end
+        \\end)
+        \\print(sink.x, ok)
+    , "100\tfalse\n");
+}
+
+test "doc 77 §6.2: an __index chain into a grid reads it on tier 0 without recording the hop" {
+    try expectProgram(
+        \\local g = {}
+        \\for i = 1, 4 do
+        \\  g[i] = {}
+        \\  for j = 1, 4 do g[i][j] = i * j end
+        \\end
+        \\local s = 0
+        \\for r = 1, 10 do
+        \\  for i = 1, 4 do s = s + g[i][2] end
+        \\end
+        \\local o = setmetatable({}, { __index = g })
+        \\for i = 1, 100 do s = s + o[2][3] end
+        \\print(s)
+    , "800\n");
+}

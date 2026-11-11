@@ -1,7 +1,8 @@
 # 77 — Recording metamethods — Design
 
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
-decided; Phases 0 and 1 landed (2026-11-11); Phases 2–7 outstanding
+decided; Phases 0, 1 and 3 landed (2026-11-11); Phases 2 and 4–7
+outstanding
 (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-11
@@ -74,6 +75,30 @@ land; move whole phases to Done once everything inside them is checked.
     appearing later. §4.2 is pinned by a test that `setmetatable` has no
     `recorded` arm.
 
+- [x] **Phase 3 — `__index` and `__newindex` tables** (§6.2, 2026-11-11).
+  Done ahead of Phase 2, because Phase 2 hoists the chains this phase
+  records.
+  - [x] a miss on a receiver whose `__index` is a table: `guard_absent` on
+    the receiver, then a hop (`metaTableHop`: `load_meta`, then
+    `forwardHashLoadRef` on the `__index` field, then `href`/`guard_hash`/
+    `hload`), then the same get shape re-run on the next table
+    (`GetFrame.tab_in`). The destination is written only by the last hop.
+  - [x] a store to an absent key (hash or array slot) whose `__newindex`
+    is a table: `guard_table ANY_META` and `guard_absent` on the receiver,
+    the hop, then the set shape on the target (`SetFrame.tab_in`), which
+    runs its own frozen and metatable checks, as `newindexResolve` does.
+  - [x] the chain bound (Q2): `MAX_INDEX_CHAIN = 100` hops; one more aborts
+    with the new `index_chain` reason. Tests pin 100 hops recording and 101
+    aborting.
+  - [x] a function at the end of a chain still aborts `has_metatable`
+    (Phase 4). So does a hop into a grid (decision note in §10.5).
+  - [x] gates in `src/interp_meta_trace_test.zig`, all ten legs: two-level
+    class chains; replacing, removing and shadowing the `__index` table
+    between entries; stores into the `__index` table inside the loop;
+    `__newindex` present and absent; inserts through `__newindex` on tier
+    0; frozen receiver and frozen target; `__index` into a grid; the chain
+    boundary.
+
 ### Outstanding
 
 - [ ] **Phase 0 numbers on the board** (the pinned pool): needs a push, then
@@ -82,8 +107,6 @@ land; move whole phases to Done once everything inside them is checked.
   metatable pointer as an invariant field only `setmetatable` writes, and
   the lookup chain of an invariant receiver evaluated once per entry;
   measured in emitted probes per iteration.
-- [ ] **Phase 3 — `__index` and `__newindex` tables** (§6.2): chains of
-  table hops, bounded deterministically.
 - [ ] **Phase 4 — function metamethods as inlined calls** (§6). Starts
   after doc 68 P2 (Q1).
   - [ ] doc 68 P2 landed: tier 0 runs metamethods as continuation frames,
@@ -617,6 +640,41 @@ others wait on later phases.
 - **Absent reads go through `forwardPendingHashLoad` before `guard_absent`
   on the metatable**, as §5.2 asks, so a sunk store of `__index` into the
   metatable earlier in the iteration is forwarded or aborts, never missed.
+
+### 10.4 After Phase 3 (2026-11-11)
+
+Same method (load ~3.8).
+
+| program | t0 ms | jit ms | LuaJIT ms | res% | remaining aborts |
+|---|---|---|---|---|---|
+| meta_fields | 378.6 | 90.0 | 14.6 | 65.0 | unchanged (no metatable involved) |
+| ray | 452.9 | 1214.4 | 32.7 | 26.5 | `cross_frame` on `get_upval` in `intersect`, `ray_trace` and `main`: a method loaded through a chain has no slot to seed its upvalues from (§6.6, Phase 4) |
+| meta_ops | 402.5 | 406.3 | 7.0 | 0.0 | unchanged (Phase 4) |
+| meta_proxy | 290.5 | 292.9 | 13.3 | 0.0 | unchanged (Phase 4) |
+| meta_close_reused | 406.7 | 416.3 | n/a | 0.0 | unchanged (Phase 5) |
+| meta_calls (doc 68) | 45.3 | 44.6 | 0.9 | 0.0 | unchanged (Phase 4) |
+
+`ray`'s `has_metatable` aborts are gone; its method lookups record and the
+traces now stop one step later, at the method's upvalues. No Phase 0
+program other than `ray` reads through a chain, so the rows did not move. A
+chain read costs every hop on every iteration (a two-hop probe loop runs at
+about 790 cycles an iteration natively); Phase 2 hoists it.
+
+### 10.5 Phase 3 decision notes (2026-11-11)
+
+- **A hop into a grid aborts.** Tier 0 deflates a grid it indexes through
+  as a metatable target, a mutation the trace cannot replay, so the hop
+  aborts `has_metatable` instead of guarding a shape that changes on the
+  first tier-0 run.
+- **The receiver's frozenness is not checked on a `__newindex` hop.**
+  `newindexResolve` checks only the table the raw store finally lands in;
+  the trace does the same (the target's set shape checks it), and a test
+  pins a frozen receiver with a writable target storing.
+- **A chain longer than the bound has its own abort reason**, `index_chain`,
+  so `--dump-aborts` separates it from an unmodelled metamethod.
+- **The shapes share an explicit error set** (`RecordError`), because a hop
+  re-enters `getShape`/`setShape` and Zig cannot infer a recursive error
+  set.
 
 ## 11. Open questions for review
 
