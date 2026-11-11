@@ -3586,7 +3586,8 @@ pub const RecordingSession = struct {
         const cell = tbl.fieldPtr(vkey) orelse return self.recordAbsentGet(regs, f);
         // Field-type restriction (the hash analogue of the narrow-array-lane rule).
         // A present cell holds a non-`nil` tagged `Value` of any type. We trace
-        // **int/float/bool/function** fields. The historic objection to bool —
+        // **int/float/bool/function/table/string/native** fields. The historic
+        // objection to bool —
         // "there is no strict bool guard; `guard_true` waves a truthy heap value
         // through" — is answered LuaJIT-style (doc 43 P1): the **load's own tag
         // check** is the strict guard. `hload ty=.boolean` tag-checks the cell in
@@ -3614,11 +3615,22 @@ pub const RecordingSession = struct {
         // the `resolveHashCell` callout (no entry seed — `seedHashCell` already
         // declines a non-slot_load root). Metatable-free is checked at record
         // time here AND at run time by guard_table, like the element precedent.
-        // String/native-builtin fields still abort.
+        // A STRING field (doc 85 — `obj.name`) records as `hload ty=.heap` + an
+        // immediate `guard_string`, the type pin; a string consumer's own
+        // `guard_string` (`stringArgRef`) dedups against it.
+        // A NATIVE field (doc 85 — `math.floor`, any library function called
+        // by its qualified name) records as `hload ty=.heap` and NO guard at
+        // the load: whoever relies on what the native is pins it there, as
+        // for a slot-loaded native (`guardBuiltinCallee`'s `guard_builtin`,
+        // `recHostCall`'s `guard_native`, or nothing when the trace ends at
+        // the call and tier-0 makes it). No op says only "a native".
+        // Userdata and the other heap types still abort.
         const fv = cell.*;
         const is_fn_field = fv.isHeap() and fv.heapType() == .function;
         const is_tbl_field = fv.isHeap() and fv.heapType() == .table;
-        if (!(fv.isInt() or fv.isFloat() or fv.isBool() or is_fn_field or is_tbl_field)) return self.abort(.nyi_opcode);
+        const is_str_field = fv.isHeap() and fv.heapType() == .string;
+        const is_native_field = fv.isHeap() and fv.heapType() == .native;
+        if (!(fv.isInt() or fv.isFloat() or fv.isBool() or is_fn_field or is_tbl_field or is_str_field or is_native_field)) return self.abort(.nyi_opcode);
         // Loading a table field consults none of its metatable (the element
         // precedent in `arrayGetShape`).
         const field_aux: i32 = if (is_tbl_field) metaAux(table_mod.Table.fromHeader(fv.asHeap())) else 0;
@@ -3676,6 +3688,10 @@ pub const RecordingSession = struct {
             // P3: pin "table, metatable-free" at run time — the mirror of the
             // `.value`-lane element pin. Downstream accesses chain off `rload`.
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload, .aux = field_aux }), .field_type, .loaded, .neutral);
+        } else if (is_str_field) {
+            self.stampProv(try self.emit(.{ .op = .guard_string, .a = rload }), .field_type, .loaded, .neutral);
+        } else if (is_native_field) {
+            // Pinned by its consumer (above).
         } else if (!fv.isBool()) {
             try self.guardNum(rload, fv, .field_type, .loaded);
         }

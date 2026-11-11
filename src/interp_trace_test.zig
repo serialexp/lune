@@ -4040,6 +4040,224 @@ test "hash field P3 end-to-end: cross-root aliasing — dynamic-root store visib
     , "10200\t50\t50\n");
 }
 
+/// Doc 85 harness: ten-leg parity, PLUS a native leg asserting the loop ran
+/// as machine code. A trace the native prover refuses falls to tier-1a and a
+/// recording that aborts falls to tier-0, and the output stays right either
+/// way, so parity alone cannot see a lost native body.
+fn expectNativeProgram(source: [:0]const u8, expected: []const u8) !void {
+    try expectProgram(source, expected);
+    if (comptime !@import("nativegen.zig").is_x64_linux) return;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try util.runNativeForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(expected, sink.buffered());
+    try testing.expect(vm.trace.native_entries > 0);
+}
+
+test "recorder (hash field, doc 85): a native field records hload ty=.heap, pinned only by its call's guard_builtin" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local s = 0
+        \\for i = 1, 50 do s = s + math.floor(i / 2) end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    // `math` is a seeded global (a slot_load); `floor` is a field of it, so
+    // the callee is the trace's one heap-typed hload. Nothing pins it at the
+    // load: the call's `guard_builtin[floor]` is its only guard.
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var callee: ?usize = null;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op == .hload and ins.ty == .heap) {
+            try testing.expect(callee == null);
+            callee = i;
+        }
+    }
+    const ref: trace.Ref = @intCast(callee.?);
+    var n_builtin: usize = 0;
+    for (t.code.instrs) |ins| switch (ins.op) {
+        .guard_builtin => if (ins.a == ref) {
+            try testing.expectEqual(@as(i32, @intFromEnum(function.RecordedBuiltin.floor)), ins.aux);
+            n_builtin += 1;
+        },
+        .guard_func, .guard_table, .guard_string => try testing.expect(ins.a != ref),
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), n_builtin);
+}
+
+test "recorder (hash field, doc 85): a string field records hload ty=.heap + guard_string on the load" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local obj = { name = "héllo" }
+        \\local s = 0
+        \\for i = 1, 50 do s = s + #obj.name end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var load: ?usize = null;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op == .hload and ins.ty == .heap) {
+            try testing.expect(load == null);
+            load = i;
+        }
+    }
+    const ref: trace.Ref = @intCast(load.?);
+    // The pin sits right behind the load, before any consumer.
+    try testing.expectEqual(trace.IrOp.guard_string, t.code.instrs[load.? + 1].op);
+    try testing.expectEqual(ref, t.code.instrs[load.? + 1].a);
+    var saw_slen = false;
+    for (t.code.instrs) |ins| {
+        if (ins.op == .slen and ins.a == ref) saw_slen = true;
+    }
+    try testing.expect(saw_slen);
+}
+
+test "hash field doc 85 end-to-end: math.floor by its qualified name runs native; all ten legs" {
+    try expectNativeProgram(
+        \\local s = 0
+        \\for i = 1, 200 do s = s + math.floor(i / 2) end
+        \\print(s)
+    , "10000\n");
+}
+
+test "hash field doc 85 end-to-end: a string field's length and a number field; all ten legs" {
+    try expectNativeProgram(
+        \\local obj = { name = "héllo", n = 3 }
+        \\local s = 0
+        \\for i = 1, 200 do s = s + #obj.name + obj.n end
+        \\print(s)
+    , "1600\n");
+}
+
+test "hash field doc 85 end-to-end: string.* by qualified name, a producer feeding the next call; all ten legs" {
+    try expectNativeProgram(
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  local w = string.sub("abcdefgh", 2, i % 5 + 2)
+        \\  s = s + #w + string.len(string.upper(w))
+        \\end
+        \\print(s)
+    , "1200\n");
+}
+
+test "hash field doc 85 end-to-end: a string and a native out of one record; all ten legs" {
+    try expectNativeProgram(
+        \\local rec = { tag = "ab", f = math.floor }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  local t = rec.tag
+        \\  s = s + #string.rep(t, i % 3 + 1) + rec.f(i / 3)
+        \\end
+        \\print(s)
+    , "7435\n");
+}
+
+test "hash field doc 85 end-to-end: type() of a loaded native pins it with guard_builtin; all ten legs" {
+    try expectNativeProgram(
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  local f = math.floor
+        \\  if type(f) == "function" then s = s + 1 end
+        \\  if math.type(i) == "integer" then s = s + 1 end
+        \\end
+        \\print(s)
+    , "400\n");
+}
+
+test "hash field doc 85 end-to-end: qualified calls and a string field inside inlined callees; all ten legs" {
+    try expectNativeProgram(
+        \\local function half(x) return math.floor(x / 2) end
+        \\local function label(r) return r.name end
+        \\local recs = { { name = "a" }, { name = "bcd" } }
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  s = s + half(i) + #label(recs[i % 2 + 1])
+        \\end
+        \\print(s)
+    , "40800\n");
+}
+
+test "hash field doc 85 end-to-end: a loaded string carried in a local across iterations runs native" {
+    // `cur` is a carried slot whose writeback is the loaded field: the
+    // carried-string rule takes a `guard_string`-covered load as its proof.
+    try expectNativeProgram(
+        \\local obj = { name = "héllo" }
+        \\local cur = "x"
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  s = s + #cur
+        \\  cur = obj.name
+        \\  if i == 120 then obj.name = "ab" end
+        \\end
+        \\print(s)
+    , "759\n");
+}
+
+test "hash field doc 85 end-to-end: math.floor replaced by another builtin mid-loop side-exits exactly" {
+    try expectProgram(
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if i == 100 then math.floor = math.ceil end
+        \\  s = s + math.floor(i / 2)
+        \\end
+        \\print(s)
+    , "10050\n");
+}
+
+test "hash field doc 85 end-to-end: math.floor replaced by a closure mid-loop side-exits exactly" {
+    try expectProgram(
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if i == 100 then math.floor = function(x) return 1000 end end
+        \\  s = s + math.floor(i / 2)
+        \\end
+        \\print(s)
+    , "103450\n");
+}
+
+test "hash field doc 85 end-to-end: a string field turning into a table and back side-exits exactly" {
+    // `#` of the table is its border, so the wrong type would still print a
+    // number: only the dynamic guard_string keeps the legs equal.
+    try expectProgram(
+        \\local obj = { name = "héllo" }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if i == 100 then obj.name = { 1, 2 } end
+        \\  if i == 150 then obj.name = "xyz" end
+        \\  s = s + #obj.name
+        \\end
+        \\print(s)
+    , "748\n");
+}
+
+test "hash field doc 85 end-to-end: a loaded native carried in a local stays exact" {
+    // Entry is a slot-loaded native, the writeback a loaded one: no native
+    // body (the carried-slot rule has no row for it), every leg agrees.
+    try expectProgram(
+        \\local f = math.ceil
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  s = s + f(i / 2)
+        \\  f = math.floor
+        \\end
+        \\print(s)
+    , "10001\n");
+}
+
 test "recorder (assert, P4): statement-form assert records guard_builtin + guard_true, copies nothing" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
@@ -4328,15 +4546,16 @@ test "recorder (hash field): a present field on a metatable-bearing table record
     try testing.expect(hash_guard);
 }
 
-test "recorder (hash field): a heap-valued (string) field aborts (no string-field pin yet)" {
+test "recorder (hash field): a field holding a coroutine aborts (no pin for that heap type)" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    // The field value is a string (heap). int/float/bool fields trace (doc 43
-    // P1), function fields pin via guard_func (P2), table fields via
-    // guard_table (P3) — STRING fields have no pin yet and abort to tier-0.
+    // int/float/bool fields trace (doc 43 P1), function fields pin via
+    // guard_func (P2), table fields via guard_table (P3), string fields via
+    // guard_string and native fields at their consumer (doc 85). A coroutine
+    // (like userdata) has no pin and aborts to tier-0.
     var chunk = try runForTrace(&vm, gpa,
-        \\local t = {x = "hi"}
+        \\local t = {x = coroutine.create(function() end)}
         \\local n = 0
         \\for i = 1, 50 do if t.x then n = n + 1 end end
         \\print(n)
@@ -4346,6 +4565,22 @@ test "recorder (hash field): a heap-valued (string) field aborts (no string-fiel
     try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
     try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
+}
+
+test "hash field doc 85: a string or native field under a truth test, then replaced by false; all ten legs" {
+    // Any heap value is truthy, so the truth test needs no pin of its own:
+    // the load's "some heap value" exit is what catches the `false`.
+    try expectProgram(
+        \\local t = { x = "hi", f = math.floor }
+        \\local n = 0
+        \\for i = 1, 200 do
+        \\  if t.x then n = n + 1 end
+        \\  if t.f then n = n + 2 end
+        \\  if i == 120 then t.x = false end
+        \\  if i == 160 then t.f = false end
+        \\end
+        \\print(n)
+    , "440\n");
 }
 
 test "recorder (hash field): a computed (non-konst) key aborts (const-key rule)" {

@@ -1223,16 +1223,41 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             // recheck happens at entry in `seedTraceInputs` (a failed cell resolve
             // routes the entry to tier-1a, never native) and per-iteration in the
             // `hload` tag-check, so in the native body it emits nothing.
-            // guard_builtin joins the hoisted no-ops: the native-identity check is in the
-            // prologue (loop-invariant callee snapshot), so nothing here.
             // guard_grid/guard_stride (doc 14): the grid structural guards, hoisted to
             // the prologue grid-elem/stride checks (invariant within a native run) —
             // nothing here, exactly like guard_table/guard_lane.
-            // guard_string (doc 24 c3) joins the hoisted/redundant no-ops: on a
-            // slot_load it is the prologue `header.type == string` pin; on a
-            // proven-string producer it is statically discharged — both emit
-            // nothing here.
-            .slot_load, .guard_int, .guard_float, .guard_builtin, .guard_grid, .guard_stride, .guard_string => {},
+            .slot_load, .guard_int, .guard_float, .guard_grid, .guard_stride => {},
+            // guard_builtin: a hoisted no-op for the invariant `.native` callee
+            // snapshot (the prologue's native-identity check). For a
+            // `.heap`-kinded operand — doc 85's native read out of a table,
+            // `math.floor` — the same three compares run here, every
+            // iteration: header.type == native, `recorded` non-null (flag
+            // byte == 1), payload ordinal == the recorded tag. Byte-identical
+            // to irinterp's `guard_builtin` arm.
+            .guard_builtin => {
+                if (kinds[ins.a] == .heap) {
+                    const nreg = try refBaseReg(a, alloc, ins.a, .rax);
+                    try a.cmpByteMemImm(nreg, HEADER_TYPE_OFF, NATIVE_TYPE);
+                    try jccNativeExit(a, exit_labels, i, .ne); // not a native → side-exit
+                    try a.cmpByteMemImm(nreg, NATIVE_RECORDED_OFF + 1, 1);
+                    try jccNativeExit(a, exit_labels, i, .ne); // no recorder arm → side-exit
+                    try a.cmpByteMemImm(nreg, NATIVE_RECORDED_OFF, @intCast(ins.aux));
+                    try jccNativeExit(a, exit_labels, i, .ne); // another builtin → side-exit
+                }
+                // else: `.native` → prologue-hoisted, no-op
+            },
+            // guard_string (doc 24 c3): a no-op on a slot_load (the prologue's
+            // `header.type == string` pin) and on a proven-string producer
+            // (statically discharged). On a heap value read out of a table
+            // (doc 85) the load proved only TAG_HEAP, so the type is checked
+            // here, every iteration.
+            .guard_string => {
+                if (prove.isLoadedHeapRef(t, kinds, ins.a)) {
+                    const sreg = try refBaseReg(a, alloc, ins.a, .rax);
+                    try a.cmpByteMemImm(sreg, HEADER_TYPE_OFF, STRING_TYPE);
+                    try jccNativeExit(a, exit_labels, i, .ne); // not a string → side-exit
+                }
+            },
             // guard_lane: hoisted no-op for an invariant `.ptr` root (the prologue
             // compares the lane byte once). For a per-iteration root — doc 43
             // P3's hload'd table field, or a carried-heap slot (doc 63

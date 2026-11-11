@@ -798,7 +798,10 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 //     or another pinned slot_load (a loop that only moves its
                 //     strings around, doc 63 §5.10.7). That load is a string at
                 //     entry by its own pin and, carried, by this same rule, so
-                //     string-ness holds by induction over the iterations.
+                //     string-ness holds by induction over the iterations. Or
+                //     (doc 85) a heap value read out of a table under its own
+                //     `guard_string`, which the body checks before the back
+                //     edge on every iteration (`cur = obj.name`).
                 // The home is a GP register/spill holding the current `*GcHeader`,
                 // refreshed by the back-edge φ shuffle; every flush uses TAG_HEAP
                 // (heap boxing is type-agnostic — the type lives in the header).
@@ -811,7 +814,8 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 const sref: u16 = @intCast(s.store_ref);
                 if (!stringPinned(t, lref)) return error.Bail;
                 const sop = t.instrs[sref].op;
-                if (!isStringProducerOp(sop) and !(sop == .slot_load and stringPinned(t, sref))) return error.Bail;
+                const pinned_src = sop == .slot_load or prove.isLoadedHeapRef(t, kinds, sref);
+                if (!isStringProducerOp(sop) and !(pinned_src and stringPinned(t, sref))) return error.Bail;
                 s.kind = .heap;
                 s.is_string = true;
             } else if (lk == .boxed and sk == .boxed) {
@@ -2308,7 +2312,10 @@ const HomeReads = struct {
                 self.has_append = true;
                 self.hot.set(r);
             },
-            .guard_int, .guard_float, .guard_builtin, .guard_grid, .guard_stride, .guard_string, .guard_is_nil, .guard_bool => {},
+            .guard_int, .guard_float, .guard_grid, .guard_stride, .guard_is_nil, .guard_bool => {},
+            // Doc 85: the body forms read the loaded value.
+            .guard_builtin => if (kinds[r] == .heap) self.hot.set(r),
+            .guard_string => if (prove.isLoadedHeapRef(t, kinds, r)) self.hot.set(r),
             .guard_is_false, .guard_is_true => if (!pinHoisted(t, slots, slot_id_of_ref, r)) self.hot.set(r),
             .guard_table, .guard_lane => if (isDynTableRoot(kinds, slots, slot_id_of_ref, r)) self.hot.set(r),
             .guard_func => if (kinds[r] == .heap) self.hot.set(r),
@@ -2774,6 +2781,11 @@ pub fn opMayExitInBody(
         // coalescing could commit a resumable home before the identity check
         // and a failed method guard would deopt a partial iteration.
         .guard_func => kinds[ins.a] == .heap,
+        // Doc 85: a guard_builtin or guard_string on a heap value read out
+        // of a table checks it in the body; the slot_load forms are the
+        // prologue's and a proven-string producer's guard emits nothing.
+        .guard_builtin => kinds[ins.a] == .heap,
+        .guard_string => prove.isLoadedHeapRef(t, kinds, ins.a),
         // Doc 57: a bool pin on a carried slot or an internal φ compares the
         // value per iteration and side-exits; on an invariant slot it is the
         // prologue check and emits nothing. `guard_is_nil` is always the

@@ -311,6 +311,12 @@ on the metatable.
 `hashGetShape` refuses native-valued fields (~3377); a handler that is a
 native (`__index = rawget`) aborts until that is lifted (deferred).
 
+Follow-up, 2026-11-11 (doc 85 Phase 1): `hashGetShape` now admits a
+native field as `hload ty=.heap` with no guard of its own; the consumer
+pins it (`guard_builtin` at a call). A native handler loaded this way
+therefore needs its call site to emit that pin, as every other consumer
+does. Native handlers themselves stay deferred.
+
 ### 5.3 The index paths, and what the shapes can do
 
 Lua consults `__index` only for a key whose raw value is nil, and

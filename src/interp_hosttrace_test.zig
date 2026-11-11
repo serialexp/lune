@@ -299,6 +299,37 @@ test "doc 63 §5.4: the loop-done exit, every call once" {
     , "1830\n", 60, 0);
 }
 
+test "doc 85: a host function read out of a table field is called from the trace" {
+    // The callee is an `hload`, not a seeded slot: `guard_native` checks the
+    // loaded pointer in the body.
+    try expectRoute(
+        \\local lib = { id = hid }
+        \\local function f(n)
+        \\  local s = 0
+        \\  for i = 1, n do s = s + lib.id(i) end
+        \\  return s
+        \\end
+        \\print(f(60))
+        \\
+    , "1830\n", 60, 0);
+}
+
+test "doc 85: a host field replaced mid-loop fails guard_native and tier-0 makes the call" {
+    try expectRoute(
+        \\local lib = { id = hid }
+        \\local function f(n)
+        \\  local s = 0
+        \\  for i = 1, n do
+        \\    if i == 40 then lib.id = hid2 end
+        \\    s = s + lib.id(i)
+        \\  end
+        \\  return s
+        \\end
+        \\print(f(60))
+        \\
+    , "1830\n", 60, 0);
+}
+
 test "doc 63 §5.4: a guard failing before the call leaves the call to tier-0" {
     try expectRoute(
         \\local function f(n)

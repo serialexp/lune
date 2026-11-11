@@ -134,6 +134,20 @@ fn markRead(body_read: []bool, ref: usize, reader: usize) void {
     if (ref != reader and ref < body_read.len) body_read[ref] = true;
 }
 
+/// Doc 85: is `ref` a heap value read out of a table — an `hload`, or a
+/// `.value`-lane `aload`, whose own tag check proved only "a heap object"?
+/// A `guard_string` on one is checked in the body every iteration; on
+/// anything else it is the prologue pin or statically discharged. The prover,
+/// the allocator's exit and home-read tables and the emitter all ask here, so
+/// they cannot disagree about which form a guard takes.
+pub fn isLoadedHeapRef(t: *const Trace, kinds: []const Kind, ref: u16) bool {
+    if (kinds[ref] != .heap) return false;
+    return switch (t.instrs[ref].op) {
+        .hload, .aload => true,
+        else => false,
+    };
+}
+
 /// Forward type-proof over the linear SSA. Fills `kinds` (and `slot_of`, the
 /// register slot of each `slot_load`) and returns `true` iff every value is a
 /// proven supported value or a use-gated boxed pass-through.
@@ -382,11 +396,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .guard_builtin => {
                 const r = ins.a;
                 if (r >= i) return false; // not linear SSA → malformed
-                // A pure guard only ever covers the callee-snapshot slot_load (the
-                // recorder emits it on a fresh seeded upvalue/global input); the native
-                // path hoists it to a prologue native/`RecordedBuiltin`-tag check.
-                if (t.instrs[r].op != .slot_load) return false;
-                pure_guarded[r] = true;
+                // On the callee-snapshot slot_load (a seeded upvalue/global
+                // input) the native path hoists it to a prologue
+                // native/`RecordedBuiltin`-tag check. On anything else — doc
+                // 85's native read out of a table, `math.floor` — Pass B
+                // wants a `.heap` operand and the body checks it every
+                // iteration (the dynamic guard_func precedent).
+                if (t.instrs[r].op == .slot_load) pure_guarded[r] = true;
             },
             .guard_native => {
                 const r = ins.a;
@@ -781,10 +797,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             // slot_load (proven `.native`). Pinned to a prologue identity check (native
             // type + recorded `RecordedBuiltin` tag); lowers to nothing in the body, like
             // guard_func. The callee is a once-seeded loop-invariant upvalue/global, so
-            // one prologue check covers the whole native run.
+            // one prologue check covers the whole native run. OR (doc 85) a
+            // `.heap`-kinded value, a native read out of a table: the same
+            // check, in the body, every iteration.
             .guard_builtin => {
                 if (ins.a >= i) return false;
-                if (kinds[ins.a] != .native) return false;
+                if (kinds[ins.a] != .native and kinds[ins.a] != .heap) return false;
                 kinds[i] = .none;
             },
             // fsqrt: a leaf float producer computing `@sqrt` of its operand (the same
@@ -848,10 +866,15 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             // `.heap` + is_string above) it is the prologue type pin — lowers
             // to nothing in the body, like guard_table. On a proven-string
             // producer result it is statically redundant (the recorder never
-            // emits that, but tolerate it). Anything else can't be discharged.
+            // emits that, but tolerate it). On a heap value read out of a
+            // table (doc 85) it is a body check, every iteration, and the
+            // operand is a proven string from here on (guard_sid's rule).
+            // Anything else can't be discharged.
             .guard_string => {
                 if (ins.a >= i) return false;
-                if (!is_string[ins.a]) return false;
+                if (isLoadedHeapRef(t, kinds, ins.a)) {
+                    is_string[ins.a] = true;
+                } else if (!is_string[ins.a]) return false;
                 kinds[i] = .none;
             },
             // --- snew class (doc 24 D4/c3): allocating string→string producers,
