@@ -3270,6 +3270,27 @@ pub const Vm = struct {
     /// `backtraceFrames` of one stack, `frames` (bottom first), into `out`,
     /// deepest-first; the stack is `thread`'s (null = the main one), running
     /// when `live`. Returns how many rows it wrote.
+    /// Doc 86 §4: what the call that entered `frames[i]` called its callee,
+    /// as Lua's `funcnamefromcall` names a frame: a local, an upvalue, a
+    /// global, a field or a method. Only when that call is the parent's own
+    /// `.call` of this frame: a parent `in_flight` is inside a native or a
+    /// metamethod, whose callee is not this frame; a frame `pcall` or
+    /// `xpcall` protects was pushed in place of the native the parent
+    /// called; and a parent that is not a Lua frame has no call
+    /// instruction. Null when no name can be proven.
+    fn callSiteName(frames: []const CallFrame, i: usize) ?[]const u8 {
+        if (i == 0 or frames[i].ctl.protect != .none) return null;
+        const parent = &frames[i - 1];
+        if (parent.in_flight or parent.pc == 0) return null;
+        const pp = parent.closure.proto;
+        if (pp.system or pp.id == coroutine.native_body_proto_id or native_act.kindOf(pp) != null) return null;
+        const at = parent.pc - 1;
+        if (at >= pp.code.len) return null;
+        const call = bytecode.callOperandsOf(pp.code[at]) orelse return null;
+        const o = bc_names.originOf(pp, @intCast(at), call.a) orelse return null;
+        return o.name;
+    }
+
     fn contextFrames(self: *const Vm, out: []FaultFrame, frames: []const CallFrame, live: bool, thread: ?*const coroutine.Thread) usize {
         const tid: u32 = if (thread) |t| t.header.id else 0;
         for (frames, 0..) |*f, i| {
@@ -3294,7 +3315,7 @@ pub const Vm = struct {
             const fpc: usize = if ((live and i == frames.len - 1) or f.in_flight) f.pc else f.pc -| 1;
             const fspan: bytecode.Span = if (fpc < fp.spans.len) fp.spans[fpc] else .{};
             row.* = .{
-                .name = fp.name,
+                .name = if (std.mem.eql(u8, fp.name, bytecode.anonymous_name)) callSiteName(frames, i) orelse fp.name else fp.name,
                 .chunk = fp.chunk,
                 .main_chunk = fp.main_chunk,
                 .proto_id = fp.id,

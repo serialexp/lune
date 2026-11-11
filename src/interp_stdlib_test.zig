@@ -306,6 +306,22 @@ test "stdlib: gsub's errors are located as a C function's (doc 68 §7.4)" {
     );
 }
 
+test "doc 86 P0: a traceback names a function expression from the call that entered it" {
+    // As Lua 5.4's `funcnamefromcall`: a local, an upvalue or a field. A
+    // function `pcall` protects was not called by its caller's `.call`, so
+    // it stays anonymous.
+    try expectProgram(
+        \\local handler = function() print(debug.traceback("t")) end
+        \\local t = { cb = function() handler() end }
+        \\t.cb()
+        \\pcall(function() print(debug.traceback("p")) end)
+        \\
+    ,
+        "t\nstack traceback:\n\tmain:1: in function 'handler'\n\tmain:2: in function 'cb'\n\tmain:3: in main chunk\n" ++
+            "p\nstack traceback:\n\tmain:4: in function 'anonymous'\n\tmain:4: in main chunk\n",
+    );
+}
+
 test "stdlib: a traceback through gsub shows it as a C function" {
     try expectProgram(
         \\local tb

@@ -1227,6 +1227,11 @@ pub const RegLiveness = struct {
 /// bytecode does not depend on `ast`.
 pub const Span = struct { start: u32 = 0, end: u32 = 0, line: u32 = 0 };
 
+/// The `Proto.name` of a function expression, which has no name of its own.
+/// A traceback names its frame from the call instead, when it can
+/// (`Vm.contextFrames`).
+pub const anonymous_name = "anonymous";
+
 /// Doc 86 §4: one local variable of a function, for debuggers, tracebacks
 /// and the visualiser. The compiler writes a row when the local becomes
 /// visible and closes it when its scope ends; rows are sorted by
