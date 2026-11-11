@@ -32,6 +32,7 @@ const function = @import("function.zig");
 const coroutine = @import("coroutine.zig");
 const trace = @import("trace.zig");
 const trace_exec = @import("trace_exec.zig");
+const jitdbg = @import("jitdbg.zig");
 const table_runtime = @import("table_runtime.zig");
 const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
@@ -6095,6 +6096,87 @@ pub const Vm = struct {
     /// trace's effect error and the bytecode pc to park it at.
     const RaiseAt = struct { pc: usize, err: Error };
 
+    // ---- doc 87 Phase 0: the glue census's events ----
+    // Every site that reports one is `if (comptime jitdbg.enabled)`, so a
+    // normal build has neither the calls nor these functions. In a
+    // `-Djit-debug` build with the census off (`trace.glue == null`, the
+    // default) each is a load and a branch, out of line.
+
+    /// The frame at `depth` as the census names it.
+    fn glueFrame(self: *const Vm, depth: usize) trace.glue_census.Frame {
+        return .{
+            .depth = depth,
+            .call_seq = self.frames[depth - 1].call_seq,
+            .ctx = if (self.current) |co| @intFromPtr(co) else 0,
+        };
+    }
+
+    /// Trace `ct` is entered from the top frame.
+    noinline fn glueArrive(self: *Vm, ct: *const trace.Trace) void {
+        const g = self.trace.glue orelse return;
+        const a = ct.code.anchor;
+        const f = self.glueFrame(self.depth);
+        switch (trace.anchorKind(a.pc)) {
+            .loop => g.arriveLoop(f, a.proto, a.pc),
+            .head, .cont => g.arriveOneShot(f, trace.entryPc(a.pc)),
+        }
+    }
+
+    /// Tier 0 is at the loop header `header` of the top frame, entering the
+    /// loop or repeating it, and has not entered a trace there.
+    noinline fn gluePassHeader(self: *Vm, proto: *const Proto, header: usize) void {
+        const g = self.trace.glue orelse return;
+        g.passHeader(self.glueFrame(self.depth), proto, @intCast(header));
+    }
+
+    /// The top frame, at the call instruction `pc`, is about to push a
+    /// frame for `callee`.
+    noinline fn glueCall(self: *Vm, pc: usize, callee: *const Proto, protected: bool, native: bool) void {
+        const g = self.trace.glue orelse return;
+        g.call(self.glueFrame(self.depth), @intCast(pc), .{
+            .vararg = callee.is_vararg,
+            .protected = protected,
+            .native = native,
+        });
+    }
+
+    /// The frame under the top one just pushed a metamethod's frame for
+    /// `callee`, for the instruction it is in.
+    noinline fn glueMetaCall(self: *Vm, callee: *const Proto) void {
+        const g = self.trace.glue orelse return;
+        g.call(self.glueFrame(self.depth - 1), trace.glue_census.unknown_pc, .{
+            .vararg = callee.is_vararg,
+            .meta = true,
+        });
+    }
+
+    /// The top frame is about to return through `instr` at `pc`; nothing
+    /// of the return has run yet (its upvalues are still open).
+    noinline fn glueRet(self: *Vm, st: *const ExecState, pc: usize, instr: *const Instr) void {
+        const g = self.trace.glue orelse return;
+        const depth = self.depth;
+        const ctl = st.frame.ctl;
+        var r: trace.glue_census.RetFacts = .{
+            .vararg = st.proto.is_vararg,
+            .protected = ctl.protect != .none,
+            .dynamic = instr.op != .halt and instr.b == bytecode.all_results,
+            .upvalues = self.open_upvalue_ceiling > st.base,
+            .meta = ctl.cont != .none,
+            .host = depth == st.stop_depth,
+        };
+        if (!r.host and depth >= 2) {
+            const parent = &self.frames[depth - 2];
+            r.land_vararg = parent.closure.proto.is_vararg;
+            r.land_protected = parent.ctl.protect != .none;
+            if (!r.meta) {
+                r.all = st.frame.ret_count == bytecode.all_results;
+                r.land_proto = parent.closure.proto;
+                r.land_pc = @intCast(parent.pc);
+            }
+        }
+        g.ret(self.glueFrame(depth), @intCast(pc), r);
+    }
+
     const BackEdgeDirective = union(enum) {
         dispatch_at: usize,
         switch_mode_at: usize,
@@ -6127,6 +6209,7 @@ pub const Vm = struct {
                 if (mode == .fast and !vm.trace.config.coverage and
                     vm.trace.skipGatedBackEdge(st.proto, @intCast(pc)))
                 {
+                    if (comptime jitdbg.enabled) vm.gluePassHeader(st.proto, pc);
                     return dispatchTail(mode, st, pc, vm);
                 }
                 return @call(.always_tail, backEdgeHandler(mode), .{ st, pc, instr, vm, tags, payloads });
@@ -6141,6 +6224,9 @@ pub const Vm = struct {
                 // dispatchTail re-derives them from `st.regs`.
                 _ = tags;
                 _ = payloads;
+                // Doc 87 Phase 0: `pc` is the loop's header on every path
+                // here. An entry the epilogue makes takes the pass back.
+                if (comptime jitdbg.enabled) vm.gluePassHeader(st.proto, pc);
                 switch (backEdgeEpilogue(mode, st, pc, instr)) {
                     .dispatch_at => |npc| return dispatchTail(mode, st, npc, vm),
                     .switch_mode_at => |npc| {
@@ -6920,6 +7006,7 @@ pub const Vm = struct {
         // Doc 26 D1 tripwire, same as the full path.
         if (ct.code.requires_unicode_pin) std.debug.assert(self.unicode_version_pinned);
         ts.entries +%= 1;
+        if (comptime jitdbg.enabled) self.glueArrive(ct);
         // Doc 22 §B.1: the native page seeds itself from this ctx.
         self.prepareNativeEpisode(closure, proto, base);
         ts.native_entries +%= 1;
@@ -7354,6 +7441,7 @@ pub const Vm = struct {
         {
             defer if (buf_live) self.trace.valuesRelease(values_mark);
             self.trace.entries +%= 1;
+            if (comptime jitdbg.enabled) self.glueArrive(ct);
             // JIT coverage time attribution (gated): open the
             // trace-exec region. `last_hop_tsc` marks the first
             // hop's start; each `onSideExit` (per hop, inc. every
@@ -8971,6 +9059,7 @@ pub const Vm = struct {
         // Doc 26 D1 tripwire, as in the full path.
         if (ct.code.requires_unicode_pin) std.debug.assert(self.unicode_version_pinned);
         ts.entries +%= 1;
+        if (comptime jitdbg.enabled) self.glueArrive(ct);
         // Doc 22 §B.1: the native page seeds itself from this ctx.
         self.prepareNativeEpisode(closure, proto, base);
         ts.native_entries +%= 1;
@@ -11509,6 +11598,8 @@ pub const Vm = struct {
         // The callee's image goes into its frame's cache at the push, the
         // fill `cachedCodeFor` would make on the fresh frame's miss.
         const code = self.closureCode(cl, cp);
+        if (comptime jitdbg.enabled)
+            self.glueCall(pc - 1, cp, entry == .pcall or entry == .xpcall, entry == .activation or entry == .native_call);
         self.pushFrameImage(cl, cp.num_registers, callee_base, ret_dest, ret_count, va_base, va_count, code, self.trace.registry.entry_registry.image_gen);
         const regs = loadFrame(st, vm, depth + 1, &self.frames[depth], cl, callee_base, code);
         if (entry == .call) {
@@ -12033,6 +12124,7 @@ pub const Vm = struct {
                 const self = vm;
                 const a: usize = instr.a;
                 const base = st.base;
+                if (comptime jitdbg.enabled) self.glueRet(st, pc - 1, instr);
                 self.closeUpvaluesFrom(base);
                 // Resolve how many values this frame returns. `ret a
                 // all_results` (the producer half of `return f()` /
@@ -12775,6 +12867,7 @@ pub const Vm = struct {
         self.heap.bumpHostEpoch();
         const parent = &self.frames[self.depth - 1];
         _ = try self.bindAndPushClosure(cl, args);
+        if (comptime jitdbg.enabled) self.glueMetaCall(cl.proto);
         parent.in_flight = true;
         const f = &self.frames[self.depth - 1];
         f.ctl = .{ .cont = .finish_op, .phase = phase };

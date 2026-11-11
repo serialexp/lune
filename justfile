@@ -79,6 +79,15 @@ hashgate *args: release
     zig build --prefix zig-out-debug
     python3 tools/hashgate.py --also-mahina zig-out-debug/bin/mahina {{args}}
 
+# Args pass through: just glue-census --filter loop_ring / --tsv out.tsv
+# Doc 87 Phase 0: what tier 0 does between one loop's trace and the next, for
+# every bench row (tools/glue-census.py). The census's hooks exist only in a
+# jit-debug build, which is installed to its own prefix so zig-out/bin/mahina
+# stays whatever it was.
+glue-census *args:
+    zig build -Doptimize=ReleaseFast -Djit-debug=true --prefix zig-out/jit-debug
+    python3 tools/glue-census.py zig-out/jit-debug/bin/mahina {{args}}
+
 # Copy this tree to DEST for an A/B shadow build (baseline binaries), stripping
 # .zig-cache/zig-out so the shadow build can never reuse THIS tree's artifacts.
 # A copied cache once made the "pre" baseline a post-source binary and burned an

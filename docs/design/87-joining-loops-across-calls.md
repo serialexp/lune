@@ -6,10 +6,11 @@ motion, §4.4) and the seam trim Bart ordered before the join (§5.6: the
 dispatcher's share of a loop visit from tier 0 went from about 1,240
 instructions to about 330). Bart answered on 2026-11-11 (§10.1): the shape
 is A (LuaJIT's), the seam is trimmed before the join, and the probe is a
-board row (`loop_ring`, `loop_ring_16`). Still open: Q2's choice between
-(R-a) and (R-b), and Q4, which needs counts first.
+board row (`loop_ring`, `loop_ring_16`). Phase 0 landed on 2026-11-12 as
+the glue census (§8 follow-up), and §10.2 has the counts Q4 was waiting
+for. Still open: Q2's choice between (R-a) and (R-b), and Q4's answer.
 Owner: Bart
-Last updated: 2026-11-11
+Last updated: 2026-11-12
 
 ## Implementation status
 
@@ -44,6 +45,11 @@ inside them is checked.
   chain is driven, and the loop lane (`Vm.enterLoopLane`).
   `loop_ring` 150.7 M → 113.1 M instructions (−25.0%), `loop_ring_16`
   457.1 M → 306.5 M (−32.9%).
+- [x] **Phase 0 — the glue census** (§8, follow-up of 2026-11-12). What
+  tier 0 does between one loop's trace and the next, counted in a
+  `-Djit-debug` build under `--glue-census`, and tabulated over the board
+  by `just glue-census`. It replaces the counters §8 first listed, which
+  count machinery Phases 1 and 2 have yet to build and land with them.
 
 ### Outstanding
 
@@ -52,8 +58,10 @@ inside them is checked.
   activation (R-b). Bart, 2026-11-11: no smaller first step unless it is
   reused; §10.1 says what (R-c) would and would not leave behind.
 - [ ] **Q4 — v1 scope** (§7). Bart, 2026-11-11: not enough information.
-  §10.1 lists the counts that would answer it; they come from Phase 0's
-  counters.
+  §10.1 lists the counts that would answer it; §10.2 has them
+  (2026-11-12), with three things §7 does not settle. Waiting for Bart.
+- [ ] **Whether the census stays jit-debug only** (§8 follow-up): the
+  alternative is counters in every build behind a runtime flag.
 - [ ] **Review round.** §11 lists the claims this draft makes from
   reading, not from running; each needs a check against the source
   before the phase that leans on it.
@@ -61,11 +69,11 @@ inside them is checked.
   lean arm for the exits of `while`, `repeat` and generic `for` loops,
   and whether the patched entry's bar of 8 iterations should move now
   that an entry is cheaper. Neither blocks Phase 1.
-- [ ] **Phase 0 — counters** (inert): glue wants, recordings, arms, hits
-  and declines by reason, with their jit-debug probes.
 - [ ] **Phase 1 — a recording that starts at a loop's exit and leaves the
-  function.**
+  function.** With its `--jit-stats` counters: glue wants and recordings,
+  and declines by reason.
 - [ ] **Phase 2 — the join runs, with the runtime moving the frames.**
+  With its counters: arms and hits.
 - [ ] **Phase 3 — the frames move in machine code.**
 - [ ] **Phase 4 — regions on a ring** (per Q2).
 - [ ] **Phase 5 — widen**: `while` and generic `for` loops, more than one
@@ -651,6 +659,50 @@ Phases 0 and 1 are the same for both shapes.
 Each phase lands behind `just test`, the jit-debug gate and the
 hashgate, and is measured on the probe row.
 
+**Follow-up, 2026-11-12: Phase 0 is a census of tier 0, not counters on
+the join.** The counters listed above (wants, recordings, arms, hits,
+declines) count things only Phases 1 and 2 create; before those exist
+every one of them reads zero, and none of them answers Q4. What Q4 needs
+is a measurement of the glue as tier 0 runs it today. So Phase 0 landed
+as that, and the listed counters move to the phases that give them
+something to count.
+
+The census (`src/trace_glue_census.zig`) is fed five events by the
+interpreter: a loop trace entered, a one-shot trace entered, a call, a
+return, and a loop header passed on tier 0 without entering a trace.
+Entering a loop trace starts a *visit*. When tier 0 is next seen in that
+frame outside the loop's bytecode extent (`bytecode.loopExtentFor`), the
+loop has ended and a *window* opens; it records every event until the
+next loop trace is entered, as a string of at most eight letters (`R` a
+return, `C` a call, `B` a loop header passed, `O` a one-shot trace) with
+the kinds of loop at both ends and the frame kinds §7 names (vararg,
+protected, `all_results`, a dynamic result count, open upvalues, a
+native-entered or metamethod frame, the host boundary). It reads no
+trace and no receipt, so it reports the same whatever the dispatcher did.
+
+Two limits. A loop left by `break` and a loop that ran to its end look
+the same (both put tier 0 past the loop's last instruction). And a
+window's frame kinds are those of all its events together, which is
+exact for the two- and three-event windows v1 is about and loose for the
+long ones.
+
+Where it lives is a choice that can be reversed:
+
+- **As built: in `-Djit-debug` builds only.** The interpreter's hooks sit
+  in `enterCallee`, `opRet`, the back-edge handlers and the three trace
+  entries, each behind `if (comptime jitdbg.enabled)`. A normal build
+  has none of them: `loop_ring` runs 113,569,897 instructions before and
+  113,570,054 after, and the binary grows by 880 bytes (the flag and its
+  help text). `--glue-census` in a normal build prints a warning and
+  does nothing. `TraceState` grows by one pointer in every build.
+- **The alternative: in every build, behind a runtime flag**, as
+  `--jit-stats` is. The census is then one flag away on any binary, and
+  every tier-0 call, return and gated back-edge pays a load and a branch
+  whether it is on or not.
+
+`just glue-census` builds the jit-debug binary to its own prefix and
+runs `tools/glue-census.py` over every board row.
+
 ## 9. Budget (Rule 20)
 
 The probe at 64 trips, instructions per round over the two loop bodies:
@@ -702,6 +754,112 @@ The ceiling is twice LuaJIT's. A phase that leaves the probe above tier
   next loop. Phase 0's counters produce these without changing any
   behaviour.
 - **Q5: as a bench.** Done (`bench/loop_ring.lua`).
+
+### 10.2 Q4's counts, 2026-11-12
+
+From `just glue-census` on af4f2ab plus the census (§8 follow-up), all
+66 board rows, each run once under `--trace --jit-native`. A *visit* is
+a loop trace entered from tier 0; a *window* is what tier 0 did from the
+end of that loop to the next loop trace.
+
+What became of 1,125,676 visits:
+
+| | visits |
+|---|---|
+| the loop ended and tier 0 went on (a window) | 718,704 |
+| the trace left mid-loop and tier 0 took the next trip | 106,990 |
+| the frame went away under an error (all `pcall_faults`) | 299,982 |
+| the function returned from inside the loop | 0 |
+
+A window's first event:
+
+| | windows |
+|---|---|
+| a loop header in the same function (the enclosing loop goes round) | 406,145 |
+| a call (the function goes on) | 49,987 |
+| a return | 262,572 |
+
+**Loop endings followed by a return (the first count §10.1 asks for):
+262,572.** The two probe rows are 199,994 of them. The other 62,578:
+`records_script` 59,975, `scimark-fft` 2,002, `globals_script` 515,
+`spectral-norm` 41, and 27 rows with four or fewer (the program's last
+loop and then its end). By the kind of loop that ended: numeric `for`
+261,056, `repeat` 1,000 (`scimark-fft`), `while` 516 (`globals_script`),
+generic `for` 0.
+
+**Frame kinds (the second count).** Of the 262,572 windows that start
+with a return, none has a vararg frame, a `pcall`'d frame, a
+native-entered frame or a metamethod's frame anywhere in it. 20,004
+have a return with a dynamic result count (`return f(...)`); 19 a return
+into a call that takes all results; 11 a frame with open upvalues; 31
+the host boundary. Of the 242,445 that reach another loop's trace within
+eight events, 6 have any of these (the `all_results` call of the three
+nsieve rows, twice each).
+
+The board cannot speak for the frame kinds it does not contain. No row
+has a vararg or `pcall`'d function whose loop ends and returns
+(`pcall_faults` leaves its loop by an error), and no row leaves a traced
+loop by `return` from inside it. A zero here says the board has no such
+program, not that programs have no such code.
+
+**Frames crossed (the third count)**, for the 242,445 windows that reach
+another loop:
+
+| returns, calls | windows | where |
+|---|---|---|
+| 1, 1 | 239,967 | the probe rows 199,978; `records_script` 39,956; 33 in seven other rows |
+| 1, 0 | 1,498 | `scimark-fft`: the callee's loop ends and returns into a loop of the caller that has a trace |
+| 1, 2 | 499 | `scimark-fft` |
+| 2, 1 | 381 | `globals_script` (`reap`'s `while`, two returns up) |
+| 3, 2 | 80 | `globals_script` |
+| 2, 2 | 19 | `spectral-norm` |
+| 3, 3 | 1 | `records_script` |
+
+The other 20,127 windows that start with a return do not reach a loop:
+20,096 run past eight events and 31 are the program's end.
+
+**The script-shaped row.** `records_script` has three loops with a
+trace (`carried`, `configured`, `refine`), each visited once a round,
+and every one of its 59,975 loop endings is followed by a return. 39,956
+(67%) are the probe's two shapes, `RC` and `RBC`, between numeric `for`
+loops, with none of §7's frame kinds. The remaining third is `carried`:
+its return is `return math.floor(w * 8)` (a dynamic result count), and
+what follows is `owed`, `tags` and `count`, whose loops have no trace
+(§2.3), so the window runs on (`RCBCORBC…`) without reaching one.
+
+**What each line of §7 leaves out, on this board.** 239,934 of the
+242,445 joined windows are the two shapes §5 designs for (numeric `for`
+at both ends, `RC` or `RBC`, no listed frame kind). The other 2,511, by
+the first thing that keeps each out:
+
+| | windows | rows |
+|---|---|---|
+| a loop that is not a numeric `for` at either end | 1,459 | `scimark-fft` 998 (`repeat`), `globals_script` 461 (`while`); 960 of these also cross more than one return or call |
+| one return and no call | 999 | `scimark-fft` |
+| more than one return or call, numeric `for` at both ends | 20 | `spectral-norm` 19, `records_script` 1 |
+| a loop header passed in the callee before its traced loop (`RCB`, `RBCB`) | 27 | `spectral-norm` 19, `nbody` 4, the two `grid_matmul` rows 2 each |
+| a listed frame kind (`all_results`) | 6 | the nsieve rows |
+
+Three things the counts raise that §7 does not settle:
+
+- **A glue with a return and no call.** §5 designs for a return followed
+  by a call. `scimark-fft` has 1,498 windows where the loop's function
+  returns straight into a loop of its caller that has a trace of its
+  own. §7's "more than one return or more than one call" does not
+  exclude it and §5.2 does not describe it.
+- **A return with a dynamic result count.** §7 lists `all_results`
+  returns among the frame kinds left out. On the script-shaped row that
+  is one loop function in three, by way of `return math.floor(...)`.
+  Today it costs nothing, because that window does not reach a traced
+  loop anyway; it starts to cost when `owed` records.
+- **The enclosing loop on tier 0.** 406,145 windows, more than all the
+  returns outside the probe rows, are an inner loop that ended, its
+  enclosing loop in the same function going round on tier 0, and the
+  inner loop's trace entered again: `euler14-bit` 299,969, `str_gmatch`
+  67,047, `scimark-lu` 15,842, `scimark-sparse` 9,999, `spectral-norm`
+  5,873. No frame moves, so this is not this document's join; it is the
+  nest docs 15, 16 and 47 own. It is listed here because the census
+  measures it and it is the larger number.
 
 ## 11. Claims a review round should verify
 

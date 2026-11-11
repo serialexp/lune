@@ -131,6 +131,8 @@ pub const isHeadAnchorPc = trace_code.isHeadAnchorPc;
 pub const AnchorPcKind = trace_code.AnchorPcKind;
 pub const anchorKind = trace_code.anchorKind;
 pub const entryPc = trace_code.entryPc;
+/// Doc 87 Phase 0: the glue census (`TraceState.glue`).
+pub const glue_census = @import("trace_glue_census.zig");
 pub const contAnchorPc = trace_code.contAnchorPc;
 pub const NativeSeedCtx = trace_code.NativeSeedCtx;
 pub const TOUCHED_CAP = trace_code.TOUCHED_CAP;
@@ -1685,6 +1687,12 @@ pub const TraceState = struct {
     /// armed edge belongs to any bridge-free closed directed subcycle.
     dbg_promotable_cycle_rows: u64 = 0,
     dbg_other_replay_rows: u64 = 0,
+    /// Doc 87 Phase 0: the glue census, or null when it is off (the
+    /// default). Only a `-Djit-debug` build can turn it on
+    /// (`enableGlueCensus`), and only that build has the interpreter hooks
+    /// that feed it, so in a normal build this is a null nobody reads. A
+    /// pointer, so the census costs `TraceState` one word in every build.
+    glue: ?*glue_census.GlueCensus = null,
     /// When non-null, the next back-edge to this anchor will arm a side-trace
     /// recording (even if a trace already exists there).  Set by
     /// `countGuardFailure` when a guard-failure crosses `hotguard`; cleared
@@ -1836,6 +1844,32 @@ pub const TraceState = struct {
         if (comptime jitdbg.enabled) {
             if (self.config.debug_log) jitdbg.log(fmt, args);
         }
+    }
+
+    /// Doc 87 Phase 0: turn the glue census on for this VM (CLI
+    /// `--glue-census`, or a test). Does nothing in a build without
+    /// `-Djit-debug`: the interpreter's hooks are compiled out there, so a
+    /// census would count nothing. Tracing must be on for it to see a loop.
+    pub fn enableGlueCensus(self: *TraceState) std.mem.Allocator.Error!void {
+        if (!jitdbg.enabled or self.glue != null) return;
+        const g = try self.gpa.create(glue_census.GlueCensus);
+        g.* = .init(self.gpa);
+        self.glue = g;
+    }
+
+    /// Close the census's run and print it, one `[jit] glue:` line a fact
+    /// (`GlueCensus.report`). Not gated on `config.debug_log`: turning the
+    /// census on is the request.
+    pub fn dbgDumpGlueCensus(self: *TraceState) void {
+        // Comptime, so a normal build carries none of the census's code.
+        if (!jitdbg.enabled) return;
+        const g = self.glue orelse return;
+        const Sink = struct {
+            pub fn line(_: @This(), comptime fmt: []const u8, args: anytype) void {
+                jitdbg.log(fmt, args);
+            }
+        };
+        g.report(Sink{});
     }
 
     /// Dump the `guard_failures` map (one line per `(anchor, exit_pc)` key with
@@ -2346,6 +2380,11 @@ pub const TraceState = struct {
 
         self.dbg_burst_terminals.deinit(self.gpa);
         self.dbg_silent_suffix_rows.deinit(self.gpa);
+        if (jitdbg.enabled) if (self.glue) |g| {
+            g.deinit();
+            self.gpa.destroy(g);
+            self.glue = null;
+        };
         self.counters.deinit(self.gpa);
         self.gate.deinit(self.gpa);
         self.record_gate.deinit(self.gpa);
@@ -5104,6 +5143,8 @@ pub const withPhis = trace_ir.withPhis;
 // run under `zig build test`.
 
 test {
+    _ = glue_census;
+    _ = @import("trace_glue_census_test.zig");
     _ = @import("trace_ir_test.zig");
     _ = @import("trace_record_test.zig");
     _ = @import("trace_chain_test.zig");

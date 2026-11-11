@@ -95,6 +95,12 @@ const usage =
     \\                       arm/disarm events) to stderr as the program runs. Only
     \\                       compiled in with `zig build -Djit-debug=true`; a plain
     \\                       binary warns and ignores the flag.
+    \\  --glue-census        count what tier 0 does between a loop a trace was
+    \\                       running and the next loop trace (returns, calls,
+    \\                       loop headers passed; doc 87 Phase 0) and print the
+    \\                       counts to stderr after the run, one `[jit] glue:`
+    \\                       line a fact. Needs tracing on (--trace) and a
+    \\                       `zig build -Djit-debug=true` binary, like --jit-debug.
     \\  --jit-coverage       imply --trace and enable JIT execution-coverage
     \\                       accounting, then print a one-line native-vs-tier-0
     \\                       loop-iteration summary to stderr after the run. Combine
@@ -217,6 +223,10 @@ const TraceOpts = struct {
     /// prints anything in a `-Djit-debug=true` build (the call sites are compiled
     /// out otherwise); a plain build warns to stderr and continues.
     jit_debug: bool = false,
+    /// `--glue-census`: turn on the glue census (doc 87 Phase 0,
+    /// `TraceState.enableGlueCensus`) and print it after the run. Counts
+    /// only in a `-Djit-debug=true` build; a plain build warns and continues.
+    glue_census: bool = false,
     /// `--jit-coverage` / `--jit-stats`: enable JIT execution-coverage accounting
     /// (`config.coverage`) — native-vs-tier-0 loop-iteration split, per anchor.
     /// Deliberately NOT implied by `--time`: the per-back-edge accounting is not
@@ -331,6 +341,11 @@ pub fn main(init: std.process.Init) u8 {
             topts.jit_debug = true;
             if (!mahina.jitdbg.enabled) {
                 mahina.io.eprint("mahina: warning: --jit-debug has no effect in this binary; rebuild with `zig build -Djit-debug=true`\n", .{});
+            }
+        } else if (std.mem.eql(u8, arg, "--glue-census")) {
+            topts.glue_census = true;
+            if (!mahina.jitdbg.enabled) {
+                mahina.io.eprint("mahina: warning: --glue-census has no effect in this binary; rebuild with `zig build -Djit-debug=true`\n", .{});
             }
         } else if (std.mem.eql(u8, arg, "--jit-coverage")) {
             topts.enabled = true;
@@ -668,6 +683,9 @@ fn configureVm(vm: *mahina.interp.Vm, topts: TraceOpts, real_sys: *mahina.host_s
     vm.trace.config.native_codegen = topts.native_codegen;
     vm.trace.config.record_aborts = topts.dump_aborts;
     vm.trace.config.debug_log = topts.jit_debug;
+    if (topts.glue_census) vm.trace.enableGlueCensus() catch {
+        mahina.io.eprint("mahina: warning: --glue-census: out of memory, the census is off\n", .{});
+    };
     vm.trace.config.coverage = topts.coverage;
     if (topts.hotguard) |v| vm.trace.config.hotguard = v;
     if (topts.silent_budget) |v| vm.trace.config.silent_budget = v;
@@ -815,6 +833,11 @@ fn runSource(gpa: std.mem.Allocator, thread_gpa: std.mem.Allocator, io: mahina.i
     if (topts.time) {
         mahina.io.eprint("mahina: executed in {d} ns ({d:.3} ms)\n", .{ exec_ns, @as(f64, @floatFromInt(exec_ns)) / 1e6 });
     }
+
+    // --- the glue census (--glue-census) --- to stderr. The chunk is still
+    // alive, so every loop's `proto.name` is valid. Prints nothing when the
+    // census is off, which it always is in a plain build.
+    vm.trace.dbgDumpGlueCensus();
 
     // --- JIT coverage output --- to stderr. `--jit-stats` prints the full block
     // (event counters + iteration split + per-anchor table); `--jit-coverage`

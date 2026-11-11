@@ -190,6 +190,10 @@ more than tier 0. Four causes, by pass:
       trim is in (entry below); the join is not built. The probe costs
       3,224 instructions a round over the loop bodies after the trim
       (5,094 before), against 1,681 on tier 0 and 231 on LuaJIT.
+      Phase 0 landed 2026-11-12 as the glue census (`--glue-census` in a
+      `-Djit-debug` build, `just glue-census` for the board); doc 87
+      §10.2 has the counts Q4 asked for. Waiting for Bart: Q2, Q4, and
+      whether the census stays jit-debug only (doc 87 §8 follow-up).
       The heapsort entry ("A short loop in a function called from a
       loop") and "A short loop in a function is entered from tier 0 on
       every call" below are cases of this.
@@ -225,6 +229,23 @@ more than tier 0. Four causes, by pass:
       nothing on the board up by more than 0.17%. Per round over the
       loop bodies: 5,094 to 3,224 (tier 0 1,681, LuaJIT 231). The next
       seven entries were found on the way.
+- [ ] **The enclosing loop runs on tier 0 around a traced inner loop**
+      (found 2026-11-12 by the glue census, doc 87 §10.2). 406,145 of
+      the board's 718,704 loop endings are followed by the enclosing
+      loop's header on tier 0 and then the same inner trace again:
+      `euler14-bit` 299,969, `str_gmatch` 67,047, `scimark-lu` 15,842,
+      `scimark-sparse` 9,999, `spectral-norm` 5,873, `repack` 1,999,
+      `scimark-fft` 1,566, `scimark-sor` 1,001. Each is a visit from
+      tier 0 (the seam of the entry above). Not diagnosed per row: walk
+      the Z-8 ladder before building anything (is the loop-done exit
+      armed, is the outer loop gated or untraceable).
+- [ ] **The board has no loop function that is vararg or `pcall`'d, and
+      no traced loop left by `return`** (found 2026-11-12, doc 87
+      §10.2). The census reads zero for those frame kinds between loops
+      because no row contains them, so doc 87 §7's exclusions cannot be
+      priced on the board. `pcall_faults` leaves its loop by an error
+      299,982 times, which is a different path. Needs Bart: whether a
+      row in that idiom is wanted.
 - [ ] **The loop lane's lean arm covers a numeric `for` only** (doc 87
       §5.6). A `while`, `repeat` or generic-`for` visit goes through the
       lane's native call and then the shared consumer
@@ -1519,7 +1540,11 @@ Seam share elsewhere: fft 21%, nsieve 16%, sparse 14%, lu 11%.
       run BEFORE any verdict") and the board's `res%` column both read
       the unpatched machine. Options to weigh: attribute coverage on the
       patched path too, or at least print a warning when patches would
-      have been installed. Found in doc 64 §11.
+      have been installed. Found in doc 64 §11. 2026-11-12, a second
+      row: `euler14-bit` enters its inner loop's trace 299,970 times in
+      a normal run (the glue census counts them) and 54 times under
+      `--jit-stats`, which then reports 83.9% of iterations as "tier-0,
+      has-trace" and runs 1,376 M instructions against 697 M.
 - [ ] **A permanently gated anchor keeps paying for each new strike.**
       Once a dispatch gate reaches `max_strikes`, `isGated` holds for
       good, yet every further region-decay strike on that owner still runs
