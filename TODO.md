@@ -147,6 +147,25 @@ more than tier 0. Four causes, by pass:
       The heapsort entry ("A short loop in a function called from a
       loop") and "A short loop in a function is entered from tier 0 on
       every call" below are cases of this.
+- [ ] **An exit-side child that ends a burst is struck on its own
+      anchor, every burst, for good** (found 2026-11-11). The short
+      loops of `configured` (8 trips) and `refine` (3) are each a root
+      with exit-side children anchored at the exit's resume pc (pc 7
+      and pc 6) that link back to the root. Each call runs root, child,
+      root, child and leaves through a child's exit.
+      `accountLegacyThrash` charges that terminal row to the child's
+      anchor with `completed=0` (the burst's entry trace reports
+      `completed=1`), so the penalty climbs without end (374 and 360
+      after 400 rounds) and `gateAnchor` runs once a round for each:
+      `legacy_thrash=39916` in 20,000 rounds. The dispatch gate it sets does nothing, because
+      the child is only ever entered through its parent's armed exit.
+      What was fixed (doc 84 §4.5 follow-up): a strike on an abandoned
+      gate no longer bumps `gate_gen` or clears the settled return
+      sites, −0.86% on this row. What is open: whether a child reached
+      through an arm should be struck on its own anchor at all, or the
+      strike should go to the burst's entry anchor, or a gate should
+      disarm the links into its anchor. Rule Z-8 territory (read doc 47
+      first); not started.
 - [ ] **A table found by a string key that is not a constant aborts**
       (`rules[item.kind]`: `bad_type get_index`; `owed` and `tags`,
       four fifths of the row's tier-0 time). `hashGetShape` wants the

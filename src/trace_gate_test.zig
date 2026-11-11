@@ -1237,6 +1237,47 @@ test "bar memo: an abandoned head stays refused without counting" {
     try testing.expectEqual(@as(?u32, null), state.counters.get(key));
 }
 
+test "gate: striking an abandoned gate again leaves it and the gate generation alone" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const proto = Proto{ .code = &.{}, .name = "t" };
+    const key: AnchorKey = .{ .proto = &proto, .pc = 6, .proto_id = proto.id };
+
+    // Up to abandonment every strike escalates and moves the generation.
+    var i: u32 = 0;
+    while (i < state.config.max_strikes) : (i += 1) {
+        const gen = state.gate_gen;
+        state.gateAnchor(key, .legacy_thrash);
+        state.gateRecordAnchor(key, .record_abort);
+        try testing.expect(state.gate_gen != gen);
+    }
+    try testing.expect(state.recordingAbandoned(key));
+    const dispatch_gate = state.gate.get(key).?;
+    const record_gate = state.record_gate.get(key).?;
+    try testing.expectEqual(state.config.max_strikes, dispatch_gate.strikes);
+
+    // Past it, a strike is a no-op on both maps: same entry, same
+    // generation, so the bar memo and the settled return sites stand.
+    const gen = state.gate_gen;
+    state.tick += 1000;
+    state.gateAnchor(key, .region_decay);
+    state.gateRecordAnchor(key, .commit_failure);
+    try testing.expectEqual(gen, state.gate_gen);
+    try testing.expectEqual(dispatch_gate, state.gate.get(key).?);
+    try testing.expectEqual(record_gate, state.record_gate.get(key).?);
+    try testing.expect(state.isGated(key));
+    try testing.expect(state.isRecordGated(key));
+
+    // Removing the gate and striking again starts a fresh one.
+    state.clearDispatchGate(key);
+    try testing.expect(!state.isGated(key));
+    state.gateAnchor(key, .legacy_thrash);
+    try testing.expectEqual(@as(u32, 1), state.gate.get(key).?.strikes);
+    try testing.expect(state.gate_gen != gen);
+}
+
 test "head want: another anchor's hot exit displaces a stale want; the same anchor's does not" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);

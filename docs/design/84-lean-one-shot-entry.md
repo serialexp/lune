@@ -19,6 +19,10 @@ land; move whole phases to Done once everything inside them is checked.
 
 ### Done
 
+- [x] **A strike on an abandoned gate no longer retires the bar memo and
+  the settled bits** (§4.5 follow-up, 2026-11-11). Found on
+  `records_script`, where two anchors were struck once a round each, for good:
+  −0.86% JIT instructions there, the rest of the board unchanged.
 - [x] **Step 1 of TODO (B): barred anchors are memoized in the call and
   return hooks** (4a8c8e6). An exact direct-mapped memo
   (`TraceState.bar_cache`) replaces two hash lookups per call and per
@@ -1078,6 +1082,21 @@ memo's per-entry generations: a gate move anywhere makes every settled
 pc take the long form once more, which settles it again. A per-anchor
 clear is a possible refinement. It has not been needed: gates move at
 recording decisions, not per call.
+
+**Follow-up, 2026-11-11: one case did move a gate per call.** On
+`records_script` (doc 85 §7) the short loops of `configured` and `refine`
+are each a root with exit-side children that link back to it. Every
+call leaves through a child's exit, and `accountLegacyThrash` strikes
+the child's own anchor with zero completions. No dispatch gate stops a trace reached through an
+armed link, so the strikes go on after the gate is abandoned: 39,916
+gate bumps in 20,000 rounds, each one moving `gate_gen` and clearing
+every settled bit. `bumpGateEntry` now returns an abandoned gate as it
+stands (every reader takes `strikes >= max_strikes` as final and reads
+nothing else of it), so the generation stays still. `records_script`
+−0.86% JIT instructions (9,300.7 M to 9,220.9 M, 4,000 per round); no
+other board row moves. Test: "gate: striking an abandoned gate again
+leaves it and the gate generation alone". Whether that child should be
+struck at all is a separate question, in `TODO.md`.
 
 **The hook.** `onRetResume` is inline at its call site in `opRet`:
 

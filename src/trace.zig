@@ -3559,8 +3559,17 @@ pub const TraceState = struct {
     /// (capped at `backoff_max`), and after `max_strikes` the anchor is
     /// abandoned for good. Deterministic — keyed only on the monotonic
     /// back-edge tick. Returns null on OOM (gate simply not escalated).
+    ///
+    /// An abandoned gate is returned as it stands. Every reader takes
+    /// `strikes >= max_strikes` as "for good" and looks no further, so there
+    /// is nothing left to escalate, and leaving the entry alone keeps
+    /// `gate_gen` still. That matters for an anchor struck on every burst
+    /// long after it was abandoned (a trace reached only through armed links,
+    /// which no dispatch gate stops): each bump used to retire the whole bar
+    /// memo and every settled return site.
     fn bumpGateEntry(self: *TraceState, map: *AnchorMap(Gate), anchor: AnchorKey, reason: GateReason) ?*Gate {
         const gop = map.getOrPut(self.gpa, anchor) catch return null;
+        if (gop.found_existing and gop.value_ptr.strikes >= self.config.max_strikes) return gop.value_ptr;
         self.noteGatesChanged();
         if (!gop.found_existing) {
             gop.value_ptr.* = .{ .retry_at = 0, .window = self.config.backoff_base, .strikes = 0, .reason = reason };

@@ -82,9 +82,11 @@ land; move whole phases to Done once everything inside them is checked.
 ### Outstanding
 
 - [ ] **`records_script` is slower with the JIT than on tier 0** (§7.2):
-  9,301 M instructions against 5,561 M, LuaJIT 853 M. Four causes, each
-  with its own entry in `TODO.md`; none is in this doc's phases. `#t`
-  is done (§7.3); what it uncovered is the next item.
+  9,221 M instructions against 5,561 M (1.66x), LuaJIT 853 M. Four
+  causes, each with its own entry in `TODO.md`; none is in this doc's
+  phases. `#t` is done (§7.3); what it uncovered is the next item. The
+  step from 9,301 M is a gate fix found on this row (doc 84 §4.5
+  follow-up).
 - [ ] **Nothing joins a loop to the next one across a return and a
   call** (§7.3). LuaJIT runs `records_script` as a ring of four loop
   traces joined by side traces that return to the caller and enter the
