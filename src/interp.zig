@@ -6177,6 +6177,46 @@ pub const Vm = struct {
         }
     };
 
+    /// The exclusion set a same-anchor sibling chain starts from
+    /// (`driveChain`'s `initially_excluded`): the walk's `visited` set, so
+    /// the chain neither re-runs the trace just entered nor a sibling
+    /// already tried on this back-edge, plus `final` when the native run
+    /// fused into a child (`final != ct`). A fused child lives at its own
+    /// anchor and is not in `visited` (which holds only the traces
+    /// trial-entered at THIS anchor); without it a retry could re-pick the
+    /// child that just failed its prologue (doc 17 2.3c-0d).
+    ///
+    /// `final` goes FIRST (blocker-3 fix): `driveChain` copies the set into
+    /// its own `[8]` visited and stops at 8, so a trailing `final` would be
+    /// truncated away when the walk already visited 8 traces. An
+    /// already-visited sibling is dropped instead, which is harmless:
+    /// `driveChain` bounds its own hops regardless.
+    ///
+    /// Built at the two sibling-chain sites, not on every entry: a run that
+    /// leaves through its loop-done exit reaches neither.
+    const ChainExclusion = struct {
+        items: [trial_visited_cap + 1]*trace.Trace = undefined,
+        len: usize = 0,
+
+        fn of(final: *trace.Trace, ct: *trace.Trace, visited: []const *trace.Trace) ChainExclusion {
+            var x: ChainExclusion = .{};
+            if (final != ct) {
+                x.items[0] = final;
+                x.len = 1;
+            }
+            for (visited) |v| {
+                if (x.len >= x.items.len) break;
+                x.items[x.len] = v;
+                x.len += 1;
+            }
+            return x;
+        }
+
+        fn slice(self: *const ChainExclusion) []const *trace.Trace {
+            return self.items[0..self.len];
+        }
+    };
+
     /// Phase 0a (doc 20 §R1-4/§R3-3): the single factored per-candidate entry +
     /// receipt routine — seed resolution, scratch borrow, coverage brackets,
     /// `safe_to_arm`, `disarmAllLinks`, `tryArmSiblingHandoff`,
@@ -7408,39 +7448,6 @@ pub const Vm = struct {
             else
                 ct;
 
-            // 2.3c-0d (doc 17): the sibling-retry `driveChain`s below
-            // seed `initially_excluded` with the walk's `visited` set so
-            // they neither re-run the trace we entered nor a sibling
-            // already tried this back-edge. `visited` holds only the
-            // `ct`s trial-entered at THIS anchor — it does NOT contain a
-            // fused child (`final != ct`), which lives at its own anchor.
-            // Once a slot is armed a child prologue-fail can surface
-            // `final` here; without excluding it a sibling retry could
-            // immediately re-pick the just-failed child. Build the
-            // exclusion set once = `visited ∪ {final}`. Byte-identical
-            // now: `final == ct`, and `ct ∈ visited`, so the union adds
-            // nothing.
-            //
-            // ORDER `final` FIRST (blocker-3 fix): `driveChain` copies
-            // `initially_excluded` into its OWN `[8]` visited and breaks
-            // at 8 (trace.zig). When the walk already visited 8 traces,
-            // a trailing `final` (excl[8]) would be truncated away and
-            // driveChain could re-pick the just-failed child. Placing
-            // `final` at excl[0] guarantees it survives the copy; a later
-            // already-visited sibling is dropped instead — harmless, as
-            // driveChain bounds its own hops regardless.
-            var excl: [trial_visited_cap + 1]*trace.Trace = undefined;
-            var nexcl: usize = 0;
-            if (final != ct) {
-                excl[nexcl] = final;
-                nexcl += 1;
-            }
-            for (wctx.visited) |v| {
-                if (nexcl >= excl.len) break;
-                excl[nexcl] = v;
-                nexcl += 1;
-            }
-
             // Doc 44 D10: fused head burst. MUST precede the scalar terminal /
             // head-zero consumers below — they read only the TERMINAL body's
             // scalars and would silently mis-consume a multi-row head ledger,
@@ -8021,14 +8028,15 @@ pub const Vm = struct {
                 // re-check a finished loop. `isSourceBranchGuardExit` excludes
                 // it, so no test is needed here.
                 if (self.trace.isSourceBranchGuardExit(final, result.exit_instr)) {
+                    const excl = ChainExclusion.of(final, ct, wctx.visited);
                     if (ran_native) {
-                        if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
+                        if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                             wctx.dead.retire(&self.trace);
                             return .{ .resume_tier0 = pc };
                         }
                     } else {
-                        if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
+                        if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                             wctx.dead.retire(&self.trace);
                             return .{ .resume_tier0 = pc };
@@ -8105,14 +8113,15 @@ pub const Vm = struct {
             // `tier` is a comptime param, so branch on `ran_native`
             // into two literal-tier calls (as the branch-guard site
             // above does) rather than a runtime tier value.
+            const excl = ChainExclusion.of(final, ct, wctx.visited);
             if (ran_native) {
-                if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
+                if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                     wctx.dead.retire(&self.trace);
                     return .{ .resume_tier0 = pc };
                 }
             } else {
-                if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
+                if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl.slice(), safe_to_arm, self.unicode_version_pinned)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                     wctx.dead.retire(&self.trace);
                     return .{ .resume_tier0 = pc };
