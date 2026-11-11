@@ -1,8 +1,11 @@
 # 87 — Joining loops across returns and calls — Design
 
 Status: draft, not implemented. One prerequisite fix landed with this draft
-(an admitted region no longer turns off native frame motion, §4.4). Q1–Q5
-(§10) are open, and no phase starts before Q1 and Q2 are answered.
+(an admitted region no longer turns off native frame motion, §4.4). Bart
+answered on 2026-11-11 (§10.1): the shape is A (LuaJIT's), the seam is
+trimmed before the join, and the probe is a board row (`loop_ring`,
+`loop_ring_16`). Still open: Q2's choice between (R-a) and (R-b), and Q4,
+which needs counts first.
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -25,24 +28,31 @@ inside them is checked.
   frame motion and the one-shot lane** (§4.4; doc 54 "Episode descent
   gate", follow-up of 2026-11-11). `fib(30)` after a linked 300×300 nest:
   10,092 M instructions → 1,017 M.
+- [x] **Q1 — the shape: A, one glue trace whose frames move at its end**
+  (§5.2; Bart, 2026-11-11).
+- [x] **Q3 — the seam is trimmed before the join** (§5.6; Bart,
+  2026-11-11). The work is the "Seam" bullet below.
+- [x] **Q5 and Phase 0's row — the probe is a bench.**
+  `bench/loop_ring.lua` with two rows, `loop_ring` (20,000 rounds of 64
+  trips) and `loop_ring_16` (80,000 of 16), and their hashgate rows. All
+  three modes and LuaJIT agree.
 
 ### Outstanding
 
-- [ ] **Q1 — the shape of the join** (§5.2 against §5.3): one glue trace
-  whose frames move at its end, or a page per frame joined by frame
-  links.
 - [ ] **Q2 — regions and the ledger on a ring** (§5.5): rows that carry
-  frame motion, or the ring as one region of the caller's activation;
-  and whether the "inert only" slice is the first step.
-- [ ] **Q3 — the seam itself** (§5.6): a lean loop episode before the
-  join, alongside it, or not now.
-- [ ] **Q4 — v1 scope** (§7): numeric `for` only, one frame down and one
-  up, fixed result counts.
-- [ ] **Q5 — the probe as a board row** (§8 Phase 0).
+  frame motion (R-a), or the ring as one region of the caller's
+  activation (R-b). Bart, 2026-11-11: no smaller first step unless it is
+  reused; §10.1 says what (R-c) would and would not leave behind.
+- [ ] **Q4 — v1 scope** (§7). Bart, 2026-11-11: not enough information.
+  §10.1 lists the counts that would answer it; they come from Phase 0's
+  counters.
 - [ ] **Review round.** §11 lists the claims this draft makes from
   reading, not from running; each needs a check against the source
   before the phase that leans on it.
-- [ ] **Phase 0 — the probe row and counters** (inert).
+- [ ] **Seam — a loop visit from tier 0 costs less** (§5.6), before
+  Phase 1.
+- [ ] **Phase 0 — counters** (inert): glue wants, recordings, arms, hits
+  and declines by reason, with their jit-debug probes.
 - [ ] **Phase 1 — a recording that starts at a loop's exit and leaves the
   function.**
 - [ ] **Phase 2 — the join runs, with the runtime moving the frames.**
@@ -565,6 +575,31 @@ The ceiling is twice LuaJIT's. A phase that leaves the probe above tier
 - **Q4 — v1 scope.** §7's list.
 - **Q5 — the probe as a board row**, and at which trip counts (64 alone,
   or 16 and 64).
+
+### 10.1 Answers, 2026-11-11
+
+- **Q1: A.** Bart asked whether B is strictly worse. It is not on every
+  line of §5.4: B shares one tail page and one head page among all
+  callers of a helper, a guard failing in the caller's code resumes in
+  the caller, and its cross-proto links would also serve mutual
+  recursion and hot calls that are not self-calls. On the join itself A
+  has fewer entries, one frame motion, and keeps values in the trace.
+- **Q2: no smaller first step unless it is reused.** (R-c) builds one
+  thing of its own: a refusal at the arm site ("both ends inert"), which
+  (R-a) or (R-b) deletes again together with the tests that pin it. The
+  episode gate it leans on (`noOpenActivation`) exists already and
+  stays. So (R-c) is not a phase. The choice between (R-a) and (R-b) is
+  still open, and Phase 2 arms nothing until it is made, because an arm
+  without either would need exactly (R-c)'s refusal.
+- **Q3: trim the seam first.**
+- **Q4: not enough information.** What would answer it, per board row
+  and for a script-shaped program: how many loop-done exits are followed
+  by a return, by loop kind (numeric `for`, `while`, generic `for`); how
+  many of those returns land in a frame that is vararg, `pcall`'d, or
+  takes `all_results`; how many frames the glue would cross before the
+  next loop. Phase 0's counters produce these without changing any
+  behaviour.
+- **Q5: as a bench.** Done (`bench/loop_ring.lua`).
 
 ## 11. Claims a review round should verify
 
