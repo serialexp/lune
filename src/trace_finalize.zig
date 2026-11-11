@@ -444,6 +444,7 @@ pub fn finalize(gpa: std.mem.Allocator, rec: anytype, options: Options) !Recordi
         .entry_slots = fields.entry_slots,
         .entry_guards = guards_owned,
         .inputs = inputs_owned,
+        .upvalue_disjoint_check = code_mod.needsUpvalueDisjointCheck(inputs_owned),
         .exit_prov = exit_prov_owned,
         .exit_prov_complete = exit_prov_complete,
         .rec_path = rec_path_owned,

@@ -469,6 +469,24 @@ pub const ForAlias = struct {
     }
 };
 
+/// Doc 43 P5: does an entry with these seeds have to re-prove that distinct
+/// upvalue alias classes, and a class and an upvalue snapshot, reach
+/// distinct cells (`Vm.upvalueClassesDisjoint`)? Only when there is a class
+/// (a writer `upvalue_cell` seed) and some other upvalue seed it could
+/// meet: a second class, or an `.upvalue`/`.callee_upvalue` snapshot.
+pub fn needsUpvalueDisjointCheck(inputs: []const InputSeed) bool {
+    var classes: usize = 0;
+    var snapshots: usize = 0;
+    for (inputs) |s| switch (s.kind) {
+        .upvalue_cell => if (!s.verify) {
+            classes += 1;
+        },
+        .upvalue, .callee_upvalue => snapshots += 1,
+        else => {},
+    };
+    return classes > 1 or (classes > 0 and snapshots > 0);
+}
+
 pub const TraceCode = struct {
     /// Borrowed proto identity; its program image must outlive this artifact.
     anchor: AnchorKey,
@@ -501,6 +519,11 @@ pub const TraceCode = struct {
     entry_slots: []u16,
     /// Immutable entry contract; runtime-only means nonserialized, not mutable.
     inputs: []InputSeed = &.{},
+    /// Doc 43 P5: `inputs` holds an upvalue alias class and a second upvalue
+    /// seed, so entry must re-prove the classes' NO-alias relation
+    /// (`needsUpvalueDisjointCheck`). Derived from `inputs` at finalize, so
+    /// the seed loops pay nothing for the traces that have no class.
+    upvalue_disjoint_check: bool = false,
     entry_guards: []EntryGuard,
     /// Conservative recorder allocation bound; blackout entry checks consume it.
     alloc_bound: u32 = 0,

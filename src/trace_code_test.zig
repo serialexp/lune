@@ -156,3 +156,28 @@ test "anchor identity (doc 44 D12b): anchorKind/entryPc/contAnchorPc decode ever
     try testing.expectEqual(@as(u32, (1 << 31) - 2), tc.entryPc(top));
     try testing.expect(top != tc.FUNC_HEAD_PC);
 }
+
+test "doc 43 P5: entry re-proves upvalue NO-alias only for a class and a second upvalue seed" {
+    const S = trace_code.InputSeed;
+    const need = trace_code.needsUpvalueDisjointCheck;
+    const class: S = .{ .kind = .upvalue_cell, .source = 0, .slot = 10 };
+    const verifier: S = .{ .kind = .upvalue_cell, .source = 1, .slot = 10, .verify = true };
+    const snap: S = .{ .kind = .upvalue, .source = 2, .slot = 11 };
+    const callee_snap: S = .{ .kind = .callee_upvalue, .source = 0, .slot = 12, .callee_slot = 3 };
+    const global: S = .{ .kind = .global, .source = 0, .slot = 13 };
+    const alias: S = .{ .kind = .upvalue_slot_alias, .source = 0, .slot = 2, .callee_slot = 3 };
+
+    try testing.expect(!need(&.{}));
+    try testing.expect(!need(&.{class}));
+    // A verifier is another path onto the same class, not a second class.
+    try testing.expect(!need(&.{ class, verifier }));
+    // Seeds that never read an upvalue cell, or read an open one.
+    try testing.expect(!need(&.{ class, global, alias }));
+    // Snapshots alone write nothing.
+    try testing.expect(!need(&.{ snap, callee_snap }));
+
+    try testing.expect(need(&.{ class, class }));
+    try testing.expect(need(&.{ snap, class }));
+    try testing.expect(need(&.{ class, callee_snap }));
+    try testing.expect(need(&.{ class, verifier, global, snap }));
+}
