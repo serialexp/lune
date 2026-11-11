@@ -2,6 +2,28 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## CRITICAL: the step count differs between tiers (doc 86 §6.1)
+
+- [ ] **Critical — native and tier-1a code do not count steps.** Only the
+      tier-0 dispatch prologue advances `Vm.safepoint_seq`; nothing in
+      `nativegen*`, `irinterp` or `trace*` does. So a JIT run ends with a
+      lower step count than the same program at tier 0, and a step means a
+      different point in the program in each tier. Today the cross-tier
+      snapshot tests hide this by masking the field
+      (`keyframeser_testutil.expectSameStateAcrossTiers`), which can hide
+      other divergence too (Bart, 2026-11-12: "Ignoring the field is a
+      great way to get secret divergence"). The fix:
+      - each trace iteration adds the bytecode instructions its path
+        covers (a constant per path, known at compile time);
+      - each exit adds the partial count up to its pc;
+      - inlined calls and metamethods add their callees' instructions;
+      - then the mask is deleted, and every cross-tier test compares
+        `safepoint_seq` again.
+      This is new JIT machinery, so it goes through a design doc first.
+      Debug sessions run tier 0 (doc 86 §5.6), so P2 goes ahead without
+      it. It must land before the JIT runs in a debug session. Decided by
+      Bart, 2026-11-12.
+
 ## JIT coverage: library calls by qualified name, heap values out of tables (doc 85)
 
 - [x] **`math.floor(x)` or `obj.name` in a hot loop never traced.** Fixed
