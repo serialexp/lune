@@ -1404,6 +1404,10 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
             const is_pre_val = marker_idx != null and i < ms and isTransient(ins.op);
             const is_int_phi = ins.op == .phi and ins.aux == trace.PHI_INTERNAL;
             if (!is_pre_val and !is_int_phi) continue;
+            // A `.none`-kind konst (an href's interned key, doc 77 §5.5 hoists
+            // those too) carries no native value: the body scan gives it the
+            // dead Loc it gives one in the body.
+            if (kinds[i] == .none) continue;
             // An immediate konst needs no home, run-once or not.
             if (imm(t, kinds, &float_read, i)) |v| {
                 loc[i] = .{ .imm = v };
@@ -1434,7 +1438,13 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                         spill_count += 1;
                     }
                 },
-                .int, .bool => {
+                // Doc 77 §5.5: a hoisted table read's `*GcHeader` (`.heap`)
+                // or hash-cell pointer (`.href`) is a GP word like an int.
+                // Neither backs a tier-0 slot, so a deopt never flushes it;
+                // tropt hoists one only while what it points at stays put
+                // for the run (`tropt.hoistableRead`).
+                .int, .bool, .heap, .href => {
+                    if (is_int_phi and (kinds[i] == .heap or kinds[i] == .href)) return error.Bail;
                     if (pickReg(&free) orelse
                         evictPrologueOnly(&evictable, slots.items, loc, &home_reg_mask, .gp)) |r|
                     {
@@ -1446,8 +1456,9 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                         spill_count += 1;
                     }
                 },
-                // A computed home must carry a boxable scalar; anything else (a `.ptr`/
-                // `.aref` hoisted into the preheader, or a mis-typed φ) cannot be homed.
+                // A computed home must carry a GP word or a float; anything else
+                // (a `.ptr`/`.aref` hoisted into the preheader, or a mis-typed φ)
+                // cannot be homed.
                 else => return error.Bail,
             }
             is_computed[i] = true;

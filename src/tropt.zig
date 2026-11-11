@@ -292,6 +292,119 @@ fn kindOf(op: IrOp) OpKind {
     };
 }
 
+/// Doc 77 §5.5: what a trace writes to table memory. On trace a hash store
+/// overwrites a present key in place (`hstore` never inserts, deletes or
+/// rehashes) and an array store touches only the array part
+/// (`astore_append` requires an empty hash part), so a store can change
+/// only the values of the keys it names.
+const TableWrites = struct {
+    /// The canonical konst refs of every key an `hstore` names. Konsts
+    /// canonicalize by value, so equal keys share one ref.
+    hash_keys: std.AutoHashMapUnmanaged(Ref, void) = .empty,
+    /// An `hstore` whose key is not a konst: it may name any key.
+    hash_any: bool = false,
+    /// Any array-part or grid store.
+    array: bool = false,
+
+    fn deinit(self: *TableWrites, gpa: std.mem.Allocator) void {
+        self.hash_keys.deinit(gpa);
+    }
+};
+
+const TableWrite = enum { none, hash, array };
+
+/// Which part of a table `op` writes. Only the `.astore` kind writes table
+/// memory; a new op there must say what it writes.
+fn tableWriteOf(op: IrOp) TableWrite {
+    return switch (kindOf(op)) {
+        .astore => switch (op) {
+            .hstore => .hash,
+            .astore, .astore_append, .gstore => .array,
+            // A closed-upvalue cell, and three read-only memory guards.
+            .ustore, .guard_absent, .guard_gcol, .guard_tostring => .none,
+            else => unreachable,
+        },
+        else => .none,
+    };
+}
+
+fn tableWrites(gpa: std.mem.Allocator, instrs: []const IrInstr, canon: []const Ref) !TableWrites {
+    var w: TableWrites = .{};
+    errdefer w.deinit(gpa);
+    for (instrs) |ins| switch (tableWriteOf(ins.op)) {
+        .none => {},
+        .array => w.array = true,
+        .hash => {
+            const href = instrs[canon[ins.a]];
+            std.debug.assert(href.op == .href);
+            const key = canon[href.b];
+            if (instrs[key].op == .konst) {
+                try w.hash_keys.put(gpa, key, {});
+            } else w.hash_any = true;
+        },
+    };
+    return w;
+}
+
+/// Does `op` read the table in its `a` operand (the memory reads LICM
+/// hoists)?
+fn readsTableOperand(op: IrOp) bool {
+    return switch (op) {
+        .load_meta, .href, .guard_absent => true,
+        else => false,
+    };
+}
+
+/// Doc 77 §5.5: is `ins`, a canonical survivor, a table read (or a guard
+/// over one) whose result is the same on every iteration of a native run?
+///
+/// - `load_meta` of an invariant table: only `setmetatable` writes a
+///   metatable, and no trace calls it (§4.2).
+/// - an unseeded `href` (table, constant key) and its `guard_hash`: no
+///   trace store changes a hash part's layout or population (`TableWrites`).
+///   A seeded `href` is already resolved once per entry by the prologue.
+/// - `hload` through a hoisted `href`: unless a store in the trace names
+///   the same key. Keys are compared, not tables, so a store to any other
+///   key, in any table, leaves the read invariant (LuaJIT's `aa_ahref`
+///   rule for constant keys).
+/// - `guard_absent` of an invariant table and key: a string key always (no
+///   store inserts or deletes); another key only when the trace stores to
+///   no array part.
+/// - a type guard on a hoisted value.
+///
+/// Nothing a trace runs can free a table or the value a hoisted read
+/// returned while it stays in the table, so a hoisted heap result stays
+/// valid for the run.
+fn hoistableRead(
+    instrs: []const IrInstr,
+    canon: []const Ref,
+    const_val: []const ?Value,
+    inv: []const bool,
+    hoist: []const bool,
+    writes: *const TableWrites,
+    ins: IrInstr,
+) bool {
+    return switch (ins.op) {
+        .load_meta => inv[canon[ins.a]],
+        .href => ins.aux < 0 and inv[canon[ins.a]] and inv[canon[ins.b]],
+        .guard_hash => hoist[canon[ins.a]],
+        .hload => blk: {
+            const ha = canon[ins.a];
+            if (!hoist[ha] or instrs[ha].op != .href) break :blk false;
+            if (writes.hash_any) break :blk false;
+            break :blk !writes.hash_keys.contains(canon[instrs[ha].b]);
+        },
+        .guard_absent => blk: {
+            if (!inv[canon[ins.a]] or !inv[canon[ins.b]]) break :blk false;
+            const key = const_val[canon[ins.b]];
+            const string_key = if (key) |k| k.isHeap() and k.heapType() == .string else false;
+            break :blk string_key or !writes.array;
+        },
+        .guard_table, .guard_func, .guard_int, .guard_float, .guard_number, .guard_bool, .guard_string, .guard_builtin => hoist[canon[ins.a]],
+        else => false,
+    };
+}
+
 /// Does the guard `ins` provably pass when its operand is the constant `v`?
 /// (Used to drop always-pass guards. An always-*fail* guard returns false and is
 /// kept — never silently removed.) `guard_fits` is lane-dependent, so it reads
@@ -649,7 +762,17 @@ pub fn optimize(
                     canon[i] = c;
                 } else try cse.put(gpa, key, @intCast(i));
             },
-            .aload, .astore => {},
+            // `load_meta` (doc 77 §5.5) is the one load that CSEs: its only
+            // writer is `setmetatable`, which no trace calls (§4.2), so two
+            // reads of one table's metatable are the same value, and the
+            // first one's fused exit covers the second.
+            .aload => if (ins.op == .load_meta) {
+                const key = CseKey{ .op = ins.op, .a = canon[ins.a], .b = 0, .aux = ins.aux, .ty = ins.ty };
+                if (cse.get(key)) |c| {
+                    canon[i] = c;
+                } else try cse.put(gpa, key, @intCast(i));
+            },
+            .astore => {},
             // `.alloc` ops are effectful roots: canonical to themselves, never
             // folded, never CSE'd (see kindOf). `.gcguard` likewise — and its
             // `a` is NOT an operand, so it must not touch the guard tables.
@@ -678,9 +801,10 @@ pub fn optimize(
     // **invariant** iff it is a `konst`, an invariant `slot_load`, a folded
     // constant, or a pure op (binary/unary) over invariant operands. An invariant
     // *computed* op (`hoist[i]`) is worth moving into a run-once preheader region;
-    // its invariant operand cone moves with it. Guards/memory/φ are never hoisted
-    // in this first cut (a guard on an invariant value is cheap and re-checking it
-    // each iteration is harmless; hoisting it is a later refinement).
+    // its invariant operand cone moves with it. φ is never hoisted. Memory reads
+    // and guards hoist only on the table-lookup path doc 77 §5.5 proves invariant
+    // (`hoistableRead`), plus the receiver `guard_table` such a read needs; every
+    // other guard and memory op stays in the body.
     //
     // Marked BEFORE liveness (it reads only canon/dead/fold_aux and the φs): a
     // hoisted side exit (`int_of_float`) leaves the body, so the liveness sweep
@@ -700,6 +824,11 @@ pub fn optimize(
         if (ins.op == .phi and ins.aux >= 0) try carried_slots.put(gpa, ins.aux, {});
     }
 
+    // Doc 77 §5.5: what the trace writes to table memory, for the memory
+    // reads below. A store decides which reads stay in the body.
+    var writes = try tableWrites(gpa, instrs, canon);
+    defer writes.deinit(gpa);
+
     const inv = try gpa.alloc(bool, n);
     defer gpa.free(inv);
     @memset(inv, false);
@@ -708,6 +837,12 @@ pub fn optimize(
     @memset(hoist, false);
     for (instrs, 0..) |ins, i| {
         if (canon[i] != i or dead[i]) continue; // only canonical survivors carry inv
+        // Doc 77 §5.5: invariant table reads, and the guards over them.
+        if (hoistableRead(instrs, canon, const_val, inv, hoist, &writes, ins)) {
+            inv[i] = true;
+            hoist[i] = true;
+            continue;
+        }
         if (fold_aux[i] != null) {
             inv[i] = true; // folded → becomes a konst → invariant (not a hoist target)
             continue;
@@ -754,6 +889,26 @@ pub fn optimize(
             // Doc 30: all excluded from LICM/hoisting fail-closed (scratch
             // effect order; alloc id stream; per-iteration status exits).
             .scratch3, .scratch1k, .proj, .alloc_proj, .parse, .setpos => {},
+        }
+    }
+
+    // Doc 77 §5.5: a hoisted read of a table that is an invariant slot
+    // takes the table's guard with it. The read assumes a table (tier-1a
+    // dereferences it) and `trace_finalize` asserts a `guard_table` comes
+    // before it; compaction keeps index order inside the preheader, and the
+    // surviving `guard_table` on a table is its first one.
+    {
+        var read_tables = try std.DynamicBitSetUnmanaged.initEmpty(gpa, n);
+        defer read_tables.deinit(gpa);
+        for (instrs, 0..) |ins, i| {
+            if (hoist[i] and readsTableOperand(ins.op)) read_tables.set(canon[ins.a]);
+        }
+        for (instrs, 0..) |ins, i| {
+            if (canon[i] != i or dead[i] or ins.op != .guard_table) continue;
+            const t = canon[ins.a];
+            if (instrs[t].op != .slot_load or !inv[t] or !read_tables.isSet(t)) continue;
+            hoist[i] = true;
+            inv[i] = true;
         }
     }
 
@@ -887,10 +1042,16 @@ pub fn optimize(
                     in_pre[canon[instrs[i].a]] = true;
                     in_pre[canon[instrs[i].b]] = true;
                 },
-                .unary => in_pre[canon[instrs[i].a]] = true,
+                .unary, .guard, .aload => in_pre[canon[instrs[i].a]] = true,
                 .cvt => {
                     in_pre[canon[instrs[i].a]] = true;
                     if (cvtReadsB(instrs[i].op)) in_pre[canon[instrs[i].b]] = true;
+                },
+                // Doc 77 §5.5: `href` (table, key) and `guard_absent`
+                // (table, key), the only `.aref`/`.astore` ops that hoist.
+                .aref, .astore => {
+                    in_pre[canon[instrs[i].a]] = true;
+                    in_pre[canon[instrs[i].b]] = true;
                 },
                 else => {}, // konst / invariant slot_load: leaf of the cone
             }

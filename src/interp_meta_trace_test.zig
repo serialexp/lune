@@ -471,3 +471,160 @@ test "doc 77 §6.2: an __index chain into a grid reads it on tier 0 without reco
         \\print(s)
     , "800\n");
 }
+
+// ---- Phase 2: invariant lookups leave the loop body (doc 77 §5.5) ----
+
+/// `op`s before (`pre`) and after (`body`) the preheader marker, across the
+/// committed traces. A trace without a marker counts wholly as body.
+const Placement = struct { pre: usize = 0, body: usize = 0 };
+
+fn placementOf(vm: *const Vm, op: trace_ir.IrOp) Placement {
+    var out: Placement = .{};
+    for (vm.trace.registry.cache.items) |t| {
+        var marker: ?usize = null;
+        for (t.code.instrs, 0..) |ins, i| {
+            if (ins.op == .preheader) {
+                marker = i;
+                break;
+            }
+        }
+        for (t.code.instrs, 0..) |ins, i| {
+            if (ins.op != op) continue;
+            if (marker != null and i < marker.?) out.pre += 1 else out.body += 1;
+        }
+    }
+    return out;
+}
+
+/// The modes whose committed traces went through tropt.
+fn optimized(mode: TraceMode) bool {
+    return mode == .record_execute or mode == .record_execute_native;
+}
+
+/// The whole chain read runs once per entry: no miss proof or metatable
+/// load is left in the body. (A store's own `guard_hash` stays there.)
+fn expectChainHoisted(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectMetaMissTraceRan(vm, mode);
+    if (!optimized(mode)) return;
+    for ([_]trace_ir.IrOp{ .load_meta, .guard_absent }) |op| {
+        const pl = placementOf(vm, op);
+        try testing.expect(pl.pre > 0);
+        try testing.expectEqual(@as(usize, 0), pl.body);
+    }
+    if (mode == .record_execute_native) try testing.expect(vm.trace.native_entries > 0);
+}
+
+test "doc 77 §5.5: a chain read of an invariant receiver runs once per entry" {
+    // `o.scale` is two hops; nothing in the loop stores to a table. The
+    // two lookups share `load_meta o` (CSE) and run before the loop.
+    try expectProgramTuned(
+        \\local Base = { scale = 3 }
+        \\Base.__index = Base
+        \\local Mid = setmetatable({}, Base)
+        \\Mid.__index = Mid
+        \\local o = setmetatable({}, Mid)
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  s = s + o.scale + o.scale
+        \\end
+        \\print(s)
+    , "1800\n", .{ .inspect = expectChainHoisted });
+}
+
+/// The chain's hops are hoisted, and an `hload` stays in the body.
+fn expectHopsHoistedReadInBody(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectMetaMissTraceRan(vm, mode);
+    if (!optimized(mode)) return;
+    try testing.expectEqual(@as(usize, 0), placementOf(vm, .load_meta).body);
+    try testing.expect(placementOf(vm, .hload).body > 0);
+}
+
+test "doc 77 §5.5: a store to the key a chain reads keeps that read in the loop" {
+    // `Base.n` is stored every iteration and read through `o`'s chain; the
+    // hops are invariant, the final read is not.
+    try expectProgramTuned(
+        \\local Base = { n = 0 }
+        \\Base.__index = Base
+        \\local o = setmetatable({}, Base)
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  s = s + o.n
+        \\  Base.n = i
+        \\end
+        \\print(s, Base.n)
+    , "19900\t200\n", .{ .inspect = expectHopsHoistedReadInBody });
+}
+
+test "doc 77 §5.5: a store to another key leaves the chain read hoisted" {
+    try expectProgramTuned(
+        \\local Base = { scale = 3, other = 0 }
+        \\Base.__index = Base
+        \\local Mid = setmetatable({}, Base)
+        \\Mid.__index = Mid
+        \\local o = setmetatable({}, Mid)
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  s = s + o.scale
+        \\  Base.other = i
+        \\end
+        \\print(s, Base.other)
+    , "900\t300\n", .{ .inspect = expectChainHoisted });
+}
+
+test "doc 77 §5.5: the hoisted chain is read again at every entry" {
+    // At i == 100 tier 0 replaces the `__index` table; the trace exits on
+    // that branch, and the next entry runs its preheader against B.
+    try expectProgramTuned(
+        \\local A = { k = 1 }
+        \\local B = { k = 2 }
+        \\local mt = { __index = A }
+        \\local o = setmetatable({}, mt)
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if i == 100 then mt.__index = B end
+        \\  s = s + o.k
+        \\end
+        \\print(s)
+    , "301\n", .{ .inspect = expectMetaMissTraceRan });
+}
+
+/// An integer-key `guard_absent` stays in the body.
+fn expectIntAbsentInBody(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectMetaMissTraceRan(vm, mode);
+    if (!optimized(mode)) return;
+    try testing.expect(placementOf(vm, .guard_absent).body > 0);
+    try testing.expectEqual(@as(usize, 0), placementOf(vm, .load_meta).body);
+}
+
+test "doc 77 §5.5: an absent integer key stays checked in a loop that stores to an array" {
+    // A store to any array may fill the hole, so the absence is not
+    // hoisted; the `__index` hop still is. (An append after the absent
+    // read aborts `store_after_load` today, so the store is an overwrite.)
+    try expectProgramTuned(
+        \\local t = setmetatable({}, { __index = { 5 } })
+        \\local out = { 0, 0, 0, 0 }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  out[2] = i
+        \\  s = s + t[1]
+        \\end
+        \\print(s, out[2])
+    , "1000\t200\n", .{ .inspect = expectIntAbsentInBody });
+}
+
+test "doc 77 §5.5: a hoisted heap value outlives collections inside the loop" {
+    // `tostring` allocates every iteration, so the collector runs inside
+    // the loop on the stress legs; the hoisted method and its class stay
+    // reachable through `o`'s metatable.
+    try expectProgram(
+        \\local C = {}
+        \\C.__index = C
+        \\function C.get(self) return self.v end
+        \\local o = setmetatable({ v = 3 }, C)
+        \\local n = 0
+        \\for i = 1, 300 do
+        \\  n = n + o:get() + #tostring(i)
+        \\end
+        \\print(n)
+    , "1692\n");
+}

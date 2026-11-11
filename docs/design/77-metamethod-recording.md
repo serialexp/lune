@@ -1,8 +1,7 @@
 # 77 — Recording metamethods — Design
 
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
-decided; Phases 0, 1 and 3 landed (2026-11-11); Phases 2 and 4–7
-outstanding
+decided; Phases 0–3 landed (2026-11-11); Phases 4–7 outstanding
 (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-11
@@ -99,14 +98,37 @@ land; move whole phases to Done once everything inside them is checked.
     0; frozen receiver and frozen target; `__index` into a grid; the chain
     boundary.
 
+- [x] **Phase 2 — invariant lookups leave the loop body** (§5.5,
+  2026-11-11). tropt's LICM pass (`tropt.hoistableRead`) moves these into
+  the run-once preheader, which runs again at every native entry:
+  - [x] `load_meta` of an invariant table, which also CSEs (two lookups on
+    one receiver share it);
+  - [x] an unseeded `href` with a constant key, its `guard_hash`, and an
+    `hload` through it unless a store in the trace names the same key
+    (decision note in §10.7);
+  - [x] `guard_absent` of an invariant table: a string key always, an
+    integer key only in a trace that stores to no array part;
+  - [x] the type guards on a hoisted value (`guard_table`, `guard_func`,
+    `guard_int` and the other value pins), and the `guard_table` of an
+    invariant slot table a hoisted read reads.
+  - [x] native: a preheader value of kind `.heap` or `.href` gets a GP
+    home (`nativegen_alloc`), and an href key konst in the preheader takes
+    no home.
+  - [x] measured in cycles per iteration (§10.6), and gated in
+    `src/interp_meta_trace_test.zig` (placement of the lookup ops before or
+    after the preheader marker; a store to the read key; a store to another
+    key; a chain replaced between entries; an integer-key absence beside an
+    array store; collections inside the loop). With the key check removed,
+    the store-to-key program's traced run prints 9747 instead of 19900.
+
 ### Outstanding
 
 - [ ] **Phase 0 numbers on the board** (the pinned pool): needs a push, then
   `gt profile`.
-- [ ] **Phase 2 — invariant lookups leave the loop body** (§5.5): the
-  metatable pointer as an invariant field only `setmetatable` writes, and
-  the lookup chain of an invariant receiver evaluated once per entry;
-  measured in emitted probes per iteration.
+- [ ] **Defer — hoisting array-part reads** (§5.5 follow-up): an
+  `__index` hop ending in an array read (`aref`/`guard_bounds`/
+  `guard_present`/`aload`) keeps that read in the body. The native
+  preheader cannot home an `aref`.
 - [ ] **Phase 4 — function metamethods as inlined calls** (§6). Starts
   after doc 68 P2 (Q1).
   - [ ] doc 68 P2 landed: tier 0 runs metamethods as continuation frames,
@@ -657,8 +679,9 @@ Same method (load ~3.8).
 `ray`'s `has_metatable` aborts are gone; its method lookups record and the
 traces now stop one step later, at the method's upvalues. No Phase 0
 program other than `ray` reads through a chain, so the rows did not move. A
-chain read costs every hop on every iteration (a two-hop probe loop runs at
-about 790 cycles an iteration natively); Phase 2 hoists it.
+chain read costs every hop on every iteration (a two-hop field read runs at
+33.6 cycles an iteration natively, §10.6; an earlier "about 790 cycles"
+here was a probe loop that also called a method); Phase 2 hoists it.
 
 ### 10.5 Phase 3 decision notes (2026-11-11)
 
@@ -675,6 +698,56 @@ about 790 cycles an iteration natively); Phase 2 hoists it.
 - **The shapes share an explicit error set** (`RecordError`), because a hop
   re-enters `getShape`/`setShape` and Zig cannot infer a recursive error
   set.
+
+### 10.6 After Phase 2 (2026-11-11)
+
+A two-hop read (`s = s + o.scale` through `Mid` to `Base`) costs 33.6
+cycles an iteration natively on the Phase 3 build and 1.0 after it
+(`--jit-stats`, 2e7 iterations): the `guard_absent` callouts, the
+`load_meta`s and the hop probes now run once per entry.
+
+Whole suite, best of two interleaved `bench/run.py` runs per binary
+(baseline 2e0b2fd from `git archive`, verified by the probe above; load ~9):
+
+| program | jit ms before | jit ms after | res% before | res% after |
+|---|---|---|---|---|
+| meta_fields | 109.2 | 50.6 | 65.3 | 90.2 |
+| ray | 1232.6 | 1244.1 | 27.2 | 27.1 |
+| meta_ops, meta_proxy, meta_calls, meta_close_reused | unchanged | | 0.0 | 0.0 |
+
+`meta_fields`' absent-key reads prove their miss once per entry now. No
+row of the 64 moved by more than the spread except those at 0% residency.
+`ray` waits on §6.6 (Phase 4).
+
+### 10.7 Phase 2 decision notes (2026-11-11)
+
+- **Stores are told apart by key, not by table.** §5.5 asked for "no hash
+  store at all, or stores only to tables proven distinct". The rule built
+  is LuaJIT's for constant keys (`aa_ahref`): an `hstore` changes only the
+  key it names, in whatever table, because on trace a hash store never
+  inserts, deletes or rehashes, and an array store (`astore_append` needs
+  an empty hash part) never touches the hash part. So an `hload` stays in
+  the body only when some `hstore` names its key, or has a non-constant
+  key; `href` and `guard_hash` (layout and population) and a string-key
+  `guard_absent` are invariant whatever the trace stores. This covers
+  "no hash store" and is wider than it, with no table-distinctness proof.
+- **A hoisted read takes its receiver's guard along.** Tier-1a's
+  `load_meta` and `href` dereference their table, and `trace_finalize`
+  asserts a `guard_table` before them, so the slot table's `guard_table`
+  moves to the preheader when a hoisted read reads it. Other guards on
+  slot values stay where they are; the native prologue checks those
+  already.
+- **A store to a hop's `__index` cannot be on trace today**: a
+  heap-valued hash store aborts recording (§5.3), so the hop reads are
+  only ever kept in the body by a scalar store to the same key name.
+- **Seeded `href`s are not hoisted.** The prologue already resolves a slot
+  table's cell once per entry; only the dynamic forms (hrefk and the
+  callout) move.
+- **A hoisted heap value is not rooted separately.** It stays reachable
+  through the receiver's chain for the run: no on-trace op changes a
+  metatable, and a field it was read from is not stored to (or it would
+  not be hoisted). The test with `tostring` allocating every iteration runs
+  it under the collector's stress legs.
 
 ## 11. Open questions for review
 
