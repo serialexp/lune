@@ -274,6 +274,9 @@ const ReplayResult = extern struct {
     /// The suspended coroutines at this step and their call chains (see
     /// `encodeCoroutines`). Empty when there are none or finished.
     coroutines: Buf = .{},
+    /// Doc 86 §4: the locals visible in the live (innermost) frame at `pc`
+    /// (see `encodeLocals`). Empty when finished or there are none.
+    locals: Buf = .{},
 };
 
 /// Wrap an owned byte slice as a `Buf` (transfers ownership to JS; freed by
@@ -514,6 +517,7 @@ export fn mahina_free_replay_result(res: ?*ReplayResult) void {
     freeBuf(r.diag);
     freeBuf(r.backtrace);
     freeBuf(r.coroutines);
+    freeBuf(r.locals);
     gpa.destroy(r);
 }
 
@@ -618,6 +622,10 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, args
             const frames = try vm.backtraceFrames(arena.allocator(), .chain);
             res.backtrace = bufFromSlice(try encodeBacktrace(frames));
             res.coroutines = bufFromSlice(try encodeCoroutines(try vm.suspendedCoroutines(arena.allocator())));
+            // A literal's span is into its own chunk's source; only the root
+            // chunk's is at hand.
+            const same_chunk = std.mem.eql(u8, proto.chunk, vm.frames[0].closure.proto.chunk);
+            res.locals = bufFromSlice(try encodeLocals(proto, @intCast(frame.pc), if (same_chunk) source else ""));
         },
         .finished => {
             // Ran to completion before `stop_after`: final state, no pending line.
@@ -1165,6 +1173,53 @@ fn encodeCoroutines(cos: []const mahina.interp.SuspendedCoroutine) ![]u8 {
         try appendU32(&buf, @intFromBool(c.started));
         try appendFrames(&buf, c.frames);
     }
+    return buf.toOwnedSlice(gpa);
+}
+
+/// Doc 86 §4: serialize the locals of `proto` visible at `pc` for JS:
+/// `u32 count`, then per local `{ u32 kind, u32 reg, u32 name_len,
+/// [name_len]u8 name, u32 text_len, [text_len]u8 text }`. `kind` 0 is a
+/// register local (`reg` is frame-relative; `text` empty), 1 a folded
+/// `<const>` (`text` is its literal's source; `reg` 0). Of two visible
+/// locals with one name only the inner one is in scope, so only it is
+/// written. `src` is the source of `proto`'s chunk, or empty when it is not
+/// at hand (a literal's text is then empty). None → empty.
+fn encodeLocals(proto: *const mahina.bytecode.Proto, pc: u32, src: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var count: u32 = 0;
+    try appendU32(&buf, 0); // patched below
+    for (proto.locals, 0..) |lv, i| {
+        if (!lv.visibleAt(pc)) continue;
+        const shadowed = for (proto.locals[i + 1 ..]) |later| {
+            if (later.visibleAt(pc) and std.mem.eql(u8, later.name, lv.name)) break true;
+        } else false;
+        if (shadowed) continue;
+        switch (lv.loc) {
+            .reg => |r| {
+                try appendU32(&buf, 0);
+                try appendU32(&buf, r);
+            },
+            .literal => {
+                try appendU32(&buf, 1);
+                try appendU32(&buf, 0);
+            },
+        }
+        try appendU32(&buf, @intCast(lv.name.len));
+        try buf.appendSlice(gpa, lv.name);
+        const text: []const u8 = switch (lv.loc) {
+            .reg => "",
+            .literal => |s| if (s.end <= src.len and s.start <= s.end) src[s.start..s.end] else "",
+        };
+        try appendU32(&buf, @intCast(text.len));
+        try buf.appendSlice(gpa, text);
+        count += 1;
+    }
+    if (count == 0) {
+        buf.deinit(gpa);
+        return &[_]u8{};
+    }
+    std.mem.writeInt(u32, buf.items[0..4], count, .little);
     return buf.toOwnedSlice(gpa);
 }
 

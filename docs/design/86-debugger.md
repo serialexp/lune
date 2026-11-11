@@ -1,6 +1,6 @@
 # Time-travel debugger over DAP — Design
 
-Status: draft, not yet implemented (reviewed; decisions settled)
+Status: partial — P0 landed; P1–P7 outstanding
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -15,12 +15,17 @@ everything inside them is checked.
 - [x] **Decisions D1–D14** (§2): settled with Bart, 2026-11-11.
 - [x] **Review round 1** (§14): Codex and Antigravity, 2026-11-11. Every
   finding is applied or answered there.
+- [x] **P0 — variable names in every Proto** (§4). The compiler emits
+  `locals` rows (name, pc range, location: register or folded literal) and
+  `upval_names` (`src/bytecode.zig` `LocalVar`, `Proto.localName`,
+  `Proto.upvalName`). `bc_names` names locals and upvalues, so runtime
+  errors read "(local 't')" / "(upvalue 'f')" as Lua 5.4 does; a traceback
+  names a function expression from its call site; the viz replay labels
+  registers with local names and lists folded `<const>`s
+  (`wasm_entry.zig` `encodeLocals`, `viz/src/snapshot.ts`).
 
 ### Outstanding
 
-- [ ] **P0 — variable names in every Proto** (§4). The compiler emits
-  `locals` rows (name, pc range, location: register, constant or none) and
-  `upval_names`. Tracebacks, `bc_names` and the viz use them.
 - [ ] **P1 — exact resume from a keyframe** (§6.1).
   - A keyframe carries everything listed in §6.1.
   - It resumes inside the prologue where it was taken, without counting

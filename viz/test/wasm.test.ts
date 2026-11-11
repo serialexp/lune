@@ -322,6 +322,38 @@ test("doc 61 Phase K: a replay step's keyframe tombstones the locals no path rea
   expect(sawDead).toBe(true);
 });
 
+test("doc 86 P0: a replay step names its locals, folded `<const>`s included", () => {
+  const src = "local K <const> = 7\nlocal a = 10\nlocal b = a * K\nprint(b)\nprint(1)\n";
+  const run = mod.runSource(src);
+  expect(run.status).toBe(0);
+
+  let sawNamed = false;
+  for (let k = 1; k <= run.safepointCount; k++) {
+    const step = mod.replay(src, run.effects, k);
+    expect(step.status).toBe(0);
+    if (step.finished) {
+      expect(step.locals).toEqual([]);
+      break;
+    }
+    // Only the locals already initialised at the step are listed.
+    const names = step.locals.map((l) => l.name);
+    if (!names.includes("b")) continue;
+    expect(step.locals.find((l) => l.name === "K")).toEqual({ name: "K", reg: null, literal: "7" });
+    const view = decodeSnapshot(step.keyframe, step.locals)!;
+    const a = view.locals.find((l) => l.label === "a");
+    const b = view.locals.find((l) => l.label === "b");
+    expect(a).toBeDefined();
+    // `b` is live until `print(b)` reads it, then tombstoned (doc 61 Phase K).
+    expect(b).toBeDefined();
+    if (b!.value === "70") sawNamed = true;
+    else expect(b).toMatchObject({ dead: true });
+    expect(view.locals.find((l) => l.label === "K")).toEqual({ label: "K", value: "7" });
+    // No register keeps its `r<slot>` label once a visible local occupies it.
+    for (const l of step.locals) if (l.reg !== null) expect(view.locals.some((v) => v.label === `r${l.reg}`)).toBe(false);
+  }
+  expect(sawNamed).toBe(true);
+});
+
 test("a run disassembles the proto tree and the replay cursor indexes it", () => {
   const src = "local s = 0\nfor i = 1, 3 do\n  s = s + i\n  print(s)\nend\nprint(\"done\")\n";
   const run = mod.runSource(src);

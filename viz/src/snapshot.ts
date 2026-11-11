@@ -17,10 +17,12 @@ import {
   type HeapObjectOutput,
 } from "./gen/generated";
 import { bytesToDisplay, floatToDisplay } from "./disasm";
+import type { StepLocal } from "./wasm/mahina";
 
 /** One named global or indexed local, value pre-formatted for display. */
 export interface NamedValue {
-  /** Global name, or `r<slot>` for a local register. */
+  /** Global name; a local's name, or `r<slot>` for a register no local
+   *  occupies (a temporary). */
   label: string;
   /** Formatted value (`42`, `"hi"`, `true`, `table#7`, …). */
   value: string;
@@ -118,9 +120,11 @@ function keyDisplay(k: SnapValueOutput, objects: Map<number, HeapObjectOutput>):
 /**
  * Decode a keyframe blob and project the globals + deepest-frame locals. Returns
  * null if the blob is empty or fails to decode (the caller then shows nothing).
- * A local whose slot is a `DeadSlot` tombstone is marked `dead`.
+ * A local whose slot is a `DeadSlot` tombstone is marked `dead`. `names` are
+ * the locals visible at the step (doc 86 §4): a register a local occupies
+ * takes its name, and a folded `<const>` is listed with its literal.
  */
-export function decodeSnapshot(blob: Uint8Array): SnapshotView | null {
+export function decodeSnapshot(blob: Uint8Array, names: readonly StepLocal[] = []): SnapshotView | null {
   if (blob.length === 0) return null;
   let kf;
   try {
@@ -146,10 +150,12 @@ export function decodeSnapshot(blob: Uint8Array): SnapshotView | null {
   // `stack[0..stack_top]`; the deepest frame spans `[base, stack_top)`, so that
   // tail slice is exactly its registers (src/keyframeser.zig).
   const locals: NamedValue[] = [];
+  const regName = new Map<number, string>();
+  for (const n of names) if (n.reg !== null) regName.set(n.reg, n.name);
   if (kf.frames.length > 0) {
     const base = kf.frames[kf.frames.length - 1].base;
     for (let i = base; i < kf.stack.length; i++) {
-      const label = `r${i - base}`;
+      const label = regName.get(i - base) ?? `r${i - base}`;
       const sv = kf.stack[i];
       if (sv.body.type === "DeadSlot") {
         locals.push({ label, value: "—", dead: true });
@@ -158,6 +164,7 @@ export function decodeSnapshot(blob: Uint8Array): SnapshotView | null {
       }
     }
   }
+  for (const n of names) if (n.reg === null) locals.push({ label: n.name, value: n.literal });
 
   return { globals, locals };
 }

@@ -191,6 +191,18 @@ export interface MahinaReplayResult {
   stoppedAt: number;
   /** The suspended coroutines at this step, oldest first (doc 73). */
   coroutines: SuspendedCoroutine[];
+  /** The locals visible in the innermost frame at `pc`, innermost binding
+   *  of each name only (doc 86 §4). Empty when finished. */
+  locals: StepLocal[];
+}
+
+/** A local variable visible at a replay step (doc 86 §4). */
+export interface StepLocal {
+  name: string;
+  /** Frame-relative register, or null for a folded `<const>`, which has
+   *  no register: its value is `literal`, the literal's source text. */
+  reg: number | null;
+  literal: string;
 }
 
 /** One row of a runtime-error backtrace. `start`/`end` are UTF-8 byte offsets. */
@@ -304,8 +316,9 @@ const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 4;
 //   u32 status; { u32 ptr; u32 len } stdout/keyframe/diag; u32 current_line (@28),
 //   current_start (@32), current_end (@36), depth (@40), finished (@44);
 //   { u32 ptr; u32 len } backtrace (@48); u32 proto_id (@56), u32 pc (@60),
-//   u32 stopped_at (@64); { u32 ptr; u32 len } coroutines (@68). Total 76 bytes.
-const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4 + 4 + 8;
+//   u32 stopped_at (@64); { u32 ptr; u32 len } coroutines (@68);
+//   { u32 ptr; u32 len } locals (@76). Total 84 bytes.
+const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4 + 4 + 8 + 8;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
@@ -477,6 +490,32 @@ function decodeCoroutines(blob: Uint8Array): SuspendedCoroutine[] {
     cos.push({ id, started, frames: r.frames });
   }
   return cos;
+}
+
+/** Decode the visible-locals blob (see `encodeLocals` in wasm_entry.zig):
+ *  `u32 count`, then per local `{ u32 kind, u32 reg, u32 name_len, name,
+ *  u32 text_len, text }`; kind 0 is a register local, 1 a folded `<const>`.
+ *  Empty → []. */
+function decodeLocals(blob: Uint8Array): StepLocal[] {
+  if (blob.length < 4) return [];
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const count = dv.getUint32(0, true);
+  const out: StepLocal[] = [];
+  let off = 4;
+  for (let i = 0; i < count; i++) {
+    const kind = dv.getUint32(off, true);
+    const reg = dv.getUint32(off + 4, true);
+    const nameLen = dv.getUint32(off + 8, true);
+    off += 12;
+    const name = decoder.decode(blob.subarray(off, off + nameLen));
+    off += nameLen;
+    const textLen = dv.getUint32(off, true);
+    off += 4;
+    const literal = decoder.decode(blob.subarray(off, off + textLen));
+    off += textLen;
+    out.push({ name, reg: kind === 0 ? reg : null, literal });
+  }
+  return out;
 }
 
 /** Decode the static disassembly blob (see `buildDisasmBlob` in wasm_entry.zig):
@@ -652,6 +691,7 @@ function wrap(exports: MahinaExports): MahinaModule {
     const pc = dv.getUint32(60, true);
     const stoppedAt = dv.getUint32(64, true);
     const coroutines = decodeCoroutines(readBuf(exports.memory, dv, 68));
+    const locals = decodeLocals(readBuf(exports.memory, dv, 76));
 
     exports.mahina_free_replay_result(resPtr);
 
@@ -670,6 +710,7 @@ function wrap(exports: MahinaExports): MahinaModule {
       pc,
       stoppedAt,
       coroutines,
+      locals,
     };
   };
 

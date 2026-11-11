@@ -828,7 +828,7 @@ export function setReplayPos(pos: number): void {
     try {
       const rs = await mahinaWorker().replay(state.replaySource, state.replayEffects!, k, state.replayArgv);
       if (req !== replayRequest) return;
-      const view = decodeSnapshot(rs.keyframe);
+      const view = decodeSnapshot(rs.keyframe, rs.locals);
       setState({ replayState: rs, replayView: view });
       // Follow the step into whichever file it is in, like a debugger.
       const loc = replayLoc();
