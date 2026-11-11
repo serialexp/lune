@@ -145,32 +145,35 @@ pub fn computeNativeLoopDoneLink(self: *const TraceState, failed: *const Trace, 
 /// skipped. See `docs/design/15-nested-loop-linking.md`.
 pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) void {
     if (exit_instr == std.math.maxInt(u32)) return; // no guard identity
-    if (self.rec.active or self.pending_exit_anchor != null) return;
-    const ins = failed.code.instrs[exit_instr];
-    // Only a loop-continuation `guard_true` failing marks "loop ran to
-    // completion"; a body type-guard (`guard_int`/…) failing is a different,
-    // mid-iteration exit and must not seed a continuation.
-    if (ins.op != .guard_true) return;
-    const exit_pc = guardExitPc(ins) orelse return;
-    if (exit_pc == 0 or exit_pc == failed.code.anchor.pc) return;
-    if (exit_pc >= proto.code.len) return;
-    // Doc 57 P3: a loop-test copy left mid-trip by an instability unroll is
-    // not "the loop ran to completion" — tier-0 replays the trip from the
-    // anchor, so no continuation is owed here.
-    if (failed.code.isLoopTestCopy(exit_instr)) return;
-    // Doc 58: only a numeric `for` seeds a continuation from its loop-done
-    // guard, at the guard's exit PC (the `for_loop` fall-through). A
-    // `while`/`repeat` root's condition guard is an ordinary exit whose resume
-    // pc is already the post-loop pc, so the EXIT-SIDE route records and arms
-    // the continuation there (doc 56) — the same way LuaJIT grows a side trace
-    // from the exit.
-    const src = failed.code.anchorSourceInstr(exit_instr) orelse return;
-    if (src.op != .for_loop) return;
-    const cont_pc: u32 = exit_pc;
-    if (!continuationReachesEnclosingBackEdge(proto, cont_pc, failed.code.anchor.pc)) {
-        self.dbg("cont-arm refuse: no enclosing back-edge from pc={d} (inner anchor {d})", .{ cont_pc, failed.code.anchor.pc });
+    // The static half, a fact of the committed code
+    // (`TraceCode.isContinuationSeed`, one load from the commit-time memo;
+    // this runs on every productive exit of a loop trace):
+    //  - only a loop-continuation `guard_true` failing marks "loop ran to
+    //    completion"; a body type-guard (`guard_int`/…) failing is a
+    //    different, mid-iteration exit and must not seed a continuation;
+    //  - doc 57 P3: a loop-test copy left mid-trip by an instability unroll
+    //    is not "the loop ran to completion" — tier-0 replays the trip from
+    //    the anchor, so no continuation is owed there;
+    //  - doc 58: only a numeric `for` seeds a continuation from its
+    //    loop-done guard, at the guard's exit PC (the `for_loop`
+    //    fall-through). A `while`/`repeat` root's condition guard is an
+    //    ordinary exit whose resume pc is already the post-loop pc, so the
+    //    EXIT-SIDE route records and arms the continuation there (doc 56) —
+    //    the same way LuaJIT grows a side trace from the exit;
+    //  - the exit pc must reach an enclosing loop's back-edge.
+    // The fact is about the anchor's proto, which is the dispatching frame's.
+    std.debug.assert(proto == failed.code.anchor.proto);
+    if (!failed.code.isContinuationSeed(exit_instr)) {
+        if (comptime jitdbg.enabled) {
+            // A loop-done guard that is not a seed has no enclosing
+            // back-edge within reach (or names no pc of this proto).
+            if (failed.code.isNumericForLoopDoneGuard(exit_instr))
+                self.dbg("cont-arm refuse: no enclosing back-edge from exit={d} (inner anchor {d})", .{ exit_instr, failed.code.anchor.pc });
+        }
         return;
     }
+    if (self.rec.active or self.pending_exit_anchor != null) return;
+    const cont_pc: u32 = guardExitPc(failed.code.instrs[exit_instr]).?;
     const key = AnchorKey{ .proto = proto, .pc = cont_pc, .proto_id = proto.id };
     // Don't fight the normal machinery: a trace already cached here, or a gated
     // anchor (a prior continuation aborted → back off), is left alone.
@@ -1057,28 +1060,21 @@ pub fn countFingerprintMiss(self: *TraceState, anchor: AnchorKey) void {
 /// check), never a `guard_true`/`guard_false`. The op check above therefore
 /// already excludes it — there is no false-negative where a real branch
 /// guard is mistaken for a generic-for loop-done one.
-pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, exit_instr: u32) bool {
+///
+/// Doc 58 §4.3 (review r2 finding 5): the loop's OWN test is a loop exit, not
+/// a branch alternation — for every loop shape, and for every unrolled copy
+/// of the test. Treating it as one would raise `wants_prime_side`, unpatch
+/// the entry, and chain same-anchor siblings on each completion. Both
+/// consumers (the prime-side want and the sibling handoff) funnel through
+/// here. This subsumes doc 57 P3's `.loop_test_copy` check for `while`, and
+/// `repeat`'s own test — never excluded before — with it.
+///
+/// The verdict is a fact of the committed code (`TraceCode.isSourceBranchGuard`,
+/// one load from the commit-time memo): the dispatcher asks it on every
+/// productive exit of a loop trace.
+pub inline fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, exit_instr: u32) bool {
     _ = self;
-    if (exit_instr == std.math.maxInt(u32)) return false;
-    const ins = failed.code.instrs[exit_instr];
-    if (ins.op != .guard_true and ins.op != .guard_false) return false;
-    const exit_pc = guardExitPc(ins) orelse return false;
-    if (exit_pc == failed.code.anchor.pc) return false;
-    // The anchor frame's own branch only (`anchorSourcePc`): an inlined
-    // callee's guard names a pc in the callee's proto, which says nothing
-    // about the anchor's decision.
-    const src = failed.code.anchorSourceInstr(exit_instr) orelse return false;
-    if (src.op == .for_loop) return false;
-    // Doc 58 §4.3 (review r2 finding 5): the loop's OWN test is a loop exit,
-    // not a branch alternation — for every loop shape, and for every unrolled
-    // copy of the test. Treating it as one would raise `wants_prime_side`,
-    // unpatch the entry, and chain same-anchor siblings on each completion.
-    // Both consumers (the prime-side want and the sibling handoff) funnel
-    // through here. This subsumes doc 57 P3's `.loop_test_copy` check for
-    // `while`, and `repeat`'s own test — never excluded before — with it.
-    if (failed.code.isOwnLoopTest(exit_instr)) return false;
-    if (failed.code.isLoopTestCopy(exit_instr)) return false;
-    return true;
+    return failed.code.isSourceBranchGuard(exit_instr);
 }
 
 /// Fused-M1 validation keyed on the EXACT exit (doc 38 unroll-first): is

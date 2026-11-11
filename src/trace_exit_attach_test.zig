@@ -144,6 +144,8 @@ fn expectFactsAgree(oracle: *const TraceCode, memo: *const TraceCode, idx: usize
     try testing.expectEqual(oracle.exitResumePc(idx), memo.exitResumePc(idx));
     try testing.expectEqual(oracle.isNumericForLoopDoneGuard(idx), memo.isNumericForLoopDoneGuard(idx));
     try testing.expectEqual(oracle.isOwnLoopTest(idx), memo.isOwnLoopTest(idx));
+    try testing.expectEqual(oracle.isSourceBranchGuard(idx), memo.isSourceBranchGuard(idx));
+    try testing.expectEqual(oracle.isContinuationSeed(idx), memo.isContinuationSeed(idx));
 }
 
 /// The verdict for `idx`, asserting the memo (built on a copy) agrees with

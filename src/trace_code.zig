@@ -444,7 +444,11 @@ pub const ExitFacts = packed struct(u64) {
     numeric_for_done: bool = false,
     /// `TraceCode.isOwnLoopTest`.
     own_loop_test: bool = false,
-    _pad: u29 = 0,
+    /// `TraceCode.isSourceBranchGuard`.
+    source_branch: bool = false,
+    /// `TraceCode.isContinuationSeed`.
+    cont_seed: bool = false,
+    _pad: u27 = 0,
     /// The resume pc `P` (`trace_exit_attach.resumeOf`) when `attachable`;
     /// 0 otherwise.
     resume_pc: u32 = 0,
@@ -753,10 +757,15 @@ pub const TraceCode = struct {
             return;
         }
         const facts = gpa.alloc(ExitFacts, self.instrs.len) catch return;
-        for (facts, 0..) |*f, i| f.* = .{
-            .numeric_for_done = self.computeNumericForLoopDoneGuard(i),
-            .own_loop_test = self.computeOwnLoopTest(i),
-        };
+        for (facts, 0..) |*f, i| {
+            const own = self.computeOwnLoopTest(i);
+            f.* = .{
+                .numeric_for_done = self.computeNumericForLoopDoneGuard(i),
+                .own_loop_test = own,
+                .source_branch = !own and self.anchorBranchShape(i),
+                .cont_seed = self.computeContinuationSeed(i),
+            };
+        }
         if (!exit_attach.fillFacts(gpa, self, facts)) {
             gpa.free(facts);
             return;
@@ -928,6 +937,71 @@ pub const TraceCode = struct {
         // `repeat`: likewise.
         const m = bytecode.repeatTestMarkerOf(proto.code, src_pc) orelse return false;
         return m + 1 == self.anchor.pc;
+    }
+
+    /// Doc 16 Phase 2: is guard `idx` a source-level branch guard of the
+    /// anchor's own frame: a `guard_true`/`guard_false` whose exit pc is not
+    /// the anchor and whose source instruction is neither a numeric
+    /// `for_loop` (a loop-done guard, doc 15) nor the loop's own test in any
+    /// shape or unrolled copy (doc 58 §4.3, doc 57 P3)? Such an exit is a
+    /// branch alternation: the prime-side want, the sibling handoff and the
+    /// same-anchor chain all ask this one question. A generic `for`'s
+    /// loop-done pin is a type guard, so the op check already excludes it.
+    /// Reads the commit-time memo.
+    pub fn isSourceBranchGuard(self: *const TraceCode, idx: usize) bool {
+        if (!self.exit_facts_built) return self.computeSourceBranchGuard(idx);
+        return idx < self.exit_facts.len and self.exit_facts[idx].source_branch;
+    }
+
+    /// The oracle behind `isSourceBranchGuard` (`noinline`: see
+    /// `computeNumericForLoopDoneGuard`).
+    noinline fn computeSourceBranchGuard(self: *const TraceCode, idx: usize) bool {
+        return self.anchorBranchShape(idx) and !self.computeOwnLoopTest(idx);
+    }
+
+    /// `isSourceBranchGuard` without the own-loop-test exclusion, which
+    /// `buildExitFacts` has already computed for the same instruction.
+    fn anchorBranchShape(self: *const TraceCode, idx: usize) bool {
+        if (idx >= self.instrs.len) return false;
+        const ins = self.instrs[idx];
+        if (ins.op != .guard_true and ins.op != .guard_false) return false;
+        const exit_pc = trace_ir.guardExitPc(ins) orelse return false;
+        if (exit_pc == self.anchor.pc) return false;
+        // The anchor frame's own branch only (`anchorSourcePc`): an inlined
+        // callee's guard names a pc in the callee's proto, which says
+        // nothing about the anchor's decision.
+        const src = self.anchorSourceInstr(idx) orelse return false;
+        if (src.op == .for_loop) return false;
+        return !self.isLoopTestCopy(idx);
+    }
+
+    /// Doc 15: can guard `idx` seed a continuation recording at its exit pc:
+    /// a numeric `for`'s loop-done `guard_true` in the anchor's own frame,
+    /// not a mid-trip copy, whose exit pc is a real pc of the anchor proto
+    /// other than the anchor, and from which a bounded forward scan reaches
+    /// the back-edge of a loop enclosing the anchor
+    /// (`continuationReachesEnclosingBackEdge`)? Everything here is a fact of
+    /// the committed code and the anchor proto; whether a trace already
+    /// stands at that pc, or recording there is barred, is asked per exit by
+    /// `trace_link.maybeArmContinuation`. Reads the commit-time memo.
+    pub fn isContinuationSeed(self: *const TraceCode, idx: usize) bool {
+        if (!self.exit_facts_built) return self.computeContinuationSeed(idx);
+        return idx < self.exit_facts.len and self.exit_facts[idx].cont_seed;
+    }
+
+    /// The oracle behind `isContinuationSeed` (`noinline`: see
+    /// `computeNumericForLoopDoneGuard`).
+    noinline fn computeContinuationSeed(self: *const TraceCode, idx: usize) bool {
+        if (idx >= self.instrs.len) return false;
+        const ins = self.instrs[idx];
+        if (ins.op != .guard_true) return false;
+        const exit_pc = trace_ir.guardExitPc(ins) orelse return false;
+        if (exit_pc == 0 or exit_pc == self.anchor.pc) return false;
+        if (exit_pc >= self.anchor.proto.code.len) return false;
+        if (self.isLoopTestCopy(idx)) return false;
+        const src = self.anchorSourceInstr(idx) orelse return false;
+        if (src.op != .for_loop) return false;
+        return exit_attach.continuationReachesEnclosingBackEdge(self.anchor.proto, exit_pc, self.anchor.pc);
     }
 
     /// Doc 39: is exit `idx` in a PEELED trace's steady region — past the

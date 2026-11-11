@@ -291,6 +291,7 @@ test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after t
     var after_while: usize = 0;
     var loop_done: usize = 0;
     var own_test: usize = 0;
+    var branch: usize = 0;
     for (vm.trace.registry.cache.items) |t| {
         const c = &t.code;
         const proto = c.anchor.proto;
@@ -308,10 +309,15 @@ test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after t
             try testing.expectEqual(oracle.exitResumePc(e), c.exitResumePc(e));
             try testing.expectEqual(oracle.isNumericForLoopDoneGuard(e), c.isNumericForLoopDoneGuard(e));
             try testing.expectEqual(oracle.isOwnLoopTest(e), c.isOwnLoopTest(e));
+            try testing.expectEqual(oracle.isSourceBranchGuard(e), c.isSourceBranchGuard(e));
+            try testing.expectEqual(oracle.isContinuationSeed(e), c.isContinuationSeed(e));
             try testing.expectEqual(oracle.isAnchorFrameGuard(e), c.isAnchorFrameGuard(e));
             try testing.expectEqual(oracle.anchorSourcePc(e), c.anchorSourcePc(e));
             loop_done += @intFromBool(c.isNumericForLoopDoneGuard(e));
             own_test += @intFromBool(c.isOwnLoopTest(e));
+            branch += @intFromBool(c.isSourceBranchGuard(e));
+            // A branch alternation is never a loop's way out.
+            if (c.isSourceBranchGuard(e)) try testing.expect(!c.isOwnLoopTest(e) and !c.isNumericForLoopDoneGuard(e));
             const p = c.exitResumePc(e) orelse continue;
             attachable += 1;
             try testing.expect(p < proto.code.len);
@@ -348,9 +354,65 @@ test "doc 56 Phase 2: bit-reverse's while-exit is attachable and resumes after t
     }
     try testing.expect(attachable > 0);
     try testing.expect(after_while > 0);
-    // The memo comparison above saw both shape facts set somewhere.
+    // The memo comparison above saw every shape fact set somewhere (the
+    // continuation seed has its own test below: this kernel has none).
     try testing.expect(loop_done > 0);
     try testing.expect(own_test > 0);
+    try testing.expect(branch > 0);
+}
+
+test "exit facts: a nested for's loop-done exit seeds a continuation, a helper loop's does not" {
+    const gpa = testing.allocator;
+    // The inner `for i` of the nest leaves onto its enclosing `for r`: a
+    // continuation recorded there can close. `sum`'s loop leaves onto a
+    // `ret`: nothing encloses it in its own proto, whoever calls it.
+    const source =
+        \\local function sum(t)
+        \\  local s = 0
+        \\  for i = 1, #t do s = s + t[i] end
+        \\  return s
+        \\end
+        \\local t = {}
+        \\for i = 1, 16 do t[i] = i end
+        \\local acc = 0
+        \\for r = 1, 8 do
+        \\  for i = 1, 16 do
+        \\    if t[i] > 8 then acc = acc + t[i] end
+        \\  end
+        \\end
+        \\for r = 1, 8 do acc = acc + sum(t) end
+        \\print(acc)
+    ;
+    var rec = try Recorded.init(gpa, source, "1888\n");
+    defer rec.deinit();
+    const vm = rec.vm;
+    const main = rec.chunk.proto;
+
+    var nest_seeds: usize = 0;
+    var helper_done: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        const c = &t.code;
+        var oracle = t.code;
+        oracle.exit_facts = &.{};
+        oracle.exit_facts_built = false;
+        oracle.off_frame = &.{};
+        oracle.off_frame_built = false;
+        try testing.expect(c.exit_facts_built);
+        for (0..c.instrs.len) |e| {
+            try testing.expectEqual(oracle.isContinuationSeed(e), c.isContinuationSeed(e));
+            try testing.expectEqual(oracle.isSourceBranchGuard(e), c.isSourceBranchGuard(e));
+            // Only a numeric `for`'s loop-done guard seeds a continuation.
+            if (c.isContinuationSeed(e)) try testing.expect(c.isNumericForLoopDoneGuard(e));
+            if (c.anchor.proto == main) {
+                nest_seeds += @intFromBool(c.isContinuationSeed(e));
+            } else {
+                helper_done += @intFromBool(c.isNumericForLoopDoneGuard(e));
+                try testing.expect(!c.isContinuationSeed(e));
+            }
+        }
+    }
+    try testing.expect(nest_seeds > 0);
+    try testing.expect(helper_done > 0);
 }
 
 fn isExecuteMode(mode: TraceMode) bool {
