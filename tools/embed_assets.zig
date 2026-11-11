@@ -1,13 +1,15 @@
-//! Build-time generator for the CLI's embedded web UI (`mahina viz`).
+//! Build-time generator that packs a directory into the binary: the CLI's
+//! embedded web UI (`mahina viz`), and the program corpus the doc 86 P1
+//! resume gate runs (`src/keyframeser_corpus_test.zig`).
 //!
 //!   embed_assets <src-dir> <out-dir>
 //!
-//! Packs every file under <src-dir> (the built `viz/dist`) into
+//! Packs every file under <src-dir> (the built `viz/dist`, or `tests/`) into
 //! <out-dir>/assets.bin and writes <out-dir>/assets.zig, which `@embedFile`s the
 //! blob and slices one `File` per asset out of it. Paths are URL-shaped
 //! ("/index.html", "/assets/index-….js") and sorted, so the same tree always
 //! gives the same bytes. `build.zig` hands this a WriteFile copy of the tree,
-//! whose content-hashed path is what makes the step re-run when an asset
+//! whose content-hashed path is what makes the step re-run when a file
 //! changes. The no-UI build uses a stub with the same declarations
 //! (`build.zig`, `viz_assets_stub`).
 

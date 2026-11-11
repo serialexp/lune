@@ -80,6 +80,29 @@ pub fn build(b: *std.Build) void {
         break :blk b.createModule(.{ .root_source_file = root });
     };
 
+    // Packs a directory into one blob plus an index module
+    // (tools/embed_assets.zig): the CLI's web UI and the program corpus.
+    const embed_tool = b.addExecutable(.{
+        .name = "embed_assets",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/embed_assets.zig"),
+            .target = b.graph.host,
+        }),
+    });
+
+    // Doc 86 P1: every program under tests/, for the exact-resume gate
+    // (src/keyframeser_corpus_test.zig). A program added there joins the
+    // gate without a list to keep. It reads a WriteFile copy of the tree, as
+    // the web UI's embedding does, so an edit re-runs the generator.
+    const program_corpus_mod = blk: {
+        const copy = b.addWriteFiles();
+        const tree = copy.addCopyDirectory(b.path("tests"), "tests", .{ .include_extensions = &.{ ".lua", ".mah" } });
+        const gen = b.addRunArtifact(embed_tool);
+        gen.addDirectoryArg2(tree, .{});
+        const root = gen.addOutputDirectoryArg2("program_corpus", .{}).path(b, "assets.zig");
+        break :blk b.createModule(.{ .root_source_file = root });
+    };
+
     // The library module: the VM core, importable by consumers and by tests.
     const mod = b.addModule("mahina", .{
         .root_source_file = b.path("src/root.zig"),
@@ -89,6 +112,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = build_opts_mod },
             .{ .name = "jit_unwind", .module = jit_unwind_mod },
             .{ .name = "stdlib_inventory", .module = inventory_mod },
+            // Test builds only (src/keyframeser_corpus_test.zig).
+            .{ .name = "program_corpus", .module = program_corpus_mod },
         },
     });
 
@@ -102,13 +127,6 @@ pub fn build(b: *std.Build) void {
     const viz_assets_root = if (viz_dist) |dist| blk: {
         const copy = b.addWriteFiles();
         const tree = copy.addCopyDirectory(dist, "dist", .{});
-        const embed_tool = b.addExecutable(.{
-            .name = "embed_assets",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tools/embed_assets.zig"),
-                .target = b.graph.host,
-            }),
-        });
         const gen = b.addRunArtifact(embed_tool);
         gen.addDirectoryArg2(tree, .{});
         break :blk gen.addOutputDirectoryArg2("viz_assets", .{}).path(b, "assets.zig");

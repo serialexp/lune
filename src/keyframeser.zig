@@ -1653,4 +1653,5 @@ test {
     _ = @import("keyframeser_resume_test.zig");
     _ = @import("keyframeser_replay_test.zig");
     _ = @import("keyframeser_unicode_test.zig");
+    _ = @import("keyframeser_corpus_test.zig");
 }
