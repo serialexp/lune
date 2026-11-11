@@ -544,11 +544,12 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
 /// unfrozen if either wanted it (`GUARD_TABLE_WRITABLE`, OR), and a
 /// metatable allowed only if both allowed one (`GUARD_TABLE_ANY_META`,
 /// AND), so a trace with any access that relies on "no metatable" still
-/// checks for one (doc 77 §4.1, Q4).
+/// checks for one (doc 77 §4.1, Q4), and marked `no_grid` if either wanted
+/// it (`GUARD_TABLE_NO_GRID`, OR).
 pub fn mergeTableGuardAux(kept: i32, folded: i32) i32 {
-    const writable = (kept | folded) & trace.GUARD_TABLE_WRITABLE;
+    const or_bits = (kept | folded) & (trace.GUARD_TABLE_WRITABLE | trace.GUARD_TABLE_NO_GRID);
     const any_meta = kept & folded & trace.GUARD_TABLE_ANY_META;
-    return writable | any_meta;
+    return or_bits | any_meta;
 }
 
 /// The unoptimized path: dupe the recorder's arrays verbatim into owned slices

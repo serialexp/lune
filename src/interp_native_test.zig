@@ -1862,6 +1862,129 @@ test "fused index: a first-lookup handler returning a non-table exits to tier 0"
     , "false\t250\ttrue\n", .{ .record_aborts = true, .inspect = assertIndex2Recorded });
 }
 
+/// The loop's trace ran and no recording stopped at a fused store.
+fn assertIndex2SetRecorded(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (mode == .off) return;
+    for (vm.trace.abort_log.items) |r| try testing.expect(r.op != .set_index2);
+    if (mode != .record_only) try testing.expect(vm.trace.entries > 0);
+}
+
+test "fused index: a store into plain nested tables records as a read and a store" {
+    // Mixed rows (no grid), an int and a float element overwritten, an
+    // inlined function `__newindex` on a row, and a table `__index` chain
+    // on the container. A row with a metatable takes no present-slot store
+    // in a `.value` lane, fused or not (`has_metatable`, `arraySetShape`).
+    try expectProgramTuned(
+        \\local log = { n = 0 }
+        \\local P = { __newindex = function(r, k, v) log.n = log.n + v end }
+        \\local rows, mrows = {}, {}
+        \\for i = 1, 6 do
+        \\  rows[i] = { i, "x", i + 0.5 }
+        \\  mrows[i] = setmetatable({}, P)
+        \\end
+        \\local cfg = setmetatable({}, { __index = { a = { w = 3 } } })
+        \\for k = 1, 300 do
+        \\  local i = k % 6 + 1
+        \\  rows[i][1] = rows[i][1] + 1
+        \\  rows[i][3] = k * 0.5
+        \\  mrows[i]["y"] = k
+        \\  cfg["a"]["w"] = cfg["a"]["w"] + 1
+        \\end
+        \\local s = 0
+        \\for i = 1, 6 do s = s + rows[i][1] + rows[i][3] end
+        \\print(s, log.n, cfg.a.w, rawget(mrows[1], "y"))
+    , "1213.5\t45150\t303\tnil\n", .{ .record_aborts = true, .inspect = assertIndex2SetRecorded });
+}
+
+test "fused index: a store whose row changes or turns nil exits to tier 0" {
+    try expectProgramTuned(
+        \\local rows = {}
+        \\for i = 1, 4 do rows[i] = { i, "s" } end
+        \\local ok, err = pcall(function()
+        \\  for k = 1, 300 do
+        \\    if k == 150 then rows[3] = { 0, "t" } end
+        \\    if k == 250 then rows[2] = nil end
+        \\    rows[k % 4 + 1][1] = k
+        \\  end
+        \\end)
+        \\print(ok, rows[3][1], rows[1][1], (string.find(err, "attempt to index a nil value", 1, true)) ~= nil)
+    , "false\t250\t252\ttrue\n", .{ .record_aborts = true, .inspect = assertIndex2SetRecorded });
+}
+
+/// `assertIndex2SetRecorded`, and in global list `G` the first 150
+/// containers stay plain while the rest are grids, in every mode.
+fn assertFreshContainersInflated(vm: *Vm, mode: TraceMode) anyerror!void {
+    try assertIndex2SetRecorded(vm, mode);
+    const g = vm.globals.get(try vm.heap.internValue("G"));
+    try testing.expect(g.isHeap() and g.heapType() == .table);
+    const list = table.Table.fromHeader(g.asHeap());
+    for (1..301) |k| {
+        const c = list.getInt(@intCast(k));
+        try testing.expect(c.isHeap() and c.heapType() == .table);
+        try testing.expectEqual(k > 150, table.Table.fromHeader(c.asHeap()).array.isGrid());
+    }
+}
+
+test "fused index: a store into a container not yet marked no_grid leaves it to tier 0" {
+    // Tier 0 tries to inflate a container on its first fused store
+    // (`fusedStoreGrid`), and marks `no_grid` one that cannot be. Each
+    // iteration stores into its own container, first ones with a hash
+    // part (never a grid, marked by their store), then all-int matrices no
+    // store has touched. The trace's store proves the mark
+    // (`GUARD_TABLE_NO_GRID`), so each of those exits before its store,
+    // tier 0 inflates it, and it is a grid in all modes.
+    try expectProgramTuned(
+        \\local list = {}
+        \\for k = 1, 300 do
+        \\  if k <= 150 then list[k] = { tag = "x", { 1, 2 }, { 3, 4 } } else list[k] = { { 1, 2 }, { 3, 4 } } end
+        \\end
+        \\G = list
+        \\local s = 0
+        \\for k = 1, 300 do
+        \\  local t = list[k]
+        \\  t[k % 2 + 1][1] = k
+        \\  s = s + t[k % 2 + 1][1] + t[1][2]
+        \\end
+        \\print(s)
+    , "45750\n", .{ .record_aborts = true, .inspect = assertFreshContainersInflated });
+}
+
+fn assertInflatingStoreLeftToTier0(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (mode != .off) {
+        var refused = false;
+        for (vm.trace.abort_log.items) |r| refused = refused or r.op == .set_index2;
+        try testing.expect(refused);
+    }
+    const g = vm.globals.get(try vm.heap.internValue("G"));
+    try testing.expect(g.isHeap() and g.heapType() == .table);
+    const list = table.Table.fromHeader(g.asHeap());
+    for (1..301) |k| {
+        const c = list.getInt(@intCast(k));
+        try testing.expect(c.isHeap() and c.heapType() == .table);
+        try testing.expect(table.Table.fromHeader(c.asHeap()).array.isGrid());
+    }
+}
+
+test "fused index: a store that would inflate its container is not recorded" {
+    // Recording runs before tier 0 executes the store, so every container
+    // here is unmarked when it is recorded, and each is an all-int matrix
+    // that tier 0 inflates on this very store. A plain two-step store
+    // recorded on it would fail its `no_grid` proof on every entry, so the
+    // recorder leaves the store to tier 0 (`Heap.gridPlan`).
+    try expectProgramTuned(
+        \\local list = {}
+        \\for k = 1, 300 do list[k] = { { 1, 2 }, { 3, 4 } } end
+        \\G = list
+        \\local s = 0
+        \\for k = 1, 300 do
+        \\  local t = list[k]
+        \\  t[k % 2 + 1][1] = k
+        \\  s = s + t[k % 2 + 1][1] + t[1][2]
+        \\end
+        \\print(s)
+    , "45750\n", .{ .record_aborts = true, .inspect = assertInflatingStoreLeftToTier0 });
+}
+
 // --- Phase 4b/4c: grids end-to-end from Lua (8-mode byte-identical) -----------
 // A grid is logically transparent: every program below must print exactly what
 // the equivalent nested-table program would, in all 8 execution modes. That the

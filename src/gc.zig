@@ -373,26 +373,55 @@ pub const Heap = struct {
     /// GC-atomic: runs inside a single opcode, so no collection sees the
     /// half-swapped parent (collection only fires at the dispatch-loop safepoint).
     pub fn inflateToGrid(self: *Heap, parent: *Table) bool {
-        const gpa = self.gpa;
+        const plan = gridPlan(parent) orelse return false;
+        const rows = plan.rows;
 
+        // --- build the grid (OOM-atomic: parent untouched until the swap) ---
+        var grid = arr.ArrayPart.initGrid(self.gpa, rows, plan.stride, plan.elem) catch return false;
+        var r: usize = 0;
+        while (r < rows) : (r += 1) {
+            const row = Table.fromHeader(parent.array.get(r + 1).asHeap());
+            // Cells are keys 1..asize-1 (slot 0 is nil — verified in the scan).
+            const rl = if (row.array.asize == 0) 0 else row.array.asize - 1;
+            var c: usize = 0;
+            while (c < rl) : (c += 1) {
+                const v = row.array.get(c + 1);
+                if (!v.isNil()) grid.gridSet(r, c, v); // grid_elem fits every cell by construction
+            }
+        }
+
+        // --- swap (no safepoint between here and return) ---
+        parent.array.deinit(self.gpa); // drop the .value row-ref buffer; row tables orphaned → GC
+        parent.array = grid;
+        return true;
+    }
+
+    /// The grid `inflateToGrid` would build from `parent`: its row count, its
+    /// stride (the longest row) and its cell lane. Null when `parent` does not
+    /// qualify (the preconditions on `inflateToGrid`). Pure: the trace
+    /// recorder asks it whether tier 0's fused store is about to inflate a
+    /// table it has not yet ruled out (`recIndex2Set`).
+    pub const GridPlan = struct { rows: usize, stride: usize, elem: arr.Lane };
+
+    pub fn gridPlan(parent: *const Table) ?GridPlan {
         // --- outer shape ---
-        if (parent.no_grid) return false; // hysteresis: ruled out, don't re-scan
-        if (parent.array.isGrid()) return false; // already a grid
-        if (parent.array.lane != .value) return false; // rows are heap refs ⇒ .value
-        if (parent.hash.count() != 0) return false; // grid owns the whole 1..len run
+        if (parent.no_grid) return null; // hysteresis: ruled out, don't re-scan
+        if (parent.array.isGrid()) return null; // already a grid
+        if (parent.array.lane != .value) return null; // rows are heap refs ⇒ .value
+        if (parent.hash.count() != 0) return null; // grid owns the whole 1..len run
         // A grid's outer `a[i]` miss returns nil with no `__index` consultation
         // (the fused read path, doc 14); a metatable'd parent would break that, so a
         // matrix carrying a metatable simply stays nested (rare; deflated on
         // `setmetatable` regardless).
-        if (parent.metatable != null) return false;
+        if (parent.metatable != null) return null;
         // Doc 18 D6: the field is `asize` (slot count incl. the key-0 slot) on a
         // scalar parent, but grid rows are 1-based — so guard BEFORE subtracting
         // (`asize == 0` underflows; `asize == 1` has no 1-based rows), and a
         // populated key 0 cannot be represented in-grid, so it blocks inflation
         // (conservative: costs only the optimization, deflation stays the
         // escape hatch).
-        if (parent.array.asize <= 1) return false;
-        if (!parent.array.get(0).isNil()) return false;
+        if (parent.array.asize <= 1) return null;
+        if (!parent.array.get(0).isNil()) return null;
         const rows = parent.array.asize - 1;
 
         // --- scan rows: qualify each, unify the cell lane, measure the box ---
@@ -405,28 +434,28 @@ pub const Heap = struct {
         var r: usize = 0;
         while (r < rows) : (r += 1) {
             const rv = parent.array.get(r + 1); // outer keys 1..rows (identity slots)
-            if (!rv.isHeap()) return false; // nil row or scalar ⇒ block
+            if (!rv.isHeap()) return null; // nil row or scalar ⇒ block
             const h = rv.asHeap();
-            if (h.type != .table) return false; // typed_array/string/... ⇒ block
+            if (h.type != .table) return null; // typed_array/string/... ⇒ block
             const row = Table.fromHeader(h);
-            if (row.metatable != null) return false;
+            if (row.metatable != null) return null;
             // A grid's rows are its cells, written by the fused store with no
             // per-row check, and deflation rebuilds them: a frozen row stays
             // a table (doc 76 §5).
-            if (row.isReadonly()) return false;
-            if (row.hash.count() != 0) return false;
+            if (row.isReadonly()) return null;
+            if (row.hash.count() != 0) return null;
             // Doc 18: a row's array part covers keys 0..asize-1; its grid-able
             // cells are keys 1..asize-1 (rowView is 1-based). A populated row
             // key 0 cannot be represented in-grid ⇒ block (same conservative
             // rule as the parent's slot 0 above).
-            if (row.array.isGrid()) return false; // nested grid ⇒ block (get() forbids grids)
+            if (row.array.isGrid()) return null; // nested grid ⇒ block (get() forbids grids)
             if (row.array.asize == 0) continue; // an empty row contributes no cells
-            if (!row.array.get(0).isNil()) return false;
+            if (!row.array.get(0).isNil()) return null;
             const rl = row.array.asize - 1; // cell count: keys 1..rl
             if (rl == 0) continue; // only the slot-0 hole ⇒ no cells
             switch (row.array.lane) {
                 .i8, .u8, .i16, .i32, .i64, .f64 => {}, // numeric leaf ok
-                else => return false, // .value/.boolean/.grid ⇒ block
+                else => return null, // .value/.boolean/.grid ⇒ block
             }
             if (rl > stride) stride = rl;
             var c: usize = 0;
@@ -441,33 +470,15 @@ pub const Heap = struct {
                 } else if (v.isFloat()) {
                     all_int = false;
                 } else {
-                    return false; // bool/heap cell ⇒ block
+                    return null; // bool/heap cell ⇒ block
                 }
             }
         }
 
-        if (stride == 0) return false; // no cells anywhere ⇒ nothing to flatten
-        if (!all_int and !all_float) return false; // mixed int/float ⇒ block
-        const grid_elem: arr.Lane = if (all_int) arr.ArrayPart.intLaneForRange(lo, hi) else .f64;
-
-        // --- build the grid (OOM-atomic: parent untouched until the swap) ---
-        var grid = arr.ArrayPart.initGrid(gpa, rows, stride, grid_elem) catch return false;
-        r = 0;
-        while (r < rows) : (r += 1) {
-            const row = Table.fromHeader(parent.array.get(r + 1).asHeap());
-            // Cells are keys 1..asize-1 (slot 0 is nil — verified in the scan).
-            const rl = if (row.array.asize == 0) 0 else row.array.asize - 1;
-            var c: usize = 0;
-            while (c < rl) : (c += 1) {
-                const v = row.array.get(c + 1);
-                if (!v.isNil()) grid.gridSet(r, c, v); // grid_elem fits every cell by construction
-            }
-        }
-
-        // --- swap (no safepoint between here and return) ---
-        parent.array.deinit(gpa); // drop the .value row-ref buffer; row tables orphaned → GC
-        parent.array = grid;
-        return true;
+        if (stride == 0) return null; // no cells anywhere ⇒ nothing to flatten
+        if (!all_int and !all_float) return null; // mixed int/float ⇒ block
+        const elem: arr.Lane = if (all_int) arr.ArrayPart.intLaneForRange(lo, hi) else .f64;
+        return .{ .rows = rows, .stride = stride, .elem = elem };
     }
 
     /// Tear a flattened grid back into a `.value` array of real heap row Tables

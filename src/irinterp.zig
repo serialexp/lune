@@ -864,10 +864,12 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // a different table than the one recorded), the raw
                 // `aload`/`astore` would skip `__index`/`__newindex` — so
                 // side-exit to tier-0 (full dispatch). A store's guard also
-                // wants the table unfrozen (doc 76 §5).
+                // wants the table unfrozen (doc 76 §5), and a fused store's
+                // container marked `no_grid` (`GUARD_TABLE_NO_GRID`).
                 .guard_table => if (values[ins.a].isHeap() and values[ins.a].heapType() == .table and
                     (ins.aux & trace_ir.GUARD_TABLE_ANY_META != 0 or table.Table.fromHeader(values[ins.a].asHeap()).metatable == null) and
-                    (ins.aux & trace_ir.GUARD_TABLE_WRITABLE == 0 or !table.Table.fromHeader(values[ins.a].asHeap()).isReadonly()))
+                    (ins.aux & trace_ir.GUARD_TABLE_WRITABLE == 0 or !table.Table.fromHeader(values[ins.a].asHeap()).isReadonly()) and
+                    (ins.aux & trace_ir.GUARD_TABLE_NO_GRID == 0 or table.Table.fromHeader(values[ins.a].asHeap()).no_grid))
                 {
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {

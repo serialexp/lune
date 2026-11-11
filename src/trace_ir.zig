@@ -79,6 +79,15 @@ pub const GUARD_TABLE_WRITABLE: i32 = 1;
 /// a metatable (`setmetatable` is not a recorded builtin, doc 77 §4.2).
 pub const GUARD_TABLE_ANY_META: i32 = 2;
 
+/// `guard_table`'s `aux` bit for the container of a fused store into a
+/// plain table (`set_index2`, doc 14): the table is marked `no_grid`, so
+/// tier 0 would not try to inflate it into a grid (`fusedStoreGrid`) and
+/// the store is the two steps the trace recorded. Nothing ever clears the
+/// mark (a deflated grid and a table that failed to inflate both keep it),
+/// so a pass holds for a whole native run: native code checks it once per
+/// entry for an invariant table. Guards on one table merge by OR on it.
+pub const GUARD_TABLE_NO_GRID: i32 = 4;
+
 pub const IrOp = enum(u8) {
     // ---- inputs ----
     /// `aux` = tier-0 register read at trace entry (a loop-variant input).
@@ -152,8 +161,9 @@ pub const IrOp = enum(u8) {
     /// asserts every table they reach is guarded first.
     /// `aux` bits: `GUARD_TABLE_WRITABLE` on a guard ahead of a store, the
     /// table must also not be frozen (doc 76 §5), or tier-0 raises;
-    /// `GUARD_TABLE_ANY_META`, a metatable is allowed (doc 77 §4.1). 0 means
-    /// a metatable-free table, frozen or not.
+    /// `GUARD_TABLE_ANY_META`, a metatable is allowed (doc 77 §4.1);
+    /// `GUARD_TABLE_NO_GRID`, the table is marked `no_grid` (a fused store's
+    /// container, doc 14). 0 means a metatable-free table, frozen or not.
     guard_table,
     /// `a`=table value ref, `aux`=lane → the table's array lane equals `aux`
     /// (bails if a monotonic widen moved it past the recorded lane).

@@ -81,6 +81,7 @@ const TABLE_TYPE = layout.TABLE_TYPE;
 const HEADER_TYPE_OFF = layout.HEADER_TYPE_OFF;
 const HEADER_READONLY_BIT = layout.HEADER_READONLY_BIT;
 const METATABLE_OFF = layout.METATABLE_OFF;
+const NO_GRID_OFF = layout.NO_GRID_OFF;
 const FUNCTION_TYPE = layout.FUNCTION_TYPE;
 const CLOSURE_PROTO_OFF = layout.CLOSURE_PROTO_OFF;
 const PROTO_ID_OFF = layout.PROTO_ID_OFF;
@@ -1093,6 +1094,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
             try a.btMemImm8(preg, 0, HEADER_READONLY_BIT);
             try a.jcc(.b, prologue_fail);
         }
+        // A fused store's container must be marked `no_grid` (doc 14). Once:
+        // nothing clears the mark.
+        if (s.no_grid) {
+            try a.cmpByteMemImm(preg, NO_GRID_OFF, 0);
+            try a.jcc(.e, prologue_fail);
+        }
         // Lane check only for array-accessed tables (s.lane >= 0). A hash-only table
         // (H1: href, no aref) has no pinned lane — skip it; the type + metatable checks
         // above already cover the hash path's validity, and the cell pointer was
@@ -1314,6 +1321,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     if (ins.aux & trace.GUARD_TABLE_WRITABLE != 0) {
                         try a.btMemImm8(tbl_reg, 0, HEADER_READONLY_BIT);
                         try jccNativeExit(a, exit_labels, i, .b);
+                    }
+                    // A fused store's container: marked `no_grid`.
+                    if (ins.aux & trace.GUARD_TABLE_NO_GRID != 0) {
+                        try a.cmpByteMemImm(tbl_reg, NO_GRID_OFF, 0);
+                        try jccNativeExit(a, exit_labels, i, .e);
                     }
                 }
                 // else: .ptr → prologue-hoisted, no-op

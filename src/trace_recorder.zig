@@ -31,6 +31,7 @@ const ObsType = @import("trace_ir.zig").ObsType;
 const PHI_INTERNAL = @import("trace_ir.zig").PHI_INTERNAL;
 const GUARD_TABLE_WRITABLE = @import("trace_ir.zig").GUARD_TABLE_WRITABLE;
 const GUARD_TABLE_ANY_META = @import("trace_ir.zig").GUARD_TABLE_ANY_META;
+const GUARD_TABLE_NO_GRID = @import("trace_ir.zig").GUARD_TABLE_NO_GRID;
 const guardExitPc = @import("trace_ir.zig").guardExitPc;
 const guardSourcePc = @import("trace_ir.zig").guardSourcePc;
 const isSideExitGuardOp = @import("trace_ir.zig").isSideExitGuardOp;
@@ -1927,11 +1928,11 @@ pub const RecordingSession = struct {
             // grid records as a cell access ONLY when it has an int or f64
             // element lane and the access is a present, in-bounds, in-lane cell
             // — exactly the shape the grid native/oracle path models; a
-            // grow/widen store aborts to tier-0, which reshapes. A read of a
-            // plain nested table records as the two reads it is
-            // (`recIndex2Get`); a store into one still aborts (`recGridSet`).
+            // grow/widen store aborts to tier-0, which reshapes. A read or a
+            // store on a plain nested table records as the read and the read
+            // or store it is (`recIndex2Get`, `recIndex2Set`).
             .get_index2 => try self.recIndex2Get(instr, regs, proto),
-            .set_index2 => try self.recGridSet(instr, regs),
+            .set_index2 => try self.recIndex2Set(instr, regs, proto),
 
             // Cluster sub-lever 1: a callee (or any loop-invariant value) reached
             // through an UPVALUE or GLOBAL. The executor cannot read these (no
@@ -2977,7 +2978,30 @@ pub const RecordingSession = struct {
         /// instruction: `.result` lands in `dst`; `.index2_mid` feeds the
         /// second lookup of a fused read.
         finish: MetaFinish = .result,
+        /// Where the value lands instead of `R[dst]`: the first lookup of a
+        /// fused store, whose row no register holds (`recIndex2Set`). Such a
+        /// read takes no function `__index` and no absent key (tier 0 would
+        /// call the handler or index nil); both abort.
+        out: ?*?Ref = null,
     };
+
+    /// Land read `f`'s value `r`: in `R[f.dst]`, or in `f.out`.
+    fn landGet(self: *RecordingSession, f: GetFrame, r: Ref) void {
+        if (f.out) |o| o.* = r else self.setReg(f.dst, r);
+    }
+
+    /// Land a forwarded pending store for read `f` (`HashForward`): true
+    /// when the read is done (forwarded, or the recording stopped).
+    fn landForward(self: *RecordingSession, f: GetFrame, fwd: HashForward) bool {
+        switch (fwd) {
+            .miss => return false,
+            .hit => |r| {
+                self.landGet(f, r);
+                return true;
+            },
+            .stopped => return true,
+        }
+    }
 
     /// The observed key of get frame `f`.
     fn frameKeyValue(regs: RegWindow, f: GetFrame) Value {
@@ -3280,7 +3304,7 @@ pub const RecordingSession = struct {
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = meta_aux }), .container_type, f.tab_od, .neutral);
             try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
             const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
-            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx, vtab.asHeap())) return;
+            if (self.landForward(f, try self.forwardArrayLoadRef(rtab, rkey, idx, vtab.asHeap()))) return;
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
             // No guard_present: the `.value` lane has no presence bitmap — nil is
@@ -3309,7 +3333,7 @@ pub const RecordingSession = struct {
             } else {
                 try self.guardNum(rload, loaded, .element_type, .loaded);
             }
-            self.setReg(f.dst, rload);
+            self.landGet(f, rload);
             return;
         }
 
@@ -3318,12 +3342,12 @@ pub const RecordingSession = struct {
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = meta_aux }), .container_type, f.tab_od, .neutral);
         try self.emitLaneGuardPinned(rtab, lane_ord, f.tab_od, vtab.asHeap());
         const rkey = try self.keyRefNarrowed(f.key.reg, f.key_od, vkey);
-        if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx, vtab.asHeap())) return;
+        if (self.landForward(f, try self.forwardArrayLoadRef(rtab, rkey, idx, vtab.asHeap()))) return;
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_present, .a = ref }), .present, .none, .neutral);
         const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
-        self.setReg(f.dst, rload);
+        self.landGet(f, rload);
     }
 
     /// Resolve an array load against the recorder's deferred-store buffer using
@@ -3342,6 +3366,19 @@ pub const RecordingSession = struct {
     /// relation is `classifyArrayKeyAlias`'s job, not a record sample's.
     /// Walking newest-to-oldest preserves last-writer-wins.
     pub fn forwardPendingArrayLoad(self: *RecordingSession, dst: u16, rtab: Ref, rkey: Ref, idx: i64, load_tab: *const object.GcHeader) !bool {
+        switch (try self.forwardArrayLoadRef(rtab, rkey, idx, load_tab)) {
+            .miss => return false,
+            .hit => |r| {
+                self.setReg(dst, r);
+                return true;
+            },
+            .stopped => return true,
+        }
+    }
+
+    /// `forwardPendingArrayLoad` without a destination register: the
+    /// forwarded value comes back as a ref, as `forwardHashLoadRef`'s.
+    pub fn forwardArrayLoadRef(self: *RecordingSession, rtab: Ref, rkey: Ref, idx: i64, load_tab: *const object.GcHeader) !HashForward {
         var n = self.pending_stores.items.len;
         while (n > 0) {
             n -= 1;
@@ -3357,7 +3394,7 @@ pub const RecordingSession = struct {
                 // this classifier wasn't written for.
                 else => {
                     self.abort(.store_fwd_ambiguity);
-                    return true;
+                    return .stopped;
                 },
             }
             const addr = self.instrs.items[ps.aref];
@@ -3382,8 +3419,7 @@ pub const RecordingSession = struct {
                         const cmp = try self.emit(.{ .op = .ne, .a = rtab, .b = addr.a, .ty = .boolean });
                         self.stampProv(try self.emit(.{ .op = .guard_false, .a = cmp }), .alias_disambig, .none, .neutral);
                     }
-                    self.setReg(dst, ps.value);
-                    return true;
+                    return .{ .hit = ps.value };
                 },
                 // Statically-distinct keys can't share a cell regardless of
                 // which table each ref holds — no guard needed.
@@ -3402,11 +3438,11 @@ pub const RecordingSession = struct {
                     // Loop-varying keys observed EQUAL: an unproven
                     // collision — abort rather than pin it (see doc comment).
                     self.abort(.store_fwd_ambiguity);
-                    return true;
+                    return .stopped;
                 },
             }
         }
-        return false;
+        return .miss;
     }
 
     /// Resolve a hash load against the deferred-store buffer (doc 08 §2026-08-20,
@@ -3928,6 +3964,42 @@ pub const RecordingSession = struct {
     /// guards then side-exit on a later iteration that would reshape). Phase 8a keeps
     /// the C1 deopt-replay rule simple: a store after *any* heap read aborts (no
     /// store-sinking yet) — matmul's hot inner loop is read-only, so this is free.
+    /// `R[a][R[b]][R[c]] = R[aux]` (`set_index2`). A grid is a cell store
+    /// (`recGridSet`). A plain table records as tier 0's two steps
+    /// (`fusedStore`): the row read by the first key, then the store into it
+    /// by the second, each with its own shape. Tier 0 first tries to inflate
+    /// a table not yet marked `no_grid` (`fusedStoreGrid`), so the trace
+    /// proves the mark (`GUARD_TABLE_NO_GRID`); a table that would inflate
+    /// (`Heap.gridPlan`) stays with tier 0. The row is held in no
+    /// register (`GetFrame.out`). Stays with tier 0: a row that is absent,
+    /// not a table or a grid; a function `__index` on the first lookup (a
+    /// function `__newindex` on the row is the store shape's, inlined).
+    fn recIndex2Set(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        const vtab = regs.get(instr.a);
+        if (!isTableValue(vtab)) return self.abort(.bad_type);
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        if (tbl.array.isGrid()) return self.recGridSet(instr, regs);
+        // Recording runs before tier 0 executes the store, so a table not
+        // yet ruled out is still unmarked here. Tier 0 marks it now unless it
+        // qualifies to inflate, and the trace then proves the mark on entry.
+        if (!tbl.no_grid and gc.Heap.gridPlan(tbl) != null) {
+            self.dbg("nyi set_index2: container would inflate to a grid pc={d}", .{self.cur_pc});
+            return self.abort(.nyi_opcode);
+        }
+        const val_reg: u16 = @intCast(instr.aux);
+        const mid = (try self.observedIndex(vtab, regs.get(instr.b))) orelse return self.abort(.has_metatable);
+        if (!isTableValue(mid)) return self.abort(.bad_type);
+        // A grid row stored to by one key would deflate its grid.
+        if (table_mod.Table.fromHeader(mid.asHeap()).array.isGrid()) return self.abort(.nyi_opcode);
+        const rtab = try self.refOf(instr.a);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_NO_GRID | GUARD_TABLE_ANY_META }), .container_type, .a, .neutral);
+        var held: ?Ref = null;
+        try self.getShape(regs, .{ .dst = instr.a, .tab = instr.a, .key = .{ .reg = instr.b }, .tab_od = .a, .key_od = .b, .out = &held });
+        if (!self.active) return;
+        const rmid = held orelse return self.abort(.nyi_opcode);
+        return self.setShape(regs, .{ .tab_in = .{ .ref = rmid, .value = mid }, .key = .{ .reg = instr.c }, .val = val_reg, .tab_od = .loaded, .key_od = .c, .val_od = .aux, .frame_proto = proto });
+    }
+
     pub fn recGridSet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
         const val_reg: u16 = @intCast(instr.aux);
         const vtab = regs.get(instr.a);
@@ -4156,8 +4228,8 @@ pub const RecordingSession = struct {
         // forwarding paths either resolve them or refuse ambiguous aliases.
         const vtab = frameTabValue(regs, f.tab, f.tab_in);
         if (key.isNumber()) {
-            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, keyIndexOf(key).?, vtab.asHeap())) return;
-        } else if (try self.forwardPendingHashLoad(f.dst, rtab, rkey, vtab.asHeap())) return;
+            if (self.landForward(f, try self.forwardArrayLoadRef(rtab, rkey, keyIndexOf(key).?, vtab.asHeap()))) return;
+        } else if (self.landForward(f, try self.forwardHashLoadRef(rtab, rkey, vtab.asHeap()))) return;
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = metaAux(tbl) }), .container_type, f.tab_od, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_absent, .a = rtab, .b = rkey }), .present, .loaded, .neutral);
@@ -4177,12 +4249,14 @@ pub const RecordingSession = struct {
                 nf.hops = f.hops + 1;
                 return self.getShape(regs, nf);
             }
+            if (f.out != null) return self.abort(.has_metatable);
             if (f.frame_proto) |fp| if (try self.metamethodIsClosure(mt, "__index")) {
                 const args = [_]Ref{ rtab, try self.operandRef(f.key) };
                 return self.recMetaCall(fp, rtab, mt, "__index", &args, f.dst, if (f.finish == .result) 1 else 0, f.tab_od, f.finish);
             };
             if (!try self.guardNoMetamethod(rtab, mt, "__index", f.tab_od, f.dst)) return;
         };
+        if (f.out != null) return self.abort(.bad_type);
         self.setReg(f.dst, try self.konst(Value.nil()));
     }
 
@@ -4337,7 +4411,7 @@ pub const RecordingSession = struct {
         // side already emitted `guard_table`/`href`/`guard_hash`/`guardNum` on this
         // same table ref + key konst, so no chain is re-emitted here), NO keeps
         // scanning / falls through to the heap read, MAY aborts fail-closed.
-        if (try self.forwardPendingHashLoad(f.dst, rtab, rkey, vtab.asHeap())) return;
+        if (self.landForward(f, try self.forwardHashLoadRef(rtab, rkey, vtab.asHeap()))) return;
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = metaAux(tbl) }), .container_type, f.tab_od, .neutral);
         // Seed the loop-invariant cell pointer for native (H1); `href.aux` carries
         // the synthetic slab slot, the hrefk `(slot, mask)` encoding for a
@@ -4355,7 +4429,7 @@ pub const RecordingSession = struct {
         // Fused native producer-exit (A-i.3): native `hload` side-exits at the load on
         // a field-type change, no `guard_*` node — same site as the consumer guardNum.
         self.stampProv(rload, .field_type, .loaded, .neutral);
-        self.setReg(f.dst, rload);
+        self.landGet(f, rload);
         // Decompose the tagged-cell load into a typed load + the existing consumer
         // type-guard (mirrors `slot_load` + `guardNum`): native lowers `hload` to a
         // tag-check + payload load of the guarded kind. The oracle returns the whole

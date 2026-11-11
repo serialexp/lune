@@ -309,13 +309,17 @@ more than tier 0. Four causes, by pass:
       key to be a recorded constant ("v1 scope" in its comment).
 - [ ] **`==` on two strings aborts** (`bad_type jeq`; `count`). Already
       listed under doc 85 above as heap `==`/`~=`.
-- [ ] **A fused store `a[i][j] = v` into a plain nested table aborts**
-      (noted 2026-11-11; `recGridSet` takes grids only). The fused read
-      records as two reads since doc 14's 2026-11-11 follow-up. The store
-      cannot simply be two steps: tier 0's `fusedStoreGrid` first tries
-      `inflateToGrid` on any table not yet marked `no_grid`, so the trace
-      must prove that mark at run time (a new guard) or tier 0 and the
-      trace would leave the heap in different shapes.
+- [ ] **A present-slot store into a `.value`-lane table with a metatable
+      aborts** (`has_metatable` in `arraySetShape`, noted 2026-11-12):
+      `t[i] = v` where `t[i]` already holds a value and `t` has any
+      metatable, plain `set_index` and the fused store alike. A present
+      slot never consults `__newindex`, but the `.value` lane has no
+      presence guard (nil is in-band), so the trace cannot prove the slot
+      stays present; it needs one (a nil check on the loaded slot).
+- [ ] **A function `__index` on a fused store's first lookup aborts**
+      (`has_metatable`, `recIndex2Set`, noted 2026-11-12). The fused read
+      finishes such a handler with `MetaFinish.index2_mid`; the store
+      needs the same stage ending in the row's store (doc 77 §6.3).
 - [ ] **A short loop in a function is entered from tier 0 on every
       call** (`refine`: three trips, 0.2% of its iterations in its loop
       trace, 61 M against 19 M; `configured`: 221 M against 46 M, five

@@ -5,7 +5,8 @@ decided; Phases 0–3 landed (2026-11-11); Phase 4 started (computed-callee
 upvalue reads and the anchor-window alias, §6.6; `__index`/`__newindex`
 functions, §6.1; arithmetic, bitwise, unary and `__len` handlers, §6.4;
 `__lt`/`__le`/`__eq` and the compare-and-branch forms, §6.4; `__call`,
-§6.7; a function `__index` under a fused read, §6.3); the rest of
+§6.7; a function `__index` under a fused read, §6.3; the fused store
+into a plain table); the rest of
 Phases 4–7 outstanding (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-12
@@ -291,7 +292,8 @@ land; move whole phases to Done once everything inside them is checked.
   phase-bit stage this list's stack bullet covers. `set_index2` on a plain
   table still aborts (doc 14, TODO.md). Gated in
   `src/interp_native_test.zig` ("fused index: …"). Follow-up (2026-11-12):
-  the function `__index` now records, see the seventh part.
+  the function `__index` now records, see the seventh part. Follow-up
+  (2026-11-12): the fused store records too, see the ninth part.
 - [x] **Phase 4, seventh part — a function `__index` under a fused read**
   (§6.3, 2026-11-12). A handler answering either lookup of a `get_index2`
   records as an inlined call. The first lookup's handler (tier 0's phase
@@ -337,6 +339,20 @@ land; move whole phases to Done once everything inside them is checked.
   - [x] the test catches a violation: a boundary opened at the instruction
     inside `finishIndex2Mid` made a second-lookup guard attachable, and the
     test failed (checked by hand, then removed).
+- [x] **Phase 4, ninth part — the fused store into a plain table** (§6.3,
+  doc 14's second follow-up, 2026-11-12). `set_index2` on a table that is
+  not a grid aborted `nyi_opcode`. `recIndex2Set` records it as the read
+  of the row and the store into it, each with its own shape (handlers
+  included: a table `__index` chain on the container, an inlined function
+  `__newindex` on the row). The container's guard proves it is marked
+  `no_grid` (`GUARD_TABLE_NO_GRID`), since tier 0 tries to inflate a table
+  not yet marked; a container tier 0 is about to inflate (`Heap.gridPlan`)
+  is not recorded. A function `__index` on the first lookup still aborts
+  `has_metatable`: a fused store has no frame finish yet (it would be a
+  second `MetaFinish` stage, the row's store). Gated in
+  `src/interp_native_test.zig` ("fused index: a store …", four tests; the
+  `no_grid` guard and the `gridPlan` refusal were each removed by hand and
+  a test failed).
 
 ### Outstanding
 
@@ -352,8 +368,9 @@ land; move whole phases to Done once everything inside them is checked.
     and §6.3's pending-instruction stages mirror its `finish_op` stages
   - [ ] the pending-instruction stack (§6.3) and its stage transitions:
     the fused read's handler stage landed as a frame finish (seventh part,
-    §6.3 second amendment); the fused store (`set_index2`, which first
-    needs a plain store to record, doc 14) and `__close` (Phase 5) remain
+    §6.3 second amendment); the fused store records without a handler
+    stage (ninth part), so a function `__index` on its first lookup still
+    aborts; that stage and `__close` (Phase 5) remain
   - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
     of a cell with an alias class, through a computed callee still abort
     `.cross_frame`

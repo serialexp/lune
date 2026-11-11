@@ -109,6 +109,10 @@ pub const SlotInfo = struct {
     /// so the prologue skips its no-metatable check. False when no guard
     /// covers the slot: the check then stays, as before the bit existed.
     meta_ok: bool = false,
+    /// For a `.ptr` (table) invariant slot: a covering `guard_table` carries
+    /// `GUARD_TABLE_NO_GRID`, so the prologue also checks once that the table
+    /// is marked `no_grid` (a fused store's container, doc 14).
+    no_grid: bool = false,
     /// For a `.func` (cross-frame callee snapshot) invariant slot: the recorded
     /// `Proto.id` its covering `guard_func` pins, checked once in the prologue
     /// (closure type + this id). Unused (0) for non-`.func` slots.
@@ -1055,6 +1059,7 @@ pub fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind
                 guards += 1;
                 if (g.aux & trace.GUARD_TABLE_ANY_META != 0) any_meta_guards += 1;
                 if (g.aux & trace.GUARD_TABLE_WRITABLE != 0) s.writable = true;
+                if (g.aux & trace.GUARD_TABLE_NO_GRID != 0) s.no_grid = true;
             }
         }
         s.meta_ok = guards != 0 and any_meta_guards == guards;

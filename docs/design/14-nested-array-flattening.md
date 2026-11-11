@@ -31,7 +31,7 @@ into a GP home, an f64 cell `movsd`s the raw double into an XMM home (Stage C).
 (8.4×; LuaJIT gap 42× → 5.0×), both byte-identical across all eight modes and to
 LuaJIT. Build size is explicitly *not* a blocker (see §Decision).
 Owner: Bart
-Last updated: 2026-06-27
+Last updated: 2026-11-12
 
 ## Implementation status
 
@@ -374,6 +374,24 @@ marked `no_grid`, and the trace would need to prove that mark (TODO.md).
 A function `__index` at either level records as an inlined call (doc 77
 §6.3 second amendment, 2026-11-12): the first lookup's handler finishes by
 recording the second lookup on its result.
+
+**Follow-up (2026-11-12): plain nested stores record.** `recIndex2Set`
+records a fused store into a plain table as tier 0's two steps
+(`fusedStore`): the row read by the first key with the read shapes, then
+the store into it by the second with the store shapes, the row held in
+no register. The container's `guard_table` carries a new bit,
+`GUARD_TABLE_NO_GRID`: the table is marked `no_grid`, so tier 0 would not
+try to inflate it. Nothing clears the mark, so native code checks it once
+per entry for an invariant table (in the prologue, like the metatable
+check) and per pass otherwise. Recording runs before tier 0 executes the
+store, so the recorded container is usually not yet marked. The recorder
+asks `Heap.gridPlan`, the scan `inflateToGrid` now calls, whether tier 0
+is about to inflate it: if so the store stays with tier 0, otherwise tier
+0 marks it during the recorded iteration and the trace's guard holds.
+Still with tier 0: a row that is absent, not a table, or a grid (its
+grid would deflate), and a function `__index` on the first lookup. A
+function `__newindex` on the row records as the store shape's inlined
+call.
 
 ## Escape detection — the gate decision (2026-06-26, Bart)
 

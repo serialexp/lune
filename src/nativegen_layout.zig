@@ -86,6 +86,8 @@ pub const HEADER_READONLY_BIT: u6 = @offsetOf(object.GcHeader, "flags") * 8 + @b
 /// after the trace was recorded must side-exit to tier-0 (which dispatches
 /// `__index`/`__newindex`), never run the raw native load/store — chunk 2a.
 pub const METATABLE_OFF: i32 = @offsetOf(table.Table, "metatable");
+/// `Table.no_grid` (a `bool`, one byte), from the `*GcHeader` (doc 14).
+pub const NO_GRID_OFF: i32 = @offsetOf(table.Table, "no_grid");
 /// `ObjectType.function` ordinal — the byte at `GcHeader.type` for a Lua closure.
 /// The cross-frame `guard_func` (U1) checks a snapshot callee value is a closure
 /// of this type before reading its `proto.id`.
