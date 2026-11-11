@@ -354,11 +354,77 @@ test "a replay-line OOM is located at the instruction about to run" {
     const at = vm.frames[vm.depth - 1].pc;
     vm.setSuspendCtl(null);
     vm.setRecordSafepointLines(true);
-    // Room for exactly one more line: the first resumed instruction
-    // records, the second one's append is the failing allocation.
+    // Room for exactly one more line. The resumed instruction's step ran
+    // before the stop (doc 86 §6.1), so it records nothing; the next one
+    // records, and the one after that is the failing allocation.
     try vm.safepoint_lines.ensureTotalCapacityPrecise(fa, vm.safepoint_lines.items.len + 1);
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
     try testing.expectError(error.OutOfMemory, vm.exec());
-    try testing.expectEqual(at + 1, vm.frames[vm.depth - 1].pc);
+    try testing.expectEqual(at + 2, vm.frames[vm.depth - 1].pc);
+    try testing.expectEqual(@as(usize, 1), vm.safepoint_lines.items.len);
+}
+
+test "doc 86 §6.1: a stop and its resume count the stopped step once" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 =
+        \\local function f(n)
+        \\  local s = 0
+        \\  for i = 1, n do s = s + i end
+        \\  return s
+        \\end
+        \\local t = 0
+        \\for j = 1, 4 do t = t + f(j) end
+        \\return t
+        \\
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var total: u64 = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(try vm.start(chunk.proto) == .finished);
+        total = vm.safepoint_seq;
+    }
+    try testing.expect(total > 20);
+
+    // Stop at every step in turn, each a fresh run; then stop at every step
+    // of one run, resuming between. Both end on the uninterrupted count.
+    var k: u64 = 1;
+    while (k < total) : (k += 1) {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        vm.setSuspendCtl(.{ .after_safepoints = k });
+        try testing.expect(try vm.start(chunk.proto) == .suspended);
+        try testing.expectEqual(k, vm.safepoint_seq);
+        vm.setSuspendCtl(null);
+        try testing.expect(try vm.exec() == .finished);
+        try testing.expectEqual(total, vm.safepoint_seq);
+    }
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        var stops: u64 = 0;
+        vm.setSuspendCtl(.{ .after_safepoints = 1 });
+        var outcome = try vm.start(chunk.proto);
+        while (outcome == .suspended) {
+            stops += 1;
+            try testing.expectEqual(stops, vm.safepoint_seq);
+            vm.setSuspendCtl(.{ .after_safepoints = stops + 1 });
+            outcome = try vm.exec();
+        }
+        try testing.expectEqual(total, vm.safepoint_seq);
+        try testing.expectEqual(total, stops);
+    }
 }

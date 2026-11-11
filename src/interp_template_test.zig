@@ -391,7 +391,7 @@ test "[REQ-115.2] a snapshot after a template loop is byte-identical in every tr
         if (mode == .native and !nativegen.is_x64_linux) continue;
         const run = try jitRun(gpa, number_and_string_loop, mode, ref.full_out);
         defer gpa.free(run.snap);
-        try testing.expectEqualSlices(u8, ref.final_snap, run.snap);
+        try ktu.expectSameStateAcrossTiers(ref.final_snap, run.snap);
         const file = try schema.SnapshotFile.decode(arena.allocator(), run.snap);
         try testing.expectEqual(ref_file.keyframe.next_obj_id, file.keyframe.next_obj_id);
     }
@@ -454,7 +454,7 @@ test "[REQ-115.1] a table hole with a __tostring is recorded with its handler in
         try testing.expect(run.handler_guards > 0);
         try testing.expect(run.entries > 0);
         if (mode == .native) try testing.expect(run.native_entries > 0);
-        try testing.expectEqualSlices(u8, ref.final_snap, run.snap);
+        try ktu.expectSameStateAcrossTiers(ref.final_snap, run.snap);
     }
 }
 
@@ -505,6 +505,6 @@ test "[REQ-115.3] a guard failure inside a template runs no hole or __tostring t
         if (mode == .native and !nativegen.is_x64_linux) continue;
         const run = try jitRun(gpa, handler_change_loop, mode, ref.full_out);
         defer gpa.free(run.snap);
-        try testing.expectEqualSlices(u8, ref.final_snap, run.snap);
+        try ktu.expectSameStateAcrossTiers(ref.final_snap, run.snap);
     }
 }

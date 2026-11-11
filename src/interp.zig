@@ -818,6 +818,10 @@ comptime {
     std.debug.assert(@sizeOf(SuspendCtl) == 32);
 }
 
+/// `Vm.resume_at`: a frame, by its activation identity, and the pc it
+/// stopped before.
+pub const ResumePoint = struct { call_seq: u64, pc: usize };
+
 /// The tier-0 virtual machine. Owns the resources a running program needs that
 /// outlive a single frame: the object heap, the global table, and the shared
 /// register/call stack.
@@ -1034,8 +1038,8 @@ pub const Vm = struct {
     /// program's stdout.
     err: ?*io.Writer = null,
     /// Lua 5.4 `warn` system enabled, toggled by the `@on`/`@off` control messages.
-    /// Per-session runtime state — NOT serialized (a warning preference, not
-    /// replayed program behaviour); a restored VM starts enabled like a fresh one.
+    /// Whether a warning prints is observable, so a keyframe carries it (doc 86
+    /// §6.1).
     warn_enabled: bool = true,
     /// Trace recorder state: hotness counters, the trace cache, and the
     /// in-progress recording. Disabled by default (`trace.config.enabled`), so
@@ -1050,6 +1054,14 @@ pub const Vm = struct {
     /// Armed by a test / future debugger to capture a resumable keyframe.
     /// Write through `setSuspendCtl` only (it owns a `trace.fast_block` bit).
     suspend_ctl: ?SuspendCtl = null,
+    /// Doc 86 §6.1: the instruction a stop left the dispatch at, with
+    /// prologue steps (1)–(4) already run for it — the collection check,
+    /// the `safepoint_seq` count, the line index and the suspend check
+    /// itself. Set by the step-(4) suspend and by a mid-execution restore;
+    /// the next dispatch of that frame at that pc enters at step (5)
+    /// (`resumeEntry`), so a stop and its resume count the step once, as
+    /// the uninterrupted run does. Any other entry leaves it alone.
+    resume_at: ?ResumePoint = null,
     /// Doc 21 Phase A (the H-5(i) fix): absolute description of the only live
     /// stack content after a genuine top-level finish — the returned result
     /// span. Published by public `exec` alone (the single top-level authority;
@@ -1079,31 +1091,26 @@ pub const Vm = struct {
     /// (0: none). A recording that would grow past it fails with the
     /// non-catchable `EffectLogLimit`; entries are never dropped.
     effect_log_limit: usize = default_effect_log_limit,
-    /// The encoded size of the log so far (`effectser.encodedEntrySize` of
-    /// every entry logged in `record`, plus the file header).
-    effect_log_encoded: usize = effectser.file_header_size,
     /// Doc 65 §4.4: whether a failed `io`/`os` call raises or returns Lua's
     /// `nil, msg, code`. Pinned into the log at the first host operation
     /// that can fail (`noteIoErrorMode`), so a replay under the other mode
     /// refuses.
     io_errors: system.IoErrors = .raise,
     /// Whether this session has pinned `io_errors` (like
-    /// `unicode_version_pinned`; in-memory only).
+    /// `unicode_version_pinned`; a keyframe carries it).
     io_errors_pinned: bool = false,
     /// Doc 65 §7: the status `os.exit` ended the program with, read by the
     /// host when a run returns `Error.Exit`. C's `exit` takes an `int`.
     exit_status: i32 = 0,
     /// Mode-independent logical count of successfully committed host effects.
     /// Unlike `effect_cursor` (replay-only), this advances once in off, record,
-    /// and replay through `onEffectCommitted`. It is replay-driver state rather
-    /// than semantic keyframe state and is not serialized.
+    /// and replay through `onEffectCommitted`. A keyframe carries it (doc 86
+    /// §6.1), so a resumed run's effect cuts land where the original's did.
     committed_effect_seq: u64 = 0,
     /// S-C: whether this session has already pinned its Unicode version (logged in
-    /// `record` / consumed in `replay`) at the first `upper`/`lower`. In-memory
-    /// only — deliberately NOT serialized: on a snapshot-resume it is re-derived
-    /// from the supplied `(effect_log, effect_cursor)` by `noteUnicodeVersion`
-    /// (scanning for an already-consumed `.unicode_version`), exactly as the PRNG
-    /// is not persisted either. See `noteUnicodeVersion`.
+    /// `record` / consumed in `replay`) at the first `upper`/`lower`. A keyframe
+    /// carries it (doc 86 §6.1): log compaction drops the prefix the pin was
+    /// logged in, so it cannot be re-derived from the log.
     unicode_version_pinned: bool = false,
     /// Embedder-supplied clock for `os.clock`/`os.nsclock` and the reading it
     /// counts from (null = none injected). Set through `setClockSource`, never
@@ -5822,6 +5829,7 @@ pub const Vm = struct {
                 {
                     std.debug.assert(self.pending_error == null);
                     st.frame.pc = pc;
+                    self.resume_at = .{ .call_seq = st.frame.call_seq, .pc = pc };
                     return .suspended;
                 }
             }
@@ -5846,7 +5854,12 @@ pub const Vm = struct {
         // this one counter test, and a regions-live program pays one
         // extra tail jump per instruction — still call-frame-free
         // (A-vii-e.2's point), just one hop farther out of line.
-        if (self.trace.regionProfitCount() != 0)
+        return dispatchObserve(mode, st, pc, iptr, vm, tags, payloads);
+    }
+
+    /// Prologue step (5), the region observer's hot test, and on.
+    inline fn dispatchObserve(comptime mode: ExecMode, st: *ExecState, pc: usize, iptr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+        if (vm.trace.regionProfitCount() != 0)
             return @call(.always_tail, regionTrampoline(mode), .{ st, pc, iptr, vm, tags, payloads });
         return dispatchPostObserve(mode, st, pc, iptr, vm, tags, payloads);
     }
@@ -5998,6 +6011,20 @@ pub const Vm = struct {
                 _ = tags; // general dispatch re-derives lanes from st.regs
                 _ = payloads;
                 return dispatchTail(mode, st, pc, vm);
+            }
+        }.h;
+    }
+
+    /// `chainEntry` for a resume at `Vm.resume_at` (doc 86 §6.1): the
+    /// instruction at `pc` already ran prologue steps (1)–(4), so dispatch
+    /// enters at step (5).
+    fn resumeEntry(comptime mode: ExecMode) *const HandlerFn {
+        return struct {
+            fn h(st: *ExecState, pc: usize, instr: *const Instr, vm: *Vm, tags: [*]u8, payloads: [*]u64) HandlerResult {
+                _ = instr;
+                _ = tags;
+                _ = payloads;
+                return dispatchObserve(mode, st, pc, &st.code[pc], vm, st.regs.tags, st.regs.payloads);
             }
         }.h;
     }
@@ -8708,7 +8735,10 @@ pub const Vm = struct {
             .entry_stop = stop_depth,
         };
         self.trace.setRegionContext(self.depth, frame.call_seq);
-        switch (@call(.never_inline, chainEntry(mode), .{ &st, frame.pc, undefined, self, st.regs.tags, st.regs.payloads })) {
+        const resuming = if (self.resume_at) |r| r.call_seq == frame.call_seq and r.pc == frame.pc else false;
+        if (resuming) self.resume_at = null;
+        const entry = if (resuming) resumeEntry(mode) else chainEntry(mode);
+        switch (@call(.never_inline, entry, .{ &st, frame.pc, undefined, self, st.regs.tags, st.regs.payloads })) {
             .finished => return st.step,
             .suspended => return .suspended,
             .switch_mode => return .switch_mode,
@@ -13323,7 +13353,7 @@ fn onEffectCommitted(self: *Vm) void {
 /// and a `bytes` result through `logEffectBytes`.
 fn logEffect(self: *Vm, e: Effect) Error!void {
     std.debug.assert(e.result == .value or e.result == .fail);
-    try chargeEffectLog(self, effectser.encodedEntrySize(e.result));
+    try chargeEffectLog(self, effectlog.entrySize(e.result));
     try self.effect_log.append(self.gpa, e);
 }
 
@@ -13332,13 +13362,13 @@ fn logEffect(self: *Vm, e: Effect) Error!void {
 fn logValue(self: *Vm, kind: EffectKind, v: Value) Error!void {
     if (!v.isHeap()) return logEffect(self, Effect.of(kind, v));
     const len = string.String.fromHeader(v.asHeap()).bytes().len;
-    try chargeEffectLog(self, effectser.encodedEntrySize(.{ .string = .{ .start = 0, .len = len } }));
+    try chargeEffectLog(self, effectlog.entrySize(.{ .string = .{ .start = 0, .len = len } }));
     try self.effect_log.appendValue(self.gpa, kind, v);
 }
 
 /// `logEffect` for a `bytes` result: the content is copied into the log.
 fn logEffectBytes(self: *Vm, kind: EffectKind, content: []const u8) Error!void {
-    try chargeEffectLog(self, effectser.encodedEntrySize(.{ .bytes = .{ .start = 0, .len = content.len } }));
+    try chargeEffectLog(self, effectlog.entrySize(.{ .bytes = .{ .start = 0, .len = content.len } }));
     try self.effect_log.appendBytes(self.gpa, kind, content);
 }
 
@@ -13357,11 +13387,10 @@ fn loggedValue(self: *Vm, r: Effect.Result) Error!Value {
     };
 }
 
-/// Count `size` encoded bytes against the cap, refusing past it.
+/// Refuse an entry of `size` encoded bytes that would take the log past the
+/// cap. The append that follows counts it (`EffectLog.encoded`).
 fn chargeEffectLog(self: *Vm, size: usize) Error!void {
-    const total = self.effect_log_encoded + size;
-    if (self.effect_log_limit != 0 and total > self.effect_log_limit) return Error.EffectLogLimit;
-    self.effect_log_encoded = total;
+    if (self.effect_log_limit != 0 and self.effect_log.encoded + size > self.effect_log_limit) return Error.EffectLogLimit;
 }
 
 /// Consume the next logged effect in call order (replay mode), checking the run
@@ -13421,49 +13450,36 @@ fn obtainRandomSeed(self: *Vm) Error!u64 {
 /// only on a snapshot-resume: the keyframe carries no "already pinned" flag,
 /// so the first pin after a restore derives it from the re-attached log +
 /// cursor instead of re-consuming an effect that was pinned before the cut.
-fn alreadyConsumed(self: *Vm, kind: EffectKind) bool {
-    const upto = @min(self.effect_cursor, self.effect_log.len());
-    for (self.effect_log.entries.items[0..upto]) |e| if (e.kind == kind) return true;
-    return false;
-}
-
 /// Pin a once-per-session constant through the record/replay boundary: the
 /// shared mechanism behind `noteUnicodeVersion` and `noteIoErrorMode`. In
 /// `off` it only marks `pinned`; in `record` it logs `want` as `kind`; in
 /// `replay` it consumes that effect and refuses with `mismatch` if the
 /// recording pinned a different value. Idempotent once `pinned` is set.
 fn pinSessionConstant(self: *Vm, kind: EffectKind, want: i64, pinned: *bool, mismatch: Error) Error!void {
+    // A keyframe carries the pin (doc 86 §6.1), so a resumed session that
+    // pinned before the cut returns here too.
     if (pinned.*) return;
-    var committed = true;
     switch (self.effect_mode) {
         .off => {},
         .record => try logEffect(self, Effect.of(kind, Value.int(want))),
         .replay => {
-            // On a snapshot-resume the constant may have been pinned before the
-            // cut; its effect then sits behind the cursor — don't consume a
-            // second one.
-            if (alreadyConsumed(self, kind)) {
-                committed = false;
-            } else {
-                // Peek, validate, THEN consume (the cursor-truthfulness contract
-                // on `nextLoggedEffect`): on a mismatch the wrong entry must stay
-                // IN FRONT of the cursor, so any later retry — a host re-running
-                // this faulted-but-live VM, or a resumed session — re-validates
-                // and re-raises instead of finding the entry behind the cursor
-                // via `alreadyConsumed` and silently pinning the wrong value.
-                const r = try peekLoggedEffect(self, kind);
-                // The decoder (effectser.checkResultShape) admits only an int
-                // here, but a log built in memory need not have been decoded;
-                // `asInt()` asserts int. A value we cannot read is, for our
-                // purposes, the wrong value — refuse rather than assert on
-                // hostile bytes.
-                if (r != .value or r.value.tag != .int or r.value.asInt() != want) return mismatch;
-                self.effect_cursor += 1; // accepted — consume
-            }
+            // Peek, validate, THEN consume (the cursor-truthfulness contract
+            // on `nextLoggedEffect`): on a mismatch the wrong entry must stay
+            // IN FRONT of the cursor, so any later retry — a host re-running
+            // this faulted-but-live VM, or a resumed session — re-validates
+            // and re-raises.
+            const r = try peekLoggedEffect(self, kind);
+            // The decoder (effectser.checkResultShape) admits only an int
+            // here, but a log built in memory need not have been decoded;
+            // `asInt()` asserts int. A value we cannot read is, for our
+            // purposes, the wrong value — refuse rather than assert on
+            // hostile bytes.
+            if (r != .value or r.value.tag != .int or r.value.asInt() != want) return mismatch;
+            self.effect_cursor += 1; // accepted — consume
         },
     }
     pinned.* = true;
-    if (committed) onEffectCommitted(self);
+    onEffectCommitted(self);
 }
 
 /// Pin the active Unicode version through the record/replay boundary (S-C). The
@@ -13476,12 +13492,9 @@ fn pinSessionConstant(self: *Vm, kind: EffectKind, want: i64, pinned: *bool, mis
 /// than this binary's table — a silent case-mapping divergence would break replay.
 /// Called by `upper`/`lower` (stdlib/string.zig); idempotent after the first call.
 ///
-/// Snapshot interaction: a *replay* resume is correct (the cursor-prefix scan above
-/// avoids a double-consume). A *record*-mode resume of a once-per-session pin —
-/// snapshotting a live recording and continuing to record — would re-log the pin,
-/// exactly as it would re-log the RNG seed; that "resume a live recording" flow is
-/// the documented out-of-scope follow-up in TODO.md (it needs the keyframe to carry
-/// `effect_log`/`effect_cursor`), not a partial fix here.
+/// Snapshot interaction: the keyframe carries the pin and the PRNG state (doc 86
+/// §6.1), so a resumed session, replaying or recording on, neither consumes nor
+/// logs the pin a second time.
 pub fn noteUnicodeVersion(self: *Vm) Error!void {
     return pinSessionConstant(self, .unicode_version, unicode_case.unicode_version_packed, &self.unicode_version_pinned, Error.UnicodeVersionMismatch);
 }

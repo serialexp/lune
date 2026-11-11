@@ -4436,7 +4436,7 @@ export class LoadedChunkDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`. Doc 86 §6.1 (v22): `vm_state` is the VM state outside the heap that feeds observable behaviour.
  */
 export interface KeyframeInput {
   /**
@@ -4559,10 +4559,14 @@ export interface KeyframeInput {
    * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
    */
   aio_next_id: bigint;
+  /**
+   * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits.
+   */
+  vm_state: VmStateInput;
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`. Doc 86 §6.1 (v22): `vm_state` is the VM state outside the heap that feeds observable behaviour.
  */
 export interface KeyframeOutput {
   /**
@@ -4685,6 +4689,10 @@ export interface KeyframeOutput {
    * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
    */
   aio_next_id: bigint;
+  /**
+   * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits.
+   */
+  vm_state: VmStateOutput;
 }
 
 export type Keyframe = KeyframeOutput;
@@ -4766,6 +4774,11 @@ export class KeyframeEncoder extends BitStreamEncoder {
     this.writeUint32(value.task_lib_id, "little_endian");
     this.writeUint32(value.aio_ops_id, "little_endian");
     this.writeUint64(value.aio_next_id, "little_endian");
+    const encoder_vm_state = new VmStateEncoder();
+    const encoded_vm_state = encoder_vm_state.encode(value.vm_state);
+    for (const byte of encoded_vm_state) {
+      this.writeUint8(byte);
+    }
     return this.finish();
   }
 
@@ -4812,6 +4825,9 @@ export class KeyframeEncoder extends BitStreamEncoder {
       size += main_context_itemEncoder.calculateSize(item);
     }
     size += 17; // length prefix (uint8) + task_lib_id + aio_ops_id + aio_next_id
+    // vm_state: custom type (VmState)
+    const vm_state_encoder = new VmStateEncoder();
+    size += vm_state_encoder.calculateSize(value.vm_state);
     return size;
   }
 }
@@ -5064,6 +5080,206 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
     value.task_lib_id = this.readUint32("little_endian");
     value.aio_ops_id = this.readUint32("little_endian");
     value.aio_next_id = this.readUint64("little_endian");
+    value.vm_state = {};
+    value.vm_state.rng = [];
+    const vm_state_rng_length = this.readUint8();
+    for (let i = 0; i < vm_state_rng_length; i++) {
+      let vm_state_rng__iter: any;
+      vm_state_rng__iter = this.readUint64("little_endian");
+      value.vm_state.rng.push(vm_state_rng__iter);
+    }
+    value.vm_state.safepoint_seq = this.readUint64("little_endian");
+    value.vm_state.committed_effect_seq = this.readUint64("little_endian");
+    value.vm_state.effect_cursor = this.readUint64("little_endian");
+    value.vm_state.warn_enabled = this.readUint8();
+    value.vm_state.io_errors = this.readUint8();
+    value.vm_state.io_errors_pinned = this.readUint8();
+    value.vm_state.unicode_version_pinned = this.readUint8();
+    value.vm_state.system_groups = this.readUint8();
+    return value;
+  }
+}
+
+/**
+ * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits.
+ */
+export interface VmStateInput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  rng: bigint[];
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  safepoint_seq: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  committed_effect_seq: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  effect_cursor: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  warn_enabled: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  io_errors: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  io_errors_pinned: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  unicode_version_pinned: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  system_groups: number;
+}
+
+/**
+ * Doc 86 §6.1 (v22): the VM state outside the heap that feeds observable behaviour, so a restored VM resumes exactly. `rng` is the PRNG's Xoshiro256 state (empty before the first `random()` seeds it, else its four words); `safepoint_seq` the step the capture stopped at, whose prologue already ran (a resume does not count it again); `committed_effect_seq` the effects committed so far; `effect_cursor` the position in the session's effect log (in record mode the log's length; the log keeps its own encoded size); `warn_enabled`, `io_errors` (0 = raise, 1 = lua) and the two once-per-session pins (`io_errors_pinned`, `unicode_version_pinned`, 0/1) as their VM fields; `system_groups` the installed interface groups as `system.Groups`' bits.
+ */
+export interface VmStateOutput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint8
+   */
+  rng: bigint[];
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  safepoint_seq: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  committed_effect_seq: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  effect_cursor: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  warn_enabled: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  io_errors: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  io_errors_pinned: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  unicode_version_pinned: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  system_groups: number;
+}
+
+export type VmState = VmStateOutput;
+
+export class VmStateEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: VmStateInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.rng.length);
+    for (let value_rng__iter_index = 0; value_rng__iter_index < value.rng.length; value_rng__iter_index++) {
+      const value_rng__iter = value.rng[value_rng__iter_index];
+      this.writeUint64(value_rng__iter, "little_endian");
+    }
+    this.writeUint64(value.safepoint_seq, "little_endian");
+    this.writeUint64(value.committed_effect_seq, "little_endian");
+    this.writeUint64(value.effect_cursor, "little_endian");
+    this.writeUint8(value.warn_enabled);
+    this.writeUint8(value.io_errors);
+    this.writeUint8(value.io_errors_pinned);
+    this.writeUint8(value.unicode_version_pinned);
+    this.writeUint8(value.system_groups);
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a VmState value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: VmState): number {
+    let size = 0;
+    // rng: array (kind: length_prefixed)
+    for (const item of value.rng) {
+      size += 8;
+    }
+    size += 30; // length prefix (uint8) + safepoint_seq + committed_effect_seq + effect_cursor + warn_enabled + io_errors + io_errors_pinned + unicode_version_pinned + system_groups
+    return size;
+  }
+}
+
+export class VmStateDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): VmStateOutput {
+    const value: any = {};
+
+    value.rng = [];
+    const rng_length = this.readUint8();
+    for (let i = 0; i < rng_length; i++) {
+      let rng__iter: any;
+      rng__iter = this.readUint64("little_endian");
+      value.rng.push(rng__iter);
+    }
+    value.safepoint_seq = this.readUint64("little_endian");
+    value.committed_effect_seq = this.readUint64("little_endian");
+    value.effect_cursor = this.readUint64("little_endian");
+    value.warn_enabled = this.readUint8();
+    value.io_errors = this.readUint8();
+    value.io_errors_pinned = this.readUint8();
+    value.unicode_version_pinned = this.readUint8();
+    value.system_groups = this.readUint8();
     return value;
   }
 }
@@ -5078,7 +5294,7 @@ export interface SnapshotFileInput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`. Doc 86 §6.1 (v22): `vm_state` is the VM state outside the heap that feeds observable behaviour.
    */
   keyframe: KeyframeInput;
 }
@@ -5093,7 +5309,7 @@ export interface SnapshotFileOutput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of EVERY unswept object, in ascending id order (doc 61 Phase K: garbage included, so a restored VM gets the same intern hits and collection points); roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the file metatable and the default input and output handles (doc 65; the same 1-based optional ids), the live register window (a slot dead at capture is a DeadSlot tombstone), the active frame closures, and the open upvalues. `gc_target` is the heap's collection target in pacing units (one per object, plus doc 73's charge for every coroutine stack held); restore derives the live-object threshold from it and the restored stacks' charge. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_file_id` is the next file handle id to hand out (doc 65 §4.1), a deterministic counter like `next_obj_id`. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated and swept before the cut (a swept object bumped the counter but leaves no entry in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode. Doc 73: `stack`/`frames`/`open_upvalues` are the RUNNING stack's; `current_id` names the coroutine running it as a 1-based optional id (0 = the main program), and then `main_context` (one entry) holds the main stack, stopped at the resume that started the chain. Doc 73 §7: `task_lib_id` is the task library's function table (1-based optional id; 0 = the program never used async code); its chunk is one of `loaded_chunks`. Doc 73 §7.6: `aio_ops_id` is the table of `aio` operations in flight, by operation id (1-based optional id; 0 = none started yet), and `aio_next_id` the next operation id, a deterministic counter like `next_file_id`. Doc 86 §6.1 (v22): `vm_state` is the VM state outside the heap that feeds observable behaviour.
    */
   keyframe: KeyframeOutput;
 }
@@ -5384,6 +5600,22 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
     value.keyframe.task_lib_id = this.readUint32("little_endian");
     value.keyframe.aio_ops_id = this.readUint32("little_endian");
     value.keyframe.aio_next_id = this.readUint64("little_endian");
+    value.keyframe.vm_state = {};
+    value.keyframe.vm_state.rng = [];
+    const keyframe_vm_state_rng_length = this.readUint8();
+    for (let i = 0; i < keyframe_vm_state_rng_length; i++) {
+      let keyframe_vm_state_rng__iter: any;
+      keyframe_vm_state_rng__iter = this.readUint64("little_endian");
+      value.keyframe.vm_state.rng.push(keyframe_vm_state_rng__iter);
+    }
+    value.keyframe.vm_state.safepoint_seq = this.readUint64("little_endian");
+    value.keyframe.vm_state.committed_effect_seq = this.readUint64("little_endian");
+    value.keyframe.vm_state.effect_cursor = this.readUint64("little_endian");
+    value.keyframe.vm_state.warn_enabled = this.readUint8();
+    value.keyframe.vm_state.io_errors = this.readUint8();
+    value.keyframe.vm_state.io_errors_pinned = this.readUint8();
+    value.keyframe.vm_state.unicode_version_pinned = this.readUint8();
+    value.keyframe.vm_state.system_groups = this.readUint8();
     return value;
   }
 }

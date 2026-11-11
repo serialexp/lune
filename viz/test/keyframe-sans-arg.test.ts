@@ -65,6 +65,17 @@ class Kf {
         task_lib_id: 0,
         aio_ops_id: 0,
         aio_next_id: 1n,
+        vm_state: {
+          rng: [],
+          safepoint_seq: 0n,
+          committed_effect_seq: 0n,
+          effect_cursor: 0n,
+          warn_enabled: 1,
+          io_errors: 0,
+          io_errors_pinned: 0,
+          unicode_version_pinned: 0,
+          system_groups: 0,
+        },
       },
     });
   }

@@ -29,6 +29,7 @@ const mahina_parser = @import("parser.zig");
 const mahina_compiler = @import("compiler.zig");
 const Diagnostics = @import("diag.zig").Diagnostics;
 const io = @import("io.zig");
+const ktu = @import("keyframeser_testutil.zig");
 
 const NativeRegistry = keyframeser.NativeRegistry;
 const encodeSnapshot = keyframeser.encodeSnapshot;
@@ -146,8 +147,8 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
     const mid = try encodeSnapshot(gpa, &vm2);
     defer gpa.free(mid);
 
-    // --- Restore + replay-from-cursor: rebuild the VM from the keyframe, then the
-    // driver re-attaches the effect log and cursor (the seam the keyframe omits).
+    // --- Restore + replay-from-cursor: rebuild the VM from the keyframe, which
+    // carries the cursor (doc 86 §6.1); the driver re-attaches the effect log.
     const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
@@ -158,7 +159,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
     vm_r.out = &sink_r;
     vm_r.effect_mode = .replay;
     try vm_r.effect_log.entries.appendSlice(gpa, ref.log);
-    vm_r.effect_cursor = cursor_at_cut;
+    try testing.expectEqual(cursor_at_cut, vm_r.effect_cursor);
     vm_r.setSuspendCtl(null);
     try testing.expect((try vm_r.exec()) == .finished);
 
@@ -257,8 +258,10 @@ test "doc 68 §9: every cut through dofile, require and sort after committed eff
         vm_r.out = &sink_r;
         try effectser.decodeInto(vm_r.effect_log, gpa, log_bytes);
         vm_r.effect_mode = .replay;
-        vm_r.effect_cursor = vm2.effect_cursor;
-        vm_r.rng = vm2.rng;
+        // The keyframe carries the cursor and the PRNG state (doc 86 §6.1).
+        try testing.expectEqual(vm2.effect_cursor, vm_r.effect_cursor);
+        try testing.expectEqual(vm2.rng, vm_r.rng);
+        try testing.expectEqual(vm2.safepoint_seq, vm_r.safepoint_seq);
         vm_r.setSuspendCtl(null);
         try testing.expect((try vm_r.exec()) == .finished);
 
@@ -266,8 +269,10 @@ test "doc 68 §9: every cut through dofile, require and sort after committed eff
         @memcpy(combined[0..out_before.len], out_before);
         @memcpy(combined[out_before.len..][0..sink_r.buffered().len], sink_r.buffered());
         try testing.expectEqualStrings(ref_out, combined[0 .. out_before.len + sink_r.buffered().len]);
-        // Every effect consumed exactly once across the cut.
+        // Every effect consumed exactly once across the cut, and every step
+        // counted once: the resume does not count the stopped step again.
         try testing.expectEqual(vm_r.effect_log.entries.items.len, vm_r.effect_cursor);
+        try testing.expectEqual(safepoints, vm_r.safepoint_seq);
     }
 }
 
@@ -375,7 +380,7 @@ test "doc 61 Phase K: a register the dead-φ filter left stale is a tombstone at
     defer native.deinit(gpa);
     try testing.expect(native.traced_iters > 0);
     try testing.expect(native.compiled_native_traces > 0);
-    try testing.expectEqualSlices(u8, tier0.keyframe, native.keyframe);
+    try ktu.expectSameStateAcrossTiers(tier0.keyframe, native.keyframe);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -420,7 +425,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
 
     // F-5 full-state oracle: semantic keyframe plus every replay-driver facet the
     // keyframe deliberately omits. No coarse counter-only shortcut is accepted.
-    try testing.expectEqualSlices(u8, tier0.keyframe, native.keyframe);
+    try ktu.expectSameStateAcrossTiers(tier0.keyframe, native.keyframe);
     try testing.expectEqualSlices(u8, tier0.effects, native.effects);
     try testing.expectEqualStrings(tier0.output_prefix, native.output_prefix);
     try testing.expectEqualSlices(u64, &tier0.rng_state, &native.rng_state);
@@ -468,9 +473,11 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     try testing.expectEqual(@as(usize, 0), resumed.trace.registry.cache.items.len);
     try effectser.decodeInto(resumed.effect_log, gpa, cut_effects);
     resumed.effect_mode = .record;
-    resumed.effect_cursor = cut_vm.effect_cursor;
-    resumed.committed_effect_seq = cut_vm.committed_effect_seq;
-    resumed.rng = cut_vm.rng;
+    // The keyframe carries the envelope (doc 86 §6.1); a recording's cursor
+    // is its log's length.
+    try testing.expectEqual(cut_vm.effect_log.len(), resumed.effect_cursor);
+    try testing.expectEqual(cut_vm.committed_effect_seq, resumed.committed_effect_seq);
+    try testing.expectEqual(cut_vm.rng, resumed.rng);
     resumed.trace.config.enabled = true;
     resumed.trace.config.execute = true;
     resumed.trace.config.optimize = true;
@@ -508,7 +515,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     defer gpa.free(resumed_final);
     const ref_final = try encodeSnapshot(gpa, &ref_vm);
     defer gpa.free(ref_final);
-    try testing.expectEqualSlices(u8, ref_final, resumed_final);
+    try ktu.expectSameStateAcrossTiers(ref_final, resumed_final);
     try testing.expectEqual(ref_vm.committed_effect_seq, resumed.committed_effect_seq);
     try testing.expectEqualSlices(u64, &ref_vm.rng.?.s, &resumed.rng.?.s);
 }

@@ -442,7 +442,7 @@ test "aio: a replay restored at any cut settles the operations in flight from th
         var sink_r = io.Writer.fixed(&buf_r);
         vm_r.out = &sink_r;
         try effectser.decodeInto(vm_r.effect_log, gpa, ref.log);
-        vm_r.effect_cursor = vm.effect_cursor;
+        try testing.expectEqual(vm.effect_cursor, vm_r.effect_cursor);
         vm_r.effect_mode = .replay;
         try testing.expect((try vm_r.exec()) == .finished);
         var combined: std.ArrayList(u8) = .empty;

@@ -19,6 +19,7 @@ const trace = @import("trace.zig");
 const irinterp = @import("irinterp.zig");
 const execlog = @import("execlog.zig");
 const effectser = @import("effectser.zig");
+const effectlog = @import("effectlog.zig");
 const compiler = @import("compiler.zig");
 const io = @import("io.zig");
 const stdmath = @import("stdlib/math.zig");
@@ -1120,8 +1121,7 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
     defer gpa.free(log_bytes);
 
     // Replay commits the identical four events with all host sources detached.
-    // Re-entering the already-consumed Unicode pin models snapshot resume: no
-    // new log entry is consumed, so the logical commit counter must not move.
+    // A second pin call consumes no entry, so the counter does not move.
     {
         var vm = try Vm.init(gpa);
         defer vm.deinit();
@@ -1134,7 +1134,6 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         try compileRun(gpa, &vm, source);
         try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
         try testing.expectEqual(vm.effect_log.entries.items.len, vm.effect_cursor);
-        vm.unicode_version_pinned = false;
         try noteUnicodeVersion(&vm);
         try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
         try testing.expectEqual(vm.effect_log.entries.items.len, vm.effect_cursor);
@@ -1404,7 +1403,7 @@ test "[REQ-76.1] doc 65 §4.5: a recording past the effect-log limit is fatal, u
     try env.install(&vm);
     vm.effect_mode = .record;
     // A nil getenv result encodes as 3 bytes (kind, tag, pad): room for three.
-    const limit = effectser.file_header_size + 3 * 3;
+    const limit = effectlog.file_header_size + 3 * 3;
     vm.effect_log_limit = limit;
     const err = compileRun(gpa, &vm,
         \\for i = 1, 10 do print(pcall(os.getenv, "UNSET")) end
@@ -1413,7 +1412,7 @@ test "[REQ-76.1] doc 65 §4.5: a recording past the effect-log limit is fatal, u
     try testing.expect(!interp.catchable(error.EffectLogLimit));
     // The entries before the cap are all there, none dropped, none past it.
     try testing.expectEqual(@as(usize, 3), vm.effect_log.len());
-    try testing.expectEqual(limit, vm.effect_log_encoded);
+    try testing.expectEqual(limit, vm.effect_log.encoded);
     try testing.expectEqualStrings("true\tnil\ntrue\tnil\ntrue\tnil\n", sink.buffered());
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1439,7 +1438,7 @@ test "[REQ-76.2] doc 65 §4.5: the cap counts what encodeFile writes, and 0 or o
         try testing.expectEqual(@as(usize, 50), vm.effect_log.len());
         const bytes = try effectser.encodeFile(gpa, vm.effect_log);
         defer gpa.free(bytes);
-        try testing.expectEqual(bytes.len, vm.effect_log_encoded);
+        try testing.expectEqual(bytes.len, vm.effect_log.encoded);
     }
     // Off mode logs nothing, so a tiny cap never trips.
     {
@@ -1489,18 +1488,44 @@ test "[REQ-71.2] doc 65 §4.4: a replay under the other io error mode refuses, a
 }
 
 test "[REQ-71.3] doc 65 §4.4: a resumed replay does not consume a second io error mode pin" {
-    // The keyframe carries no pinned flag: after a restore the pin before the
-    // cut is found behind the cursor, as for `unicode_version`.
+    // The keyframe carries the pin (doc 86 §6.1): a VM restored after the
+    // pin skips it, and the cursor stays on the next entry.
     const gpa = testing.allocator;
+    const keyframeser = @import("keyframeser.zig");
+    const source: [:0]const u8 =
+        \\local a = 1
+        \\local b = a + 1
+        \\return b
+    ;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     vm.effect_mode = .replay;
     try vm.effect_log.append(gpa, Effect.of(.io_error_mode, Value.int(0)));
     try vm.effect_log.append(gpa, Effect.of(.file_seek, Value.int(9)));
-    vm.effect_cursor = 1;
     try interp.noteIoErrorMode(&vm);
-    try testing.expectEqual(@as(usize, 1), vm.effect_cursor);
-    try testing.expectEqual(@as(i64, 9), (try interp.replayHost(&vm, .file_seek)).value.asInt());
+    var diags = @import("diag.zig").Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try @import("parser.zig").parse(gpa, source, &diags);
+    defer tree.deinit();
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    vm.setSuspendCtl(.{ .after_safepoints = 2 });
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    const mid = try keyframeser.encodeSnapshot(gpa, &vm);
+    defer gpa.free(mid);
+
+    const vm_r = try keyframeser.restore(gpa, mid, .of(source), keyframeser.NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+    try testing.expect(vm_r.io_errors_pinned);
+    try testing.expectEqual(@as(usize, 1), vm_r.effect_cursor);
+    vm_r.shareEffectLog(vm.effect_log);
+    vm_r.effect_mode = .replay;
+    try interp.noteIoErrorMode(vm_r);
+    try testing.expectEqual(@as(usize, 1), vm_r.effect_cursor);
+    try testing.expectEqual(@as(i64, 9), (try interp.replayHost(vm_r, .file_seek)).value.asInt());
 }
 
 test "[REQ-75.1] doc 65 §4.2: host results — values, failures and bytes — record, encode and replay" {
@@ -1520,7 +1545,7 @@ test "[REQ-75.1] doc 65 §4.2: host results — values, failures and bytes — r
         try interp.recordHost(&vm, .file_write, .{ .value = Value.nil() });
         try testing.expectEqual(@as(u64, 6), vm.committed_effect_seq);
         log_bytes = try effectser.encodeFile(gpa, vm.effect_log);
-        try testing.expectEqual(log_bytes.len, vm.effect_log_encoded);
+        try testing.expectEqual(log_bytes.len, vm.effect_log.encoded);
     }
     defer gpa.free(log_bytes);
     var vm = try Vm.init(gpa);
@@ -1545,10 +1570,10 @@ test "[REQ-76.3] doc 65 §4.5: a bytes result past the cap is refused and leaves
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     vm.effect_mode = .record;
-    vm.effect_log_limit = effectser.file_header_size + 2 + 4 + 15;
+    vm.effect_log_limit = effectlog.file_header_size + 2 + 4 + 15;
     try testing.expectError(error.EffectLogLimit, interp.recordHostBytes(&vm, .file_read_op, "sixteen bytes!!!"));
     try testing.expectEqual(@as(usize, 0), vm.effect_log.len());
     try testing.expectEqual(@as(usize, 0), vm.effect_log.bytes.items.len);
     try interp.recordHostBytes(&vm, .file_read_op, "fifteen bytes!!");
-    try testing.expectEqual(vm.effect_log_limit, vm.effect_log_encoded);
+    try testing.expectEqual(vm.effect_log_limit, vm.effect_log.encoded);
 }

@@ -154,7 +154,13 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v21 (doc 68 §7.4): byte buffers. `HeapObject` gained `HeapBytes` (obj_type
 /// 9: the used bytes), what `string.gsub`'s activation builds its result in
 /// between two replacement calls.
-pub const snapshot_format_version: u32 = 21;
+///
+/// v22 (doc 86 §6.1): `Keyframe.vm_state`, the VM state outside the heap
+/// that feeds observable behaviour, so a restored VM resumes exactly without
+/// the host passing it alongside: the PRNG state, `safepoint_seq`,
+/// `committed_effect_seq`, `effect_cursor`, `warn_enabled`, `io_errors` and its pin, the Unicode pin, and
+/// `system_groups`.
+pub const snapshot_format_version: u32 = 22;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -557,6 +563,9 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
         .name = lc.chunk.proto.name,
     };
 
+    // Doc 86 §6.1: the PRNG's state, empty until the first `random()`.
+    const rng: []const u64 = if (vm.rng) |*r| &r.s else &.{};
+
     const file: schema.SnapshotFile = .{
         .version = snapshot_format_version,
         .keyframe = .{
@@ -592,6 +601,19 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             .task_lib_id = if (vm.task_lib) |t| t.header.id + 1 else 0,
             .aio_ops_id = if (vm.aio_ops) |t| t.header.id + 1 else 0,
             .aio_next_id = vm.aio_next_id,
+            .vm_state = .{
+                .rng = rng,
+                .safepoint_seq = vm.safepoint_seq,
+                .committed_effect_seq = vm.committed_effect_seq,
+                // A recording does not advance the cursor: its position is
+                // the log's length.
+                .effect_cursor = if (vm.effect_mode == .record) vm.effect_log.len() else vm.effect_cursor,
+                .warn_enabled = @intFromBool(vm.warn_enabled),
+                .io_errors = @intFromEnum(vm.io_errors),
+                .io_errors_pinned = @intFromBool(vm.io_errors_pinned),
+                .unicode_version_pinned = @intFromBool(vm.unicode_version_pinned),
+                .system_groups = @bitCast(vm.system_groups),
+            },
         },
     };
     return file.encode(gpa);
@@ -650,6 +672,7 @@ pub const RestoreError = error{
     NextFileIdBelowFiles, // next_file_id is at or below a restored file's id, or below the standard streams' 3
     InvalidThread, // a coroutine record no capture writes: an unknown kind or status, a stack that doesn't match the status, a running coroutine or a resumer (v13 captures only with none running), a second main thread, a non-function body
     UpvalueOpenTwice, // an open upvalue cell appears in two open lists
+    InvalidVmState, // a v22 envelope field no capture writes: an rng that is not 0 or 4 words (or all zero), a flag byte past 1, an unknown io_errors mode or group bit
 } || std.mem.Allocator.Error || SchemaDecodeError // + the codec's own decode errors
 || table.Table.Error; // a corrupt snapshot could carry a nil/NaN table key
 
@@ -1510,8 +1533,63 @@ pub fn restoreSnapshot(
     }
     try stdaio.restoreOps(vm, kf.aio_next_id);
 
+    try restoreVmState(vm, kf.vm_state);
+
     return vm;
 }
+
+/// Doc 86 §6.1: apply the keyframe's VM state outside the heap. A capture
+/// stops in the prologue with steps (1)–(4) run for the top frame's pc
+/// (`Vm.resume_at`), so a mid-execution restore resumes there without
+/// counting the step again.
+fn restoreVmState(vm: *Vm, kf: schema.VmState) RestoreError!void {
+    switch (kf.rng.len) {
+        0 => vm.rng = null,
+        4 => {
+            // Xoshiro's all-zero state is a fixed point no seed produces.
+            if (kf.rng[0] | kf.rng[1] | kf.rng[2] | kf.rng[3] == 0) return error.InvalidVmState;
+            vm.rng = .{ .s = kf.rng[0..4].* };
+        },
+        else => return error.InvalidVmState,
+    }
+    const flag = struct {
+        fn f(b: u8) RestoreError!bool {
+            return switch (b) {
+                0 => false,
+                1 => true,
+                else => error.InvalidVmState,
+            };
+        }
+    }.f;
+    vm.warn_enabled = try flag(kf.warn_enabled);
+    vm.io_errors_pinned = try flag(kf.io_errors_pinned);
+    vm.unicode_version_pinned = try flag(kf.unicode_version_pinned);
+    vm.io_errors = std.enums.fromInt(system.IoErrors, kf.io_errors) orelse return error.InvalidVmState;
+    const groups: system.Groups = @bitCast(kf.system_groups);
+    if (groups._pad != 0) return error.InvalidVmState;
+    vm.system_groups = groups;
+    vm.effect_cursor = std.math.cast(usize, kf.effect_cursor) orelse return error.InvalidVmState;
+    vm.safepoint_seq = kf.safepoint_seq;
+    vm.committed_effect_seq = kf.committed_effect_seq;
+    if (vm.depth > 0) {
+        const top = &vm.frames[vm.depth - 1];
+        vm.resume_at = .{ .call_seq = top.call_seq, .pc = top.pc };
+    }
+}
+
+/// The `VmState` of a VM that has run nothing: what a hand-built test
+/// keyframe carries.
+pub const fresh_vm_state: schema.VmState = .{
+    .rng = &.{},
+    .safepoint_seq = 0,
+    .committed_effect_seq = 0,
+    .effect_cursor = 0,
+    .warn_enabled = 1,
+    .io_errors = 0,
+    .io_errors_pinned = 0,
+    .unicode_version_pinned = 0,
+    .system_groups = 0,
+};
 
 // ---------------------------------------------------------------------------
 // Tests

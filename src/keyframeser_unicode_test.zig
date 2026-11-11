@@ -117,23 +117,23 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
     const mid = try encodeSnapshot(gpa, &vm2);
     defer gpa.free(mid);
 
-    // --- Restore + replay-from-cursor. `restore` rebuilds the VM fresh, so
-    // `unicode_version_pinned` is false again — the derivation is what must hold.
+    // --- Restore + replay-from-cursor. The keyframe carries the pin and the
+    // cursor (doc 86 §6.1): nothing is re-derived from the log.
     const vm_r = try restore(gpa, mid, .of(source), NativeRegistry.base());
     defer {
         vm_r.deinit();
         gpa.destroy(vm_r);
     }
-    try testing.expect(!vm_r.unicode_version_pinned); // restore did NOT carry the flag
+    try testing.expect(vm_r.unicode_version_pinned);
+    try testing.expectEqual(cursor_at_cut, vm_r.effect_cursor);
     var buf_r: [512]u8 = undefined;
     var sink_r = io.Writer.fixed(&buf_r);
     vm_r.out = &sink_r;
     vm_r.effect_mode = .replay;
     try vm_r.effect_log.entries.appendSlice(gpa, ref.log);
-    vm_r.effect_cursor = cursor_at_cut;
     vm_r.setSuspendCtl(null);
-    // If the derivation were wrong, the post-cut upper() would try to consume a
-    // second effect and fault (log exhausted); instead it finishes cleanly.
+    // Were the pin lost, the post-cut upper() would try to consume a second
+    // effect and fault (log exhausted); instead it finishes cleanly.
     try testing.expect((try vm_r.exec()) == .finished);
 
     var combined: [1024]u8 = undefined;

@@ -522,7 +522,7 @@ fn reserveLog(vm: *Vm, o: *const Options) !void {
     var need: usize = recordOverhead(n);
     if (o.capturesStdout()) need +|= o.max_bytes;
     if (o.capturesStderr()) need +|= o.max_bytes *| n;
-    if (vm.effect_log_limit != 0 and vm.effect_log_encoded +| need > vm.effect_log_limit) return error.EffectLogLimit;
+    if (vm.effect_log_limit != 0 and vm.effect_log.encoded +| need > vm.effect_log_limit) return error.EffectLogLimit;
 }
 
 /// The one body of both calls: ask the host (or the log), log the answer,

@@ -1384,6 +1384,7 @@ pub const Keyframe = struct {
     task_lib_id: u32,
     aio_ops_id: u32,
     aio_next_id: u64,
+    vm_state: VmState,
 
     pub fn encode(self: Keyframe, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -1431,6 +1432,7 @@ pub const Keyframe = struct {
         try enc.writeUint32(self.task_lib_id, .little_endian);
         try enc.writeUint32(self.aio_ops_id, .little_endian);
         try enc.writeUint64(self.aio_next_id, .little_endian);
+        try self.vm_state.encodeInto(enc, ctx);
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!Keyframe {
@@ -1494,6 +1496,70 @@ pub const Keyframe = struct {
         result.task_lib_id = try dec.readUint32(.little_endian);
         result.aio_ops_id = try dec.readUint32(.little_endian);
         result.aio_next_id = try dec.readUint64(.little_endian);
+        result.vm_state = try VmState.decodeWith(allocator, dec, root);
+        return result;
+    }
+};
+
+pub const VmState = struct {
+    rng: []const u64,
+    safepoint_seq: u64,
+    committed_effect_seq: u64,
+    effect_cursor: u64,
+    warn_enabled: u8,
+    io_errors: u8,
+    io_errors_pinned: u8,
+    unicode_version_pinned: u8,
+    system_groups: u8,
+
+    pub fn encode(self: VmState, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: VmState, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint8(@intCast(self.rng.len));
+        for (self.rng) |_item_0| {
+            try enc.writeUint64(_item_0, .little_endian);
+        }
+        try enc.writeUint64(self.safepoint_seq, .little_endian);
+        try enc.writeUint64(self.committed_effect_seq, .little_endian);
+        try enc.writeUint64(self.effect_cursor, .little_endian);
+        try enc.writeUint8(self.warn_enabled);
+        try enc.writeUint8(self.io_errors);
+        try enc.writeUint8(self.io_errors_pinned);
+        try enc.writeUint8(self.unicode_version_pinned);
+        try enc.writeUint8(self.system_groups);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!VmState {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!VmState {
+        _ = root;
+        var result: VmState = undefined;
+        const _len_4 = try dec.readUint8();
+        const _buf_5 = try allocator.alloc(u64, @as(usize, _len_4));
+        errdefer allocator.free(_buf_5);
+        for (0.._buf_5.len) |_i_2| {
+            _buf_5[_i_2] = try dec.readUint64(.little_endian);
+        }
+        result.rng = _buf_5;
+        result.safepoint_seq = try dec.readUint64(.little_endian);
+        result.committed_effect_seq = try dec.readUint64(.little_endian);
+        result.effect_cursor = try dec.readUint64(.little_endian);
+        result.warn_enabled = try dec.readUint8();
+        result.io_errors = try dec.readUint8();
+        result.io_errors_pinned = try dec.readUint8();
+        result.unicode_version_pinned = try dec.readUint8();
+        result.system_groups = try dec.readUint8();
         return result;
     }
 };

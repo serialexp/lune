@@ -2777,6 +2777,9 @@ the hypothetical "resume a live recording as a fresh recording" flow is exposed,
 it is exposed *symmetrically* for both effects, so the fix belongs at the keyframe
 layer (persist `rng`/`effect_cursor`/`effect_log` + a `snapshot_format_version` bump),
 not as a per-effect patch. Out of scope for S-C — noted so it isn't lost.
+**RESOLVED (doc 86 P1, 2026-11-11):** keyframe v22 carries `vm_state` (the PRNG
+state, the cursor, both pins, the step and commit counters), the effect log is
+session-owned (`Vm.shareEffectLog`), and the prefix scan is gone.
 
 **S-E LANDED (June 2026) — the `u8` (unsigned-byte) array lane.** Byte arrays
 (integers in `[0,255]`) now pack at **1 byte/slot** instead of `i16`'s two (a byte

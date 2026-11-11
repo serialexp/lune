@@ -62,9 +62,7 @@ pub const schema = @import("gen/trace_schema.zig");
 /// stage.
 pub const effect_format_version: u32 = 12;
 
-/// The encoded size of an `EffectFile` with no entries: the `version` word and
-/// the entry count.
-pub const file_header_size: usize = 4 + 4;
+const file_header_size = effectlog.file_header_size;
 
 /// Errors from encoding/decoding an effect log.
 pub const DecodeError = error{
@@ -160,23 +158,6 @@ fn checkResultShape(kind: EffectKind, result: Effect.Result) DecodeError!void {
     if (!ok) return error.MismatchedEffectResult;
 }
 
-/// The encoded size of one entry with this result: the kind byte, the
-/// result's tag byte, and its body. `Vm.logEffect` charges it against the
-/// recording cap (doc 65 §4.5), so it must match what `encodeFile` writes
-/// (pinned by a test below).
-pub fn encodedEntrySize(result: Effect.Result) usize {
-    const body: usize = switch (result) {
-        .fail => 1,
-        .bytes, .string => |span| 4 + span.len,
-        .value => |v| switch (v.tag) {
-            .nil, .boolean => 1,
-            .int, .float => 8,
-            // Never logged (`checkResultShape`); `toWire` refuses them.
-            .heap_ref, .row_view => 0,
-        },
-    };
-    return 1 + 1 + body;
-}
 
 /// Serialize an ordered effect log to bytes (binschema wire format). The result
 /// is owned by the caller (`gpa.free`). String results (`getenv`/`file_read`)
@@ -213,9 +194,11 @@ pub fn decodeInto(log: *EffectLog, gpa: std.mem.Allocator, bytes: []const u8) De
 
     const entries0 = log.entries.items.len;
     const bytes0 = log.bytes.items.len;
+    const encoded0 = log.encoded;
     errdefer {
         log.entries.shrinkRetainingCapacity(entries0);
         log.bytes.shrinkRetainingCapacity(bytes0);
+        log.encoded = encoded0;
     }
     try log.entries.ensureUnusedCapacity(gpa, file.effects.len);
     for (file.effects) |we| {
@@ -233,6 +216,7 @@ pub fn decodeInto(log: *EffectLog, gpa: std.mem.Allocator, bytes: []const u8) De
         // boundary, so no replay consumer has to re-check (or panic on a corrupt log).
         try checkResultShape(kind, result);
         log.entries.appendAssumeCapacity(.{ .kind = kind, .result = result });
+        log.encoded += effectlog.entrySize(result);
     }
 }
 
@@ -399,7 +383,7 @@ test "an environ record round-trips as bytes, is charged exactly, and cannot be 
     try log.appendBytes(gpa, .environ, &rec);
     const bytes = try encodeFile(gpa, &log);
     defer gpa.free(bytes);
-    try testing.expectEqual(file_header_size + encodedEntrySize(log.entries.items[0].result), bytes.len);
+    try testing.expectEqual(file_header_size + effectlog.entrySize(log.entries.items[0].result), bytes.len);
     var back: EffectLog = .{};
     defer back.deinit(gpa);
     try decodeInto(&back, gpa, bytes);
@@ -472,7 +456,7 @@ test "encode then decode reproduces the same bytes (stable)" {
     try testing.expectEqualSlices(u8, b0, b1);
 }
 
-test "encodedEntrySize matches what encodeFile writes, entry by entry" {
+test "entrySize matches what encodeFile writes, entry by entry" {
     // `Vm.logEffect` charges the recording cap with these sizes, so they must
     // add up to the real encoding exactly.
     const gpa = testing.allocator;
@@ -491,7 +475,7 @@ test "encodedEntrySize matches what encodeFile writes, entry by entry" {
         const bytes = try encodePrefix(gpa, &log, n);
         defer gpa.free(bytes);
         try testing.expectEqual(want, bytes.len);
-        if (n < log.len()) want += encodedEntrySize(log.entries.items[n].result);
+        if (n < log.len()) want += effectlog.entrySize(log.entries.items[n].result);
     }
 }
 

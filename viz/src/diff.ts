@@ -168,6 +168,9 @@ export function keyframeSansArg(bytes: Uint8Array): string {
     // while it does.
     current: Number(kf.current_id) > 0 ? visit(Number(kf.current_id) - 1) : -1,
     main_context: kf.main_context.map(canonContext),
+    // Doc 86 §6.1: the VM state outside the heap (the PRNG, the step and
+    // effect counters, the cursor, the pins and the installed groups).
+    vm_state: kf.vm_state,
   };
 
   const objects: any[] = [];

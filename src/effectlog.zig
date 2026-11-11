@@ -63,12 +63,41 @@ pub const HostResult = union(enum) {
     fail: system.ErrorClass,
 };
 
+/// The encoded size of an effect file with no entries: the `version` word
+/// and the entry count.
+pub const file_header_size: usize = 4 + 4;
+
+/// The encoded size of one entry with this result: the kind byte, the
+/// result's tag byte, and its body. It must match what
+/// `effectser.encodeFile` writes (pinned by a test there).
+pub fn entrySize(result: Effect.Result) usize {
+    const body: usize = switch (result) {
+        .fail => 1,
+        .bytes, .string => |span| 4 + span.len,
+        .value => |v| switch (v.tag) {
+            .nil, .boolean => 1,
+            .int, .float => 8,
+            // Never logged (`effectser.checkResultShape`), and
+            // `effectser.toWire` refuses them.
+            .heap_ref, .row_view => 0,
+        },
+    };
+    return 1 + 1 + body;
+}
+
 /// The log: entries in call order, plus the bytes their `bytes` results
-/// point into. Owned by the VM (`Vm.effect_log`).
+/// point into. A VM's own, or the debug session's that its VMs share
+/// (`Vm.shareEffectLog`, doc 86 §6.1).
 pub const EffectLog = struct {
     entries: std.ArrayList(Effect) = .empty,
     /// Every `bytes` result's content, back to back, in entry order.
     bytes: std.ArrayList(u8) = .empty,
+    /// What `effectser.encodeFile` would write for the log: the header
+    /// plus every appended entry's `entrySize`. The recording cap
+    /// (`Vm.effect_log_limit`, doc 65 §4.5) is charged against it. It is the
+    /// log's, not a VM's, so every VM recording into a shared log counts
+    /// against the one total, and a keyframe need not carry it.
+    encoded: usize = file_header_size,
 
     pub fn deinit(self: *EffectLog, gpa: std.mem.Allocator) void {
         self.entries.deinit(gpa);
@@ -81,6 +110,7 @@ pub const EffectLog = struct {
 
     pub fn append(self: *EffectLog, gpa: std.mem.Allocator, e: Effect) std.mem.Allocator.Error!void {
         try self.entries.append(gpa, e);
+        self.encoded += entrySize(e.result);
     }
 
     /// Append an entry whose result is `content` as bytes: the content is
@@ -106,7 +136,9 @@ pub const EffectLog = struct {
         try self.entries.ensureUnusedCapacity(gpa, 1);
         const start = self.bytes.items.len;
         try self.bytes.appendSlice(gpa, content);
-        self.entries.appendAssumeCapacity(.{ .kind = kind, .result = @unionInit(Effect.Result, @tagName(tag), .{ .start = start, .len = content.len }) });
+        const result = @unionInit(Effect.Result, @tagName(tag), .{ .start = start, .len = content.len });
+        self.entries.appendAssumeCapacity(.{ .kind = kind, .result = result });
+        self.encoded += entrySize(result);
     }
 
     /// The content of a `string` or `bytes` result.

@@ -146,3 +146,19 @@ pub const NoResizeInPlace = struct {
         self.child.rawFree(memory, alignment, ra);
     }
 };
+
+/// Expect two snapshots to hold the same state, as a run under one tier and
+/// the same program under another must. The one field that may differ is
+/// `vm_state.safepoint_seq` (doc 86 §6.1): it counts tier-0 steps, and a
+/// native trace runs its iterations without passing a safepoint. Every other
+/// byte, the rest of the VM state included, must match.
+pub fn expectSameStateAcrossTiers(want: []const u8, got: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var w = try schema.SnapshotFile.decode(a, want);
+    var g = try schema.SnapshotFile.decode(a, got);
+    w.keyframe.vm_state.safepoint_seq = 0;
+    g.keyframe.vm_state.safepoint_seq = 0;
+    try testing.expectEqualSlices(u8, try w.encode(a), try g.encode(a));
+}

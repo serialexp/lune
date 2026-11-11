@@ -426,7 +426,7 @@ test "§R3: capture→restore→resume with tracing+opt+native — restored narr
     // consts are excluded from the snapshot walk, so bytes compare directly).
     const final_snap_r = try encodeSnapshot(gpa, vm_r);
     defer gpa.free(final_snap_r);
-    try testing.expectEqualSlices(u8, ref.final_snap, final_snap_r);
+    try util.expectSameStateAcrossTiers(ref.final_snap, final_snap_r);
 }
 
 test "§R3: failing-allocator restore during the array-part lane and grid rebuild leaks nothing" {
@@ -682,6 +682,7 @@ fn expectTwoFrameWindowError(second_base: u32, stack: []const schema.StackValue)
             .task_lib_id = 0,
             .aio_ops_id = 0,
             .aio_next_id = 1,
+            .vm_state = keyframeser.fresh_vm_state,
         },
     };
     try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);
@@ -772,6 +773,7 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             .task_lib_id = 0,
             .aio_ops_id = 0,
             .aio_next_id = 1,
+            .vm_state = keyframeser.fresh_vm_state,
         },
     };
     try expectRestoreError(bad, .{ .image = &rootp }, error.FrameWindowMismatch);
@@ -829,7 +831,7 @@ test "doc 21 §T-A.2: cross-tier final snapshots byte-identical (the minimized H
     defer ref.deinit(gpa);
     const snap = try jitFinalSnapshot(gpa, source, ref);
     defer gpa.free(snap);
-    try testing.expectEqualSlices(u8, ref.final_snap, snap);
+    try util.expectSameStateAcrossTiers(ref.final_snap, snap);
 }
 
 test "doc 24 c4 (arc-B acceptance): allocating snew/tostr loop — cross-tier final snapshots byte-identical, next_obj_id explicit, pairs order pinned" {
@@ -872,7 +874,7 @@ test "doc 24 c4 (arc-B acceptance): allocating snew/tostr loop — cross-tier fi
     defer ref.deinit(gpa);
     const snap = try jitFinalSnapshot(gpa, source, ref);
     defer gpa.free(snap);
-    try testing.expectEqualSlices(u8, ref.final_snap, snap);
+    try util.expectSameStateAcrossTiers(ref.final_snap, snap);
 
     // `next_obj_id` equality asserted EXPLICITLY (D9.3), not only via the
     // byte-compare above: decode both keyframes and compare the field.
