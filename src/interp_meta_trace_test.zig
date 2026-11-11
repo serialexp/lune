@@ -1607,28 +1607,74 @@ test "doc 77 §8: a __close that raises, and a value that is not closable, leave
     , "false\tboom\t449\t20349\tfalse\ttrue\n", .{ .record_aborts = true, .inspect = expectCloseRan });
 }
 
-fn expectHeadRetClose(vm: *Vm, mode: TraceMode) anyerror!void {
-    if (!recorded(mode)) return;
+/// Doc 77 §8: the committed one-shot traces of anchor kind `kind` that end
+/// in a `return_closed_interp` terminal, and how many of those inlined a
+/// `__close` (which pins the handler with `guard_func`).
+const ClosedRets = struct { closed: usize = 0, inlined: usize = 0 };
+
+fn closedRets(vm: *const Vm, kind: trace.AnchorPcKind) ClosedRets {
+    var seen: ClosedRets = .{};
+    for (vm.trace.registry.cache.items) |t| {
+        if (trace.anchorKind(t.code.anchor.pc) != kind) continue;
+        const instrs = t.code.instrs;
+        if (instrs.len == 0) continue;
+        const last = instrs[instrs.len - 1];
+        if (last.op != .terminal or last.a != @intFromEnum(trace_ir.TerminalKind.return_closed_interp)) continue;
+        seen.closed += 1;
+        for (instrs) |ins| if (ins.op == .guard_func) {
+            seen.inlined += 1;
+            break;
+        };
+    }
+    return seen;
+}
+
+fn expectNoCloseAbort(vm: *const Vm) !void {
     for (vm.trace.abort_log.items) |r| switch (r.op) {
         .tbc, .ret_close => return error.TestUnexpectedResult,
         else => {},
     };
-    // Route 4's interim (§7): a head trace calls no `__close` (it would
-    // pin the handler with `guard_func`), so its return terminal resumes
-    // tier 0 at a `ret_close` none of whose closes ran.
-    var heads: usize = 0;
-    for (vm.trace.registry.cache.items) |t| {
-        if (trace.anchorKind(t.code.anchor.pc) != .head) continue;
-        heads += 1;
-        for (t.code.instrs) |ins| try testing.expect(ins.op != .guard_func);
-    }
-    try testing.expect(heads > 0);
 }
 
-test "doc 77 §8: a head trace ends at its ret_close, and tier 0 runs the closes once" {
+fn expectHeadRetClose(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    try expectNoCloseAbort(vm);
+    // Route 4 (§7): a head trace calls the `__close` and ends in the
+    // "closes done, return only" terminal.
+    try testing.expect(closedRets(vm, .head).inlined > 0);
+}
+
+fn expectHeadRetCloseNothing(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    try expectNoCloseAbort(vm);
+    try testing.expect(closedRets(vm, .head).closed > 0);
+}
+
+fn expectContRetClose(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    try expectNoCloseAbort(vm);
+    try testing.expect(closedRets(vm, .cont).inlined > 0);
+}
+
+fn expectHeadRetCloseExits(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectHeadRetClose(vm, mode);
+    if (!recorded(mode)) return;
+    const seen = try exitRoutes(vm);
+    try testing.expect(seen.inlined > 0);
+    try testing.expect(seen.mid > 0);
+}
+
+fn expectNoClosedRet(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    try testing.expectEqual(@as(usize, 0), closedRets(vm, .head).closed);
+    try testing.expectEqual(@as(usize, 0), closedRets(vm, .cont).closed);
+}
+
+test "doc 77 §8: a head trace runs its ret_close's closes, and tier 0 performs only the return" {
     // The loop never records (`setmetatable` is no recorded builtin, §4.2),
-    // so `f` is called from tier 0 and gets a head trace. Its return
-    // terminal resumes tier 0 at the `ret_close` (route 4's interim).
+    // so `f` is called from tier 0 and gets a head trace. It inlines the
+    // `__close`, and its return terminal resumes tier 0 with the closes
+    // done (route 4): a close run twice would show in the count.
     try expectProgramTuned(
         \\local function mk()
         \\  local c = { n = 0 }
@@ -1645,6 +1691,109 @@ test "doc 77 §8: a head trace ends at its ret_close, and tier 0 runs the closes
         \\end
         \\print(s, c.n)
     , "45450\t300\n", .{ .record_aborts = true, .inspect = expectHeadRetClose });
+}
+
+test "doc 77 §8: a head trace whose ret_close closes only nil and false still returns once" {
+    try expectProgramTuned(
+        \\local function f(x)
+        \\  local h <close> = nil
+        \\  local k <close> = false
+        \\  return x + 1, x * 2
+        \\end
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  local a, b = f(setmetatable({}, nil) and i)
+        \\  s = s + a + b
+        \\end
+        \\print(s)
+    , "135750\n", .{ .record_aborts = true, .inspect = expectHeadRetCloseNothing });
+}
+
+test "doc 77 §8: a continuation trace after a call returns runs its ret_close's closes" {
+    // `sum`'s loop keeps it out of `f`'s head trace, so it returns into
+    // `f` from tier 0; the continuation trace there closes `h` and returns.
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, setmetatable({}, { __close = function() c.n = c.n + 1 end })
+        \\end
+        \\local c, g = mk()
+        \\local function sum(n)
+        \\  local t = 0
+        \\  for k = 1, n do t = t + k end
+        \\  return t
+        \\end
+        \\local function f(x)
+        \\  local h <close> = g
+        \\  local y = sum(x % 3)
+        \\  return x + y
+        \\end
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  s = s + f(i)
+        \\end
+        \\print(s, c.n)
+    , "45550\t300\n", .{ .record_aborts = true, .inspect = expectContRetClose });
+}
+
+test "doc 77 §7: a head trace's ret_close handlers exit by route, and each close runs once" {
+    // `q` closes first. Its handler's branch turns at its 101st call
+    // (route 1), and at its 250th it replaces `p`'s `__close`, so the
+    // guard on `p`'s handler, after `q`'s returned, fails (route 2: the
+    // head re-runs from its entry on tier 0, which must not close `q`
+    // twice). `p` alternates between two values, so its guards stay in.
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { a = 0, b = 0 }
+        \\  local A = { __close = function(o)
+        \\    c.a = c.a + 1
+        \\    if c.a > 200 then o.v = 2 end
+        \\  end }
+        \\  local A2 = function(o)
+        \\    c.a = c.a + 1
+        \\    if c.a > 200 then o.v = 2 end
+        \\  end
+        \\  local B = { __close = function(o)
+        \\    c.b = c.b + 1
+        \\    if c.b > 100 then o.v = 1 end
+        \\    if c.b == 250 then A.__close = A2 end
+        \\  end }
+        \\  return c, { setmetatable({ v = 0 }, A), setmetatable({ v = 0 }, A) }, setmetatable({ v = 0 }, B)
+        \\end
+        \\local c, as, b = mk()
+        \\local function f(x, y, i)
+        \\  local p <close> = x
+        \\  local n <close> = nil
+        \\  local q <close> = y
+        \\  return i * 2
+        \\end
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  s = s + f(as[i % 2 + 1], setmetatable(b, getmetatable(b)), i)
+        \\end
+        \\print(s, c.a, c.b, as[1].v, as[2].v, b.v)
+    , "90300\t300\t300\t2\t2\t1\n", .{ .record_aborts = true, .inspect = expectHeadRetCloseExits });
+}
+
+test "doc 77 §8: a head trace's ret_close with a dynamic result count leaves the closes to tier 0" {
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, { __close = function() c.n = c.n + 1 end }
+        \\end
+        \\local c, G = mk()
+        \\local function pass(...) return ... end
+        \\local function f(g, x)
+        \\  local h <close> = g
+        \\  return pass(x + 1, x)
+        \\end
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  local a, b = f(setmetatable({}, G), i)
+        \\  s = s + a + b
+        \\end
+        \\print(s, c.n)
+    , "90600\t300\n", .{ .record_aborts = true, .inspect = expectNoClosedRet });
 }
 
 test "doc 77 §7: a close's handlers exit by route" {

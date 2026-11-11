@@ -7,9 +7,9 @@ computed-callee upvalue reads and the anchor-window alias, §6.6;
 `__len` handlers, §6.4; `__lt`/`__le`/`__eq` and the compare-and-branch
 forms, §6.4; `__call`, §6.7; function `__index` under fused reads and
 stores, §6.3), its computed-callee upvalue writes deferred; Phase 5's
-`__close` recording landed (2026-11-12), its "closes done, return only"
-completion outstanding; Phase 6 landed (2026-11-12); Phase 7 measured on
-the pinned pool (§10.15, 2026-11-12)
+`__close` recording and its "closes done, return only" completion landed
+(2026-11-12, §8); Phase 6 landed (2026-11-12); Phase 7 measured on the
+pinned pool (§10.15, 2026-11-12)
 Owner: Bart
 Last updated: 2026-11-12
 
@@ -389,7 +389,29 @@ land; move whole phases to Done once everything inside them is checked.
   numbers.
   - [x] §7 route 4, its interim form: the head-trace test checks that no
     head trace inlines a `__close` (no `guard_func`), and every close runs
-    once.
+    once. Superseded by the completion below.
+- [x] **Phase 5 — the "closes done, return only" completion** (§8 second
+  amendment, 2026-11-12). A one-shot recording's depth-0 `ret_close` with
+  a fixed result count records its closes (`recRet` → `recCloseStage` →
+  `finishClose`) and closes with `TerminalKind.return_closed_interp` (4;
+  `viz/src/enums.ts` mirrors it, and now names kinds 2 and 3 too). Every
+  completion producer maps the kind to `resume_closed_ret` or
+  `resume_frame_motion_closed_ret` (`terminalDirective`); the head and
+  continuation entries resume through `resumeClosedRet`, which tail-calls
+  `opRet` on the proto's `ret_close` without a second prologue; the
+  loop-anchor consumers treat them as unreachable. The native return pop
+  accepts the `ret_close` of the new kind. A dynamic result count at depth
+  0 still leaves the closes to tier 0 (`return_interp`). Gated in
+  `src/interp_meta_trace_test.zig` (a head trace inlining the `__close`, a
+  head trace closing only nil and false, a continuation trace, the
+  dynamic count, and "doc 77 §7: a head trace's ret_close handlers exit by
+  route", the full form of route 4: a guard after a handler's return
+  fails coarse and no close runs twice) and `src/interp_native_test.zig`
+  ("frame motion: a recursion's ret_close …", the pop witness). Each
+  mutation fails tests (checked by hand, then removed): re-dispatching the
+  `ret_close` instead of `resumeClosedRet` (3), a pop accepting only
+  `ret` (the witness), skipping the depth-0 closes (4), and recording them
+  under `return_interp` (5). §10.16 has the numbers.
 - [x] **Phase 4, ninth part — the fused store into a plain table** (§6.3,
   doc 14's second follow-up, 2026-11-12). `set_index2` on a table that is
   not a grid aborted `nyi_opcode`. `recIndex2Set` records it as the read
@@ -415,8 +437,8 @@ land; move whole phases to Done once everything inside them is checked.
   - [x] the pending-instruction stack (§6.3) and its stage transitions:
     the fused read's handler stage landed as a frame finish (seventh part,
     §6.3 second amendment); the fused store's (tenth part) and
-    `__close`'s (Phase 5, first part) landed too. The "closes done, return
-    only" completion is Phase 5's bullet under Outstanding.
+    `__close`'s (Phase 5, first part) landed too, and the "closes done,
+    return only" completion with it (Phase 5).
 
 ### Outstanding
 
@@ -424,11 +446,6 @@ land; move whole phases to Done once everything inside them is checked.
   `__index` hop ending in an array read (`aref`/`guard_bounds`/
   `guard_present`/`aload`) keeps that read in the body. The native
   preheader cannot home an `aref`.
-- [ ] **Phase 5 — the "closes done, return only" completion** (§8): a
-  depth-0 `ret_close` of a one-shot recording still ends the trace before
-  its closes (the interim §8 allows; see the first part under Done). The
-  completion both executors share would let the trace run them and
-  return.
 - [ ] **Defer — computed-callee upvalue writes** (§6.6, second follow-up):
   a `set_upval`, and a read of a cell with an alias class, through a
   computed callee still abort `.cross_frame`. No bench or board program
@@ -1000,6 +1017,30 @@ with no boundary of their own, so they exit coarse as §7's route 2 says;
 the close's successor gets no boundary either, which would make them
 attach and skip a close.
 
+Second amendment (2026-11-12, Phase 5 completion; Bart chose "a new
+resume kind"): the completion is a terminal kind of its own,
+`TerminalKind.return_closed_interp` (4). A one-shot recording's depth-0
+`ret_close` with a fixed result count now records its closes as an inlined
+frame's does (`recCloseStage`, then `finishClose`), and its return
+terminal carries the new kind; `aux` is still the `ret_close`'s pc.
+Completing it, both executors' consumers resume tier 0 with the closes
+done: `resumeClosedRet` tail-calls `opRet` on the canonical `ret_close`
+(the proto's code, never the per-VM image, which may hold a continuation
+patch at that pc), with `stack_top` covering the frame's window, as
+`closeStep` does once its last close returns. It does not go through a
+second dispatch prologue. Tier 0 runs one prologue per `ret_close`, which
+the trace's entry already stands for, and a park at that pc (a suspend
+cut, a debug stop, `.fast`'s mode switch) would re-dispatch the
+`ret_close` and run its closes again: the values stay in their registers
+after closing. The native return pop (doc 54 P1) accepts the `ret_close`
+of a `return_closed_interp` terminal as it accepts a `ret`; a decline
+exits through the plain terminal into the same resume. The consumers that
+only loop anchors reach (a root recording aborts at a depth-0 return)
+treat the new directives as the frame-motion one: unreachable. A dynamic
+result count (`return f()` under to-be-closed variables) stays as it was:
+its closes are not recorded, and its `return_interp` terminal resumes at
+the `ret_close`, which runs them.
+
 ## 9. Invariants, gates and doc amendments
 
 ### 9.1 Invariants
@@ -1334,6 +1375,23 @@ bisected to 6406e6d (Protos carry local names, doc 86 P0; +33%
 instructions, all in `bc_names`), TODO.md; `str_sort` t0 39.9 → 44.4 and
 `co_many` t0 42.4 → 48.7 have flat instruction counts across the range,
 unexplained, also TODO.md.
+
+### 10.16 After the "closes done, return only" completion (2026-11-12)
+
+ReleaseFast builds of 34dc811 and with the completion, `--jit-native`,
+user-mode instructions (`perf stat`). Two probes:
+
+| probe | before | after |
+|---|---|---|
+| `f(setmetatable({}, G), i)` 1M times, `f` closing `h` and returning (a head trace) | 2,268 M | 1,616 M |
+| `f(40)` 20,000 times, a recursion closing `h` in every activation | 1,360 M | 530 M |
+
+Before, the head trace ended at the `ret_close` and tier 0 ran the close
+and the return; after, `--jit-stats` shows 999,888 native head entries
+and nothing on tier 0 with a trace. The recursion's returns now pop
+natively, as `ret` returns do. Programs without a to-be-closed return are
+flat: recursive-fib, binary-trees (−0.03%), euler14-bit, call_small_fn,
+meta_close_reused and pcall_faults move by under 0.1%.
 
 The alias fix after it (8f65f78 and its entry-flag follow-up) moves the
 doc 77 programs by under 0.1% in instructions (`perf stat`, ReleaseFast,

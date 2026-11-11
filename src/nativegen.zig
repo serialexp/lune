@@ -2818,7 +2818,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 // consumer's resume contract); any decline falls through to
                 // the plain `head_terminal` exit, byte-identical to pre-D12c
                 // (tier-0 re-executes the `ret` generically).
-                if (@as(trace.TerminalKind, @enumFromInt(@as(u16, @intCast(term.a)))) == .return_interp) {
+                // Doc 77 §8: a `return_closed_interp` terminal's `ret_close`
+                // ran its closes on trace, so its pop is a `ret`'s; its
+                // decline resumes tier 0 with the closes done
+                // (`interp.resumeClosedRet`), never re-executing them.
+                const term_kind: trace.TerminalKind = @enumFromInt(@as(u16, @intCast(term.a)));
+                if (term_kind == .return_interp or term_kind == .return_closed_interp) {
                     // A dynamic `ret a, all_results` pops with the count the
                     // recorder resolved (`term.b` = the window's end + 1): the
                     // values the trace wrote back are exactly `[a, end)`, and
@@ -2829,7 +2834,8 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                         if (proto_.is_vararg) break :blk null;
                         if (term.aux < 0 or term.aux >= proto_.code.len) break :blk null;
                         const ci = proto_.code[@intCast(term.aux)];
-                        if (ci.op != .ret) break :blk null;
+                        const want_op: @TypeOf(ci.op) = if (term_kind == .return_closed_interp) .ret_close else .ret;
+                        if (ci.op != want_op) break :blk null;
                         const count: u32 = if (ci.b == bytecode.all_results) dyn: {
                             if (term.b == 0 or term.b - 1 < ci.a) break :blk null;
                             break :dyn @as(u32, term.b - 1) - ci.a;

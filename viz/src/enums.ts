@@ -135,6 +135,9 @@ export type IrOpName = (typeof IR_OP_NAMES)[number];
 export const TERMINAL_KIND_NAMES = [
   "return_interp", // 0  trace ends at a depth-0 ret; tier-0 performs it
   "self_call_interp", // 1  trace ends at a depth-0 self-call; tier-0 performs it
+  "call_interp", // 2  trace ends at a depth-0 host call; tier-0 performs it
+  "backedge_interp", // 3  a .cont trace ends at a loop back-edge; tier-0 executes it
+  "return_closed_interp", // 4  trace ran a depth-0 ret_close's closes; tier-0 returns only
 ] as const;
 
 /** Observed/result types, indexed by wire ordinal (mirrors trace.ObsType, 0..5). */

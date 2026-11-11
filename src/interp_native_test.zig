@@ -2925,6 +2925,37 @@ test "frame motion: recursion after a linked loop nest still pushes and pops nat
     try testing.expect(vm.trace.ret_cont_link_hits >= 100);
 }
 
+test "frame motion: a recursion's ret_close runs its closes on trace and pops natively" {
+    // Doc 77 §8: each activation's `ret_close` closes `h` on trace, then
+    // returns through the native pop (`return_closed_interp`). A close
+    // run twice, or none, shows in the count; output cannot tell a native
+    // pop from tier 0's return, so the witness is asserted.
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runFrameMotion(&vm,
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, setmetatable({}, { __close = function() c.n = c.n + 1 end })
+        \\end
+        \\local c, g = mk()
+        \\local function f(n)
+        \\  local h <close> = g
+        \\  if n == 0 then return 0 end
+        \\  return f(n - 1) + 1
+        \\end
+        \\local s = 0
+        \\for i = 1, 30 do s = s + f(20) end
+        \\print(s, c.n)
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("600\t630\n", sink.buffered());
+    try testing.expect(vm.trace.self_call_pushes >= 100);
+    try testing.expect(vm.trace.self_ret_pops >= 100);
+}
+
 test "frame motion: recursion between the rounds of a nest that reopens its region each round" {
     // The same premise, alternating: the region opens for each round's nest
     // and closes when that nest ends, and the recursion after it runs with

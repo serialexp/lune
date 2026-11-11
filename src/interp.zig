@@ -5793,6 +5793,24 @@ pub const Vm = struct {
         return dispatchTail(mode, st, pc, vm);
     }
 
+    /// Doc 77 §8: a `return_closed_interp` completion. The trace ran the
+    /// closes of the `ret_close` at `pc` (a fixed result count), so tier 0
+    /// performs only its return, as `closeStep` does once its last close
+    /// returns: no second prologue, since a park at `pc` would re-dispatch
+    /// the `ret_close` and run its closes again. The instruction comes from
+    /// the proto's code: the per-VM image may hold a continuation patch at
+    /// `pc`.
+    inline fn resumeClosedRet(comptime mode: ExecMode, st: *ExecState, pc: usize, vm: *Vm) HandlerResult {
+        const ins = &st.proto.code[pc];
+        if (std.debug.runtime_safety) {
+            std.debug.assert(ins.op == .ret_close and ins.b != bytecode.all_results);
+            std.debug.assert(vm.trace.pending_ret_anchor == null);
+        }
+        st.frame.pc = pc + 1;
+        vm.stack_top = st.base + st.regs.n;
+        return @call(.always_tail, opRet(mode), .{ st, pc + 1, ins, vm, st.regs.tags, st.regs.payloads });
+    }
+
     inline fn dispatchTail(comptime mode: ExecMode, st: *ExecState, pc: usize, vm: *Vm) HandlerResult {
         // Lanes re-derived from `st.regs` — the authoritative window for an
         // arbitrary target (post-reload, post-epilogue); identical reads to
@@ -6307,6 +6325,12 @@ pub const Vm = struct {
         /// patch site can receive it (loop pages never emit either epilogue;
         /// cont pages enter with net 0, so their pops decline in v1).
         resume_frame_motion: usize,
+        /// Doc 77 §8: a `return_closed_interp` completion: tier 0 performs
+        /// only the return of the `ret_close` at this pc (`resumeClosedRet`).
+        resume_closed_ret: usize,
+        /// `resume_closed_ret` after native frame motion: reload the top
+        /// frame first, as `resume_frame_motion` does.
+        resume_frame_motion_closed_ret: usize,
         /// Doc 45 D5: a PRECISE trace's effect shim raised a runtime error
         /// (`.precise_error`). The executor already restored the failing
         /// op's snapshot (pre-instruction registers; the iteration's earlier
@@ -6317,6 +6341,16 @@ pub const Vm = struct {
         /// never a mode switch, never a sibling/chain continuation.
         raise_at: RaiseAt,
     };
+
+    /// The resume a `.terminal` completion hands tier 0: at `term.aux`, with
+    /// a `ret_close`'s closes done for `return_closed_interp` (doc 77 §8).
+    /// `motion`: the native run moved frames (a pushed descent).
+    fn terminalDirective(term: trace.trace_ir.IrInstr, comptime motion: bool) EntryDirective {
+        const rpc: usize = @intCast(term.aux);
+        const closed = term.a == @intFromEnum(trace.trace_ir.TerminalKind.return_closed_interp);
+        if (motion) return if (closed) .{ .resume_frame_motion_closed_ret = rpc } else .{ .resume_frame_motion = rpc };
+        return if (closed) .{ .resume_closed_ret = rpc } else .{ .resume_tier0 = rpc };
+    }
 
     /// Same-anchor trial-walk cap (visited/dead arrays; `dead ⊆ visited`).
     const trial_visited_cap = 8;
@@ -6622,7 +6656,7 @@ pub const Vm = struct {
                     self.noteHostCallTerminal(term);
                     ts.noteHeadSiblingCompletion(.{ .proto = owner.code.anchor.proto, .pc = owner.code.anchor.pc, .proto_id = owner.code.anchor.proto_id }, owner.id);
                     self.consumeHeadWalkFail(owner.id);
-                    return .{ .resume_tier0 = @intCast(term.aux) };
+                    return terminalDirective(term, false);
                 },
                 .deopt => {
                     if (row.outcome == .yielded) {
@@ -6804,7 +6838,7 @@ pub const Vm = struct {
                     // D12a: want retirement moved to the single funnel above
                     // (keyed on the ENTERED trace, round-6 change 5 — a second
                     // call here would double-fire with a different id).
-                    return .{ .resume_frame_motion = @intCast(term.aux) };
+                    return terminalDirective(term, true);
                 },
                 .call_push => {
                     // A cont page committed a real push but its call-head slot
@@ -7128,7 +7162,7 @@ pub const Vm = struct {
             // correctly ends quietness for the NEXT entry (the arm needs
             // the full path's selection-sited `tryArmSiblingHandoff`).
             self.consumeHeadWalkFail(ct.id);
-            return .{ .resume_tier0 = @intCast(term.aux) };
+            return terminalDirective(term, false);
         }
         // Head guard-fail zero exit / prologue-fail — deopt to function entry.
         // The receipt calls are the REAL funnels, verbatim semantics: they
@@ -7776,7 +7810,7 @@ pub const Vm = struct {
             // handoff observation on the failer's exit.
             self.consumeHeadWalkFail(final.id);
             wctx.dead.retire(&self.trace);
-            return .{ .resume_tier0 = @intCast(term.aux) };
+            return terminalDirective(term, false);
         }
         // Doc 45 D6: tier-1a PRECISE deopt. The executor already
         // materialized the failing op's per-bytecode snapshot into the
@@ -10376,6 +10410,8 @@ pub const Vm = struct {
             },
             // Doc 44 D11: only head pages emit the push epilogue.
             .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
+            // Doc 77 §8: only one-shot recordings close at a return.
+            .resume_closed_ret, .resume_frame_motion_closed_ret => @panic("return terminal from a loop-anchor entry"),
             // Doc 45 D5: park the precise effect error at its
             // bytecode — registers already snapshot-restored.
             .raise_at => |r| {
@@ -10461,6 +10497,8 @@ pub const Vm = struct {
                     },
                     // Doc 44 D11: only head pages emit the push epilogue.
                     .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
+                    // Doc 77 §8: only one-shot recordings close at a return.
+                    .resume_closed_ret, .resume_frame_motion_closed_ret => @panic("return terminal from a loop-anchor entry"),
                     // Doc 45 D5: park the precise effect error at its
                     // bytecode — registers already snapshot-restored.
                     .raise_at => |r| {
@@ -10554,6 +10592,12 @@ pub const Vm = struct {
                         if (mode == .fast and self.trace.pending_ret_anchor != null) return .switch_mode;
                         return dispatchTail(mode, st, rpc, vm);
                     },
+                    // Doc 77 §8: the trace ran a `ret_close`'s closes.
+                    .resume_closed_ret => |rpc| return resumeClosedRet(mode, st, rpc, vm),
+                    .resume_frame_motion_closed_ret => |rpc| {
+                        reloadTopFrame(st);
+                        return resumeClosedRet(mode, st, rpc, vm);
+                    },
                     // Doc 45 D5: park the precise effect error at its
                     // bytecode — registers already snapshot-restored.
                     .raise_at => |r| {
@@ -10632,6 +10676,12 @@ pub const Vm = struct {
                         // already the resume pc).
                         if (mode == .fast and self.trace.pending_ret_anchor != null) return .switch_mode;
                         return dispatchTail(mode, st, rpc, vm);
+                    },
+                    // Doc 77 §8: the trace ran a `ret_close`'s closes.
+                    .resume_closed_ret => |rpc| return resumeClosedRet(mode, st, rpc, vm),
+                    .resume_frame_motion_closed_ret => |rpc| {
+                        reloadTopFrame(st);
+                        return resumeClosedRet(mode, st, rpc, vm);
                     },
                     // Doc 45 D5: park the precise effect error at its
                     // bytecode — registers already snapshot-restored.
@@ -12687,6 +12737,8 @@ pub const Vm = struct {
                         .switch_mode_at => |npc| return .{ .switch_mode_at = npc },
                         // Doc 44 D11: only head pages emit the push epilogue.
                         .resume_frame_motion => @panic("native frame motion from a loop-anchor entry"),
+                        // Doc 77 §8: only one-shot recordings close at a return.
+                        .resume_closed_ret, .resume_frame_motion_closed_ret => @panic("return terminal from a loop-anchor entry"),
                         // Doc 45 D5: relay the precise effect error to the
                         // trampoline (which parks it — never a retry).
                         .raise_at => |r| return .{ .raise_at = r },

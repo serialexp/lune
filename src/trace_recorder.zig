@@ -4702,20 +4702,30 @@ pub const RecordingSession = struct {
         return try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
     }
 
-    /// `ret`, and doc 76's `ret_close`. In an inlined frame a `ret_close`
-    /// first calls its `__close` handlers (`recCloseStage`; the last one's
-    /// return makes the return, `finishClose`), except with a dynamic
-    /// result count, which keeps doc 76's rule: it records only when it
-    /// closes nothing (`recCloseScope`). At depth 0 a one-shot recording's
-    /// return terminal resumes tier 0 at the `ret_close`, which runs the
-    /// closes itself, so the trace records none of them (doc 77 §8: until
-    /// the executors share a "closes done, return only" completion).
+    /// `ret`, and doc 76's `ret_close`. A `ret_close` with a fixed result
+    /// count first calls its `__close` handlers (`recCloseStage`; the last
+    /// one's return makes the return, `finishClose`), in an inlined frame
+    /// and, for a one-shot recording, at depth 0, whose return terminal then
+    /// resumes tier 0 with the closes done (`return_closed_interp`, doc 77
+    /// §8 second amendment). A dynamic result count keeps doc 76's rule in
+    /// an inlined frame: it records only when it closes nothing
+    /// (`recCloseScope`). At depth 0 its return terminal resumes tier 0 at
+    /// the `ret_close`, which runs the closes, so the trace records none.
     fn recRet(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, multret: ?u32) !void {
-        if (instr.op == .ret_close and self.inline_depth > 0) {
-            if (instr.b == bytecode.all_results) {
-                try self.recCloseScope(proto, pc - 1, 0, regs);
-            } else if (try self.recCloseStage(proto, pc - 1, 0, std.math.maxInt(u16), regs)) return;
-            if (!self.active) return;
+        if (instr.op == .ret_close) {
+            if (self.inline_depth == 0) {
+                // A loop root aborts at the return below; it records no
+                // closes first.
+                if (instr.b != bytecode.all_results and isOneShotKind(self.kind)) {
+                    if (try self.recCloseStage(proto, pc - 1, 0, std.math.maxInt(u16), regs)) return;
+                    if (!self.active) return;
+                }
+            } else {
+                if (instr.b == bytecode.all_results) {
+                    try self.recCloseScope(proto, pc - 1, 0, regs);
+                } else if (try self.recCloseStage(proto, pc - 1, 0, std.math.maxInt(u16), regs)) return;
+                if (!self.active) return;
+            }
         }
         return self.recRetTail(instr, regs, multret);
     }
@@ -4763,11 +4773,13 @@ pub const RecordingSession = struct {
         // `multret_top`, which trace execution never sets: refused, codex
         // round-1 change 4). A loop root still aborts (LLEAVE): it must not
         // leave the loop.
+        // A fixed-count `ret_close` got here with its closes recorded
+        // (`recRet`, `finishClose`): tier 0 performs only the return.
         if (!isOneShotKind(self.kind)) return self.abort(.cross_frame);
         if (instr.b == bytecode.all_results)
             self.closeDynamicTerminal(.return_interp, instr.a, multret)
         else
-            self.closeHeadTerminal(.return_interp, 0);
+            self.closeHeadTerminal(if (instr.op == .ret_close) .return_closed_interp else .return_interp, 0);
     }
 
     /// Doc 77 §8: `tbc` of the value in `reg` (also `tfor_prep`'s closing

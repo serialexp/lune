@@ -1036,6 +1036,13 @@ pub const TerminalKind = enum(u16) {
     /// root. No link machinery: the second half of a stitched iteration
     /// (doc 44, trace stitching). Plain terminal exit; no frame motion.
     backedge_interp = 3,
+    /// Doc 77 §8: the trace ends at a depth-0 `ret_close` with a fixed
+    /// result count whose closes it ran (inlined `__close` handlers, or
+    /// pinned nil/false values). Tier-0 resumes at the `ret_close`
+    /// (terminal.aux) with the closes done and performs only the return
+    /// (`interp.resumeClosedRet`): re-dispatching it would run them again.
+    /// The native return pop accepts it as it accepts a `ret`.
+    return_closed_interp = 4,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that

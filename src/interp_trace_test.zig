@@ -5975,6 +5975,7 @@ test "recorder (head, doc 44 P0): fib-shaped recursion records a head trace clos
                     .self_call_interp => saw_cont_self_call = true,
                     .return_interp => saw_cont_return = true,
                     .call_interp, .backedge_interp => return error.TestUnexpectedResult, // no host calls or loops in fib
+                    .return_closed_interp => return error.TestUnexpectedResult, // no to-be-closed variables in fib
                 }
             },
             .loop => return error.TestUnexpectedResult, // no loops in this program
