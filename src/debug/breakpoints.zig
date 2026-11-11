@@ -26,6 +26,12 @@ const Allocator = std.mem.Allocator;
 /// One breakpoint the client asks for on a source.
 pub const Request = struct {
     line: u32,
+    /// An expression for the pure-read evaluator (§7.3): the breakpoint
+    /// stops only where it is truthy.
+    condition: ?[]const u8 = null,
+    /// DAP's `hitCondition`: `N` (the Nth hit), `>= N` (from the Nth on)
+    /// or `% N` (every Nth). Hits count only where the condition holds.
+    hit_condition: ?[]const u8 = null,
 };
 
 /// A breakpoint as the client sees it: `line` is the line it is bound to
@@ -34,16 +40,70 @@ pub const Breakpoint = struct {
     id: u32,
     line: u32,
     verified: bool,
+    /// Why it is not verified, when that is not a missing chunk.
+    message: ?[]const u8 = null,
 };
 
-const Entry = struct {
+/// A parsed `hitCondition`.
+pub const HitCondition = union(enum) {
+    eq: u64,
+    ge: u64,
+    every: u64,
+
+    /// Parse DAP's `hitCondition` text, or null when it is malformed.
+    pub fn parse(text: []const u8) ?HitCondition {
+        const t = std.mem.trim(u8, text, " \t");
+        if (std.mem.startsWith(u8, t, ">=")) return .{ .ge = number(t[2..]) orelse return null };
+        if (std.mem.startsWith(u8, t, "%")) {
+            const n = number(t[1..]) orelse return null;
+            return if (n == 0) null else .{ .every = n };
+        }
+        if (std.mem.startsWith(u8, t, "==")) return .{ .eq = number(t[2..]) orelse return null };
+        return .{ .eq = number(t) orelse return null };
+    }
+
+    fn number(text: []const u8) ?u64 {
+        return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \t"), 10) catch null;
+    }
+
+    /// Whether the hit numbered `count` (from 1) stops.
+    pub fn admits(self: HitCondition, count: u64) bool {
+        return switch (self) {
+            .eq => |n| count == n,
+            .ge => |n| count >= n,
+            .every => |n| count % n == 0,
+        };
+    }
+};
+
+pub const Entry = struct {
     id: u32,
     req_line: u32,
     line: u32,
     verified: bool,
+    /// Owned by the table.
+    condition: ?[]u8 = null,
+    hit_condition: ?HitCondition = null,
+    /// Set when the client's `hitCondition` does not parse; the
+    /// breakpoint then never binds.
+    invalid: ?[]const u8 = null,
+    /// The hits so far where the condition held.
+    hits: u64 = 0,
+    /// The condition's evaluation failure was reported (it is reported
+    /// once per breakpoint).
+    condition_reported: bool = false,
 
     fn view(self: Entry) Breakpoint {
-        return .{ .id = self.id, .line = if (self.verified) self.line else self.req_line, .verified = self.verified };
+        return .{
+            .id = self.id,
+            .line = if (self.verified) self.line else self.req_line,
+            .verified = self.verified,
+            .message = self.invalid,
+        };
+    }
+
+    fn deinit(self: *Entry, gpa: Allocator) void {
+        if (self.condition) |c| gpa.free(c);
     }
 };
 
@@ -103,6 +163,7 @@ pub const Table = struct {
     pub fn deinit(self: *Table) void {
         for (self.sources.items) |*s| {
             self.gpa.free(s.name);
+            for (s.entries.items) |*e| e.deinit(self.gpa);
             s.entries.deinit(self.gpa);
         }
         self.sources.deinit(self.gpa);
@@ -144,31 +205,58 @@ pub const Table = struct {
 
     /// Replace the breakpoints of `source` with `requests`, and write each
     /// one's binding to `out` (same length, same order). A request for a
-    /// line that already had a breakpoint keeps that breakpoint's id.
+    /// line that already had a breakpoint keeps that breakpoint's id and
+    /// its hit count.
     pub fn set(self: *Table, source: []const u8, requests: []const Request, out: []Breakpoint) !void {
         std.debug.assert(out.len == requests.len);
         const s = try self.sourceFor(source);
         var entries: std.ArrayList(Entry) = .empty;
-        errdefer entries.deinit(self.gpa);
+        errdefer {
+            for (entries.items) |*e| e.deinit(self.gpa);
+            entries.deinit(self.gpa);
+        }
         try entries.ensureTotalCapacity(self.gpa, requests.len);
         var reused: std.DynamicBitSetUnmanaged = try .initEmpty(self.gpa, s.entries.items.len);
         defer reused.deinit(self.gpa);
         for (requests) |r| {
-            const id = for (s.entries.items, 0..) |old, i| {
+            var id: u32 = 0;
+            var hits: u64 = 0;
+            for (s.entries.items, 0..) |old, i| {
                 if (old.req_line == r.line and !reused.isSet(i)) {
                     reused.set(i);
-                    break old.id;
+                    id = old.id;
+                    hits = old.hits;
+                    break;
                 }
-            } else blk: {
-                defer self.next_id += 1;
-                break :blk self.next_id;
-            };
-            entries.appendAssumeCapacity(.{ .id = id, .req_line = r.line, .line = 0, .verified = false });
+            } else {
+                id = self.next_id;
+                self.next_id += 1;
+            }
+            const condition = if (r.condition) |c| try self.gpa.dupe(u8, c) else null;
+            errdefer if (condition) |c| self.gpa.free(c);
+            var e: Entry = .{ .id = id, .req_line = r.line, .line = 0, .verified = false, .condition = condition, .hits = hits };
+            if (r.hit_condition) |text| {
+                if (std.mem.trim(u8, text, " \t").len != 0) {
+                    e.hit_condition = HitCondition.parse(text);
+                    if (e.hit_condition == null) e.invalid = "the hit condition is not N, >= N or % N";
+                }
+            }
+            entries.appendAssumeCapacity(e);
         }
+        for (s.entries.items) |*e| e.deinit(self.gpa);
         s.entries.deinit(self.gpa);
         s.entries = entries;
         try self.rebind();
         for (s.entries.items, out) |e, *o| o.* = e.view();
+    }
+
+    /// The breakpoint `id`, while it is set. The pointer lives until the
+    /// next `set`.
+    pub fn entry(self: *Table, id: u32) ?*Entry {
+        for (self.sources.items) |*s| {
+            for (s.entries.items) |*e| if (e.id == id) return e;
+        }
+        return null;
     }
 
     /// The ids of the breakpoints bound at `pc` of `proto`, or null for
@@ -227,6 +315,7 @@ pub const Table = struct {
     /// after the one asked for that has code. The first chunk to bind it
     /// fixes the line it reports.
     fn bindIn(self: *Table, e: *Entry, chunk: Chunk) !void {
+        if (e.invalid != null) return;
         const first = std.sort.lowerBound(Site, chunk.sites, e.req_line, cmpLine);
         if (first == chunk.sites.len) return;
         const line = chunk.sites[first].line;

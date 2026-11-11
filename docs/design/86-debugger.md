@@ -70,12 +70,20 @@ everything inside them is checked.
   - [x] Line breakpoints, including pending ones
     (`src/debug/breakpoints.zig`; how it differs from the plan is in
     §5.2's follow-up). Tests are in `src/debug/breakpoints_test.zig`.
-  - [ ] Conditional breakpoints and hit counts, on the pure-read
-    evaluator.
+  - [x] The pure-read evaluator (`src/debug/eval.zig`, §7.3), with
+    `Session.evaluate` on the top frame, plus conditional breakpoints and
+    hit counts (`N`, `>= N`, `% N`, counted where the condition holds).
+    String literals go through `src/strlit.zig`, which is the compiler's
+    decoder lifted out so the two cannot disagree. Tests are in
+    `src/debug/eval_test.zig`; one shows that evaluating at every stop
+    leaves the step count and the final snapshot bytes unchanged.
+  - [ ] Evaluate reads a folded `<const>` (§4 `literal` rows). It needs
+    the chunk's source text, which the session does not hold yet, so for
+    now it refuses.
+  - [ ] Evaluate in any frame (`frameId`), with the stack (below).
   - [ ] Step in, over and out.
   - [ ] Error stops at every site where an error is raised (§5.4).
-  - [ ] Threads, the stack, scopes, variables with slot-order paging, and
-    pure-read `evaluate`.
+  - [ ] Threads, the stack, scopes, and variables with slot-order paging.
 - [ ] **P3 — `mahina dap`** (§8). The DAP server on stdio, with the full
   lifecycle (initialize, configuration, disconnect and terminate) and a
   post-exit stop. Program output goes to `output` events, and stdin comes
@@ -821,6 +829,24 @@ It accepts:
 
 It refuses calls, method calls, assignment, and any operation where a
 metamethod would apply. Each refusal comes with a message.
+
+**As built (P2, 2026-11-11).** The evaluator also accepts `??`,
+bitwise operators, and backtick templates whose holes are not
+`__tostring` values. Its outcome has three kinds:
+
+- `ok`: a value, or a scratch byte string;
+- `refused`: the expression would run code or apply a metamethod, or it
+  does not parse;
+- `failed`: the program would fault (`nil + 1`), worded as the VM words
+  it.
+
+A local whose register is dead at the pc is refused as unavailable.
+Arithmetic and comparison go through the VM's own `arith` routines.
+Before each operation where the VM would dispatch a metamethod, the
+evaluator checks for that metamethod with a raw get on the metatable, and
+refuses if it is there. A string key is looked up through
+`Heap.internedLookup`, which only reads: bytes that are not interned
+cannot be any table's key.
 
 It works in the session's arena, never on the VM heap. A concatenation
 produces a scratch byte string, and nothing is interned. So evaluating

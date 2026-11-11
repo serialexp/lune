@@ -22,6 +22,7 @@ const interp = @import("../interp.zig");
 const bytecode = @import("../bytecode.zig");
 const coroutine = @import("../coroutine.zig");
 const breakpoints = @import("breakpoints.zig");
+const eval = @import("eval.zig");
 
 const Vm = interp.Vm;
 const Proto = bytecode.Proto;
@@ -86,6 +87,9 @@ pub const Driver = struct {
     /// with its source loaded, so a pending breakpoint is now verified
     /// (DAP's `breakpoint` event, reason `changed`).
     breakpoint_changed: ?*const fn (ctx: *anyopaque, s: *Session, bp: Breakpoint) void = null,
+    /// A message for the client's console (DAP's `output` event, category
+    /// `console`): a breakpoint condition that cannot be evaluated.
+    console: ?*const fn (ctx: *anyopaque, s: *Session, text: []const u8) void = null,
 };
 
 pub const BreakpointRequest = breakpoints.Request;
@@ -172,6 +176,10 @@ pub const Session = struct {
     /// Scratch for the bindings a chunk load changed.
     changed: std.ArrayList(Breakpoint) = .empty,
     visits: LineVisits = .{},
+    /// The evaluator's scratch, reset at every evaluation.
+    eval_arena: std.heap.ArenaAllocator,
+    /// The ids of the breakpoints that stop at this pc.
+    passing: std.ArrayList(u32) = .empty,
 
     /// Attach to `vm`, which must be idle and not already debugged. The
     /// session must stay where it is until `detach` (the VM points at it).
@@ -185,6 +193,7 @@ pub const Session = struct {
             .hooks = .{ .ctx = self, .check = &check },
             .entry_pending = opts.stop_on_entry,
             .breakpoints = .init(gpa),
+            .eval_arena = .init(gpa),
         };
         if (opts.stop_on_entry) self.hooks.flags.store(Flags.pause, .release);
         vm.trace.raiseSuspend();
@@ -200,6 +209,15 @@ pub const Session = struct {
         self.vm.trace.lowerSuspend();
         self.breakpoints.deinit();
         self.changed.deinit(self.gpa);
+        self.eval_arena.deinit();
+        self.passing.deinit(self.gpa);
+    }
+
+    /// Evaluate `expression` in the stopped program's top frame (§7.3).
+    /// The outcome's text lives until the next evaluation. While stopped.
+    pub fn evaluate(self: *Session, expression: []const u8) Error!eval.Outcome {
+        _ = self.eval_arena.reset(.retain_capacity);
+        return eval.evaluate(self.eval_arena.allocator(), self.vm, .top(self.vm), expression);
     }
 
     /// Run `proto` as the program, to its end, then make the end stop
@@ -305,7 +323,9 @@ pub const Session = struct {
         var hits: ?[]const u32 = null;
         if (f & Flags.breakpoints != 0) {
             if (self.chunks_seen != vm.loaded_chunks.items.len) try self.syncChunks();
-            if (fresh) hits = try self.breakpoints.at(proto, pc);
+            if (fresh) if (try self.breakpoints.at(proto, pc)) |ids| {
+                hits = try self.admit(ids);
+            };
         }
         // One stop per prologue: a breakpoint here also answers a pause.
         if (hits != null or f & Flags.pause != 0) {
@@ -314,6 +334,36 @@ pub const Session = struct {
             self.entry_pending = false;
             try self.stop(.{ .reason = reason, .hits = hits orelse &.{} }, .{ .proto = proto, .pc = pc });
         }
+    }
+
+    /// The breakpoints among `ids` that stop: those whose condition holds
+    /// and whose hit condition admits this hit. Null for none.
+    fn admit(self: *Session, ids: []const u32) Error!?[]const u32 {
+        self.passing.clearRetainingCapacity();
+        for (ids) |id| {
+            const e = self.breakpoints.entry(id) orelse continue;
+            if (e.condition) |c| {
+                const holds = switch (try self.evaluate(c)) {
+                    .ok => |v| v.truthy(),
+                    .refused, .failed => |msg| blk: {
+                        // Counts as false, and is reported once (§5.2).
+                        if (!e.condition_reported) {
+                            e.condition_reported = true;
+                            if (self.driver.console) |f| {
+                                const text = try std.fmt.allocPrint(self.eval_arena.allocator(), "breakpoint condition `{s}`: {s}", .{ c, msg });
+                                f(self.driver.ctx, self, text);
+                            }
+                        }
+                        break :blk false;
+                    },
+                };
+                if (!holds) continue;
+            }
+            e.hits += 1;
+            if (e.hit_condition) |hc| if (!hc.admits(e.hits)) continue;
+            try self.passing.append(self.gpa, id);
+        }
+        return if (self.passing.items.len == 0) null else self.passing.items;
     }
 
     fn stop(self: *Session, s: Stop, at: Location) Error!void {

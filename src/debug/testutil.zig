@@ -61,8 +61,11 @@ pub const Script = struct {
     on_requests: ?*const fn (self: *Script, s: *Session) void = null,
     /// Every `breakpoint_changed` event, in order.
     changed: std.ArrayList(session_mod.Breakpoint) = .empty,
+    /// When set, `driver` returns it (a test that adds callbacks).
+    driver_override: ?session_mod.Driver = null,
 
     pub fn driver(self: *Script) session_mod.Driver {
+        if (self.driver_override) |d| return d;
         return .{ .ctx = self, .stopped = &stopped, .requests = &requests, .breakpoint_changed = &breakpointChanged };
     }
 
