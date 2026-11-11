@@ -189,6 +189,13 @@ table — and then it goes through a design doc first. Read doc 47
 the fill-then-reuse staleness story, the convergence path, and the
 outstanding increments.
 
+## Editors
+
+**There is never a VS Code extension.** Editor integration targets Zed
+(`editors/zed`) and the Tree-sitter grammar (`editors/tree-sitter-mahina`); the
+LSP and DAP servers stay editor-neutral, but do not propose, plan, or ask about a
+VS Code extension (decided by Bart, 2026-11-11).
+
 ## Build
 
 Use the `just` recipes (`justfile`) as the canonical entry points — they wrap
