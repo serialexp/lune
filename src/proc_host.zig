@@ -146,6 +146,7 @@ fn signalName(sig: u32, buf: *[24]u8) []const u8 {
 }
 
 fn closeFd(fd: posix.fd_t) void {
+    if (comptime !supported) return;
     _ = posix.system.close(fd);
 }
 

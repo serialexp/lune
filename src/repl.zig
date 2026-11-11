@@ -754,6 +754,8 @@ fn writePrompt(session: *Session, env: *const std.process.Environ.Map, w: *Write
 /// Read one line with the editor. Status says how it ended; the line is in
 /// `ed.line()` when submitted.
 fn editLine(term: *Terminal, ed: *lineedit.Editor, hist: *const lineedit.History, prompt: []const u8) !lineedit.Status {
+    // Terminal is a stub without an fd where there is no tty support.
+    if (comptime !tty_supported) return .eof;
     const w = mio.stdout();
     const pw = lineedit.promptWidth(prompt);
     ed.reset();
