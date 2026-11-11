@@ -5,10 +5,10 @@ decided; Phases 0–3 landed (2026-11-11); Phase 4 started (computed-callee
 upvalue reads and the anchor-window alias, §6.6; `__index`/`__newindex`
 functions, §6.1; arithmetic, bitwise, unary and `__len` handlers, §6.4;
 `__lt`/`__le`/`__eq` and the compare-and-branch forms, §6.4; `__call`,
-§6.7); the rest of
+§6.7; a function `__index` under a fused read, §6.3); the rest of
 Phases 4–7 outstanding (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
-Last updated: 2026-11-11
+Last updated: 2026-11-12
 
 ## Implementation status
 
@@ -290,7 +290,33 @@ land; move whole phases to Done once everything inside them is checked.
   `__index` at either level still aborts `has_metatable`: that is the
   phase-bit stage this list's stack bullet covers. `set_index2` on a plain
   table still aborts (doc 14, TODO.md). Gated in
-  `src/interp_native_test.zig` ("fused index: …").
+  `src/interp_native_test.zig` ("fused index: …"). Follow-up (2026-11-12):
+  the function `__index` now records, see the seventh part.
+- [x] **Phase 4, seventh part — a function `__index` under a fused read**
+  (§6.3, 2026-11-12). A handler answering either lookup of a `get_index2`
+  records as an inlined call. The first lookup's handler (tier 0's phase
+  0) gets the frame finish `index2_mid`. Its return reads the handler's
+  first result, pops the frame and records the second lookup on it
+  (`finishIndex2Mid` in `trace_recorder.zig`), into `R[A]`. The second
+  key is saved for that frame in `meta_keys`, beside `frames`, because
+  the register window has moved by then. The second lookup's handler
+  (phase 1) is an ordinary `result` frame into `R[A]`, so both handlers of
+  `G[k][k]` inline, one after the other.
+  - [x] the second lookup's guards stay in the `ret`'s ordinal, as
+    `finishMetaCompare`'s do: a failure exits coarse and re-runs the
+    iteration, so the first handler is not called twice. The shape's own
+    `guard_table` pins the handler's result as a table.
+  - [x] `meta_keys` grows `Vm` by 96 bytes (`offsets_x64.inc` updated,
+    both blocks).
+  - [x] stays with tier 0: a first handler that answers with a non-table
+    (`bad_type`; tier 0 raises) or a grid (`nyi_opcode`, a bare read would
+    deflate it); a native handler (`has_metatable`); a recording in
+    precise mode, which `recMetaCallAt` refuses (`nyi_opcode`).
+  - [x] gated in `src/interp_native_test.zig`: handlers at both levels with
+    an order-revealing sum and counting stores, a row turning float after
+    the first handler ran (each call counted once), and a first handler
+    answering with a number, so tier 0 raises.
+  - [x] measured (§10.13).
 
 ### Outstanding
 
@@ -304,7 +330,10 @@ land; move whole phases to Done once everything inside them is checked.
   after doc 68 P2 (Q1).
   - [ ] doc 68 P2 landed: tier 0 runs metamethods as continuation frames,
     and §6.3's pending-instruction stages mirror its `finish_op` stages
-  - [ ] the pending-instruction stack (§6.3) and its stage transitions
+  - [ ] the pending-instruction stack (§6.3) and its stage transitions:
+    the fused read's handler stage landed as a frame finish (seventh part,
+    §6.3 second amendment); the fused store (`set_index2`, which first
+    needs a plain store to record, doc 14) and `__close` (Phase 5) remain
   - [ ] the per-route exit contract (§7), with its exclusions tested
   - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
     of a cell with an alias class, through a computed callee still abort
@@ -653,6 +682,14 @@ handler's `InlineFrame` (`finish`: `result`, `truthy`, `truthy_not`,
 `recRet` applies it when that frame returns. The stack is still the plan
 for the instructions with more than one stage (the fused index pair,
 `__close`); the frame's byte becomes the top entry's finish when it lands.
+
+Second amendment (2026-11-12, Phase 4 seventh part): the fused read did not
+need the stack either. Its two stages are strictly in order and each makes
+at most one call, so its first stage's state fits in one more frame finish
+(`index2_mid`) plus the second key, kept per frame in
+`RecordingSession.meta_keys`. A second-stage handler is pushed after the
+first one's frame has popped, so it is again the top frame. The stack
+stays the plan for `__close`, whose stages repeat for each open variable.
 
 ### 6.4 Exact call signatures
 
@@ -1093,6 +1130,21 @@ of its table, 2M iterations, two runs each:
 `--jit-stats` after: ~1.9 cycles per traced iteration. The handler's load
 from the metatable and its `guard_func` are in the preheader; its read of
 `self.k` stays in the body (`href` on the table, its guards).
+
+### 10.13 After a function `__index` under a fused read (2026-11-12)
+
+ReleaseFast builds of HEAD (c57abe0) and with this part, load 3–4. No
+Phase 0 program has a fused read, so a probe: `u = u + F[k][2] + G[k][k]`,
+3M iterations, where `F`'s handler returns one of 64 rows and `G`'s returns
+a table whose own handler answers the second lookup; each handler bumps a
+counter field. Two runs each:
+
+| | t0 s | jit s |
+|---|---|---|
+| before (aborts `has_metatable` at `get_index2`) | 0.48, 0.45 | 0.49, 0.48 |
+| after | 0.44, 0.48 | 0.01, 0.01 |
+
+`--jit-stats` after: the loop runs 100% traced, ~16 cycles per iteration.
 
 ## 11. Open questions for review
 

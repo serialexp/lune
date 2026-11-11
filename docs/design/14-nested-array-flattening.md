@@ -371,6 +371,9 @@ read's guards prove the container is not a grid; a grid reached as the
 row, whose bare read would deflate it, aborts. A fused store into a plain
 table still aborts: tier 0 first tries `inflateToGrid` on a table not yet
 marked `no_grid`, and the trace would need to prove that mark (TODO.md).
+A function `__index` at either level records as an inlined call (doc 77
+§6.3 second amendment, 2026-11-12): the first lookup's handler finishes by
+recording the second lookup on its result.
 
 ## Escape detection — the gate decision (2026-06-26, Bart)
 

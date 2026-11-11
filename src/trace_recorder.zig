@@ -565,8 +565,17 @@ pub const InlineFrame = struct {
 /// (`ret_count` is 0), negated for `~=` (`.truthy_not`). `.branch_true`
 /// and `.branch_false` take a compare-and-branch's branch on it
 /// (`cmpBranchTail`), for a branch that jumps when the relation holds or
-/// when it fails.
-pub const MetaFinish = enum(u8) { result, truthy, truthy_not, branch_true, branch_false };
+/// when it fails. `.index2_mid` is the first lookup of a fused `get_index2`
+/// (tier 0's phase 0): the result is the table the second lookup reads,
+/// with the key `RecordingSession.meta_keys` saved for this frame.
+pub const MetaFinish = enum(u8) { result, truthy, truthy_not, branch_true, branch_false, index2_mid };
+
+/// Doc 77 §6.3: what a pending fused `get_index2` keeps while its first
+/// lookup's handler runs: the second key's register and observed value,
+/// and the proto of the frame running the instruction. The handler's frame
+/// cannot read the caller's registers, and the key's value is fixed for
+/// the instruction (a handler writes no register of its caller).
+pub const MetaKey = struct { value: Value, reg: u16, proto: *const Proto };
 
 /// Build a guard's ordered inline-path prefix (doc 17, A-i.2) from the recorder's
 /// live inline-frame stack: `path[i]` is the call edge that opened frame `i`.
@@ -979,6 +988,9 @@ pub const RecordingSession = struct {
     /// Saved caller contexts for the currently-open inlined calls, indexed by
     /// `inline_depth - 1`. Pushed at an inlined `.call`, popped at the `.ret`.
     frames: [MAX_INLINE_DEPTH]InlineFrame = undefined,
+    /// Doc 77 §6.3: for each open frame whose finish is `.index2_mid`, the
+    /// fused read's second key, at the frame's index in `frames`.
+    meta_keys: [MAX_INLINE_DEPTH]MetaKey = undefined,
     /// Number of inlined calls currently open (frame-stack depth). 0 at the anchor
     /// frame; a `.call` beyond `MAX_INLINE_DEPTH` aborts `.too_deep`.
     inline_depth: u8 = 0,
@@ -1918,7 +1930,7 @@ pub const RecordingSession = struct {
             // grow/widen store aborts to tier-0, which reshapes. A read of a
             // plain nested table records as the two reads it is
             // (`recIndex2Get`); a store into one still aborts (`recGridSet`).
-            .get_index2 => try self.recIndex2Get(instr, regs),
+            .get_index2 => try self.recIndex2Get(instr, regs, proto),
             .set_index2 => try self.recGridSet(instr, regs),
 
             // Cluster sub-lever 1: a callee (or any loop-invariant value) reached
@@ -2729,7 +2741,7 @@ pub const RecordingSession = struct {
         self.cur_proto_id = fr.caller_proto_id;
         const t = (try self.truthRef(r, v)) orelse return self.abort(.bad_type);
         switch (fr.finish) {
-            .result => unreachable,
+            .result, .index2_mid => unreachable,
             .truthy => self.setReg(fr.ret_dest, t),
             .truthy_not => self.setReg(fr.ret_dest, if (self.konstValueOf(t)) |kv|
                 try self.konst(Value.boolean(!kv.isTruthy()))
@@ -2956,7 +2968,21 @@ pub const RecordingSession = struct {
         /// other read (globals, builtins), where tier 0 calls the handler
         /// in place and a function handler stops the recording.
         frame_proto: ?*const Proto = null,
+        /// The key's observed value when no register of the running frame
+        /// holds it now: the second lookup of a fused read, made after its
+        /// first lookup's handler returned (doc 77 §6.3). `key` still names
+        /// the register its ref comes from.
+        key_in: ?Value = null,
+        /// How a function `__index` handler's return finishes the
+        /// instruction: `.result` lands in `dst`; `.index2_mid` feeds the
+        /// second lookup of a fused read.
+        finish: MetaFinish = .result,
     };
+
+    /// The observed key of get frame `f`.
+    fn frameKeyValue(regs: RegWindow, f: GetFrame) Value {
+        return f.key_in orelse operandValue(regs, f.key);
+    }
 
     /// Doc 77 Q2: the longest `__index`/`__newindex` table chain a recording
     /// unrolls, as LuaJIT's `LJ_MAX_IDXCHAIN`. Counted in hops of the access
@@ -3156,7 +3182,7 @@ pub const RecordingSession = struct {
     /// shapes for a number, the hash shapes for a string (the `get_index`
     /// dispatch in `recordInstr`).
     fn getShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) RecordError!void {
-        const key = operandValue(regs, f.key);
+        const key = frameKeyValue(regs, f);
         if (key.isNumber()) return self.arrayGetShape(regs, f);
         if (isStringKey(key)) return self.hashGetShape(regs, f);
         return self.abort(.bad_type);
@@ -3207,7 +3233,7 @@ pub const RecordingSession = struct {
 
     pub fn arrayGetShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) RecordError!void {
         const vtab = frameTabValue(regs, f.tab, f.tab_in);
-        const vkey = operandValue(regs, f.key);
+        const vkey = frameKeyValue(regs, f);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const idx = keyIndexOf(vkey) orelse {
             self.dbg("bad_type arrayGet key: isInt={} isFloat={} pc={d}", .{ vkey.isInt(), vkey.isFloat(), self.cur_pc });
@@ -3762,20 +3788,63 @@ pub const RecordingSession = struct {
     /// `__index` on either stops the recording (doc 77 §6.3, the
     /// pending-instruction stack, owns that). A second read's guard that
     /// fails exits to the instruction, which tier 0 runs whole.
-    fn recIndex2Get(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
+    fn recIndex2Get(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
         const vtab = regs.get(instr.b);
         if (isTableValue(vtab) and table_mod.Table.fromHeader(vtab.asHeap()).array.isGrid())
             return self.recGridGet(instr, regs);
         const key2: u16 = @intCast(instr.aux);
         // The first read lands in `R[a]`; the second reads its key after.
         if (instr.a == key2) return self.abort(.nyi_opcode);
-        const mid = (try self.observedIndex(vtab, regs.get(instr.c))) orelse return self.abort(.has_metatable);
+        const first: GetFrame = .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c, .frame_proto = proto, .finish = .index2_mid };
+        const mid = (try self.observedIndex(vtab, regs.get(instr.c))) orelse {
+            // A handler answers the first lookup (tier 0's phase 0): it is
+            // inlined, and its return makes the second (`finishIndex2Mid`).
+            const depth = self.inline_depth;
+            try self.getShape(regs, first);
+            if (!self.active) return;
+            if (self.inline_depth != depth + 1 or self.frames[depth].finish != .index2_mid) return self.abort(.has_metatable);
+            self.meta_keys[depth] = .{ .value = regs.get(key2), .reg = key2, .proto = proto };
+            return;
+        };
         // A grid row read by one key is a row view, which no shape models.
         if (isTableValue(mid) and table_mod.Table.fromHeader(mid.asHeap()).array.isGrid()) return self.abort(.nyi_opcode);
-        try self.getShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c });
+        try self.getShape(regs, first);
         if (!self.active) return;
         const rmid = try self.refOf(instr.a);
-        return self.getShape(regs, .{ .dst = instr.a, .tab_in = .{ .ref = rmid, .value = mid }, .key = .{ .reg = key2 }, .tab_od = .loaded, .key_od = .aux });
+        return self.index2Second(regs, proto, instr.a, key2, .{ .ref = rmid, .value = mid }, null);
+    }
+
+    /// The second lookup of a fused read: the table `mid` indexed by the
+    /// key in register `key2` (observed `key_in`, when no register of the
+    /// running window holds it), into `R[dst]` of the frame of `proto`. A
+    /// function `__index` here is tier 0's phase 1, a `.finish_op` frame
+    /// whose first result lands in `R[dst]` as a plain read's does.
+    fn index2Second(self: *RecordingSession, regs: RegWindow, proto: *const Proto, dst: u16, key2: u16, mid: TabIn, key_in: ?Value) !void {
+        return self.getShape(regs, .{ .dst = dst, .tab_in = mid, .key = .{ .reg = key2 }, .key_in = key_in, .tab_od = .loaded, .key_od = .aux, .frame_proto = proto });
+    }
+
+    /// Doc 77 §6.3: the first lookup's handler of a fused read returned `v`
+    /// (ref `r`), the table the second lookup reads, with the key saved for
+    /// its frame (`meta_keys`). As `finishMetaCompare`, the second lookup's
+    /// guards stay in the `ret`'s ordinal, which has no snapshot: a failure
+    /// is coarse and re-runs the iteration, so the handler is not called
+    /// twice. A result that is not a table, or a grid (a bare read would
+    /// deflate it), stays with tier 0.
+    fn finishIndex2Mid(self: *RecordingSession, fr: InlineFrame, r: Ref, v: Value, regs: RegWindow) !void {
+        const saved_pc = self.cur_pc;
+        const saved_proto = self.cur_proto_id;
+        defer {
+            self.cur_pc = saved_pc;
+            self.cur_proto_id = saved_proto;
+        }
+        self.cur_pc = fr.call_pc + 1;
+        self.cur_proto_id = fr.caller_proto_id;
+        const mk = self.meta_keys[self.inline_depth];
+        if (!isTableValue(v)) return self.abort(.bad_type);
+        if (table_mod.Table.fromHeader(v.asHeap()).array.isGrid()) return self.abort(.nyi_opcode);
+        // Every read shape guards its table (`guard_table`), which pins the
+        // handler's result as one.
+        return self.index2Second(regs, mk.proto, fr.ret_dest, mk.reg, .{ .ref = r, .value = v }, mk.value);
     }
 
     /// What `tbl[key]` reads for an index operation (`indexGet`): the raw
@@ -4076,7 +4145,7 @@ pub const RecordingSession = struct {
     /// General absent lookup. Keep the nil constant behind a runtime proof;
     /// never specialize an observed absence into an unconditional result.
     fn recordAbsentGet(self: *RecordingSession, regs: RegWindow, f: GetFrame) RecordError!void {
-        const key = operandValue(regs, f.key);
+        const key = frameKeyValue(regs, f);
         const rtab = try self.frameTabRef(f.tab, f.tab_in);
         const rkey = if (key.isNumber())
             try self.keyRefNarrowed(f.key.reg, f.key_od, key)
@@ -4110,7 +4179,7 @@ pub const RecordingSession = struct {
             }
             if (f.frame_proto) |fp| if (try self.metamethodIsClosure(mt, "__index")) {
                 const args = [_]Ref{ rtab, try self.operandRef(f.key) };
-                return self.recMetaCall(fp, rtab, mt, "__index", &args, f.dst, 1, f.tab_od, .result);
+                return self.recMetaCall(fp, rtab, mt, "__index", &args, f.dst, if (f.finish == .result) 1 else 0, f.tab_od, f.finish);
             };
             if (!try self.guardNoMetamethod(rtab, mt, "__index", f.tab_od, f.dst)) return;
         };
@@ -4194,7 +4263,7 @@ pub const RecordingSession = struct {
 
     pub fn hashGetShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) RecordError!void {
         const vtab = frameTabValue(regs, f.tab, f.tab_in);
-        const vkey = operandValue(regs, f.key);
+        const vkey = frameKeyValue(regs, f);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         // A metatable (doc 77 §5.3): a present field never consults it, and
@@ -4525,13 +4594,15 @@ pub const RecordingSession = struct {
                 if (!self.active) return;
             }
             if (fr.finish != .result) {
-                // Doc 77 §6.3: a compare handler. Its first result is read
-                // in its own frame, which `recReturn` (`ret_count` 0) pops.
+                // Doc 77 §6.3: a compare handler, or a fused read's first
+                // lookup. Its first result is read in its own frame, which
+                // `recReturn` (`ret_count` 0) pops.
                 if (instr.b == bytecode.all_results) return self.abort(.cross_frame);
                 const v = if (instr.b == 0) Value.nil() else regs.get(instr.a);
                 const r = if (instr.b == 0) try self.konst(Value.nil()) else try self.refOf(instr.a);
                 try self.recReturn(instr, multret);
                 if (!self.active) return;
+                if (fr.finish == .index2_mid) return self.finishIndex2Mid(fr, r, v, regs);
                 return self.finishMetaCompare(fr, r, v);
             }
             return self.recReturn(instr, multret);

@@ -1808,16 +1808,58 @@ test "fused index: a nested read whose row or element changes exits to tier 0" {
     , "1281.5\t600\tfalse\ttrue\n", .{ .record_aborts = true, .inspect = assertIndex2Recorded });
 }
 
-test "fused index: a function __index at either level stays with tier 0" {
-    // Tier 0 gives the handler a frame with a phase bit; the recording's
-    // pending-instruction stack (doc 77 §6.3) does not model it yet.
-    try expectProgram(
-        \\local F = setmetatable({}, { __index = function(_, k) return { k, k } end })
-        \\local R = { setmetatable({}, { __index = function(_, k) return k * 3 end }) }
+test "fused index: a function __index at either level records as an inlined call" {
+    // Doc 77 §6.3: tier 0 calls a first-lookup handler in a frame with a
+    // phase bit, then reads its result; the recording inlines the handler
+    // and records the second lookup at its return. `F` answers the first
+    // lookup and its row 200 turns the second lookup's element float, so
+    // that exit comes after the handler's counting store (`c.f` counts
+    // each call once). `G` and `Row` answer both lookups of `G[k][k]`;
+    // `Row`'s handler adds `c.a`, so the sum shows they run in order.
+    try expectProgramTuned(
+        \\local c = { a = 0, b = 0, f = 0 }
+        \\local rows = {}
+        \\for i = 1, 300 do rows[i] = { i, i * 2 } end
+        \\rows[200] = { 200, 0.5 }
+        \\local F = setmetatable({}, { __index = function(_, k)
+        \\  c.f = c.f + 1
+        \\  return rows[k]
+        \\end })
+        \\local Row = setmetatable({}, { __index = function(_, j)
+        \\  c.b = c.b + c.a
+        \\  return j * 3
+        \\end })
+        \\local G = setmetatable({}, { __index = function(_, k)
+        \\  c.a = c.a + 1
+        \\  return Row
+        \\end })
+        \\local R = { Row }
         \\local u = 0
-        \\for k = 1, 300 do u = u + F[k][1] + R[1][k] end
-        \\print(u)
-    , "180600\n");
+        \\for k = 1, 300 do
+        \\  u = u + F[k][2] + G[k][k] + R[1][k]
+        \\end
+        \\print(u, c.a, c.b, c.f)
+    , "360800.5\t300\t90300\t300\n", .{ .record_aborts = true, .inspect = assertIndex2Recorded });
+}
+
+test "fused index: a first-lookup handler returning a non-table exits to tier 0" {
+    // The second lookup needs a table; a handler that answers with a
+    // number at k == 250 makes tier 0 raise, and the handler ran once.
+    try expectProgramTuned(
+        \\local c = { n = 0 }
+        \\local row = { 4, 5 }
+        \\local F = setmetatable({}, { __index = function(_, k)
+        \\  c.n = c.n + 1
+        \\  if k == 250 then return 7 end
+        \\  return row
+        \\end })
+        \\local ok, err = pcall(function()
+        \\  local u = 0
+        \\  for k = 1, 300 do u = u + F[k][2] end
+        \\  return u
+        \\end)
+        \\print(ok, c.n, (string.find(err, "attempt to index a number value", 1, true)) ~= nil)
+    , "false\t250\ttrue\n", .{ .record_aborts = true, .inspect = assertIndex2Recorded });
 }
 
 // --- Phase 4b/4c: grids end-to-end from Lua (8-mode byte-identical) -----------
