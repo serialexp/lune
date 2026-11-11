@@ -143,10 +143,43 @@ more than tier 0. Four causes, by pass:
       `LJ_TRLINK_ROOT` at any depth), and main's own loop dies
       unrolling `carried` (`loop_unroll`, 389 IR). Doc 44's frame links
       (`ret_cont`, `call_head`) are the nearest machinery and arm
-      nothing in this run. Needs a design doc; not started, not picked.
+      nothing in this run. Design drafted 2026-11-11: doc 87 (Bart
+      picked "Design: join loops across calls"); its Q1–Q5 are open and
+      nothing is built. A two-function probe (doc 87 §2.1) costs 5,094
+      instructions a round over the loop bodies, against 1,681 on tier 0
+      and 231 on LuaJIT.
       The heapsort entry ("A short loop in a function called from a
       loop") and "A short loop in a function is entered from tier 0 on
       every call" below are cases of this.
+- [x] **One admitted region turned native frame motion and the one-shot
+      lane off for the rest of the program** (found 2026-11-11 while
+      reading for doc 87; older than doc 85). The descent gate
+      (`NativeSeedCtx.descent_ok`) and `headEpisodeQuiet` both asked
+      `receiptsInert()`, which also reads the two physical maps, and
+      those stay populated while an admitted region's traces live.
+      `fib(30)` after a 300×300 nest: 10,092 M instructions (tier 0:
+      1,296 M); now 1,017 M. Both ask `noOpenActivation()` now
+      (`receiptInertFor(trace)` as well for a loop-anchored quiet
+      entry); the argument is in doc 54 "Episode descent gate". Board:
+      euler14-bit −0.64%, spectral-norm −0.41%, globals_script −0.35%,
+      ray −0.31%, binary-trees −0.22%; records_script +0.16%
+      instructions and −1.8% cycles (more entries pass the region term
+      and are refused by a later one).
+- [ ] **Native frame motion still declines while a region activation is
+      open anywhere** (what the fix above left). Recursion called from
+      inside a linked nest whose region is open pays a dispatcher entry
+      per call: a non-member receipt then charges the open region's
+      payoff, so the rows are not inert. Doc 87 §5.5 is the design
+      question.
+- [ ] **A loop trace entered from tier 0 costs ~1,240 instructions a
+      visit in the dispatcher** (doc 87 §2.2, callgrind on the probe:
+      `enterSelectedTrace` 573 itself, receipt/provenance/arming helpers
+      670). Two of the helpers repeat a refusal that cannot change:
+      `maybeArmContinuation` re-derives "no enclosing back-edge" at
+      every loop-done exit (192 with its callees), and
+      `anchorSourceInstr` takes 130 instructions per call. Doc 44 D9
+      left "the loop-anchor quiet episode" as a follow-up; doc 87 Q3
+      asks when. Not started.
 - [ ] **An exit-side child that ends a burst is struck on its own
       anchor, every burst, for good** (found 2026-11-11). The short
       loops of `configured` (8 trips) and `refine` (3) are each a root
