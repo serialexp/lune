@@ -36,6 +36,11 @@ pub const supported = switch (builtin.os.tag) {
     else => true,
 };
 
+/// A process id, or a placeholder of the same size where nothing can spawn:
+/// `posix.pid_t` is an opaque handle on Windows, so a field typed by it cannot
+/// default to 0 there.
+const Pid = if (supported) posix.pid_t else i32;
+
 /// How long a SIGTERM'd group has before SIGKILL, and how long after SIGKILL
 /// the pipes are waited on.
 const term_grace_ns: u64 = 500 * std.time.ns_per_ms;
@@ -389,10 +394,10 @@ const Pipes = struct {
 pub const Job = struct {
     gpa: Allocator,
     n: usize = 0,
-    pids: [max_stages]posix.pid_t = undefined,
+    pids: [max_stages]Pid = undefined,
     /// How each child ended, once it has been reaped.
     ended: [max_stages]?Reaped = @splat(null),
-    pgid: posix.pid_t = 0,
+    pgid: Pid = 0,
     pipes: Pipes = .{},
     /// What the first stage's stdin is fed from, and how much has gone.
     input: []const u8 = "",
@@ -432,6 +437,7 @@ pub const Job = struct {
     /// Signal the whole group, unless every child has already been reaped:
     /// a reaped pid may be recycled, so a finished job is never signalled.
     pub fn signal(self: *Job, sig: posix.SIG) bool {
+        if (comptime !supported) return false;
         if (self.finished) return false;
         _ = posix.system.kill(-self.pgid, sig);
         return true;
@@ -440,6 +446,7 @@ pub const Job = struct {
     /// End the job now: SIGTERM, a moment to leave, then SIGKILL, and reap
     /// everything. For a VM that is closing with children still running.
     pub fn terminate(self: *Job) void {
+        if (comptime !supported) return;
         if (self.finished) return;
         _ = posix.system.kill(-self.pgid, .TERM);
         const give_up = nowNs() + term_grace_ns;
@@ -782,11 +789,12 @@ pub fn start(job: *Job, io: Io, host_env: ?*const std.process.Environ.Map, req: 
         };
         if (!last) {
             // This stage's stdout is the next one's stdin.
-            var fds: [2]posix.fd_t = undefined;
-            if (posix.errno(posix.system.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) {
+            // std's pipe2 falls back to pipe() + F_SETFD where the platform has
+            // no pipe2 (macOS); posix.system.pipe2 is void there.
+            const fds = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch {
                 failure = .{ .stage = @intCast(i), .class = .other };
                 break;
-            }
+            };
             next_r = fds[0];
             w = fds[1];
             out_spawn = .{ .file = .{ .handle = fds[1], .flags = .{ .nonblocking = false } } };
@@ -801,11 +809,10 @@ pub fn start(job: *Job, io: Io, host_env: ?*const std.process.Environ.Map, req: 
             out_spawn = out_mode;
             if (req.stderr == .merge and req.stdout == .capture) {
                 // One pipe, both streams: this file reads it.
-                var fds: [2]posix.fd_t = undefined;
-                if (posix.errno(posix.system.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) {
+                const fds = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch {
                     failure = .{ .stage = @intCast(i), .class = .other };
                     break;
-                }
+                };
                 merged = fds;
                 out_spawn = .{ .file = .{ .handle = fds[1], .flags = .{ .nonblocking = false } } };
                 err_mode = out_spawn;
