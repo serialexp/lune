@@ -35,6 +35,7 @@ concurrency:
 
 permissions:
   contents: write
+  artifacts: write
 
 env:
   # Pinned by .zig-version (the same pin as ci.yml); the digest is
