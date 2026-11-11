@@ -9,10 +9,13 @@
 //! probe in the current proto (`at`).
 //!
 //! A breakpoint on a line with no code moves to the next line that has
-//! code in that chunk, and binds at that line's first pc in every proto
+//! code in that chunk, and binds at every pc of that line in every proto
 //! with code there (an outer function and a closure on one line both
-//! stop). A breakpoint whose source has no chunk yet is pending
-//! (`verified = false`) until `addChunk` indexes one with that name.
+//! stop). Which of those pcs stop is the session's line-visit test
+//! (`session.LineVisits`): a breakpoint stops once per visit to its line,
+//! so a one-line loop stops on every pass (Bart, 2026-11-11). A breakpoint
+//! whose source has no chunk yet is pending (`verified = false`) until
+//! `addChunk` indexes one with that name.
 
 const std = @import("std");
 const bytecode = @import("../bytecode.zig");
@@ -49,7 +52,7 @@ const Source = struct {
     entries: std.ArrayList(Entry) = .empty,
 };
 
-/// The first pc of `line` in `proto`.
+/// A pc of `line` in `proto`.
 const Site = struct {
     line: u32,
     proto: *const Proto,
@@ -58,7 +61,7 @@ const Site = struct {
 
 const Chunk = struct {
     root: *const Proto,
-    /// Sorted by line; within a line, one site per proto.
+    /// Sorted by line, then proto, then pc.
     sites: []Site,
 };
 
@@ -259,22 +262,14 @@ pub const Table = struct {
     }
 };
 
-/// The first pc of every line in every proto of the chunk at `root`,
-/// sorted by line, then proto id. Instructions with no line (span line
-/// 0) are not breakable.
+/// Every pc of every proto of the chunk at `root`, sorted by line, then
+/// proto, then pc. Instructions with no line (span line 0) are not
+/// breakable.
 fn indexChunk(gpa: Allocator, root: *const Proto) ![]Site {
     var all: std.ArrayList(Site) = .empty;
     errdefer all.deinit(gpa);
     try collect(gpa, &all, root);
     std.mem.sortUnstable(Site, all.items, {}, lessSite);
-    // Keep the first pc of each (line, proto).
-    var n: usize = 0;
-    for (all.items) |s| {
-        if (n > 0 and all.items[n - 1].line == s.line and all.items[n - 1].proto == s.proto) continue;
-        all.items[n] = s;
-        n += 1;
-    }
-    all.shrinkRetainingCapacity(n);
     return all.toOwnedSlice(gpa);
 }
 
@@ -282,12 +277,8 @@ fn collect(gpa: Allocator, out: *std.ArrayList(Site), proto: *const Proto) !void
     if (proto.system) return;
     const n = @min(proto.code.len, proto.spans.len);
     try out.ensureUnusedCapacity(gpa, n);
-    var prev: u32 = 0;
     for (proto.spans[0..n], 0..) |span, pc| {
-        // A run of one line adds its first pc only; the sort and the
-        // dedupe handle a line that comes back later.
-        if (span.line == 0 or span.line == prev) continue;
-        prev = span.line;
+        if (span.line == 0) continue;
         out.appendAssumeCapacity(.{ .line = span.line, .proto = proto, .pc = @intCast(pc) });
     }
     for (proto.protos) |child| try collect(gpa, out, child);

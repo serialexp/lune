@@ -419,17 +419,26 @@ breakpoint binds, the session sends a `breakpoint` event with reason
 - **`loadedSource` events.** These cannot rely on that check, which runs
   only while a flag is set. P3 should sync at every stop and every
   request drain.
-- **Indexing.** A chunk is indexed once: the first pc of each line in each
-  proto, sorted by line, in O(code log code). Binding a breakpoint is a
-  binary search, and the dispatch-time test is one bitset probe in the
-  current proto, cached by proto.
+- **Indexing.** A chunk is indexed once: every pc with a line, sorted by
+  line, in O(code log code). Binding a breakpoint is a binary search, and
+  the dispatch-time test is one bitset probe in the current proto, cached
+  by proto.
 - **Ids.** A `setBreakpoints` that keeps a line keeps that breakpoint's id.
 - **Breakpoint and pause together.** When a breakpoint and a pause fall
   on the same instruction, they make one stop, reported as the
   breakpoint.
-- **One-line loops.** Binding to the first pc means a breakpoint on a
-  one-line loop (`for i = 1, 3 do f(i) end`) stops once, at the loop's
-  setup, not once per pass as a §5.3 line visit would.
+- **A stop per line visit, not per line's first pc.** This changes the
+  binding rule above (Bart, 2026-11-11), so that a breakpoint on a
+  one-line loop (`for i = 1, 3 do f(i) end`) stops on every pass. A
+  breakpoint binds to every pc of its line, and stops where a §5.3 line
+  visit begins (`session.LineVisits`). The test compares the activation
+  (`CallFrame.call_seq` and proto) and pc of the previous prologue the
+  check saw: a new visit is a change of line, or a pc at or before the
+  previous one (a back-edge). When the activation differs (entry, a
+  call returning, a coroutine resuming after its yield), the
+  instruction before this pc is taken as its predecessor. The tracker
+  resets whenever every flag clears, since after that the check stops
+  observing prologues. Stepping (§5.3) uses the same tracker.
 
 ### 5.3 Stepping
 

@@ -222,3 +222,51 @@ test "doc 86 P2: a breakpoint and a pause on the same instruction make one stop,
     try testing.expectEqual(session_mod.Reason.breakpoint, script.seen.items[0].reason);
     try testing.expectEqual(session_mod.Reason.ended, script.seen.items[1].reason);
 }
+
+/// Run `source` with breakpoints on `lines` of the main chunk, and return
+/// the breakpoint stops' lines in `buf`.
+fn hitLines(source: [:0]const u8, lines: []const u32, buf: []u32) ![]u32 {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var prog = try Program.init(gpa, &vm, source);
+    defer prog.deinit();
+    var script: Script = .{ .gpa = gpa, .decide = &testutil.alwaysContinue };
+    defer script.deinit();
+    var s: Session = undefined;
+    s.attach(gpa, &vm, script.driver(), .{});
+    defer s.detach();
+    var out: [8]Breakpoint = undefined;
+    _ = try setLines(&s, "main", lines, &out);
+    _ = try s.run(prog.chunk.proto);
+    const got = script.breakpointLines(buf);
+    return got;
+}
+
+test "doc 86 P2: a breakpoint on a one-line loop stops on every pass" {
+    var buf: [16]u32 = undefined;
+    const got = try hitLines("local s = 0\nfor i = 1, 3 do s = s + i end\nreturn s\n", &.{2}, &buf);
+    try testing.expectEqualSlices(u32, &.{ 2, 2, 2 }, got);
+}
+
+test "doc 86 P2: a call returning into its line does not start a new visit" {
+    var buf: [16]u32 = undefined;
+    const got = try hitLines("local function f() return 1 end\nlocal x = f() + f()\nreturn x\n", &.{2}, &buf);
+    try testing.expectEqualSlices(u32, &.{2}, got);
+}
+
+test "doc 86 P2: a coroutine resumed in the middle of a line goes on with that visit" {
+    var buf: [16]u32 = undefined;
+    const source =
+        \\local co = coroutine.wrap(function()
+        \\    for i = 1, 2 do coroutine.yield(i) end
+        \\end)
+        \\co()
+        \\co()
+        \\co()
+    ;
+    // One stop per pass of the loop: the resumes after each yield go on
+    // with the pass the yield was in.
+    const got = try hitLines(source, &.{2}, &buf);
+    try testing.expectEqualSlices(u32, &.{ 2, 2 }, got);
+}

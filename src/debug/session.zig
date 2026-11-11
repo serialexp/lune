@@ -108,6 +108,52 @@ pub const Location = struct {
     }
 };
 
+/// Doc 86 §5.3: where a *line visit* begins. A stoppable pc starts one
+/// when the previous instruction its activation ran was on another line,
+/// or was a back-edge (at or past this pc, as in `for i = 1, 3 do f(i)
+/// end`, where each pass is a new visit). A breakpoint stops at the start
+/// of a visit to its line, and so will a step.
+///
+/// The test sees only the prologues the check runs at, so `reset` must be
+/// called whenever the check stops running at every prologue (all flags
+/// cleared): the next observation then falls back to the static
+/// predecessor, as it does when a call returns into the frame.
+pub const LineVisits = struct {
+    /// The activation (`CallFrame.call_seq`, plus its proto, which a tail
+    /// call replaces in place) and pc of the last prologue observed.
+    last_seq: u64 = 0,
+    last_proto: ?*const Proto = null,
+    last_pc: usize = 0,
+
+    pub fn reset(self: *LineVisits) void {
+        self.last_proto = null;
+    }
+
+    /// Observe the prologue of `pc` in activation `seq`, and say whether
+    /// it starts a visit to its line.
+    pub fn observe(self: *LineVisits, seq: u64, proto: *const Proto, pc: usize) bool {
+        const line = lineOf(proto, pc);
+        const same = self.last_proto == proto and self.last_seq == seq;
+        const fresh = if (line == 0)
+            false
+        else if (same)
+            pc <= self.last_pc or lineOf(proto, self.last_pc) != line
+        else
+            // Entered the frame (pc 0), or came back to it from a call, a
+            // resumed coroutine's yield, or an unobserved stretch: the
+            // instruction before this one is its predecessor.
+            pc == 0 or lineOf(proto, pc - 1) != line;
+        self.last_seq = seq;
+        self.last_proto = proto;
+        self.last_pc = pc;
+        return fresh;
+    }
+
+    fn lineOf(proto: *const Proto, pc: usize) u32 {
+        return if (pc < proto.spans.len) proto.spans[pc].line else 0;
+    }
+};
+
 pub const Session = struct {
     gpa: std.mem.Allocator,
     vm: *Vm,
@@ -125,6 +171,7 @@ pub const Session = struct {
     chunks_seen: usize = 0,
     /// Scratch for the bindings a chunk load changed.
     changed: std.ArrayList(Breakpoint) = .empty,
+    visits: LineVisits = .{},
 
     /// Attach to `vm`, which must be idle and not already debugged. The
     /// session must stay where it is until `detach` (the VM points at it).
@@ -251,11 +298,14 @@ pub const Session = struct {
             f = self.hooks.flags.load(.acquire);
         }
         if (f & Flags.terminate != 0) return Error.DebugTerminated;
+        defer if (self.hooks.flags.load(.acquire) == 0) self.visits.reset();
+        std.debug.assert(vm.depth > 0 and vm.frames[vm.depth - 1].closure.proto == proto);
+        const fresh = self.visits.observe(vm.frames[vm.depth - 1].call_seq, proto, pc);
         if (!stoppable(proto)) return;
         var hits: ?[]const u32 = null;
         if (f & Flags.breakpoints != 0) {
             if (self.chunks_seen != vm.loaded_chunks.items.len) try self.syncChunks();
-            hits = try self.breakpoints.at(proto, pc);
+            if (fresh) hits = try self.breakpoints.at(proto, pc);
         }
         // One stop per prologue: a breakpoint here also answers a pause.
         if (hits != null or f & Flags.pause != 0) {
