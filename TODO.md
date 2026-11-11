@@ -2789,8 +2789,8 @@ not as a per-effect patch. Out of scope for S-C — noted so it isn't lost.
 state, the cursor, both pins, the step and commit counters), the effect log is
 session-owned (`Vm.shareEffectLog`), and the prefix scan is gone.
 
-- [ ] **Two stale comments in `src/interp.zig` after doc 86 P1** (coral-raven;
-      waiting for coral-marten's interp.zig window, 2026-11-11). The
+- [x] **Two stale comments in `src/interp.zig` after doc 86 P1** (coral-raven,
+      fixed 2026-11-11). The
       `host_refs` field doc still says "keyframes do not carry them" (v23 does,
       `HostRoots`). Above `pinSessionConstant`, a four-line doc fragment for
       the removed `alreadyConsumed` ("Has an effect of `kind` already been

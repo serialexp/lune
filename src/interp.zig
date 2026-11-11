@@ -1261,9 +1261,9 @@ pub const Vm = struct {
     /// long as the ref lives. Slots are generational (a freed-and-reused index
     /// bumps `generation`, so a stale ref is a deterministic API error, never a
     /// dangling read); freed slots hold nil so the root walk cannot mark stale
-    /// pointers. Rooted by the collector (`forEachRootHeader`). Host refs are
-    /// host state, not guest-deterministic state, and keyframes do not carry
-    /// them.
+    /// pointers. Rooted by the collector (`forEachRootHeader`). A keyframe
+    /// carries the table, its generations and the free list (doc 86 §6.1,
+    /// `HostRoots`), since they root objects.
     host_refs: std.ArrayList(HostRefSlot) = .empty,
     /// Free slot indices for `host_refs` (LIFO reuse).
     host_ref_free_list: std.ArrayList(u32) = .empty,
@@ -13507,10 +13507,6 @@ fn obtainRandomSeed(self: *Vm) Error!u64 {
     return seed;
 }
 
-/// Has an effect of `kind` already been consumed earlier this session? Used
-/// only on a snapshot-resume: the keyframe carries no "already pinned" flag,
-/// so the first pin after a restore derives it from the re-attached log +
-/// cursor instead of re-consuming an effect that was pinned before the cut.
 /// Pin a once-per-session constant through the record/replay boundary: the
 /// shared mechanism behind `noteUnicodeVersion` and `noteIoErrorMode`. In
 /// `off` it only marks `pinned`; in `record` it logs `want` as `kind`; in
