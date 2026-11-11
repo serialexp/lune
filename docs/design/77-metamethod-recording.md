@@ -2,8 +2,8 @@
 
 Status: designed, reviewed (Codex and Antigravity, 2026-11-01), Q1–Q5
 decided; Phases 0–3 landed (2026-11-11); Phase 4 started (computed-callee
-upvalue reads, §6.6); Phases 4–7 outstanding (doc 68 P2, which Phase 4
-waits on, has landed)
+upvalue reads, §6.6; `__index`/`__newindex` functions, §6.1); the rest of
+Phases 4–7 outstanding (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -139,6 +139,38 @@ land; move whole phases to Done once everything inside them is checked.
     (same-proto closure swap, per-object closures of one proto with mixed
     value types, a cell tier 0 writes between runs);
   - [x] measured (§10.8).
+- [x] **Phase 4, second part — `__index` and `__newindex` functions**
+  (§6.1, 2026-11-11). A miss on `get_index`/`get_field`, or a store to an
+  absent key on `set_index`/`set_field`, whose metamethod is a Lua function
+  records as an inlined call (`recMetaCall` in `trace_recorder.zig`):
+  `guard_absent` on the receiver, the handler loaded from the metatable
+  (`loadMetaField`, the hop's `load_meta`/`href`/`guard_hash`/`hload`),
+  `guard_func` on its proto id, then the callee window seeded with
+  `(t, k)` or `(t, k, v)` and an `InlineFrame` pushed with the handler as
+  its callee. The handler's `ret` lands through `recReturn` (one result, or
+  none for `__newindex`), which is all `finishOp` does for these four
+  instructions, so they need no pending-instruction stage (§6.3).
+  - [x] the key and value go to the handler as the instruction read them:
+    a float key is not narrowed, and a store's value restrictions (no nil,
+    numbers and booleans only) now apply only to a raw store, after the
+    absent-key branch.
+  - [x] a function at the end of a table chain is called; so is one whose
+    `__index` reads through another function `__index` (inline depth 2).
+  - [x] stays with tier 0: a vararg handler (`cross_frame`), a native
+    handler (`has_metatable`; tier 0 calls it in place), a precise
+    recording (`nyi_opcode`, doc 45; an allocating handler asks for one),
+    the reads and stores that do not get a `.finish_op` frame (globals,
+    the raw builtins, the fused `get_index2`/`set_index2`; their frames
+    carry no `frame_proto`).
+  - [x] gated in `src/interp_meta_trace_test.zig`, all ten legs: a function
+    at the end of a chain; a float key; nil, table and string values
+    through `__newindex`; the handler replaced between entries by one of
+    the same proto, another proto, and a chain; a guard inside the handler
+    that exits (the handler runs once per iteration); nested handlers; the
+    tier-0 cases above. A probe at 2M iterations (an `__index` and two
+    `__newindex` calls per iteration, plus a chain ending in a function)
+    runs ~10 cycles per iteration natively against ~10.8k on tier 0, with
+    the metatable loads hoisted.
 
 ### Outstanding
 
@@ -160,7 +192,6 @@ land; move whole phases to Done once everything inside them is checked.
   - [ ] the anchor-window alias for computed callees: a method's cell open
     over the anchor frame (ray's `main`) aborts; doc 53's SSA redirect
     needs an access path a computed callee lacks
-  - [ ] `__index`/`__newindex` functions
   - [ ] arithmetic, `__unm`, bitwise, `__bnot`
   - [ ] `__len`, `__eq`, `__lt`, `__le`, the compare-and-branch forms (§6.4)
   - [ ] `__call` (§6.7)
@@ -447,6 +478,16 @@ tier-0 run. The mirror sees the callee's instructions from the nested
 dispatch at the pushed depth; the callee's `ret` reaches `recReturn`, which
 hands the result to the pending instruction (§6.3). Phase 0 proves this
 against the real dispatcher.
+
+Amendment (2026-11-11, Phase 4): since doc 68 P2 tier 0 runs a Lua handler
+as a `.finish_op` frame in the same dispatch (`pushMetaFrame`), not through
+a nested `callValue`, and only for the instructions `finishesOp` names. A
+recording therefore inlines a handler only where the frame carries the
+instruction's proto (`GetFrame`/`SetFrame.frame_proto`), which also gives
+the callee window (`base + num_registers`, as `bindAndPushClosure`). For
+`get_index`/`get_field`/`set_index`/`set_field`, `finishOp` only stores the
+first result in `R[a]` or drops it, which `recReturn` already does, so
+these record without a pending-instruction stage.
 
 ### 6.2 Table chains
 

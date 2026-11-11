@@ -90,6 +90,15 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       abort. LuaJIT's `lj_record_objcmp` compares references for
       everything without an `__eq`. Not started.
 
+## `v == nil` on a table value stops the recording (noted 2026-11-11)
+
+`if v == nil then` compiles to `jeq_p`; when `v` holds a table (or any
+heap value) at record time, `recCmpBranch` aborts `bad_type`. A loop over
+`local v = xs[i]; if v == nil then … end` with tables in `xs` never
+traces. Found while writing doc 77 Phase 4's `__newindex` tests (the test
+uses `type(v) == "nil"` instead). A heap value never equals a primitive
+constant, so the branch is decided by the value's tag alone.
+
 ## `records_script` runs 1.67x slower with the JIT than on tier 0 (noted 2026-11-11)
 
 `bench/records_script.lua` (doc 85 Phase 4, the board row Bart asked for

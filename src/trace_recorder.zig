@@ -1865,9 +1865,9 @@ pub const RecordingSession = struct {
             // division) — `recArrayGet` narrows it via `keyRefNarrowed` or aborts
             // `.bad_type` for a fractional float, same net abort as before.
             .get_index => if (regs.get(instr.c).isNumber())
-                try self.recArrayGet(instr, regs)
+                try self.recArrayGet(instr, regs, proto)
             else if (isStringKey(regs.get(instr.c)))
-                try self.recHashGet(instr, regs)
+                try self.recHashGet(instr, regs, proto)
             else blk: {
                 self.dbg("bad_type get_index dispatch: isInt={} isFloat={} isNil={} isHeap={} pc={d}", .{ regs.get(instr.c).isInt(), regs.get(instr.c).isFloat(), regs.get(instr.c).isNil(), regs.get(instr.c).isHeap(), self.cur_pc });
                 break :blk self.abort(.bad_type);
@@ -1877,16 +1877,16 @@ pub const RecordingSession = struct {
             // in-bounds in-lane, C1 deopt-replay rule); constant STRING key →
             // hash-field write (doc 11, present-key overwrite only); else abort.
             .set_index => if (regs.get(instr.b).isNumber())
-                try self.recArraySet(instr, regs)
+                try self.recArraySet(instr, regs, proto)
             else if (isStringKey(regs.get(instr.b)))
-                try self.recHashSet(instr, regs)
+                try self.recHashSet(instr, regs, proto)
             else
                 self.abort(.bad_type),
 
             // Doc 66 P2: the constant-key forms are the string-key shapes with
             // the key taken from the proto's constants.
-            .get_field => try self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .konst = proto.constants[instr.c] }, .tab_od = .b, .key_od = .c }),
-            .set_field => try self.hashSetShape(regs, .{ .tab = instr.a, .key = .{ .konst = proto.constants[instr.b] }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c }),
+            .get_field => try self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .konst = proto.constants[instr.c] }, .tab_od = .b, .key_od = .c, .frame_proto = proto }),
+            .set_field => try self.hashSetShape(regs, .{ .tab = instr.a, .key = .{ .konst = proto.constants[instr.b] }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c, .frame_proto = proto }),
 
             // Fused two-level access `a[i][j]` / `a[i][j]=v` (doc 14, Phase 8). We
             // record ONLY when the container is already a flattened grid with an
@@ -2678,6 +2678,13 @@ pub const RecordingSession = struct {
         raw: bool = false,
         /// `__index` table hops taken to reach this table (doc 77 §6.2).
         hops: u8 = 0,
+        /// The proto of the frame the instruction runs in, when a Lua
+        /// function `__index` would get a frame of its own: tier 0's
+        /// `.finish_op` instructions (`get_index`, `get_field`), whose
+        /// handler `recMetaCall` inlines (doc 77 Phase 4). Null for every
+        /// other read (globals, builtins), where tier 0 calls the handler
+        /// in place and a function handler stops the recording.
+        frame_proto: ?*const Proto = null,
     };
 
     /// Doc 77 Q2: the longest `__index`/`__newindex` table chain a recording
@@ -2700,6 +2707,8 @@ pub const RecordingSession = struct {
         raw: bool = false,
         /// `__newindex` table hops taken to reach this table (doc 77 §6.2).
         hops: u8 = 0,
+        /// As `GetFrame.frame_proto`, for `set_index`/`set_field`.
+        frame_proto: ?*const Proto = null,
     };
 
     /// The observed table of a get or set frame.
@@ -2790,11 +2799,22 @@ pub const RecordingSession = struct {
             self.abort(.has_metatable);
             return null;
         }
+        const ref = (try self.loadMetaField(rtab, mt, key_ref, od)) orelse return null;
+        return .{ .ref = ref, .tbl = next };
+    }
+
+    /// The metamethod `rtab`'s metatable (observed `mt`) holds under the
+    /// interned name `key_ref`, which the caller saw present: `load_meta`,
+    /// then the raw constant-key read on it, forwarded through the pending
+    /// stores first (§5.2), as an `hload ty=.heap` the caller pins. Null
+    /// when the recording stopped.
+    fn loadMetaField(self: *RecordingSession, rtab: Ref, mt: *table_mod.Table, key_ref: Ref, od: OperandDesig) !?Ref {
+        const key = self.konstValueOf(key_ref).?;
         const rmt = try self.emit(.{ .op = .load_meta, .a = rtab, .ty = .heap });
         self.stampProv(rmt, .metamethod, od, .neutral);
         switch (try self.forwardHashLoadRef(rmt, key_ref, &mt.header)) {
             .stopped => return null,
-            .hit => |r| return .{ .ref = r, .tbl = next },
+            .hit => |r| return r,
             .miss => {},
         }
         const count: u32 = @intCast(mt.hash.count());
@@ -2804,7 +2824,51 @@ pub const RecordingSession = struct {
         self.stampProv(try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) }), .metamethod, od, .neutral);
         const rload = try self.emit(.{ .op = .hload, .a = ref, .ty = .heap });
         self.stampProv(rload, .metamethod, od, .neutral);
-        return .{ .ref = rload, .tbl = next };
+        return rload;
+    }
+
+    /// Doc 77 Phase 4: the Lua function `name` of `rtab`'s metatable `mt`
+    /// (`__index`/`__newindex`), called as `handler(args...)` for the
+    /// instruction being recorded, which runs in a frame of `frame_proto`.
+    /// Tier 0 gives the handler a `.finish_op` frame (`pushMetaFrame`) on
+    /// the window a call would use, and `finishOp` stores its first result
+    /// in `ret_dest` (`ret_count` 1) or drops it (`ret_count` 0). The
+    /// recording does the same as `recCall` does for a call: the handler is
+    /// loaded from the metatable and pinned by `guard_func` (its proto id),
+    /// the callee window is seeded with `args`, and the frame is pushed with
+    /// the handler as its callee, so its upvalue reads go through it
+    /// (§6.1). Its `ret` lands through `recReturn`. Every guard inside runs
+    /// at inline depth > 0, so it has no snapshot of its own and exits
+    /// coarse (§7): tier 0 re-runs the whole iteration and calls the
+    /// handler once.
+    fn recMetaCall(self: *RecordingSession, frame_proto: *const Proto, rtab: Ref, mt: *table_mod.Table, name: []const u8, args: []const Ref, ret_dest: u16, ret_count: u16, od: OperandDesig) !void {
+        if (self.pending_link_close != null or self.precise) return self.abort(.nyi_opcode);
+        const key_ref = (try self.foldInternedStr(name)) orelse return self.abort(.has_metatable);
+        const handler = mt.get(self.konstValueOf(key_ref).?);
+        std.debug.assert(handler.isHeap() and handler.heapType() == .function);
+        const cp = function.Closure.fromHeader(handler.asHeap()).proto;
+        if (cp.is_vararg) return self.abort(.cross_frame);
+        if (self.inline_depth >= MAX_INLINE_DEPTH) return self.abort(.too_deep);
+        const callee_base_off: u32 = self.base_off + frame_proto.num_registers;
+        if (@as(usize, callee_base_off) + cp.num_registers > self.reg_map.len)
+            return self.abort(.frame_bounds);
+        const href = (try self.loadMetaField(rtab, mt, key_ref, od)) orelse return;
+        self.stampProv(try self.emit(.{ .op = .guard_func, .a = href, .aux = @bitCast(cp.id) }), .callee_identity, od, .neutral);
+        var i: u16 = 0;
+        while (i < cp.num_registers) : (i += 1) {
+            const seed: Ref = if (i < cp.num_params and i < args.len) args[i] else try self.konst(Value.nil());
+            self.defineSlotAbs(callee_base_off + i, seed);
+        }
+        self.frames[self.inline_depth] = .{
+            .base_off = self.base_off,
+            .ret_dest = ret_dest,
+            .ret_count = ret_count,
+            .caller_proto_id = frame_proto.id,
+            .call_pc = self.cur_pc - 1,
+            .callee = href,
+        };
+        self.inline_depth += 1;
+        self.base_off = callee_base_off;
     }
 
     /// The read shape for `f`'s key on the table `f` names: the array
@@ -2856,8 +2920,8 @@ pub const RecordingSession = struct {
     ///   * out-of-bounds at record time → `.bad_type`;
     ///   * `.value`-lane with an element of any other heap type (a coroutine,
     ///     userdata) → `.nyi_opcode`.
-    pub fn recArrayGet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
-        return self.arrayGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c });
+    pub fn recArrayGet(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        return self.arrayGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c, .frame_proto = proto });
     }
 
     pub fn arrayGetShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) RecordError!void {
@@ -3196,8 +3260,8 @@ pub const RecordingSession = struct {
     ///     through a guard, so "no earlier `aload` at all" covers both the data and
     ///     control channels with one obviously-sound rule. nsieve's sieve-clearing
     ///     loop is a pure write of `false` (no `aload`), so the rule costs it nothing.
-    pub fn recArraySet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
-        return self.arraySetShape(regs, .{ .tab = instr.a, .key = .{ .reg = instr.b }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c });
+    pub fn recArraySet(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        return self.arraySetShape(regs, .{ .tab = instr.a, .key = .{ .reg = instr.b }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c, .frame_proto = proto });
     }
 
     pub fn arraySetShape(self: *RecordingSession, regs: RegWindow, f: SetFrame) RecordError!void {
@@ -3214,7 +3278,6 @@ pub const RecordingSession = struct {
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (f.tab_in == null and self.globalsStoreBars(vtab)) return self.abort(.aliased_input); // doc 43 P0b
         const idx = keyIndexOf(vkey) orelse return self.abort(.bad_type);
-        if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         // A metatable (doc 77 §5.3): a store to an absent key could fire
         // `__newindex`, and the append path below stores to exactly such a key
@@ -3227,8 +3290,10 @@ pub const RecordingSession = struct {
         const meta_guarded = tbl.metatable != null and !f.raw;
         const lane = tbl.array.lane;
         // An absent key on a table whose `__newindex` is a table stores into
-        // that table instead (doc 77 §6.2).
+        // that table instead (doc 77 §6.2), and a function one takes the
+        // value as an argument, whatever it is (Phase 4).
         if (meta_guarded and tbl.getInt(idx).isNil()) return self.recordNewindexHop(regs, f, tbl);
+        if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
         if (meta_guarded and lane == .value) return self.abort(.has_metatable);
         if (tbl.isReadonly()) return self.abort(.readonly_table);
         const table_aux = GUARD_TABLE_WRITABLE | metaAux(tbl);
@@ -3699,7 +3764,10 @@ pub const RecordingSession = struct {
         // Doc 77 §5.3: a raw miss on a table with a metatable reads nil only
         // while that metatable has no `__index`; `rawget` never asks. An
         // `__index` table repeats the read on it (§6.2), as `indexResolve`
-        // does; a function `__index` is Phase 4 (`guardNoMetamethod` aborts).
+        // does. A Lua function `__index` is called as `handler(t, k)` with the
+        // key as the instruction read it (not narrowed: tier 0 passes the
+        // register), when the instruction gives it a frame (Phase 4); any
+        // other present `__index` stops the recording (`guardNoMetamethod`).
         if (tbl.metatable) |mt| if (!f.raw) {
             if (try self.metamethodIsTable(mt, "__index")) {
                 const next = (try self.metaTableHop(rtab, mt, "__index", f.hops, f.tab_od)) orelse return;
@@ -3709,6 +3777,10 @@ pub const RecordingSession = struct {
                 nf.hops = f.hops + 1;
                 return self.getShape(regs, nf);
             }
+            if (f.frame_proto) |fp| if (try self.metamethodIsClosure(mt, "__index")) {
+                const args = [_]Ref{ rtab, try self.operandRef(f.key) };
+                return self.recMetaCall(fp, rtab, mt, "__index", &args, f.dst, 1, f.tab_od);
+            };
             if (!try self.guardNoMetamethod(rtab, mt, "__index", f.tab_od, f.dst)) return;
         };
         self.setReg(f.dst, try self.konst(Value.nil()));
@@ -3718,9 +3790,21 @@ pub const RecordingSession = struct {
     /// §6.2). False when the name is not interned (`guardNoMetamethod`
     /// then aborts) or the field is absent or not a table.
     fn metamethodIsTable(self: *RecordingSession, mt: *const table_mod.Table, name: []const u8) !bool {
-        const key_ref = (try self.foldInternedStr(name)) orelse return false;
-        const v = mt.get(self.konstValueOf(key_ref).?);
+        const v = try self.metamethodValue(mt, name);
         return v.isHeap() and v.heapType() == .table;
+    }
+
+    /// Whether `mt`'s `name` field is a Lua function, which tier 0 calls in
+    /// a frame of its own (`metaCall`); a native is called in place.
+    fn metamethodIsClosure(self: *RecordingSession, mt: *const table_mod.Table, name: []const u8) !bool {
+        const v = try self.metamethodValue(mt, name);
+        return v.isHeap() and v.heapType() == .function;
+    }
+
+    /// `mt`'s raw `name` field; nil when the name is not interned.
+    fn metamethodValue(self: *RecordingSession, mt: *const table_mod.Table, name: []const u8) !Value {
+        const key_ref = (try self.foldInternedStr(name)) orelse return Value.nil();
+        return mt.get(self.konstValueOf(key_ref).?);
     }
 
     /// Doc 77 §6.2: a store to an absent key of `tbl` (a table with a
@@ -3728,12 +3812,17 @@ pub const RecordingSession = struct {
     /// on that table (`newindexResolve`): `guard_absent` on this one, the
     /// hop, then the store shape on the next table, whose own rules apply
     /// (a present key overwrites; an absent one hops again or aborts as an
-    /// insert). Anything else aborts: an insert with no `__newindex` is
-    /// deferred hash insertion, a function `__newindex` is Phase 4. This
-    /// table is only read, so its frozenness does not matter, as in tier 0.
+    /// insert). A Lua function `__newindex` is called as `handler(t, k, v)`
+    /// when the instruction gives it a frame (Phase 4, `recMetaCall`), with
+    /// the key and value as the instruction read them. Anything else
+    /// aborts: an insert with no `__newindex` is deferred hash insertion.
+    /// This table is only read, so its frozenness does not matter, as in
+    /// tier 0.
     fn recordNewindexHop(self: *RecordingSession, regs: RegWindow, f: SetFrame, tbl: *const table_mod.Table) RecordError!void {
         const mt = tbl.metatable.?;
-        if (!try self.metamethodIsTable(mt, "__newindex")) return self.abort(.has_metatable);
+        const hop = try self.metamethodIsTable(mt, "__newindex");
+        if (!hop and !(f.frame_proto != null and try self.metamethodIsClosure(mt, "__newindex")))
+            return self.abort(.has_metatable);
         const vkey = operandValue(regs, f.key);
         const vtab = frameTabValue(regs, f.tab, f.tab_in);
         const rtab = try self.frameTabRef(f.tab, f.tab_in);
@@ -3756,6 +3845,10 @@ pub const RecordingSession = struct {
         }
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = GUARD_TABLE_ANY_META }), .container_type, f.tab_od, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_absent, .a = rtab, .b = rkey }), .present, .none, .neutral);
+        if (!hop) {
+            const args = [_]Ref{ rtab, try self.operandRef(f.key), try self.refOf(f.val) };
+            return self.recMetaCall(f.frame_proto.?, rtab, mt, "__newindex", &args, 0, 0, f.tab_od);
+        }
         const next = (try self.metaTableHop(rtab, mt, "__newindex", f.hops, f.tab_od)) orelse return;
         var nf = f;
         nf.tab_in = .{ .ref = next.ref, .value = Value.heap(&next.tbl.header) };
@@ -3764,8 +3857,8 @@ pub const RecordingSession = struct {
         return self.setShape(regs, nf);
     }
 
-    pub fn recHashGet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
-        return self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c });
+    pub fn recHashGet(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        return self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c, .frame_proto = proto });
     }
 
     pub fn hashGetShape(self: *RecordingSession, regs: RegWindow, f: GetFrame) RecordError!void {
@@ -3908,8 +4001,8 @@ pub const RecordingSession = struct {
     ///     present key never consults the metatable (doc 77 §5.3);
     ///   * computed (non-`konst`) key → `.bad_type`;
     ///   * recorder allocation failure → `.alloc` (ordinary recording abort).
-    pub fn recHashSet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
-        return self.hashSetShape(regs, .{ .tab = instr.a, .key = .{ .reg = instr.b }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c });
+    pub fn recHashSet(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        return self.hashSetShape(regs, .{ .tab = instr.a, .key = .{ .reg = instr.b }, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c, .frame_proto = proto });
     }
 
     /// Doc 43 §3.2 (P0b): record that a store targets `vtab`; if that is the
@@ -3933,6 +4026,16 @@ pub const RecordingSession = struct {
         // A `set_global` (`tab_in`) checks its own key against the seeds
         // (`recSetGlobal`); a store through a `_G` handle keeps the coarse rule.
         if (f.tab_in == null and self.globalsStoreBars(vtab)) return self.abort(.aliased_input);
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        // A metatable (doc 77 §5.3): an overwrite of a present key never
+        // consults `__newindex`, and `guard_hash` exits if the key has gone,
+        // so the store records under ANY_META. An absent key with a
+        // `__newindex` is a hop or a call (§6.2, Phase 4), which takes the
+        // value whatever it is; any other absent key is an insert.
+        if (tbl.fieldPtr(vkey) == null) {
+            if (tbl.metatable != null and !f.raw) return self.recordNewindexHop(regs, f, tbl);
+            return self.abort(.bad_type); // absent = insert
+        }
         if (vval.isNil()) return self.abort(.bad_type); // delete — out of scope
         // Value restriction, the store mirror of `hashGetShape`'s read rule:
         // int/float (runtime-pinned by the `guardNum` below) and bool (statically
@@ -3941,15 +4044,6 @@ pub const RecordingSession = struct {
         // (`obj.done = true`, `p.alive = q.alive`); reference fields
         // (`obj.next = node`) stay tier-0 pending P2/P3.
         if (!(vval.isInt() or vval.isFloat() or vval.isBool())) return self.abort(.nyi_opcode);
-        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
-        // A metatable (doc 77 §5.3): an overwrite of a present key never
-        // consults `__newindex`, and `guard_hash` exits if the key has gone,
-        // so the store records under ANY_META. An absent key with a table
-        // `__newindex` is a hop (§6.2); any other absent key is an insert.
-        if (tbl.fieldPtr(vkey) == null) {
-            if (tbl.metatable != null and !f.raw) return self.recordNewindexHop(regs, f, tbl);
-            return self.abort(.bad_type); // absent = insert
-        }
         if (tbl.isReadonly()) return self.abort(.readonly_table);
         const rkey = try self.operandRef(f.key);
         if (self.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);

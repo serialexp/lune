@@ -370,15 +370,30 @@ test "doc 77 §6.2: a store into the __index table inside the loop is seen by th
     , "20100\t200\tnil\n", .{ .inspect = expectMetaMissTraceRan });
 }
 
-test "doc 77 §6.2: a function __index at the end of a table chain stops the recording, tier 0 calls it" {
-    try expectProgram(
-        \\local calls = 0
-        \\local Top = setmetatable({}, { __index = function(_, k) calls = calls + 1; return 4 end })
+/// A function metamethod was inlined: the loop's trace loads it from the
+/// metatable (`load_meta`), pins it (`guard_func`) and ran.
+fn expectMetaCallRan(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    try testing.expect(countOps(vm, .load_meta) > 0);
+    try testing.expect(countOps(vm, .guard_func) > 0);
+    if (executed(mode)) try testing.expect(vm.trace.entries > 0);
+}
+
+test "doc 77 Phase 4: a function __index at the end of a table chain is called on the trace" {
+    // The handler's state lives in a closed cell (`counter`); a cell open
+    // over the anchor's own window still stops the recording (§6.6).
+    try expectProgramTuned(
+        \\local function counter()
+        \\  local c = { n = 0 }
+        \\  return c, function(_, k) c.n = c.n + 1; return 4 end
+        \\end
+        \\local c, h = counter()
+        \\local Top = setmetatable({}, { __index = h })
         \\local o = setmetatable({}, { __index = Top })
         \\local s = 0
         \\for i = 1, 100 do s = s + o.z end
-        \\print(s, calls)
-    , "400\t100\n");
+        \\print(s, c.n)
+    , "400\t100\n", .{ .inspect = expectMetaCallRan });
 }
 
 /// A chain of `n` tables, each the `__index` of the one before, the last
@@ -762,4 +777,132 @@ test "doc 77 §6.6: table, string and native upvalues of a method, across collec
         \\cfg.scale = 10
         \\print(a, run(o, 300))
     , "4092\t13692\n", .{ .inspect = expectUvloadHoisted });
+}
+
+// ---- Phase 4: function `__index` and `__newindex` (doc 77 §6.1) ----
+
+test "doc 77 Phase 4: a function __index gets the key as the instruction read it" {
+    // `a[i / 1]` passes a float key; tier 0 does not narrow it for the call.
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local mtype = math.type
+        \\  return { __index = function(t, k) if mtype(k) == "float" then return 1 end return 2 end }
+        \\end
+        \\local a = setmetatable({}, mk())
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  s = s + a[i] + a[i / 1] + a["x"]
+        \\end
+        \\print(s)
+    , "1000\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 Phase 4: a function __newindex takes any value, nil and tables included, and stores nothing" {
+    try expectProgramTuned(
+        \\local function sink()
+        \\  local seen = { tables = 0, nils = 0, strs = 0 }
+        \\  return seen, function(t, k, v)
+        \\    local ty = type(v)
+        \\    if ty == "nil" then seen.nils = seen.nils + 1
+        \\    elseif ty == "table" then seen.tables = seen.tables + 1
+        \\    else seen.strs = seen.strs + 1 end
+        \\  end
+        \\end
+        \\local seen, h = sink()
+        \\local o = setmetatable({}, { __newindex = h })
+        \\local arr = setmetatable({}, { __newindex = h })
+        \\local box = {}
+        \\for i = 1, 200 do
+        \\  o.k = box
+        \\  o.k = nil
+        \\  arr[i] = "s"
+        \\end
+        \\print(seen.tables, seen.nils, seen.strs, rawget(o, "k"), #arr)
+    , "200\t200\t200\tnil\t0\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 Phase 4: replacing the __index function between entries, by one of the same or another proto, or a table" {
+    // `scaled(2)` and `scaled(3)` share a proto: `guard_func` passes and the
+    // factor is read through the new closure (§6.6). Another proto fails
+    // the guard; a table chain ending in a function takes the hop first.
+    try expectProgramTuned(
+        \\local function scaled(f)
+        \\  return function(_, k) return k * f end
+        \\end
+        \\local mt = { __index = scaled(2) }
+        \\local o = setmetatable({}, mt)
+        \\local function run()
+        \\  local s = 0
+        \\  for i = 1, 100 do s = s + o[i] end
+        \\  return s
+        \\end
+        \\local r1 = run()
+        \\mt.__index = scaled(3)
+        \\local r2 = run()
+        \\mt.__index = function(_, k) return -k end
+        \\local r3 = run()
+        \\mt.__index = setmetatable({ [1] = 1000 }, { __index = scaled(1) })
+        \\local r4 = run()
+        \\print(r1, r2, r3, r4)
+    , "10100\t15150\t-5050\t6049\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 §7: an exit inside a function __index runs the handler once per iteration" {
+    // The branch in the handler turns at k = 151: its guard exits coarse,
+    // tier 0 re-runs the iteration, and the count stays one per read.
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, function(_, k)
+        \\    c.n = c.n + 1
+        \\    if k > 150 then return 10 end
+        \\    return 1
+        \\  end
+        \\end
+        \\local c, h = mk()
+        \\local o = setmetatable({}, { __index = h })
+        \\local s = 0
+        \\for i = 1, 300 do s = s + o[i] end
+        \\print(s, c.n)
+    , "1650\t300\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 Phase 4: a function __index that reads through another function __index" {
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local inner = setmetatable({}, { __index = function(_, k) return k + 1 end })
+        \\  return setmetatable({}, { __index = function(_, k) return inner[k] * 2 end })
+        \\end
+        \\local outer = mk()
+        \\local s = 0
+        \\for i = 1, 200 do s = s + outer[i] end
+        \\print(s)
+    , "40600\n", .{ .inspect = expectMetaCallRan });
+}
+
+test "doc 77 Phase 4: a vararg or native __index, and a handler that allocates, stay with tier 0" {
+    // A vararg handler's extra arguments are not modelled (`cross_frame`);
+    // a native is called in place by tier 0; an allocating handler needs a
+    // precise recording, which inlines nothing (doc 45).
+    try expectProgram(
+        \\local va = setmetatable({}, { __index = function(...) return select("#", ...) end })
+        \\local nat = setmetatable({ q = 5 }, { __index = rawget })
+        \\local s = 0
+        \\for i = 1, 200 do s = s + va[i] + (nat[i] or 1) end
+        \\print(s)
+    , "600\n");
+    try expectProgram(
+        \\local function mk()
+        \\  local made = { n = 0 }
+        \\  return made, function(_, k) made.n = made.n + 1; return { k, k + 1 } end
+        \\end
+        \\local made, h = mk()
+        \\local o = setmetatable({}, { __index = h })
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  local p = o[i]
+        \\  s = s + p[1] + p[2]
+        \\end
+        \\print(s, made.n)
+    , "90600\t300\n");
 }
