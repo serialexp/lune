@@ -13029,9 +13029,8 @@ pub inline fn fastResult(vm: *const Vm, fast: function.FastBuiltin, regs: RegWin
             var best = x;
             var i: usize = 1;
             while (i < nargs) : (i += 1) {
-                const v = regs.get(first + i);
-                if (!v.isNumber()) return null;
-                best = stdmath.pickExtremum(which == .max, best, v);
+                // Null for a mixed pair too: the native orders it exactly.
+                best = stdmath.pickExtremumSameType(which == .max, best, regs.get(first + i)) orelse return null;
             }
             return best;
         },

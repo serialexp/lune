@@ -108,8 +108,27 @@ pub inline fn sqrtOf(x: Value) Value {
 
 /// One step of `math.max`/`math.min`'s scan: `v` replaces `best` only when it
 /// is strictly beyond it, so ties keep the earlier argument (and its subtype).
+/// The order is the `<` operator's: exact for two integers and across the
+/// int/float boundary (integers past 2^53 do not all have their own `f64`),
+/// and false whenever a NaN is involved, so a NaN never replaces `best` and is
+/// never replaced.
 pub inline fn pickExtremum(comptime max: bool, best: Value, v: Value) Value {
-    const beyond = if (max) v.toFloat() > best.toFloat() else v.toFloat() < best.toFloat();
+    if (pickExtremumSameType(max, best, v)) |r| return r;
+    const beyond = value.compareNumeric(v, best) == (if (max) value.NumOrder.gt else value.NumOrder.lt);
+    return if (beyond) v else best;
+}
+
+/// `pickExtremum` for two integers or two floats, which is one compare; null
+/// for a mixed pair (and for a `v` that is no number). The tier-0 fast path
+/// takes only this much, so it stays free of calls: a mixed pair needs the
+/// exact cross-type order, and that is the native's.
+pub inline fn pickExtremumSameType(comptime max: bool, best: Value, v: Value) ?Value {
+    const beyond = if (v.isInt() and best.isInt())
+        (if (max) v.asInt() > best.asInt() else v.asInt() < best.asInt())
+    else if (v.isFloat() and best.isFloat())
+        (if (max) v.asFloat() > best.asFloat() else v.asFloat() < best.asFloat())
+    else
+        return null;
     return if (beyond) v else best;
 }
 

@@ -156,6 +156,26 @@ test "fast functions: argument and result counts around the fast path" {
     );
 }
 
+test "math.max and math.min order integers exactly, alone and against a float" {
+    // 2^53 and 2^53 + 1 share one f64, so a comparison through floats ties.
+    try testutil.expectProgram(
+        \\local a, b = 9007199254740992, 9007199254740993
+        \\print(math.max(a, b), math.max(b, a), math.min(a, b), math.min(b, a))
+        \\print(math.max(a + 0.0, b) == b, math.min(b, a + 0.0) == a, math.max(b, a + 0.0) == b)
+        \\print(math.max(math.maxinteger - 1, math.maxinteger), math.min(math.mininteger + 1, math.mininteger))
+        \\local nan = 0 / 0
+        \\print(math.max(nan, 1) ~= math.max(nan, 1), math.max(1, nan), math.min(1, nan))
+        \\print(math.max(table.unpack({ a, b, a })), math.min(table.unpack({ b, a, b })))
+        \\
+    ,
+        "9007199254740993\t9007199254740993\t9007199254740992\t9007199254740992\n" ++
+            "true\ttrue\ttrue\n" ++
+            "9223372036854775807\t-9223372036854775808\n" ++
+            "true\t1\t1\n" ++
+            "9007199254740993\t9007199254740992\n",
+    );
+}
+
 test "fast functions: math.type names the subtype, and its error shape falls back" {
     try testutil.expectProgram(
         \\print(math.type(1), math.type(-0.0), math.type("1"), math.type(nil))
