@@ -317,6 +317,26 @@ land; move whole phases to Done once everything inside them is checked.
     the first handler ran (each call counted once), and a first handler
     answering with a number, so tier 0 raises.
   - [x] measured (§10.13).
+- [x] **Phase 4, eighth part — the per-route exit contract, tested** (§7,
+  2026-11-12). "doc 77 §7: exits by route …" in
+  `src/interp_meta_trace_test.zig` runs one loop through a function
+  `__index`, `__newindex`, `__add`, `__unm`, `__len`, `__lt` (a branch),
+  `__call` and a fused read's first-lookup handler. Each handler counts its
+  calls, and each has a branch, a result or a row element that turns
+  mid-run. `exitRoutes` reads every committed trace's exit provenance:
+  - [x] route 1: a guard at inline depth > 0 is not attachable, has no
+    resume pc, names no anchor source pc (sibling handoff and the bridge
+    classifiers go through `anchorSourcePc`) and is no bridge candidate.
+  - [x] route 2: a depth-0 guard of an instruction placed after that
+    instruction's inlined handler is not attachable (`no_snapshot`: it has
+    no boundary of its own), except a compare-and-branch's branch, which
+    attaches at a successor and never at the instruction.
+  - [x] route 3: a later instruction's guard (`if i == 280`) attaches.
+  - [x] every handler's count is the iteration count in all eight modes,
+    so no exit ran a handler twice.
+  - [x] the test catches a violation: a boundary opened at the instruction
+    inside `finishIndex2Mid` made a second-lookup guard attachable, and the
+    test failed (checked by hand, then removed).
 
 ### Outstanding
 
@@ -334,12 +354,12 @@ land; move whole phases to Done once everything inside them is checked.
     the fused read's handler stage landed as a frame finish (seventh part,
     §6.3 second amendment); the fused store (`set_index2`, which first
     needs a plain store to record, doc 14) and `__close` (Phase 5) remain
-  - [ ] the per-route exit contract (§7), with its exclusions tested
   - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
     of a cell with an alias class, through a computed callee still abort
     `.cross_frame`
 - [ ] **Phase 5 — `__close`** (§8): doc 76's Phase 3b, with the
-  "closes done, return only" completion.
+  "closes done, return only" completion, and §7's route 4 added to the
+  exit-contract test.
 - [ ] **Phase 6 — doc amendments** (§9.3): doc 61 §2 and F3, the
   `nativegen.zig` prologue argument, doc 10's non-goal, doc 68 §4.6, doc 23,
   TODO.md's `guard_no_metatable` entry.
@@ -836,6 +856,14 @@ exit commits them and the handler does not run again. Without the boundary
 the guard exited coarse and never healed: a handler whose answer turned
 left 99.5% of the iterations on tier 0, against 0.1% with it. The result's
 type guards (`truthRef`) stay coarse.
+
+Amendment (2026-11-12, Phase 4 eighth part): route 2 needs no explicit
+marking after all. A guard emitted after a handler returns, with no boundary
+of its own, has no exit snapshot, and the attach classifier refuses it
+(`no_snapshot`). The guards of a fused read's second lookup are coarse this
+way. So the contract holds while every depth-0 boundary a handler's return
+opens is at a successor of the instruction, as the compare-and-branch's is.
+The §7 test checks the result on each trace's exits.
 
 ## 8. `__close` (doc 76 Phase 3b)
 

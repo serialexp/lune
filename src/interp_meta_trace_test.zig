@@ -1165,6 +1165,145 @@ test "doc 77 §7: a compare handler whose answer turns runs once per iteration, 
     , "1659\t300\n", .{ .inspect = expectCompareBranchAttachable });
 }
 
+/// What `expectExitContract` saw: guards inside a handler (route 1), guards
+/// of an instruction after its handler returned (route 2), and attachable
+/// exits after a handler at a later instruction (route 3).
+const ExitRoutes = struct { inlined: usize = 0, mid: usize = 0, later_attachable: usize = 0 };
+
+/// Doc 77 §7, read off each committed trace's exit provenance. Route 1: a
+/// guard at inline depth > 0 is coarse; it attaches nowhere, names no
+/// anchor source pc (which sibling handoff and the bridge classifiers go
+/// through) and is no bridge candidate. Route 2: a depth-0 guard of an
+/// instruction whose handler was inlined, placed after that handler, is
+/// coarse too, except a compare-and-branch's branch, which attaches at a
+/// successor and never at the instruction (§7 amendment). Route 3: a guard
+/// of a later instruction attaches as any guard does.
+fn exitRoutes(vm: *Vm) !ExitRoutes {
+    var seen: ExitRoutes = .{};
+    for (vm.trace.registry.cache.items) |t| {
+        const c = &t.code;
+        const proto = c.anchor.proto;
+        var body: usize = 0;
+        for (c.instrs, 0..) |ins, i| if (ins.op == .preheader) {
+            body = i;
+            break;
+        };
+        // The first body index of an inlined handler, by its call pc in
+        // the anchor frame.
+        const first = try testing.allocator.alloc(?usize, proto.code.len);
+        defer testing.allocator.free(first);
+        @memset(first, null);
+        var last_call: usize = 0;
+        for (c.exit_prov) |e| {
+            const gp = switch (e.prov) {
+                .guard => |g| g,
+                .link_terminal => continue,
+            };
+            if (gp.inline_depth == 0) continue;
+            try testing.expect(!c.exitAttachable(e.index));
+            try testing.expect(c.exitResumePc(e.index) == null);
+            try testing.expect(c.anchorSourcePc(e.index) == null);
+            try testing.expect(!c.isBridgeCandidate(e.index));
+            seen.inlined += 1;
+            const edge = gp.path[0];
+            if (edge.caller_proto_id != proto.id or e.index < body or edge.call_pc >= first.len) continue;
+            if (first[edge.call_pc] == null) first[edge.call_pc] = e.index;
+            last_call = @max(last_call, e.index);
+        }
+        for (c.exit_prov) |e| {
+            const gp = switch (e.prov) {
+                .guard => |g| g,
+                .link_terminal => continue,
+            };
+            if (gp.inline_depth != 0 or gp.source_proto_id != proto.id or gp.source_pc >= first.len) continue;
+            if (first[gp.source_pc]) |f| if (e.index > f) {
+                seen.mid += 1;
+                if (gp.role == .branch_cond) {
+                    if (c.exitResumePc(e.index)) |rp| try testing.expect(rp != gp.source_pc);
+                } else try testing.expect(!c.exitAttachable(e.index));
+                continue;
+            };
+            if (last_call != 0 and e.index > last_call and c.exitAttachable(e.index)) seen.later_attachable += 1;
+        }
+    }
+    return seen;
+}
+
+fn expectExitContract(vm: *Vm, mode: TraceMode) anyerror!void {
+    try expectMetaCallRan(vm, mode);
+    if (!recorded(mode)) return;
+    const seen = try exitRoutes(vm);
+    try testing.expect(seen.inlined > 0);
+    try testing.expect(seen.mid > 0);
+    if (mode != .record_only) try testing.expect(seen.later_attachable > 0);
+}
+
+test "doc 77 §7: exits by route, with every handler kind exiting once its answer turns" {
+    // Each handler counts its calls and has a branch, a result type or a
+    // row element that turns mid-run: a guard inside the handler fails
+    // (route 1), or one of its instruction after it returned (route 2:
+    // the sum's type, the fused read's second lookup). Each count is the
+    // iteration count, so no exit called a handler twice. `i == 280` is a
+    // later instruction's branch, which attaches (route 3).
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { idx = 0, new = 0, add = 0, unm = 0, len = 0, lt = 0, call = 0, row = 0 }
+        \\  local M = {}
+        \\  M.__index = function(t, k)
+        \\    c.idx = c.idx + 1
+        \\    if t.n > 200 then return 2 end
+        \\    return 1
+        \\  end
+        \\  M.__newindex = function(t, k, v)
+        \\    c.new = c.new + 1
+        \\    if v > 220 then rawset(t, "n", v) end
+        \\  end
+        \\  M.__add = function(a, b)
+        \\    c.add = c.add + 1
+        \\    if a.n > 230 then return 0.5 end
+        \\    return a.n + b
+        \\  end
+        \\  M.__unm = function(a)
+        \\    c.unm = c.unm + 1
+        \\    return a.n > 240 and 1 or -1
+        \\  end
+        \\  M.__len = function(a)
+        \\    c.len = c.len + 1
+        \\    return a.n > 250 and 7 or 3
+        \\  end
+        \\  M.__lt = function(a, b)
+        \\    c.lt = c.lt + 1
+        \\    return a.n < b
+        \\  end
+        \\  M.__call = function(self, x)
+        \\    c.call = c.call + 1
+        \\    if x > 260 then return 4 end
+        \\    return 2
+        \\  end
+        \\  local rows = {}
+        \\  for i = 1, 300 do rows[i] = { i, i * 2 } end
+        \\  rows[270] = { 270, 0.5 }
+        \\  local F = setmetatable({}, { __index = function(_, k)
+        \\    c.row = c.row + 1
+        \\    return rows[k]
+        \\  end })
+        \\  return c, M, F
+        \\end
+        \\local c, M, F = mk()
+        \\local o = setmetatable({ n = 0 }, M)
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  rawset(o, "n", i)
+        \\  s = s + o.x
+        \\  o.y = i
+        \\  s = s + (o + 1) + -o + #o + o(i) + F[i][2]
+        \\  if o < 150 then s = s + 1 else s = s + 2 end
+        \\  if i == 280 then s = s + 0.25 end
+        \\end
+        \\print(s, c.idx, c.new, c.add, c.unm, c.len, c.lt, c.call, c.row)
+    , "119041.75\t300\t300\t300\t300\t300\t300\t300\t300\n", .{ .inspect = expectExitContract });
+}
+
 test "doc 77 Phase 4: __eq is asked only for two distinct tables, the first operand's handler first" {
     // `run(p, p)` and `run(r, r)` never call; `run(r, p)` calls `p`'s
     // handler (`r`'s metatable has none) until `F.__eq` appears; removing
