@@ -1453,3 +1453,68 @@ test "B-2b: a seeded child needing another episode defers WITHOUT latching the d
     try testing.expect(!state.provenance_arms_pending);
     try testing.expect(!state.provenance_arms_episode_pending);
 }
+
+test "settlement: each deferred state ends the idle settlement, and the settlement then drains it" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const phys = &state.registry.native_physical;
+    var empty: TraceState.NativeCallProvenance = undefined;
+    empty.len = 0;
+
+    // At rest a settlement with nothing captured is idle, and changes nothing.
+    try testing.expect(state.settlementHeadIdle());
+    state.settleNativeCallProvenance(&empty, true);
+    try testing.expect(state.settlementHeadIdle());
+    try testing.expectEqual(@as(u64, 0), state.region_rebuilds);
+
+    // `applyPendingDisarms` syncs the registry's debug flag.
+    state.config.debug_log = true;
+    try testing.expect(!state.settlementHeadIdle());
+    state.settleNativeCallProvenance(&empty, true);
+    try testing.expect(phys.debug_log);
+    try testing.expect(state.settlementHeadIdle());
+    state.config.debug_log = false;
+    state.settleNativeCallProvenance(&empty, true);
+    try testing.expect(!phys.debug_log);
+
+    // `syncNativeInvalidation` turns a registry invalidation into a pending
+    // arm pass, and takes a resident demotion notice.
+    phys.provenance_invalidated = true;
+    try testing.expect(!state.settlementHeadIdle());
+    state.settleNativeCallProvenance(&empty, true);
+    try testing.expect(!phys.provenance_invalidated);
+    try testing.expect(state.provenance_arms_pending);
+    state.provenance_arms_pending = false;
+    phys.resident_demotion_notice = @enumFromInt(7);
+    try testing.expect(!state.settlementHeadIdle());
+    state.settleNativeCallProvenance(&empty, true);
+    try testing.expect(phys.resident_demotion_notice == null);
+
+    // `drainBarrier` owns a deferred teardown.
+    phys.pending_teardown = .all;
+    try testing.expect(!state.settlementHeadIdle());
+    state.settleNativeCallProvenance(&empty, true);
+    try testing.expect(phys.pending_teardown == .none);
+
+    // The two walk-deferred requests are consumed (neither names a live
+    // trace here, so each is dropped).
+    state.pending_exit_side_disarm = .{ .trace_id = 99, .exit_instr = 0 };
+    try testing.expect(!state.settlementHeadIdle());
+    state.settleNativeCallProvenance(&empty, true);
+    try testing.expect(state.pending_exit_side_disarm == null);
+    state.pending_bridge_arm = .{ .trace_id = 99, .exit_instr = 0 };
+    try testing.expect(!state.settlementHeadIdle());
+    state.settleNativeCallProvenance(&empty, true);
+    try testing.expect(state.pending_bridge_arm == null);
+    try testing.expect(state.settlementHeadIdle());
+
+    // A deferred region rebuild is not part of the idle predicate: the idle
+    // settlement tests it itself, after the arm drain, as the full one does.
+    try testing.expectEqual(@as(u64, 0), state.region_rebuilds);
+    state.pending_region_rebuild = true;
+    try testing.expect(state.settlementHeadIdle());
+    state.settleNativeCallProvenance(&empty, true);
+    try testing.expect(!state.pending_region_rebuild);
+    try testing.expectEqual(@as(u64, 1), state.region_rebuilds);
+}

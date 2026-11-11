@@ -3073,6 +3073,7 @@ pub const TraceState = struct {
     pub const NativeCallOrigin = trace_chain_mod.NativeCallOrigin;
     pub const captureNativeCallProvenance = trace_chain_mod.captureNativeCallProvenance;
     pub const settleNativeCallProvenance = trace_chain_mod.settleNativeCallProvenance;
+    pub const settlementHeadIdle = trace_chain_mod.settlementHeadIdle;
     pub const replayLedger = trace_chain_mod.replayLedger;
     pub const replayLedgerSuffix = trace_chain_mod.replayLedgerSuffix;
     pub const replayLedgerFrom = trace_chain_mod.replayLedgerFrom;

@@ -1434,7 +1434,12 @@ pub const NativeCallOrigin = enum {
 /// common case that captures nothing. Measured on scimark-lu at this
 /// revision: `memcpyFast` was 4.04% of the run, 3.94% of it reached through
 /// this function. The out-param is the whole fix; the body is unchanged.
-pub fn captureNativeCallProvenance(
+///
+/// Inline, with the ordinary capture's two preconditions tested here
+/// (`captureProvenanceVerdicts` returns 0 without them): a native call in a
+/// program with no provenance edge, or with nothing armed, captures nothing
+/// and makes no call. That is every loop visit from tier 0.
+pub inline fn captureNativeCallProvenance(
     self: *TraceState,
     origin: NativeCallOrigin,
     result: trace_exec.ExecResult,
@@ -1446,6 +1451,8 @@ pub fn captureNativeCallProvenance(
     if (origin != .dispatcher_root) noteExitSideBurstSkip(self, entries);
     captured.len = if (result.silent_active != 0)
         self.captureSilentSuffixProvenance(result, &captured.verdicts)
+    else if (self.provenance_edges.items.len == 0 or self.registry.native_physical.armedLinks().len == 0)
+        0
     else
         self.captureProvenanceVerdicts(entries, 0, &captured.verdicts);
 }
@@ -1468,7 +1475,46 @@ fn noteExitSideBurstSkip(self: *TraceState, entries: []const trace_exec.LedgerEn
     self.exit_side_burst_skips +|= 1;
 }
 
-pub fn settleNativeCallProvenance(
+/// The settlement half of the capture contract above: deferred disarms,
+/// then the captured verdicts, then the arms they allow. Runs exactly once
+/// after every native call's replay, at every origin.
+///
+/// Inline: a settlement with nothing captured and nothing deferred
+/// (`settlementHeadIdle`) runs only the two steps that gate themselves, so
+/// the usual native call settles in a handful of loads.
+pub inline fn settleNativeCallProvenance(
+    self: *TraceState,
+    captured: *const NativeCallProvenance,
+    safe_to_arm: bool,
+) void {
+    if (captured.len != 0 or !self.settlementHeadIdle())
+        return settleNativeCallProvenanceFull(self, captured, safe_to_arm);
+    // Steps 1 to 4 below change nothing. The arm drain gates itself inline;
+    // it can ask for a region rebuild, so that test follows it, as in the
+    // full funnel.
+    self.drainProvenanceArms(safe_to_arm);
+    if (self.pending_region_rebuild) self.drainPendingRegionRebuild();
+}
+
+/// Whether the first four steps of a settlement with nothing captured would
+/// change nothing. One line per step; every test is a load.
+pub inline fn settlementHeadIdle(self: *const TraceState) bool {
+    const phys = &self.registry.native_physical;
+    // `applyPendingDisarms`: its `debug_log` sync, `drainBarrier` (which
+    // also panics inside a replay walk: the full funnel keeps that), and
+    // `syncNativeInvalidation`'s two takes.
+    return phys.debug_log == self.config.debug_log and
+        phys.replay_walk_depth == 0 and
+        phys.pending_demote.items.len == 0 and phys.pending_teardown == .none and
+        !phys.provenance_invalidated and phys.resident_demotion_notice == null and
+        // `drainPendingExitSideDisarm`.
+        self.pending_exit_side_disarm == null and
+        // `drainPendingBridgeArm`. (`applyProvenanceVerdicts` is the
+        // caller's `captured.len == 0`.)
+        self.pending_bridge_arm == null;
+}
+
+noinline fn settleNativeCallProvenanceFull(
     self: *TraceState,
     captured: *const NativeCallProvenance,
     safe_to_arm: bool,
@@ -3460,7 +3506,11 @@ pub fn finishDispatcherDirective(
 /// Direct-dispatch origin adapter. The universal drain remains the only
 /// `silent_active` consumer; this wrapper merely preserves the dispatcher's
 /// established post-replay transaction order and directive integration.
-pub fn driveDispatcherSilentResult(
+///
+/// Inline for the result that never was silent, which is every direct entry
+/// outside a promoted set: it has nothing to drain, and its settlement is
+/// the inline one.
+pub inline fn driveDispatcherSilentResult(
     self: *TraceState,
     seed: *Trace,
     result: trace_exec.ExecResult,
@@ -3468,31 +3518,7 @@ pub fn driveDispatcherSilentResult(
     regs: RegWindow,
     safe_to_arm: bool,
 ) ?ChainResult {
-    var linked_completed: usize = 0;
-    var resume_pc: u32 = seed.code.anchor.pc;
-    var hops: usize = 0;
-    const max_hops: usize = 8;
-    if (result.silent_active != 0 and result.ledger_len != 0) {
-        if (result.ledger_len > trace_exec.LEDGER_CAP)
-            @panic("driveDispatcherSilentResult: suffix ledger exceeds cap");
-        if (result.silent_cum > std.math.maxInt(usize))
-            @panic("driveDispatcherSilentResult: silent cumulative count exceeds usize");
-        self.noteDispatcherLedgerTerminal(
-            self.ledger_scratch[0..result.ledger_len],
-            @intCast(result.silent_cum),
-        );
-    }
-    const directive = self.drainSilentResult(
-        result,
-        .dispatcher_root,
-        proto,
-        &linked_completed,
-        &resume_pc,
-        &hops,
-        max_hops,
-        safe_to_arm,
-        regs,
-    ) orelse {
+    if (result.silent_active == 0) {
         // Multi-row ordinary calls are captured by `driveDispatcherLedger`
         // immediately below the dispatcher. The scalar/short return never
         // enters that adapter, so settle its (normally empty) transaction
@@ -3513,7 +3539,46 @@ pub fn driveDispatcherSilentResult(
             self.settleNativeCallProvenance(&provenance, safe_to_arm);
         }
         return null;
-    };
+    }
+    return driveDispatcherSilentBurst(self, seed, result, proto, regs, safe_to_arm);
+}
+
+/// `driveDispatcherSilentResult` for a result with silence standing.
+noinline fn driveDispatcherSilentBurst(
+    self: *TraceState,
+    seed: *Trace,
+    result: trace_exec.ExecResult,
+    proto: *const Proto,
+    regs: RegWindow,
+    safe_to_arm: bool,
+) ?ChainResult {
+    std.debug.assert(result.silent_active != 0);
+    var linked_completed: usize = 0;
+    var resume_pc: u32 = seed.code.anchor.pc;
+    var hops: usize = 0;
+    const max_hops: usize = 8;
+    if (result.ledger_len != 0) {
+        if (result.ledger_len > trace_exec.LEDGER_CAP)
+            @panic("driveDispatcherSilentResult: suffix ledger exceeds cap");
+        if (result.silent_cum > std.math.maxInt(usize))
+            @panic("driveDispatcherSilentResult: silent cumulative count exceeds usize");
+        self.noteDispatcherLedgerTerminal(
+            self.ledger_scratch[0..result.ledger_len],
+            @intCast(result.silent_cum),
+        );
+    }
+    const directive = self.drainSilentResult(
+        result,
+        .dispatcher_root,
+        proto,
+        &linked_completed,
+        &resume_pc,
+        &hops,
+        max_hops,
+        safe_to_arm,
+        regs,
+        // The drain declines only a result that was never silent.
+    ) orelse unreachable;
     var provenance: NativeCallProvenance = undefined;
     provenance.len = 0;
     self.captureNativeCallProvenance(
