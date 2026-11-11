@@ -2,16 +2,22 @@
 //! nondeterministic inputs a run observed. `record` appends, `replay` reads
 //! front to back, and `effectser` maps it to and from the wire format.
 //!
-//! A result is a `Value` (a scalar, `nil`, or an interned heap string), the
-//! bytes of a `b`-mode read, or the error class of a failed host call. The
-//! bytes live in the log's own buffer, never in a VM byte array: a byte
-//! array is mutable, so the log keeps its own copy and a replay builds a
-//! fresh array from it each time.
+//! A result is a scalar or `nil`, a string's bytes, the bytes of a `b`-mode
+//! read, or the error class of a failed host call. The log holds no heap
+//! value (doc 86 §6.1): every byte lives in the log's own buffer, so one log
+//! outlives the VMs that record and replay it and never roots an object.
+//! A replay turns a string entry back into a value only when it consumes
+//! it, interning it then, as the recording interned it when the host
+//! produced it, so both runs allocate the same objects in the same order.
+//! (Interning a whole log at decode would allocate its strings early.) A
+//! byte array is mutable, so a `b`-mode read keeps its own copy too and a
+//! replay builds a fresh array from it each time.
 
 const std = @import("std");
 const value = @import("value.zig");
 const function = @import("function.zig");
 const system = @import("system.zig");
+const string = @import("string.zig");
 
 const Value = value.Value;
 pub const EffectKind = function.EffectKind;
@@ -20,16 +26,17 @@ pub const EffectKind = function.EffectKind;
 pub const ByteSpan = struct { start: usize, len: usize };
 
 /// One recorded nondeterministic input: the effect that produced it and what
-/// it returned. `result.value` may be a heap **string** (`getenv`,
-/// `file_read`); such results are GC roots while parked in the log (see
-/// `Vm.forEachRootHeader`) and serialize as inline bytes.
+/// it returned.
 pub const Effect = struct {
     kind: EffectKind,
     result: Result,
 
     pub const Result = union(enum) {
-        /// A scalar, `nil`, or an interned heap string.
+        /// A scalar or `nil`, never a heap value.
         value: Value,
+        /// A string result (`getenv`, `file_read`, a text read): its bytes,
+        /// in `EffectLog.bytes`.
+        string: ByteSpan,
         /// A `b`-mode read: the bytes, in `EffectLog.bytes`.
         bytes: ByteSpan,
         /// The host call failed (doc 65 §4.2). The message is rebuilt from
@@ -38,10 +45,22 @@ pub const Effect = struct {
         fail: system.ErrorClass,
     };
 
-    /// The common case: a `Value` result.
+    /// A scalar result. A string goes through `EffectLog.appendValue`.
     pub fn of(kind: EffectKind, v: Value) Effect {
+        std.debug.assert(!v.isHeap());
         return .{ .kind = kind, .result = .{ .value = v } };
     }
+};
+
+/// What a host operation hands the record/replay boundary, and what a replay
+/// hands back: an entry's result with a string as a live heap string of the
+/// VM at hand (`Vm.recordHost`, `Vm.replayHost`).
+pub const HostResult = union(enum) {
+    /// A scalar, `nil`, or a heap string.
+    value: Value,
+    /// A `b`-mode read: the bytes, in `EffectLog.bytes`.
+    bytes: ByteSpan,
+    fail: system.ErrorClass,
 };
 
 /// The log: entries in call order, plus the bytes their `bytes` results
@@ -67,13 +86,30 @@ pub const EffectLog = struct {
     /// Append an entry whose result is `content` as bytes: the content is
     /// copied into the log.
     pub fn appendBytes(self: *EffectLog, gpa: std.mem.Allocator, kind: EffectKind, content: []const u8) std.mem.Allocator.Error!void {
+        return self.appendSpan(gpa, kind, .bytes, content);
+    }
+
+    /// Append an entry whose result is the string `content`, copied into the
+    /// log.
+    pub fn appendString(self: *EffectLog, gpa: std.mem.Allocator, kind: EffectKind, content: []const u8) std.mem.Allocator.Error!void {
+        return self.appendSpan(gpa, kind, .string, content);
+    }
+
+    /// Append a value result: a heap string as its bytes, a scalar as it is.
+    /// No other heap value is ever an effect result.
+    pub fn appendValue(self: *EffectLog, gpa: std.mem.Allocator, kind: EffectKind, v: Value) std.mem.Allocator.Error!void {
+        if (v.isHeap()) return self.appendString(gpa, kind, string.String.fromHeader(v.asHeap()).bytes());
+        return self.append(gpa, Effect.of(kind, v));
+    }
+
+    fn appendSpan(self: *EffectLog, gpa: std.mem.Allocator, kind: EffectKind, comptime tag: std.meta.Tag(Effect.Result), content: []const u8) std.mem.Allocator.Error!void {
         try self.entries.ensureUnusedCapacity(gpa, 1);
         const start = self.bytes.items.len;
         try self.bytes.appendSlice(gpa, content);
-        self.entries.appendAssumeCapacity(.{ .kind = kind, .result = .{ .bytes = .{ .start = start, .len = content.len } } });
+        self.entries.appendAssumeCapacity(.{ .kind = kind, .result = @unionInit(Effect.Result, @tagName(tag), .{ .start = start, .len = content.len }) });
     }
 
-    /// The content of a `bytes` result.
+    /// The content of a `string` or `bytes` result.
     pub fn bytesOf(self: *const EffectLog, span: ByteSpan) []const u8 {
         return self.bytes.items[span.start..][0..span.len];
     }

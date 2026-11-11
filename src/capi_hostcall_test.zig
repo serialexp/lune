@@ -467,7 +467,7 @@ const Pair = struct {
             vm.system = .{ .ctx = &det_ctx, .vtable = &det_vtable };
             vm.effect_mode = mode;
             if (log) |bytes| {
-                try mahina.effectser.decodeInto(&vm.effect_log, vm.gpa, vm.heap, bytes);
+                try mahina.effectser.decodeInto(&vm.effect_log, vm.gpa, bytes);
             }
             if (tier == .tier1) vm.trace.config.native_codegen = false;
             if (tier != .off) {

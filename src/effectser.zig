@@ -10,9 +10,9 @@
 //! never hand-rolls bytes. An effect result is a `schema.EffectResult`: a small
 //! tag space of its own (NOT a `Value.Tag` mirror) carrying scalars, **inline
 //! string bytes** (getenv/file_read), the inline bytes of a `b`-mode read, or a
-//! failed host call's error class (doc 65 §4.2), never a heap ref. A standalone
-//! effect log has no heap graph, so a string result is carried inline
-//! (length-prefixed) and re-interned into the caller's heap on decode.
+//! failed host call's error class (doc 65 §4.2), never a heap ref. Neither the
+//! log nor its wire form holds a heap value, so decoding needs no VM: a string
+//! result stays bytes until a replay consumes it (`effectlog.zig`).
 
 const std = @import("std");
 const value = @import("value.zig");
@@ -72,8 +72,9 @@ pub const DecodeError = error{
     UnsupportedVersion,
     /// `Effect.kind` is not a known `interp.EffectKind` ordinal.
     UnknownEffectKind,
-    /// An effect result was a heap value that isn't a string (a table/closure).
-    /// Effects only ever return scalars or strings, so this is a serializer bug.
+    /// An entry's value result was a heap value. The log keeps a string as
+    /// bytes and no effect returns any other heap value, so this is a bug in
+    /// whatever built the log.
     UnsupportedEffectResult,
     /// A decoded effect's result type doesn't match what its kind can ever produce
     /// (e.g. a `file_read`/`getenv` result that isn't nil-or-string, a `clock`
@@ -147,21 +148,16 @@ fn checkResultShape(kind: EffectKind, result: Effect.Result) DecodeError!void {
             .int, .number, .string_or_nil, .zone, .environ => false,
         },
         .bytes => |span| shape == .read_value or shape == .nil_bytes_or_fail or shape == .environ or shape == .bytes_or_fail or (shape == .zone and span.len >= system.local_zone_fixed_len),
+        .string => shape == .string_or_nil or shape == .string_or_fail or shape == .read_value,
         .value => |v| switch (shape) {
             .int, .int_or_fail => v.tag == .int,
             .number => v.tag == .int or v.tag == .float,
-            .string_or_nil => v.tag == .nil or isString(v),
-            .ok_or_fail, .nil_bytes_or_fail => v.tag == .nil,
-            .string_or_fail => isString(v),
-            .read_value => v.tag == .nil or v.tag == .int or v.tag == .float or isString(v),
-            .zone, .environ, .bytes_or_fail => false,
+            .string_or_nil, .ok_or_fail, .nil_bytes_or_fail => v.tag == .nil,
+            .read_value => v.tag == .nil or v.tag == .int or v.tag == .float,
+            .string_or_fail, .zone, .environ, .bytes_or_fail => false,
         },
     };
     if (!ok) return error.MismatchedEffectResult;
-}
-
-fn isString(v: Value) bool {
-    return v.isHeap() and v.heapType() == .string;
 }
 
 /// The encoded size of one entry with this result: the kind byte, the
@@ -171,12 +167,12 @@ fn isString(v: Value) bool {
 pub fn encodedEntrySize(result: Effect.Result) usize {
     const body: usize = switch (result) {
         .fail => 1,
-        .bytes => |span| 4 + span.len,
+        .bytes, .string => |span| 4 + span.len,
         .value => |v| switch (v.tag) {
             .nil, .boolean => 1,
             .int, .float => 8,
-            .heap_ref => 4 + (if (isString(v)) string.String.fromHeader(v.asHeap()).bytes().len else 0),
-            .row_view => 0,
+            // Never logged (`checkResultShape`); `toWire` refuses them.
+            .heap_ref, .row_view => 0,
         },
     };
     return 1 + 1 + body;
@@ -184,8 +180,7 @@ pub fn encodedEntrySize(result: Effect.Result) usize {
 
 /// Serialize an ordered effect log to bytes (binschema wire format). The result
 /// is owned by the caller (`gpa.free`). String results (`getenv`/`file_read`)
-/// are written inline; the borrowed bytes are valid only while the source VM is
-/// alive (true during encode).
+/// are written inline.
 pub fn encodeFile(gpa: std.mem.Allocator, log: *const EffectLog) ![]u8 {
     return encodePrefix(gpa, log, log.len());
 }
@@ -208,10 +203,9 @@ pub fn encodePrefix(gpa: std.mem.Allocator, log: *const EffectLog, n: usize) ![]
 
 /// Decode an effect log from bytes and append its entries to `log` (`gpa` is
 /// the log's allocator). Validates the version, every effect kind, and every
-/// result against its kind. A string result is re-interned into `heap` (so it
-/// is a live heap string in the VM about to replay it); a `bytes` result is
-/// copied into the log. On an error `log` is left as it was.
-pub fn decodeInto(log: *EffectLog, gpa: std.mem.Allocator, heap: *gc.Heap, bytes: []const u8) DecodeError!void {
+/// result against its kind. A string or `bytes` result is copied into the
+/// log. On an error `log` is left as it was.
+pub fn decodeInto(log: *EffectLog, gpa: std.mem.Allocator, bytes: []const u8) DecodeError!void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit(); // decoded structs consumed here (scalars by value; bytes copied)
     const file = schema.EffectFile.decode(arena.allocator(), bytes) catch return error.Malformed;
@@ -231,12 +225,8 @@ pub fn decodeInto(log: *EffectLog, gpa: std.mem.Allocator, heap: *gc.Heap, bytes
             .ConstBool => |b| .{ .value = Value.boolean(b.v != 0) },
             .ConstInt => |x| .{ .value = Value.int(x.v) },
             .ConstFloat => |x| .{ .value = Value.float(x.v) },
-            .ConstString => |str| .{ .value = try heap.internValue(str.v) },
-            .EffectBytes => |b| blk: {
-                const start = log.bytes.items.len;
-                try log.bytes.appendSlice(gpa, b.v);
-                break :blk .{ .bytes = .{ .start = start, .len = b.v.len } };
-            },
+            .ConstString => |str| .{ .string = try copySpan(log, gpa, str.v) },
+            .EffectBytes => |b| .{ .bytes = try copySpan(log, gpa, b.v) },
             .HostFail => |f| .{ .fail = std.enums.fromInt(system.ErrorClass, f.class) orelse return error.MismatchedEffectResult },
         };
         // Establish the kind→result-type invariant once, here at the trust
@@ -246,25 +236,27 @@ pub fn decodeInto(log: *EffectLog, gpa: std.mem.Allocator, heap: *gc.Heap, bytes
     }
 }
 
-/// Map a result to its wire `EffectResult`: scalars directly, a heap string
-/// and a `bytes` result as inline bytes, a failure as its class. A non-string
-/// heap value can never be an effect result, so it is a serializer-side bug.
+/// Copy `content` into the log's byte buffer; its span there.
+fn copySpan(log: *EffectLog, gpa: std.mem.Allocator, content: []const u8) DecodeError!effectlog.ByteSpan {
+    const start = log.bytes.items.len;
+    try log.bytes.appendSlice(gpa, content);
+    return .{ .start = start, .len = content.len };
+}
+
+/// Map a result to its wire `EffectResult`: scalars directly, a string and a
+/// `bytes` result as inline bytes, a failure as its class. The log holds no
+/// heap value, so one here is a bug in whatever built the log.
 fn toWire(log: *const EffectLog, result: Effect.Result) DecodeError!schema.EffectResult {
     return switch (result) {
         .fail => |class| .{ .tag = 6, .body = .{ .HostFail = .{ .class = @intFromEnum(class) } } },
         .bytes => |span| .{ .tag = 5, .body = .{ .EffectBytes = .{ .v = log.bytesOf(span) } } },
+        .string => |span| .{ .tag = 4, .body = .{ .ConstString = .{ .v = log.bytesOf(span) } } },
         .value => |v| switch (v.tag) {
             .nil => .{ .tag = 0, .body = .{ .ConstNil = .{ .pad = 0 } } },
             .boolean => .{ .tag = 1, .body = .{ .ConstBool = .{ .v = @intFromBool(v.asBool()) } } },
             .int => .{ .tag = 2, .body = .{ .ConstInt = .{ .v = v.asInt() } } },
             .float => .{ .tag = 3, .body = .{ .ConstFloat = .{ .v = v.asFloat() } } },
-            .heap_ref => if (isString(v))
-                .{ .tag = 4, .body = .{ .ConstString = .{ .v = string.String.fromHeader(v.asHeap()).bytes() } } }
-            else
-                error.UnsupportedEffectResult,
-            // A grid row handle is never an effect result; reaching here is a
-            // serializer-side bug.
-            .row_view => error.UnsupportedEffectResult,
+            .heap_ref, .row_view => error.UnsupportedEffectResult,
         },
     };
 }
@@ -283,20 +275,17 @@ fn testLog(effects: []const Effect) !EffectLog {
     return log;
 }
 
-/// Round-trip a log with no string results: encode, decode into a throwaway
-/// heap, compare kind + result. (Strings need the same heap on both sides — see
-/// the dedicated string test.)
+/// Round-trip a log with no string or bytes results: encode, decode, compare
+/// kind + result.
 fn expectLogRoundTrips(effects: []const Effect) !void {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
     var log = try testLog(effects);
     defer log.deinit(gpa);
     const bytes = try encodeFile(gpa, &log);
     defer gpa.free(bytes);
     var back: EffectLog = .{};
     defer back.deinit(gpa);
-    try decodeInto(&back, gpa, &heap, bytes);
+    try decodeInto(&back, gpa, bytes);
     try testing.expectEqual(effects.len, back.len());
     for (effects, back.entries.items) |want, got| {
         try testing.expectEqual(want.kind, got.kind);
@@ -304,7 +293,7 @@ fn expectLogRoundTrips(effects: []const Effect) !void {
         switch (want.result) {
             .value => |v| try testing.expect(v.eql(got.result.value)),
             .fail => |c| try testing.expectEqual(c, got.result.fail),
-            .bytes => unreachable, // see the bytes test
+            .bytes, .string => unreachable, // see the bytes and string tests
         }
     }
 }
@@ -357,8 +346,6 @@ test "doc 65 host-operation results round-trip, failures as their class" {
 
 test "a local-zone record round-trips; a short one is refused" {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
     var rec: [system.max_local_zone_len]u8 = undefined;
     const zone: system.LocalZone = .{ .offset = -7 * 3600, .dst = true, .abbr = "PDT" };
     var log: EffectLog = .{};
@@ -368,7 +355,7 @@ test "a local-zone record round-trips; a short one is refused" {
     defer gpa.free(bytes);
     var back: EffectLog = .{};
     defer back.deinit(gpa);
-    try decodeInto(&back, gpa, &heap, bytes);
+    try decodeInto(&back, gpa, bytes);
     const got = system.decodeLocalZone(back.bytesOf(back.entries.items[0].result.bytes));
     try testing.expectEqual(zone.offset, got.offset);
     try testing.expectEqual(zone.dst, got.dst);
@@ -381,13 +368,11 @@ test "a local-zone record round-trips; a short one is refused" {
     defer gpa.free(short_bytes);
     var refused: EffectLog = .{};
     defer refused.deinit(gpa);
-    try testing.expectError(error.MismatchedEffectResult, decodeInto(&refused, gpa, &heap, short_bytes));
+    try testing.expectError(error.MismatchedEffectResult, decodeInto(&refused, gpa, short_bytes));
 }
 
 test "a bytes result round-trips into the decoding log's own buffer" {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
     var log: EffectLog = .{};
     defer log.deinit(gpa);
     try log.appendBytes(gpa, .file_read_op, &.{ 0xff, 0, 0xfe });
@@ -399,7 +384,7 @@ test "a bytes result round-trips into the decoding log's own buffer" {
     var back: EffectLog = .{};
     defer back.deinit(gpa);
     try back.appendBytes(gpa, .file_read_op, "pre");
-    try decodeInto(&back, gpa, &heap, bytes);
+    try decodeInto(&back, gpa, bytes);
     try testing.expectEqual(@as(usize, 4), back.len());
     try testing.expectEqualSlices(u8, &.{ 0xff, 0, 0xfe }, back.bytesOf(back.entries.items[1].result.bytes));
     try testing.expectEqual(@as(i64, 3), back.entries.items[2].result.value.asInt());
@@ -408,8 +393,6 @@ test "a bytes result round-trips into the decoding log's own buffer" {
 
 test "an environ record round-trips as bytes, is charged exactly, and cannot be a failure" {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
     var log: EffectLog = .{};
     defer log.deinit(gpa);
     const rec = [_]u8{ 1, 0, 0, 0, 1, 0, 0, 0, 'A', 1, 0, 0, 0, 'x' };
@@ -419,7 +402,7 @@ test "an environ record round-trips as bytes, is charged exactly, and cannot be 
     try testing.expectEqual(file_header_size + encodedEntrySize(log.entries.items[0].result), bytes.len);
     var back: EffectLog = .{};
     defer back.deinit(gpa);
-    try decodeInto(&back, gpa, &heap, bytes);
+    try decodeInto(&back, gpa, bytes);
     try testing.expectEqualSlices(u8, &rec, back.bytesOf(back.entries.items[0].result.bytes));
 
     var bad = try testLog(&.{.{ .kind = .environ, .result = .{ .fail = .other } }});
@@ -428,55 +411,62 @@ test "an environ record round-trips as bytes, is charged exactly, and cannot be 
     defer gpa.free(bad_bytes);
     var sink: EffectLog = .{};
     defer sink.deinit(gpa);
-    try testing.expectError(error.MismatchedEffectResult, decodeInto(&sink, gpa, &heap, bad_bytes));
+    try testing.expectError(error.MismatchedEffectResult, decodeInto(&sink, gpa, bad_bytes));
 }
 
 test "a string effect result round-trips as inline bytes (getenv/file_read)" {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
-    // Intern the inputs into `heap`, encode, then decode back into the SAME heap:
-    // identical bytes intern to the identical object, so `eql` (pointer identity)
-    // holds — and an empty string is distinct from a nil result.
-    var log = try testLog(&.{
-        Effect.of(.getenv, try heap.internValue("/home/bart")),
-        Effect.of(.file_read, try heap.internValue("alpha")),
-        Effect.of(.getenv, try heap.internValue("")), // set-but-empty
-        Effect.of(.getenv, Value.nil()), // unset
-        Effect.of(.fs_tmpname, try heap.internValue("/tmp/lua_x")),
-    });
+    // Strings are bytes in the log and on the wire, and an empty string is
+    // distinct from a nil result.
+    var log: EffectLog = .{};
     defer log.deinit(gpa);
+    try log.appendString(gpa, .getenv, "/home/bart");
+    try log.appendString(gpa, .file_read, "alpha");
+    try log.appendString(gpa, .getenv, ""); // set-but-empty
+    try log.append(gpa, Effect.of(.getenv, Value.nil())); // unset
+    try log.appendString(gpa, .fs_tmpname, "/tmp/lua_x");
     const bytes = try encodeFile(gpa, &log);
     defer gpa.free(bytes);
     var back: EffectLog = .{};
     defer back.deinit(gpa);
-    try decodeInto(&back, gpa, &heap, bytes);
+    try decodeInto(&back, gpa, bytes);
     try testing.expectEqual(log.len(), back.len());
     for (log.entries.items, back.entries.items) |want, got| {
         try testing.expectEqual(want.kind, got.kind);
-        try testing.expect(want.result.value.eql(got.result.value));
+        switch (want.result) {
+            .string => |span| try testing.expectEqualStrings(log.bytesOf(span), back.bytesOf(got.result.string)),
+            .value => |v| try testing.expect(v.eql(got.result.value)),
+            .bytes, .fail => unreachable,
+        }
     }
-    // The empty-string result decoded to a (non-nil) heap string, not nil.
-    try testing.expect(isString(back.entries.items[2].result.value));
+    try testing.expectEqual(@as(usize, 0), back.entries.items[2].result.string.len);
     try testing.expect(back.entries.items[3].result.value.tag == .nil);
+}
+
+test "doc 86 §6.1: a heap string logs as its bytes, so the log roots nothing" {
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    var log: EffectLog = .{};
+    defer log.deinit(gpa);
+    try log.appendValue(gpa, .getenv, try heap.internValue("päth"));
+    try log.appendValue(gpa, .getenv, Value.nil());
+    try testing.expectEqualStrings("päth", log.bytesOf(log.entries.items[0].result.string));
+    try testing.expect(log.entries.items[1].result.value.tag == .nil);
 }
 
 test "encode then decode reproduces the same bytes (stable)" {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
-    var log = try testLog(&.{
-        Effect.of(.clock, Value.int(100)),
-        Effect.of(.getenv, try heap.internValue("X=1")),
-        .{ .kind = .fs_mutate, .result = .{ .fail = .is_a_directory } },
-    });
+    var log = try testLog(&.{Effect.of(.clock, Value.int(100))});
     defer log.deinit(gpa);
+    try log.appendString(gpa, .getenv, "X=1");
+    try log.append(gpa, .{ .kind = .fs_mutate, .result = .{ .fail = .is_a_directory } });
     try log.appendBytes(gpa, .file_read_op, "\x00\x01");
     const b0 = try encodeFile(gpa, &log);
     defer gpa.free(b0);
     var back: EffectLog = .{};
     defer back.deinit(gpa);
-    try decodeInto(&back, gpa, &heap, b0);
+    try decodeInto(&back, gpa, b0);
     const b1 = try encodeFile(gpa, &back);
     defer gpa.free(b1);
     try testing.expectEqualSlices(u8, b0, b1);
@@ -486,16 +476,14 @@ test "encodedEntrySize matches what encodeFile writes, entry by entry" {
     // `Vm.logEffect` charges the recording cap with these sizes, so they must
     // add up to the real encoding exactly.
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
     var log = try testLog(&.{
         Effect.of(.getenv, Value.nil()),
         Effect.of(.clock, Value.float(0.25)),
         Effect.of(.random_seed, Value.int(-1)),
-        Effect.of(.getenv, try heap.internValue("päth")),
-        .{ .kind = .file_open, .result = .{ .fail = .not_found } },
     });
     defer log.deinit(gpa);
+    try log.appendString(gpa, .getenv, "päth");
+    try log.append(gpa, .{ .kind = .file_open, .result = .{ .fail = .not_found } });
     try log.appendBytes(gpa, .file_read_op, "abcdef");
     var want: usize = file_header_size;
     var n: usize = 0;
@@ -509,8 +497,6 @@ test "encodedEntrySize matches what encodeFile writes, entry by entry" {
 
 test "a decode error leaves the receiving log as it was" {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
     const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{
         .{ .kind = @intFromEnum(EffectKind.file_read_op), .result = .{ .tag = 5, .body = .{ .EffectBytes = .{ .v = "abc" } } } },
         .{ .kind = 250, .result = .{ .tag = 2, .body = .{ .ConstInt = .{ .v = 1 } } } },
@@ -520,27 +506,23 @@ test "a decode error leaves the receiving log as it was" {
     var log: EffectLog = .{};
     defer log.deinit(gpa);
     try log.append(gpa, Effect.of(.clock, Value.int(1)));
-    try testing.expectError(error.UnknownEffectKind, decodeInto(&log, gpa, &heap, bytes));
+    try testing.expectError(error.UnknownEffectKind, decodeInto(&log, gpa, bytes));
     try testing.expectEqual(@as(usize, 1), log.len());
     try testing.expectEqual(@as(usize, 0), log.bytes.items.len);
 }
 
 test "a wrong-version effect file is rejected" {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
     const file: schema.EffectFile = .{ .version = effect_format_version + 1, .effects = &.{} };
     const bytes = try file.encode(gpa);
     defer gpa.free(bytes);
     var log: EffectLog = .{};
     defer log.deinit(gpa);
-    try testing.expectError(error.UnsupportedVersion, decodeInto(&log, gpa, &heap, bytes));
+    try testing.expectError(error.UnsupportedVersion, decodeInto(&log, gpa, bytes));
 }
 
 test "an unknown effect kind is rejected" {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
     // 3 and 4 are the retired argc/argv.
     for ([_]u8{ 3, 4, 22, 250 }) |kind| {
         const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{
@@ -550,14 +532,12 @@ test "an unknown effect kind is rejected" {
         defer gpa.free(bytes);
         var log: EffectLog = .{};
         defer log.deinit(gpa);
-        try testing.expectError(error.UnknownEffectKind, decodeInto(&log, gpa, &heap, bytes));
+        try testing.expectError(error.UnknownEffectKind, decodeInto(&log, gpa, bytes));
     }
 }
 
 test "a result whose type contradicts its kind is rejected at decode (corrupt log)" {
     const gpa = testing.allocator;
-    var heap = gc.Heap.init(gpa);
-    defer heap.deinit();
     const Case = struct { kind: EffectKind, result: schema.EffectResult };
     const int1: schema.EffectResult = .{ .tag = 2, .body = .{ .ConstInt = .{ .v = 42 } } };
     const str: schema.EffectResult = .{ .tag = 4, .body = .{ .ConstString = .{ .v = "nope" } } };
@@ -597,17 +577,19 @@ test "a result whose type contradicts its kind is rejected at decode (corrupt lo
         defer gpa.free(bytes);
         var log: EffectLog = .{};
         defer log.deinit(gpa);
-        try testing.expectError(error.MismatchedEffectResult, decodeInto(&log, gpa, &heap, bytes));
+        try testing.expectError(error.MismatchedEffectResult, decodeInto(&log, gpa, bytes));
     }
 }
 
-test "a non-string heap effect result is a serializer-side error" {
+test "a heap value result is a serializer-side error" {
     const gpa = testing.allocator;
     var heap = gc.Heap.init(gpa);
     defer heap.deinit();
-    // A table can never be an effect result; encoding one is a serializer bug.
+    // The log keeps strings as bytes and no effect returns another heap value,
+    // so an entry built around one is refused. (`Effect.of` asserts against
+    // it, hence the literal.)
     const t = try heap.newTable();
-    var log = try testLog(&.{Effect.of(.getenv, Value.heap(&t.header))});
+    var log = try testLog(&.{.{ .kind = .getenv, .result = .{ .value = Value.heap(&t.header) } }});
     defer log.deinit(gpa);
     try testing.expectError(error.UnsupportedEffectResult, encodeFile(gpa, &log));
 }

@@ -56,7 +56,7 @@ fn run(gpa: std.mem.Allocator, opts: RunOpts, source: [:0]const u8) !Run {
     try vm.enableSystem(opts.groups);
     if (opts.host) |h| vm.system = h.system();
     vm.io_errors = opts.io_errors;
-    if (opts.mode == .replay) try effectser.decodeInto(&vm.effect_log, gpa, vm.heap, opts.log);
+    if (opts.mode == .replay) try effectser.decodeInto(&vm.effect_log, gpa, opts.log);
     vm.effect_mode = opts.mode;
     var exit: ?i32 = null;
     compileRun(gpa, &vm, source) catch |e| {

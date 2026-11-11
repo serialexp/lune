@@ -291,7 +291,7 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         defer vm.deinit();
         var sink = io.Writer.fixed(&rep_out_buf);
         vm.out = &sink;
-        try effectser.decodeInto(&vm.effect_log, gpa, vm.heap, log_bytes);
+        try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
         vm.effect_mode = .replay; // NO host system — content must come from the log
         try compileRun(gpa, &vm, driver);
         try testing.expectEqualStrings("hi mahina\n", sink.buffered());

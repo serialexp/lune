@@ -624,17 +624,18 @@ test "[REQ-97.5] env: a recorded string result survives a GC collection while pa
     vm.effect_mode = .record;
     try fenv.install(&vm);
 
-    // Read HOME but discard the result — nothing references the string except the
-    // effect log. A collection would de-intern + free it without the new root.
+    // Read HOME but discard the result: nothing references the string. The
+    // log keeps its bytes, not the string (doc 86 §6.1), so a collection
+    // frees the string as an unrecorded run would and the log is unaffected.
     try compileRun(gpa, &vm, "os.getenv(\"HOME\")");
     try testing.expectEqual(@as(usize, 1), vm.effect_log.entries.items.len);
+    const objects_before = vm.heap.object_count;
 
     vm.collect(); // force a stop-the-world sweep
 
-    // The logged result must still be a live string reading "/home/bart".
-    const res = vm.effect_log.entries.items[0].result.value;
-    try testing.expect(res.isHeap() and res.heapType() == .string);
-    try testing.expectEqualStrings("/home/bart", string.String.fromHeader(res.asHeap()).bytes());
+    try testing.expect(vm.heap.object_count < objects_before);
+    const res = vm.effect_log.entries.items[0].result;
+    try testing.expectEqualStrings("/home/bart", vm.effect_log.bytesOf(res.string));
 }
 
 test "[REQ-97.3] env: replay feeds back a logged string result without calling the native" {
@@ -645,15 +646,64 @@ test "[REQ-97.3] env: replay feeds back a logged string result without calling t
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    // Preload a getenv result interned into *this* VM's heap, then replay with no
-    // host system: getenv is not called — the logged string is fed back.
+    // Preload a getenv result, then replay with no host system: getenv is not
+    // called — the logged string is fed back.
     try vm.enableSystem(.{ .env = true });
-    const logged = try vm.heap.internValue("REPLAYED");
-    try vm.effect_log.append(gpa, Effect.of(.getenv, logged));
+    try vm.effect_log.appendString(gpa, .getenv, "REPLAYED");
     vm.effect_mode = .replay;
 
     try compileRun(gpa, &vm, "print(os.getenv(\"IGNORED\"))");
     try testing.expectEqualStrings("REPLAYED\n", sink.buffered());
+}
+
+test "doc 86 §6.1: a replay allocates what the recording did, string results included" {
+    const gpa = testing.allocator;
+    const keyframeser = @import("keyframeser.zig");
+    // Each result is a fresh string the host produced, and tables are made
+    // after it. A replay that interned the logged strings when it decoded the
+    // log, or a recording whose log kept them alive, would give these objects
+    // other ids or keep others, and the final heaps would differ.
+    const source: [:0]const u8 =
+        \\local seen = {}
+        \\for i = 1, 3 do
+        \\  local h = os.getenv("HOME")
+        \\  seen[#seen + 1] = { h .. i }
+        \\end
+        \\local gone = os.getenv("EMPTY")
+        \\print(#seen, seen[3][1], gone == "")
+    ;
+    var fenv = FakeEnv{};
+    var log_bytes: []u8 = undefined;
+    var recorded: []u8 = undefined;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [128]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        vm.effect_mode = .record;
+        try fenv.install(&vm);
+        try compileRun(gpa, &vm, source);
+        try testing.expectEqualStrings("3\t/home/bart3\ttrue\n", sink.buffered());
+        log_bytes = try effectser.encodeFile(gpa, &vm.effect_log);
+        recorded = try keyframeser.encodeSnapshot(gpa, &vm);
+    }
+    defer gpa.free(log_bytes);
+    defer gpa.free(recorded);
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    try vm.enableSystem(.{ .env = true });
+    try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
+    vm.effect_mode = .replay;
+    try compileRun(gpa, &vm, source);
+    try testing.expectEqualStrings("3\t/home/bart3\ttrue\n", sink.buffered());
+    const replayed = try keyframeser.encodeSnapshot(gpa, &vm);
+    defer gpa.free(replayed);
+    try testing.expectEqualSlices(u8, recorded, replayed);
 }
 
 test "[REQ-97.4] S-B: getenv of non-UTF-8 host bytes raises a catchable error" {
@@ -1045,7 +1095,7 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         var out_buf: [256]u8 = undefined;
         var sink = io.Writer.fixed(&out_buf);
         vm.out = &sink;
-        try effectser.decodeInto(&vm.effect_log, gpa, vm.heap, log_bytes);
+        try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
         vm.effect_mode = .replay;
         try compileRun(gpa, &vm, source);
         try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
@@ -1203,7 +1253,7 @@ test "L-3: record→serialize→replay reproduces output with the FS detached" {
         defer vm.deinit();
         var sink = io.Writer.fixed(&rep_out_buf);
         vm.out = &sink;
-        try effectser.decodeInto(&vm.effect_log, gpa, vm.heap, log_bytes);
+        try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
         vm.effect_mode = .replay;
         // No fs_source set on purpose.
         try compileRun(gpa, &vm, driver);
@@ -1441,7 +1491,7 @@ test "[REQ-75.1] doc 65 §4.2: host results — values, failures and bytes — r
     defer gpa.free(log_bytes);
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    try effectser.decodeInto(&vm.effect_log, gpa, vm.heap, log_bytes);
+    try effectser.decodeInto(&vm.effect_log, gpa, log_bytes);
     vm.effect_mode = .replay;
     try interp.noteIoErrorMode(&vm);
     try testing.expectEqual(@as(i64, 3), (try interp.replayHost(&vm, .file_open)).value.asInt());

@@ -557,7 +557,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, args
     if (eff_bytes.len > 0) {
         // String results (getenv/file_read) are re-interned into `vm.heap`;
         // the effect-log GC root keeps them alive while the cursor feeds them back.
-        try mahina.effectser.decodeInto(&vm.effect_log, vm.gpa, vm.heap, eff_bytes);
+        try mahina.effectser.decodeInto(&vm.effect_log, vm.gpa, eff_bytes);
     }
     // Pure tier-0: trace recording/execution stays off (the default), so each
     // instruction is one safepoint — matching `Result.safepoint_count`.
@@ -970,7 +970,7 @@ fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, eff_
 
     vm.effect_mode = .replay;
     if (eff_bytes.len > 0) {
-        try mahina.effectser.decodeInto(&vm.effect_log, vm.gpa, vm.heap, eff_bytes);
+        try mahina.effectser.decodeInto(&vm.effect_log, vm.gpa, eff_bytes);
     }
     vm.setRecordSafepointLines(true);
     // Arm a suspend at the cap: if the program needs more safepoints than the cap,

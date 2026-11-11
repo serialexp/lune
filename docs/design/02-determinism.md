@@ -265,6 +265,14 @@ that for a time-travel debugger it *is* the architecture.
       source. An `arg` convenience *table* (Lua-style) is left to stdlib — it would
       need a heap table on the wire, whereas these scalars/strings ride the log
       directly.
+      **Superseded (doc 86 §6.1, 2026-11-11):** both choices above changed. The
+      in-memory log now keeps a string result as **bytes** too, so it holds no
+      heap value and roots nothing, and decode needs no heap. A replay interns a
+      string when it **consumes** the entry, as the recording interned it when
+      the host returned it. Interning at decode allocated every logged string
+      up front, which shifted later allocation ids, and rooting them kept
+      strings alive in a recorded run that an unrecorded one collected. One
+      log can now outlive, and be shared by, the VMs that record and replay it.
       The format was deliberately deferred until the first genuine input+output pair
       (vs. output-only `print`) so it was designed against a real effect, not guessed.
 - [x] **Runtime compilation replays deterministically** (L-1/L-2/L-3). `load`,

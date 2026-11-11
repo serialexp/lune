@@ -194,6 +194,7 @@ pub const EffectKind = function.EffectKind;
 /// (`effectlog.zig`). The log is consumed in call order on replay (the kind +
 /// result fully describe each entry).
 pub const Effect = effectlog.Effect;
+pub const HostResult = effectlog.HostResult;
 pub const EffectLog = effectlog.EffectLog;
 
 /// Doc 65 §4.5: the default cap on a recording's encoded effect log.
@@ -4548,10 +4549,8 @@ pub const Vm = struct {
     ///      constant the sweep will free (`invalidateDeadTraceConsts`), so
     ///      liveness is identical in every tier and no trace keeps a dangling
     ///      constant.
-    ///   6. effect-log heap results — a string-valued effect (`getenv`/`file_read`)
-    ///      parked in `effect_log` must outlive collection until it is serialized
-    ///      (record) or fed back to the program (replay). Without this root, the
-    ///      sweep would de-intern and free an otherwise-unreferenced result string.
+    ///   (The effect log roots nothing: it keeps a string result as bytes and
+    ///   a replay interns them when it consumes the entry, doc 86 §6.1.)
     pub fn forEachRootHeader(
         self: *Vm,
         ctx: anytype,
@@ -4581,10 +4580,6 @@ pub const Vm = struct {
         for (self.host_refs.items) |slot| if (slot.value.isHeap()) cb(ctx, slot.value.asHeap());
         for (self.parked_inline[0..self.parked_inline_len]) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         for (self.parked_results.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
-        for (self.effect_log.entries.items) |e| switch (e.result) {
-            .value => |v| if (v.isHeap()) cb(ctx, v.asHeap()),
-            .bytes, .fail => {},
-        };
         // 7. the in-flight Lua error value — rooted while parked between a raise and
         //    its catch. Load-bearing for the `xpcall` handler path, which allocates
         //    (and so may collect) while the error value waits to be handed over.
@@ -13275,7 +13270,7 @@ fn performEffect(self: *Vm, kind: EffectKind, nat: *const function.Native, args:
         .off => nat.func(@ptrCast(self), args) catch |e| return narrowError(e),
         .record => blk: {
             const r = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
-            try logEffect(self, Effect.of(kind, r));
+            try logValue(self, kind, r);
             break :blk r;
         },
         .replay => try nextLoggedEffect(self, kind),
@@ -13299,17 +13294,42 @@ fn onEffectCommitted(self: *Vm) void {
 
 /// Append one effect to the ordered log (record mode), charging its encoded
 /// size against `effect_log_limit` first (doc 65 §4.5). Shared by every
-/// effect family. A `bytes` result goes through `logEffectBytes` instead.
+/// effect family. `e` is a scalar result; a string goes through `logValue`
+/// and a `bytes` result through `logEffectBytes`.
 fn logEffect(self: *Vm, e: Effect) Error!void {
-    std.debug.assert(e.result != .bytes);
+    std.debug.assert(e.result == .value or e.result == .fail);
     try chargeEffectLog(self, effectser.encodedEntrySize(e.result));
     try self.effect_log.append(self.gpa, e);
+}
+
+/// `logEffect` for a value result: a heap string is logged as its bytes
+/// (the log holds no heap value, doc 86 §6.1).
+fn logValue(self: *Vm, kind: EffectKind, v: Value) Error!void {
+    if (!v.isHeap()) return logEffect(self, Effect.of(kind, v));
+    const len = string.String.fromHeader(v.asHeap()).bytes().len;
+    try chargeEffectLog(self, effectser.encodedEntrySize(.{ .string = .{ .start = 0, .len = len } }));
+    try self.effect_log.appendValue(self.gpa, kind, v);
 }
 
 /// `logEffect` for a `bytes` result: the content is copied into the log.
 fn logEffectBytes(self: *Vm, kind: EffectKind, content: []const u8) Error!void {
     try chargeEffectLog(self, effectser.encodedEntrySize(.{ .bytes = .{ .start = 0, .len = content.len } }));
     try self.effect_log.appendBytes(self.gpa, kind, content);
+}
+
+/// An entry's result as the value the recording produced: a string is
+/// interned into this VM now, at its consumption, as the recording interned
+/// it when the host returned it, so a replay allocates what the recording did
+/// when it did (doc 86 §6.1).
+fn loggedValue(self: *Vm, r: Effect.Result) Error!Value {
+    return switch (r) {
+        .value => |v| v,
+        .string => |span| try self.heap.internValue(self.effect_log.bytesOf(span)),
+        // The decoder checks every entry's result against its kind
+        // (`effectser.checkResultShape`), and the kinds read as a value
+        // never log these; anything else is a log this binary did not write.
+        .bytes, .fail => Error.EffectKindMismatch,
+    };
 }
 
 /// Count `size` encoded bytes against the cap, refusing past it.
@@ -13333,13 +13353,9 @@ fn chargeEffectLog(self: *Vm, size: usize) Error!void {
 /// version check) must follow the same rule: peek via `peekLoggedEffect`,
 /// validate, and only then advance.
 fn nextLoggedEffect(self: *Vm, kind: EffectKind) Error!Value {
-    const r = try peekLoggedEffect(self, kind);
-    // The decoder checks every entry's result against its kind
-    // (`effectser.checkResultShape`), and the kinds read here only ever log
-    // a `value`; anything else is a log this binary did not write.
-    if (r != .value) return Error.EffectKindMismatch;
+    const v = try loggedValue(self, try peekLoggedEffect(self, kind));
     self.effect_cursor += 1;
-    return r.value;
+    return v;
 }
 
 /// The non-consuming half of `nextLoggedEffect`: bounds- and kind-check the
@@ -13460,9 +13476,14 @@ pub fn noteIoErrorMode(self: *Vm) Error!void {
 /// here, never a string — so this only logs, in `record`. A `bytes` result
 /// goes through `recordHostBytes`. In `replay` the native calls `replayHost`
 /// instead.
-pub fn recordHost(self: *Vm, kind: EffectKind, result: Effect.Result) Error!void {
+pub fn recordHost(self: *Vm, kind: EffectKind, result: HostResult) Error!void {
     std.debug.assert(self.effect_mode != .replay);
-    if (self.effect_mode == .record) try logEffect(self, .{ .kind = kind, .result = result });
+    if (self.effect_mode == .record) switch (result) {
+        .value => |v| try logValue(self, kind, v),
+        .fail => |c| try logEffect(self, .{ .kind = kind, .result = .{ .fail = c } }),
+        // A `bytes` result's content goes through `recordHostBytes`.
+        .bytes => unreachable,
+    };
     onEffectCommitted(self);
 }
 
@@ -13474,12 +13495,18 @@ pub fn recordHostBytes(self: *Vm, kind: EffectKind, content: []const u8) Error!v
 }
 
 /// Replay one `io`/`os` host operation: consume the next logged outcome of
-/// `kind`, which the decoder has already checked against the kind. A `bytes`
-/// result's content is `effect_log.bytesOf(span)`; the native builds a fresh
-/// byte array from it.
-pub fn replayHost(self: *Vm, kind: EffectKind) Error!Effect.Result {
+/// `kind`, which the decoder has already checked against the kind. A string
+/// is interned now (`loggedValue`); a `bytes` result's content is
+/// `effect_log.bytesOf(span)`, and the native builds a fresh byte array from
+/// it.
+pub fn replayHost(self: *Vm, kind: EffectKind) Error!HostResult {
     std.debug.assert(self.effect_mode == .replay);
-    const r = try peekLoggedEffect(self, kind);
+    const r: HostResult = switch (try peekLoggedEffect(self, kind)) {
+        .bytes => |span| .{ .bytes = span },
+        .fail => |c| .{ .fail = c },
+        .value => |v| .{ .value = v },
+        .string => |span| .{ .value = try self.heap.internValue(self.effect_log.bytesOf(span)) },
+    };
     self.effect_cursor += 1;
     onEffectCommitted(self);
     return r;
@@ -13517,7 +13544,7 @@ pub fn obtainFileRead(self: *Vm, path: []const u8) Error!Value {
 
 /// Log a `file_read` result in `record` mode; returns it.
 fn logFileRead(self: *Vm, r: Value) Error!Value {
-    if (self.effect_mode == .record) try logEffect(self, Effect.of(.file_read, r));
+    if (self.effect_mode == .record) try logValue(self, .file_read, r);
     return r;
 }
 
