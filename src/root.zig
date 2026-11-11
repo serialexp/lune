@@ -211,6 +211,7 @@ test {
     _ = resolve;
     _ = lsp;
     _ = debug;
+    _ = @import("strlit.zig");
     _ = string;
     _ = array;
     _ = table;

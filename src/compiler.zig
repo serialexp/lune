@@ -32,6 +32,7 @@ const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
 const gc = @import("gc.zig");
 const diag = @import("diag.zig");
+const strlit = @import("strlit.zig");
 const bc_liveness = @import("bc_liveness.zig");
 const bc_dom = @import("bc_dom.zig");
 const HashPart = @import("hash_part.zig").HashPart;
@@ -2805,130 +2806,19 @@ const Compiler = struct {
     }
 
     fn decodeEscapes(self: *Compiler, inner: []const u8, span: ast.Span, template: bool) Error![]const u8 {
-        var buf: std.ArrayList(u8) = .empty;
-        try buf.ensureTotalCapacity(self.arena, inner.len);
-
-        var i: usize = 0;
-        while (i < inner.len) {
-            const ch = inner[i];
-            if (ch != '\\') {
-                i += 1;
-                if (template and (ch == '\n' or ch == '\r')) {
-                    if (i < inner.len and (inner[i] == '\n' or inner[i] == '\r') and inner[i] != ch) i += 1;
-                    try buf.append(self.arena, '\n');
-                } else try buf.append(self.arena, ch);
-                continue;
-            }
-            i += 1;
-            if (i >= inner.len) break; // trailing backslash (lexer should prevent)
-            const esc = inner[i];
-            i += 1;
-            switch (esc) {
-                'n' => try buf.append(self.arena, '\n'),
-                't' => try buf.append(self.arena, '\t'),
-                'r' => try buf.append(self.arena, '\r'),
-                'a' => try buf.append(self.arena, 7),
-                'b' => try buf.append(self.arena, 8),
-                'f' => try buf.append(self.arena, 12),
-                'v' => try buf.append(self.arena, 11),
-                '\\' => try buf.append(self.arena, '\\'),
-                '"' => try buf.append(self.arena, '"'),
-                '\'' => try buf.append(self.arena, '\''),
-                '`', '{', '}' => if (template) try buf.append(self.arena, esc) else return self.fail(span, .invalid_escape),
-                // A backslash before a newline (LF, CR, CRLF or LFCR) is one `\n`.
-                '\n', '\r' => {
-                    if (i < inner.len and (inner[i] == '\n' or inner[i] == '\r') and inner[i] != esc) i += 1;
-                    try buf.append(self.arena, '\n');
-                },
-                // `\z` skips the whitespace after it, newlines included.
-                'z' => while (i < inner.len and std.mem.indexOfScalar(u8, " \t\n\r\x0B\x0C", inner[i]) != null) {
-                    i += 1;
-                },
-                'x' => {
-                    var val: u16 = 0;
-                    var digits: usize = 0;
-                    while (digits < 2 and i < inner.len and isHex(inner[i])) : (digits += 1) {
-                        val = val * 16 + hexValue(inner[i]);
-                        i += 1;
-                    }
-                    if (digits != 2) return self.fail(span, .hex_escape_digits);
-                    if (val > 0x7F) return self.fail(span, .hex_escape_not_ascii);
-                    try buf.append(self.arena, @intCast(val));
-                },
-                '0'...'9' => {
-                    var val: u16 = esc - '0';
-                    var digits: usize = 1;
-                    while (digits < 3 and i < inner.len and inner[i] >= '0' and inner[i] <= '9') : (digits += 1) {
-                        val = val * 10 + (inner[i] - '0');
-                        i += 1;
-                    }
-                    if (val > 0x7F) return self.fail(span, .decimal_escape_not_ascii);
-                    try buf.append(self.arena, @intCast(val));
-                },
-                'u' => {
-                    // `\u{XXXX}` — a Unicode code point encoded to UTF-8.
-                    if (i >= inner.len or inner[i] != '{') return self.fail(span, .unicode_escape_open_brace);
-                    i += 1;
-                    var cp: u32 = 0;
-                    var digits: usize = 0;
-                    while (i < inner.len and isHex(inner[i])) : (digits += 1) {
-                        cp = cp * 16 + hexValue(inner[i]);
-                        i += 1;
-                        if (cp > 0x10FFFF) return self.fail(span, .unicode_escape_out_of_range);
-                    }
-                    if (digits == 0) return self.fail(span, .unicode_escape_no_digits);
-                    if (i >= inner.len or inner[i] != '}') return self.fail(span, .unicode_escape_close_brace);
-                    i += 1;
-                    var tmp: [4]u8 = undefined;
-                    const n = std.unicode.utf8Encode(@intCast(cp), &tmp) catch
-                        return self.fail(span, .unicode_escape_invalid);
-                    try buf.appendSlice(self.arena, tmp[0..n]);
-                },
-                else => return self.fail(span, .invalid_escape),
-            }
-        }
-        if (!std.unicode.utf8ValidateSlice(buf.items)) return self.fail(span, .invalid_utf8);
-        return buf.items;
+        return self.decoded(try strlit.decodeEscapes(self.arena, inner, template), span);
     }
 
-    /// Decode a long-bracket string literal `raw` = `[` `=`{n} `[` body `]` `=`{n} `]`.
-    /// The content is verbatim (no escape interpretation); if the body begins with
-    /// a newline it is dropped (Lua 5.4 §3.1: a `\r\n`/`\n\r`/`\r`/`\n` immediately
-    /// after the opening bracket is not part of the string), and every other
-    /// newline sequence reads as one `\n`, as in Lua. A body without a `\r`
-    /// borrows `self.source`, which is fine — `stringConstant` interns (copies) it
-    /// immediately; one with a `\r` is rebuilt in the arena. UTF-8 validated like
-    /// every mahina string literal.
     fn decodeLongString(self: *Compiler, raw: []const u8, span: ast.Span) Error![]const u8 {
-        std.debug.assert(raw[0] == '[');
-        var level: usize = 0;
-        while (raw[1 + level] == '=') level += 1;
-        const delim = level + 2; // length of `[` `=`{level} `[` and of the close
-        std.debug.assert(raw.len >= 2 * delim);
-        var inner = raw[delim .. raw.len - delim];
-        // Drop a single leading end-of-line (any of \n, \r, \r\n, \n\r).
-        if (inner.len > 0 and (inner[0] == '\n' or inner[0] == '\r')) {
-            const first = inner[0];
-            inner = inner[1..];
-            if (inner.len > 0 and (inner[0] == '\n' or inner[0] == '\r') and inner[0] != first) {
-                inner = inner[1..];
-            }
-        }
-        if (!std.unicode.utf8ValidateSlice(inner)) return self.fail(span, .invalid_utf8);
-        if (std.mem.indexOfScalar(u8, inner, '\r') == null) return inner;
-        var buf: std.ArrayList(u8) = .empty;
-        try buf.ensureTotalCapacity(self.arena, inner.len);
-        var i: usize = 0;
-        while (i < inner.len) : (i += 1) {
-            const ch = inner[i];
-            if (ch != '\n' and ch != '\r') {
-                buf.appendAssumeCapacity(ch);
-                continue;
-            }
-            if (i + 1 < inner.len and (inner[i + 1] == '\n' or inner[i + 1] == '\r') and inner[i + 1] != ch) i += 1;
-            buf.appendAssumeCapacity('\n');
-        }
-        return buf.items;
+        return self.decoded(try strlit.decodeLongString(self.arena, raw), span);
+    }
+
+    /// A decoded literal's bytes, or its diagnostic reported at `span`.
+    fn decoded(self: *Compiler, d: strlit.Decoded, span: ast.Span) Error![]const u8 {
+        return switch (d) {
+            .ok => |bytes| bytes,
+            .bad => |code| self.fail(span, code),
+        };
     }
 
     fn lineOf(self: *const Compiler, offset: u32) u32 {
@@ -2992,18 +2882,6 @@ fn binOpCode(op: ast.BinaryOp) OpCode {
     };
 }
 
-fn isHex(ch: u8) bool {
-    return (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
-}
-
-fn hexValue(ch: u8) u8 {
-    return switch (ch) {
-        '0'...'9' => ch - '0',
-        'a'...'f' => ch - 'a' + 10,
-        'A'...'F' => ch - 'A' + 10,
-        else => 0,
-    };
-}
 
 // ---------------------------------------------------------------------------
 // Tests — parse → compile → run, asserting the observable result. This is the
