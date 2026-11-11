@@ -1982,16 +1982,18 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                     // after the load for the tier-1a oracle; `proveKinds` discharges it
                     // statically against the kind proven here, so it emits nothing.
                     //
-                    // Three element shapes (doc 32): a table pointer (Phase 2,
-                    // array-of-structs), an int, or a float. A hole reads back as an
-                    // in-band nil `Value`, whose tag matches none of the three — so the
+                    // Four element shapes (doc 32, doc 85 §5): a heap pointer (a
+                    // table for array-of-structs, or a string, closure or native),
+                    // an int, a float, or a bool. A hole reads back as an
+                    // in-band nil `Value`, whose tag matches none of the four — so the
                     // absent `guard_present` (the .value lane has no presence bitmap)
                     // costs nothing: the tag check IS the presence check.
                     const want_tag: u8 = switch (kinds[i]) {
                         .heap => TAG_HEAP,
                         .int => TAG_INT,
                         .float => TAG_FLOAT,
-                        else => unreachable, // proveKinds admitted only these three
+                        .bool => TAG_BOOL,
+                        else => unreachable, // proveKinds admitted only these four
                     };
                     // Address in rcx, NOT rax. `arrayFieldReg(…, .rax)` returns `.rax`
                     // itself whenever `data` was not hoisted into a register home
@@ -2032,8 +2034,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                             .reg, .imm => unreachable, // a float never homes in a GP register
                         }
                     } else {
-                        // .heap → the *GcHeader; .int → the i64. Same 8-byte payload
-                        // load either way.
+                        // .heap → the *GcHeader; .int → the i64; .bool → the
+                        // canonical full-width 0/1 (`Value.boolean` defines all
+                        // 8 bytes). The same 8-byte payload load each way.
                         try a.movRegMem(.rax, elem, off + VALUE_PAYLOAD_OFF);
                         try regToPlace(a, placeOfRef(alloc, i), .rax);
                     }

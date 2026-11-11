@@ -579,12 +579,35 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                 // reader (`Table.getInt`), so an executed trace reads byte-identical
                 // to tier-0 by construction. By the time we run, `guard_bounds` (and
                 // `guard_present` for narrow lanes) have already passed, so this hits
-                // the array fast path. For `.value`-lane table loads, the subsequent
-                // `guard_table` on the result verifies it is a table.
+                // the array fast path.
+                //
+                // A `.value`-lane `aload` is a **typed** load, as `hload` is
+                // (doc 85 §5): the lane holds full tagged `Value`s, so the
+                // element's tag is checked against the recorded `ins.ty` and a
+                // mismatch (a hole reads back nil, which matches none)
+                // side-exits here, before logging. This is the native
+                // lowering's fused tag exit. A subtype pin follows where the
+                // recorder needs one (`guard_table`, `guard_string`,
+                // `guard_func`); a bool element has this check alone, and a
+                // native is pinned by its consumer.
                 .aload => {
                     const ar = t.instrs[ins.a];
                     const tbl = table.Table.fromHeader(values[ar.a].asHeap());
-                    values[i] = tbl.getInt(values[ar.b].asInt());
+                    const ev = tbl.getInt(values[ar.b].asInt());
+                    if (ins.aux == @intFromEnum(arr.Lane.value)) {
+                        const type_ok = switch (ins.ty) {
+                            .int => ev.isInt(),
+                            .float => ev.isFloat(),
+                            .boolean => ev.isBool(),
+                            .heap => ev.isHeap(),
+                            else => false, // the recorder emits only these four
+                        };
+                        if (!type_ok) {
+                            if (record) rec.exit(i, .guard, values[ar.a]);
+                            break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                        }
+                    }
+                    values[i] = ev;
                     if (record) rec.value(i, values[i]);
                 },
                 // `astore` — the FIRST mid-iteration heap mutation in the system

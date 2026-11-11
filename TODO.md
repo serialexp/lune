@@ -8,15 +8,37 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
       for hash fields holding a string or a native (doc 85 Phase 1,
       2026-11-11): `math.floor` by its qualified name went from 1,282 M to
       211 M instructions on a three-million-iteration loop.
+- [x] **`names[i]` in a hot loop never traced.** Fixed for `.value`-lane
+      elements holding a string, a native, a closure or a bool (doc 85
+      Phase 2, 2026-11-11): `#names[i % 3 + 1]` went from 1,036 M to 121 M
+      instructions on a three-million-iteration loop.
 - [ ] **The rest of doc 85 waits for Bart** (he has not picked the arc):
-      Phase 2, a `.value`-lane array element holding a string, a native, a
-      closure or a bool (`names[i]`; str_sort's three abort sites); Phase
-      3, recorder arms for `math.abs`/`math.min`/`math.max`
+      Phase 3, recorder arms for `math.abs`/`math.min`/`math.max`
       (globals_script's `clamp`, `near`, `move`, `tick` stop at them with
-      `host_barrier` now); Phase 4, a board row in the script idiom; Q1
-      (how `abs`/`min`/`max` record) and Q2 (hoisting the module-table
-      load chain: a qualified `math.floor` is 70 instructions per
-      iteration, the cached local 59).
+      `host_barrier` now), which needs Q1 (how they record); Phase 4, a
+      board row in the script idiom; Q2 (hoisting the module-table load
+      chain: a qualified `math.floor` is 70 instructions per iteration,
+      the cached local 59).
+- [ ] **A typed load whose type alternates makes the JIT 2.5 to 3.4
+      times slower than tier 0** (found 2026-11-11, present before doc
+      85). `acc = acc + mixed[i % 4 + 1]` over `{ 1, 2.5, 3, 4.5 }`: 897 M
+      instructions on tier 0, 3,030 M with `--trace --jit-native`; a field
+      that is an int in one record and a float in the next, 1,113 M
+      against 3,202 M. `--jit-stats`: one trace, 1.5 M native entries of
+      one iteration each, `exit side: wants=0`. The exit native code takes
+      is the load's own tag check (`aload` in the `.value` lane, `hload`),
+      and that instruction has no row in the trace's exit table: no
+      snapshot, not attachable, no exit-side state
+      (`TraceCode.exitSnapIdx` wants an `isSideExitGuardOp`). The guard
+      behind the load is attachable, and native code never exits there.
+      So `routeExitSide` never wants the exit and nothing records the
+      other type. A branch that alternates is fine (423 M against
+      1,157 M). Doc 85 §5.2 has the table, the `-Djit-debug` evidence and
+      the two shapes a fix can take. Needs a design choice; not started.
+- [ ] **A string stored into an array aborts the recording**
+      (`nyi_opcode set_index`: str_sort, sort_cmp, co_garbage). Doc 85's
+      deferred "heap values stored into tables"; with Phase 2 in, it is
+      the next thing str_sort's loops stop at, with `concat`.
 - [ ] **A loop barred from recording costs about 30 instructions per
       iteration with the JIT on.** Seen on doc 85's probes before the
       fix: `for i = 1, n do acc = acc + math.floor(i / 2) end` was 397

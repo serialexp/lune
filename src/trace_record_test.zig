@@ -284,7 +284,7 @@ test "recArrayGet records a .value-lane table element (array-of-structs)" {
     try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.value)), aload_ins.aux);
 }
 
-test "recArrayGet aborts on a .value-lane bool element — nyi scope cut" {
+test "recArrayGet: doc 85 — a .value-lane bool element records as a typed aload with no trailing guard" {
     const gpa = testing.allocator;
     // Force .value lane by storing a table then a boolean at different indices.
     const inner = try table_mod.Table.create(gpa);
@@ -299,12 +299,20 @@ test "recArrayGet aborts on a .value-lane bool element — nyi scope cut" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
-    // Access index 2 (the boolean) — a bool has no *strict* type guard (`guard_true`
-    // would wave a truthy heap value through), so it stays out of doc 32's admission.
+    // Access index 2 (the boolean). The load's own tag check is the strict pin
+    // (both executors exit at the `aload` on any other tag), so nothing follows
+    // it: `guard_true` would wave a truthy heap value through, and is not needed.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
-    try testing.expect(!state.isRecording());
-    try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
+    try testing.expect(state.isRecording());
+    try testing.expectEqual(@as(?AbortReason, null), state.rec.abort_reason);
+    const ops = state.rec.instrs.items;
+    // slot_load(table), guard_table, guard_lane(.value), slot_load(key),
+    // guard_int(key), aref, guard_bounds, aload(ty=.boolean).
+    try testing.expectEqual(@as(usize, 8), ops.len);
+    try testing.expectEqual(IrOp.aload, ops[7].op);
+    try testing.expectEqual(ObsType.boolean, ops[7].ty);
+    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.value)), ops[7].aux);
 }
 
 /// Build a heterogeneous `.value`-lane table: index 1 holds `inner` (a table, which
@@ -423,14 +431,15 @@ test "recArraySet: doc 32 — a .value-lane numeric store pins the value with gu
 
 test "abort log records (anchor, reason, opcode) and dedups recurrences" {
     const gpa = testing.allocator;
-    // Force .value lane by storing a table at [1] and a boolean at [2].
-    // Accessing [2] (a non-table in .value lane) triggers nyi_opcode.
+    // Force .value lane by storing a table at [1] and a host object at [2].
+    // Accessing [2] (a heap type no guard pins, doc 85 §5) triggers nyi_opcode.
     const inner = try table_mod.Table.create(gpa);
     defer inner.destroy(gpa);
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
+    var host = @import("object.zig").GcHeader.init(.host);
     try t.set(gpa, Value.int(1), Value.heap(&inner.header)); // → .value lane
-    try t.set(gpa, Value.int(2), Value.boolean(true)); // stays .value
+    try t.set(gpa, Value.int(2), Value.heap(&host)); // stays .value
     try testing.expectEqual(arr.Lane.value, t.array.lane);
 
     const proto = Proto{ .code = &.{}, .name = "loop", .num_registers = 3 };
@@ -438,7 +447,7 @@ test "abort log records (anchor, reason, opcode) and dedups recurrences" {
     defer state.deinit();
     state.config.record_aborts = true; // what --dump-aborts flips on
 
-    // Access index 2 (the boolean, not the table) → nyi_opcode.
+    // Access index 2 (the host object, not the table) → nyi_opcode.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
     // Re-arm and abort the same anchor/op three times: a real loop aborts on every
     // back-edge, and the log must collapse that to one row with count == 3.

@@ -1,10 +1,11 @@
 # 85 — Library calls through their module table, and heap values read out of tables — Design
 
 Status: partial — Phase 0 (a tier-0 ordering bug in `math.max`/`math.min`,
-found while reading for Phase 3) and Phase 1 (string and native hash fields)
-landed. Phases 2 to 4 are not started; Q1 and Q2 (§8) are open. Bart has not
-picked this arc: it was started on 2026-11-11 under "continue using your best
-judgement" after three asks went unanswered, so Phases 2 to 4 wait for him.
+found while reading for Phase 3), Phase 1 (string and native hash fields) and
+Phase 2 (string, native, closure and bool array elements) landed. Phases 3
+and 4 are not started; Q1 and Q2 (§8) are open. Bart has not picked this arc:
+it was started on 2026-11-11 under "continue using your best judgement" after
+four asks went unanswered. Phase 3 needs his answer to Q1.
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -41,10 +42,16 @@ land; move whole phases to Done once everything inside them is checked.
   The board is flat, as §2.2 predicted (geomean +0.016%, the same
   native-call instruction as Phase 0).
 
+- [x] **Phase 2 — a `.value`-lane array element holding a string, a native,
+  a closure or a bool records and runs native** (§5, §5.1 for what was
+  built and measured). With the JIT on: `#names[i % 3 + 1]` 1,036 M to
+  121 M instructions, a native element called 1,123 M to 214 M, closure
+  elements called 3,150 M to 127 M. The board is flat: str_sort's three
+  `get_index` sites now record and its loops stop at the next thing they
+  cannot do (a string stored into an array, `concat`).
+
 ### Outstanding
 
-- [ ] **Phase 2 — a `.value`-lane array element holding a string, a native,
-  a closure or a bool** (§5).
 - [ ] **Phase 3 — `math.abs`, `math.min`, `math.max` get recorder arms**
   (§6). Needs Q1.
 - [ ] **Phase 4 — a board row** that calls `math.*` and `string.*` without
@@ -57,6 +64,11 @@ land; move whole phases to Done once everything inside them is checked.
   string, closure or table decline native today; the recorder's
   `bad_type set_field` and `nyi_opcode set_index` rows are a separate
   census, §2.2).
+- [ ] **Defer — a typed load whose type alternates gets no sibling
+  trace.** Older than this doc and not specific to it (§5.2): an array
+  mixing ints and floats, or a field that is an int in one record and a
+  float in the next, runs 2.5 to 3.4 times slower with the JIT than on
+  tier 0. Phase 2 lets a few more arrays reach it. Noted in `TODO.md`.
 - [ ] **Defer — a barred loop's back-edge cost.** A loop whose recording
   is abandoned pays about 30 instructions per iteration over tier 0 with
   the JIT on (§2.1's `math.floor` row). Noted in `TODO.md`.
@@ -288,6 +300,111 @@ them". For bool that was answered by doc 43 P1 (the fused tag exit is the
 strict guard); for strings by `guard_string`. To check when building:
 that the native `.value`-lane `aload` lowers `ty = .boolean`, and that a
 nil element (the lane's in-band hole) fails each pin.
+
+### 5.1 Implemented, 2026-11-11
+
+- **The `.value`-lane `aload` is a typed load in both executors.** Native
+  code already checked the element's tag against the recorded `ty` inside
+  the load and exited there. Tier 1a read the element and left the check
+  to the guard behind it, which a native or a bool element does not have.
+  `irinterp`'s `aload` now makes the same tag check for the `.value` lane
+  and exits at the load, as its `hload` does. That one rule ("a `.heap`
+  load is some heap value, a `.boolean` load is a bool") is what the
+  consumers of a field already rely on, so everything Phase 1 established
+  for a loaded field holds for a loaded element. A hole (in-band nil)
+  fails the tag check.
+- **Recorder.** `arrayGetShape` pins a string with `guard_string`, a
+  closure with `guard_func` (its proto id, the pin a function field has),
+  and emits nothing behind a native or a bool. `boolTyped` takes a bool
+  `.value`-lane load as a proven bool. A coroutine or userdata element
+  still aborts.
+- **Native.** The prover and the emitter take `ty = .boolean` (`TAG_BOOL`,
+  the canonical 0/1 payload into a GP home, `hload`'s bool arm). Strings,
+  closures and natives needed nothing: Phase 1's `isLoadedHeapRef` already
+  named `aload`, and `guard_func`/`guard_builtin` take any `.heap` operand.
+
+Three million iterations, `instructions:u`, against 7ed7ff0:
+
+| loop body | tier 0 | before (JIT) | after (JIT) | per iteration |
+|---|---|---|---|---|
+| `acc = acc + #names[i % 3 + 1]` | 945 M | 1,036 M | 121 M | 40 |
+| `acc = acc + fns[1](i / 2)` (natives) | 1,032 M | 1,123 M | 214 M | 71 |
+| `acc = hs[i % 3 + 1](acc)` (closures) | 1,902 M | 3,150 M | 127 M | 42 |
+| `if flags[i % 2 + 1] then acc = acc + 1 end` (bools beside a string) | 863 M | 954 M | 373 M | 124 |
+
+The closure row was 1.7 times slower with the JIT than without it: the
+loop did not record, and each call entered the callee's own trace through
+the one-shot lane (doc 84's subject).
+
+Board, `--trace --jit-native`: every row within 0.001% except str_sort
++0.036% (its recordings now get further before they abort). The census
+for str_sort went from `nyi_opcode get_index` at three sites to
+`nyi_opcode set_index` (a string stored into an array, the deferred item
+above), `nyi_opcode concat`, `needs_precise new_table` and one
+`host_barrier call`. co_many's `get_index` row stays: that element is a
+coroutine.
+
+Tests: the recorder shape for a string element, the abort for a coroutine
+element, native end-to-end programs for string, native, closure and bool
+elements and a carried string element, and exactness programs for two
+natives alternating at one call site, a closure replaced mid-loop, a bool
+turning into a hole, a string turning into a table and back, strings and
+numbers mixed in one array, and a native under a truth test replaced by
+`false`. `trace_record_test`'s "a `.value`-lane bool element aborts" now
+pins the typed load with no trailing guard.
+
+### 5.2 Found: a typed load whose type alternates
+
+Not caused by this doc, and measured on 7ed7ff0 before Phase 2:
+
+| loop body | tier 0 | JIT |
+|---|---|---|
+| `acc = acc + mixed[i % 4 + 1]`, `mixed = { 1, 2.5, 3, 4.5 }` | 897 M | 3,030 M |
+| the same over `{ 1, {}, 3, {} }` behind `type(v) == "number"` | 1,431 M | 3,541 M |
+| `acc = acc + objs[i % 2 + 1].v`, `v` an int in one record, a float in the other | 1,113 M | 3,202 M |
+| for comparison, a branch that alternates (`if i % 2 == 0`) | 1,157 M | 423 M |
+
+`--jit-stats` on the first row: one trace, 1,499,973 native entries, half
+the iterations run on tier 0 "despite a trace", `exit side: wants=0`. The
+trace is specialised to the type it was recorded with, the load's tag
+check fails on the next iteration, and nothing ever records the other
+type. Each native entry that runs a single iteration costs about 1,700
+instructions against 300 for the iteration on tier 0. A branch that
+alternates is handled (last row).
+
+The first rung of rule Z-8's ladder, from a `-Djit-debug` run of that
+loop: every receipt reads `exit=19`, and instruction 19 is the `aload`.
+The trace's exit table (`exit-loc:`) has no row for 19. It has one for
+instruction 20, the `guard_int` on the loaded value, and that row says
+`attach=attachable resume=15`. So the exit native code takes (the tag
+check fused into the load) has no snapshot, no attachability and no
+exit-side state: `TraceCode.exitSnapIdx` wants a side-exit guard op
+(`trace_ir.isSideExitGuardOp`) and a load is not one. The guard behind
+the load has all three, and native code never exits there, because the
+prover discharges it against the kind the load proved. `routeExitSide`
+therefore never wants the exit; and since every entry completes an
+iteration, `noteTakenExit` files it as a productive receipt of a
+non-branch guard, which raises no want either. An `hload` is the same in
+both executors.
+
+Tier 1a used to exit at the guard for an element (the attachable row)
+and at the load for a field; since Phase 2 it exits at the load for both,
+as native code does. The oracle mode got faster on these loops (8,070 M
+to 5,658 M on the first row), having lost the side traces it recorded and
+ran slowly.
+
+Phase 2 widens who can meet this a little: before it, an array of mixed
+types recorded only when the recorded iteration happened to load a number
+or a table; now a string, bool, closure or native iteration records too.
+
+What a fix has to decide (not designed here): the load's exit either
+takes the identity of the guard behind it (its snapshot and exit-side
+state exist already; a bool and a native have no such guard), or a typed
+load becomes an exit in its own right with its own exit facts in both
+executors (the op-level `isSideExitGuardOp` cannot tell a `.value`-lane
+load from a narrow-lane one, which never exits). Either way the other
+type then records as an exit-started side trace (doc 56), the machinery
+that serves the alternating branch.
 
 ## 6. Phase 3 — `math.abs`, `math.min`, `math.max`
 

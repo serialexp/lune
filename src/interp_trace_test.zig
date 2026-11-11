@@ -4258,6 +4258,171 @@ test "hash field doc 85 end-to-end: a loaded native carried in a local stays exa
     , "10001\n");
 }
 
+test "recorder (array element, doc 85): a string element records a typed aload + guard_string on the load" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local names = { "alpha", "be", "gamma" }
+        \\local s = 0
+        \\for i = 1, 50 do s = s + #names[i % 3 + 1] end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.registry.cache.items.len);
+    const t = vm.trace.registry.cache.items[0];
+    var load: ?usize = null;
+    for (t.code.instrs, 0..) |ins, i| {
+        if (ins.op == .aload and ins.ty == .heap) {
+            try testing.expectEqual(@as(i32, @intFromEnum(array.Lane.value)), ins.aux);
+            try testing.expect(load == null);
+            load = i;
+        }
+    }
+    const ref: trace.Ref = @intCast(load.?);
+    try testing.expectEqual(trace.IrOp.guard_string, t.code.instrs[load.? + 1].op);
+    try testing.expectEqual(ref, t.code.instrs[load.? + 1].a);
+}
+
+test "recorder (array element, doc 85): an element holding a coroutine aborts (no pin for that heap type)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local cos = { coroutine.create(function() end), 1 }
+        \\local n = 0
+        \\for i = 1, 50 do if cos[1] then n = n + 1 end end
+        \\print(n)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.registry.cache.items.len);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "array element doc 85 end-to-end: string elements' lengths run native; all ten legs" {
+    try expectNativeProgram(
+        \\local names = { "alpha", "be", "gamma" }
+        \\local s = 0
+        \\for i = 1, 200 do s = s + #names[i % 3 + 1] end
+        \\print(s)
+    , "799\n");
+}
+
+test "array element doc 85 end-to-end: a native element is called from the trace; all ten legs" {
+    try expectNativeProgram(
+        \\local fns = { math.floor, math.ceil }
+        \\local s = 0
+        \\for i = 1, 200 do s = s + fns[1](i / 2) end
+        \\print(s)
+    , "10000\n");
+}
+
+test "array element doc 85 end-to-end: two natives alternating in one call site stay exact" {
+    // The call's guard_builtin is the element's only pin: the other native
+    // fails it every other iteration.
+    try expectProgram(
+        \\local fns = { math.floor, math.ceil }
+        \\local s = 0
+        \\for i = 1, 200 do s = s + fns[i % 2 + 1](i / 2) end
+        \\print(s)
+    , "10100\n");
+}
+
+test "array element doc 85 end-to-end: closure elements are called from the trace, one replaced mid-loop" {
+    try expectNativeProgram(
+        \\local function inc(x) return x + 1 end
+        \\local function two(x) return x + 2 end
+        \\local hs = { inc, inc, inc }
+        \\local acc = 0
+        \\for i = 1, 200 do
+        \\  if i == 100 then hs[2] = two end
+        \\  acc = hs[i % 3 + 1](acc)
+        \\end
+        \\print(acc)
+    , "234\n");
+}
+
+test "array element doc 85 end-to-end: bool elements of a .value array under a truth test and ==; all ten legs" {
+    // The string makes the array a `.value` lane, so the bools are tagged
+    // Values and the load's own tag check is their pin.
+    try expectNativeProgram(
+        \\local flags = { true, false, "x", true }
+        \\local a, b = 0, 0
+        \\for i = 1, 200 do
+        \\  if flags[i % 4 + 1] then a = a + 1 end
+        \\  if flags[i % 4 + 1] == true then b = b + 1 end
+        \\end
+        \\print(a, b)
+    , "150\t100\n");
+}
+
+test "array element doc 85 end-to-end: a bool element turning into a hole side-exits exactly" {
+    try expectProgram(
+        \\local flags = { true, false, "x", true }
+        \\local a, b = 0, 0
+        \\for i = 1, 200 do
+        \\  if i == 120 then flags[1] = nil end
+        \\  if flags[i % 4 + 1] then a = a + 1 end
+        \\  if flags[i % 4 + 1] == true then b = b + 1 end
+        \\end
+        \\print(a, b)
+    , "129\t79\n");
+}
+
+test "array element doc 85 end-to-end: a string element turning into a table and back side-exits exactly" {
+    // `#` of the table is its border, so the wrong type would still print a
+    // number: only the dynamic guard_string keeps the legs equal.
+    try expectProgram(
+        \\local names = { "alpha", "be", "gamma" }
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if i == 100 then names[2] = { 1, 2, 3, 4 } end
+        \\  if i == 150 then names[2] = "xyz" end
+        \\  s = s + #names[i % 3 + 1]
+        \\end
+        \\print(s)
+    , "850\n");
+}
+
+test "array element doc 85 end-to-end: strings and numbers mixed in one array stay exact" {
+    try expectProgram(
+        \\local mixed = { "a", 1, "bb", 2 }
+        \\local acc = 0
+        \\for i = 1, 200 do
+        \\  local v = mixed[i % 4 + 1]
+        \\  if type(v) == "string" then acc = acc + #v else acc = acc + v end
+        \\end
+        \\print(acc)
+    , "300\n");
+}
+
+test "array element doc 85 end-to-end: a loaded string element carried in a local runs native" {
+    try expectNativeProgram(
+        \\local names = { "alpha", "be", "gamma" }
+        \\local cur = "x"
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  s = s + #cur
+        \\  cur = names[i % 3 + 1]
+        \\end
+        \\print(s)
+    , "795\n");
+}
+
+test "array element doc 85 end-to-end: a native element under a truth test, then replaced by false" {
+    try expectProgram(
+        \\local fns = { math.floor, "pad" }
+        \\local n = 0
+        \\for i = 1, 200 do
+        \\  if i == 120 then fns[1] = false end
+        \\  if fns[1] then n = n + 1 end
+        \\end
+        \\print(n)
+    , "119\n");
+}
+
 test "recorder (assert, P4): statement-form assert records guard_builtin + guard_true, copies nothing" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);

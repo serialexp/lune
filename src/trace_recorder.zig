@@ -2338,9 +2338,8 @@ pub const RecordingSession = struct {
 
     /// Doc 57: is `ref` statically a boolean on every run of the trace? A bool
     /// konst, or a producer whose result type is fixed: the compares and `not`
-    /// (always a bool), a bool-LANE `aload` (checked by lane, not by the
-    /// observed `ty`, which a value-lane load also stamps), and a bool
-    /// `hload`/`uload` field (their fused tag check exits on drift — the
+    /// (always a bool), a bool-LANE `aload`, and a bool `.value`-lane `aload`
+    /// or `hload`/`uload` field (their fused tag check exits on drift — the
     /// `recHashSet` P1 discipline). `slot_load`/`phi` are never typed: a peel
     /// φ copies its init's `ty`, which proves nothing about the update.
     fn boolTyped(self: *const RecordingSession, ref: Ref) bool {
@@ -2348,7 +2347,8 @@ pub const RecordingSession = struct {
         const ins = self.instrs.items[@intCast(ref)];
         return switch (ins.op) {
             .eq, .ne, .lt, .le, .not => true,
-            .aload => ins.aux == @intFromEnum(arr.Lane.boolean),
+            .aload => ins.aux == @intFromEnum(arr.Lane.boolean) or
+                (ins.aux == @intFromEnum(arr.Lane.value) and ins.ty == .boolean),
             .hload, .uload => ins.ty == .boolean,
             else => false,
         };
@@ -2732,22 +2732,29 @@ pub const RecordingSession = struct {
     ///
     /// **`.value` lane** (the type-erased lane holding full 16-byte Values): emits the
     /// same prefix but omits `guard_present` (`.value` lane has no presence bitmap —
-    /// nil is in-band) and appends a type guard on the *loaded value*. Two element
-    /// shapes are recordable:
-    ///   * a **table** with no metatable — the array-of-structs pattern
-    ///     (`bodies[i].x`), pinned by `guard_table` on the load. The result is a heap
-    ///     table ref subsequent `recHashGet`/`recHashSet` calls chain from.
+    /// nil is in-band). The load is TYPED: both executors exit at the `aload` when
+    /// the element's tag is not the recorded `ty`'s (the `hload` discipline), and a
+    /// subtype pin follows where one is needed. The element shapes:
+    ///   * a **table** — the array-of-structs pattern (`bodies[i].x`), pinned by
+    ///     `guard_table` on the load. The result is a heap table ref subsequent
+    ///     `recHashGet`/`recHashSet` calls chain from.
     ///   * an **int or float** — the mixed/erased numeric array (doc 32), pinned by
     ///     `guard_int`/`guard_float`. Arises whenever an int-lane array takes a float
     ///     store (or vice versa): `widenFor` has no cross-family rung, so the array
     ///     erases to `.value` permanently.
+    ///   * a **string** (doc 85 §5, `names[i]`) — pinned by `guard_string`.
+    ///   * a **closure** — pinned by `guard_func` (its proto id), as a function
+    ///     field is (doc 43 P2).
+    ///   * a **native** — no pin at the load: its consumer pins it, as for a
+    ///     native field (`hashGetShape`).
+    ///   * a **bool** — the load's own tag check is the strict pin, as for a bool
+    ///     field (doc 43 P1).
     ///
     /// Aborts (leaving tier-0 untouched) when:
     ///   * non-table container or non-int key → `.bad_type`;
-    ///   * out-of-bounds or hole at record time → `.bad_type`;
-    ///   * `.value`-lane with a bool, string, or function element → `.nyi_opcode`
-    ///     (no strict type guard pins those — doc 32 §3);
-    ///   * element table has a metatable → `.has_metatable`.
+    ///   * out-of-bounds at record time → `.bad_type`;
+    ///   * `.value`-lane with an element of any other heap type (a coroutine,
+    ///     userdata) → `.nyi_opcode`.
     pub fn recArrayGet(self: *RecordingSession, instr: Instr, regs: RegWindow) !void {
         return self.arrayGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = .{ .reg = instr.c }, .tab_od = .b, .key_od = .c });
     }
@@ -2777,23 +2784,21 @@ pub const RecordingSession = struct {
 
         if (lane == .value) {
             // The `.value` lane stores full 16-byte Values (tag+payload, nil in-band).
-            // Two element shapes are recordable, distinguished only by the *trailing*
-            // type guard on the loaded ref — the address/bounds prefix is identical:
-            //
-            //   * a **table** with no metatable — the array-of-structs pattern
-            //     (`bodies[i].x`), guarded by `guard_table` on the load;
-            //   * an **int or float** — the mixed/erased numeric array (doc 32),
-            //     guarded by `guard_int`/`guard_float` on the load.
-            //
-            // Everything else (bool, string, function) stays nyi: neither has a
-            // *strict* type guard that pins the element so a later iteration changing
-            // it side-exits — `guard_true` would wave a truthy heap value through, and
-            // a string element would additionally need `guard_string` plumbing. This
-            // is the same int/float restriction `hashGetShape` applies to hash fields,
-            // for the same reason.
-            const elem_is_table = loaded.isHeap() and loaded.heapType() == .table;
+            // The address/bounds prefix is the same for every element; the shapes
+            // differ in the recorded `ty` (which the load itself checks, in both
+            // executors) and the subtype pin behind it. The element types are
+            // exactly `hashGetShape`'s field types, pinned the same way: a table
+            // (`guard_table`), a number (`guard_int`/`guard_float`), a string
+            // (`guard_string`), a closure (`guard_func`), a native (pinned by its
+            // consumer) and a bool (the load's tag check). Any other heap type
+            // (a coroutine, userdata) has no pin and aborts.
+            const elem_heap: ?object.ObjectType = if (loaded.isHeap()) loaded.heapType() else null;
+            const elem_is_table = elem_heap == .table;
             const elem_is_num = loaded.isInt() or loaded.isFloat();
-            if (!elem_is_table and !elem_is_num) return self.abort(.nyi_opcode);
+            const elem_is_str = elem_heap == .string;
+            const elem_is_fn = elem_heap == .function;
+            const elem_is_native = elem_heap == .native;
+            if (!(elem_is_table or elem_is_num or elem_is_str or elem_is_fn or elem_is_native or loaded.isBool())) return self.abort(.nyi_opcode);
             // Loading an element consults none of its metatable; whatever
             // the trace does with it next guards its own needs.
             const elem_aux: i32 = if (elem_is_table) metaAux(table_mod.Table.fromHeader(loaded.asHeap())) else 0;
@@ -2807,19 +2812,28 @@ pub const RecordingSession = struct {
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
             // No guard_present: the `.value` lane has no presence bitmap — nil is
-            // encoded in-band (tag == .nil). A nil element fails the trailing type
-            // guard below (nil is neither a heap_ref nor a number) and side-exits to
-            // tier-0. Correct for both element shapes.
+            // encoded in-band (tag == .nil). A nil element fails the load's own
+            // tag check (nil is no heap_ref, number or bool) and side-exits to
+            // tier-0. Correct for every element shape.
             const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
-            // Fused native producer-exit (A-i.3): the native `.value` `aload` tag-checks
-            // the loaded element against the tag its recorded `ty` implies and side-exits
-            // there, with no `guard_*` node — so the exit identity rides the `aload`
-            // itself. The recorder still emits the guard below for the tier-1a oracle;
-            // native discharges it statically (proven kind) and emits nothing.
+            // Fused producer-exit (A-i.3): the `.value` `aload` tag-checks the
+            // loaded element against the tag its recorded `ty` implies and
+            // side-exits there, with no `guard_*` node, so the exit identity
+            // rides the `aload` itself. Native has always done this; tier 1a
+            // does since doc 85 §5, which is what lets a native or a bool
+            // element go without a trailing guard.
             self.stampProv(rload, .element_type, .loaded, .neutral);
-            // Pin the element's type so a later iteration changing it side-exits.
+            // Pin the element's subtype so a later iteration changing it side-exits.
             if (elem_is_table) {
                 self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload, .aux = elem_aux }), .element_type, .loaded, .neutral);
+            } else if (elem_is_str) {
+                self.stampProv(try self.emit(.{ .op = .guard_string, .a = rload }), .element_type, .loaded, .neutral);
+            } else if (elem_is_fn) {
+                // The identity pin a function field gets (doc 43 P2).
+                const cl = function.Closure.fromHeader(loaded.asHeap());
+                self.stampProv(try self.emit(.{ .op = .guard_func, .a = rload, .aux = @bitCast(cl.proto.id) }), .callee_identity, .loaded, .neutral);
+            } else if (elem_is_native or loaded.isBool()) {
+                // A native is pinned by its consumer; a bool by the load.
             } else {
                 try self.guardNum(rload, loaded, .element_type, .loaded);
             }

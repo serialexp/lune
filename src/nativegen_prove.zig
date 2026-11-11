@@ -1240,18 +1240,23 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (ins.aux == VALUE_LANE) {
                     // The .value lane holds full 16-byte tagged Values, so the
                     // element's kind comes from the recorded `ty`, not from the lane.
-                    // Three shapes lower (the tag check is FUSED into the load — see
+                    // Four shapes lower (the tag check is FUSED into the load — see
                     // the codegen arm and `opMayExitInBody`):
-                    //   .heap  → a per-iteration *GcHeader for a table (Phase 2,
-                    //            array-of-structs `bodies[i].x`);
-                    //   .int   → TAG_INT payload into a GP register (doc 32);
-                    //   .float → TAG_FLOAT payload into an XMM register (doc 32).
-                    // Anything else (bool/string/unknown) still bails; the recorder
-                    // does not emit those shapes, so this is defence in depth.
+                    //   .heap    → a per-iteration *GcHeader: a table (Phase 2,
+                    //              array-of-structs `bodies[i].x`) or, doc 85 §5,
+                    //              a string, closure or native, each subtype
+                    //              pinned by its own guard (`isLoadedHeapRef`);
+                    //   .int     → TAG_INT payload into a GP register (doc 32);
+                    //   .float   → TAG_FLOAT payload into an XMM register (doc 32);
+                    //   .boolean → TAG_BOOL, the canonical 0/1 payload into a GP
+                    //              register (doc 85 §5; `hload`'s bool arm).
+                    // Anything else (nil/unknown) bails; the recorder does not
+                    // emit those shapes, so this is defence in depth.
                     kinds[i] = switch (ins.ty) {
                         .heap => .heap,
                         .int => .int,
                         .float => .float,
+                        .boolean => .bool,
                         else => return false,
                     };
                 } else {
