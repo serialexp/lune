@@ -547,18 +547,19 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
 
                 // ---- `#t` fast-case border (doc 23 D3) ----
                 // Produce `max(asize−1, 0)` when the exact fast case holds (hash
-                // empty ∧ presence-bitmap lane ∧ (asize ≤ 1 ∨ present(asize−1))) —
-                // the premises under which `Table.length()` returns exactly this
-                // value with no trim loop or hash search — else side-exit to
-                // tier-0, which owns the general border search (holes, hash
-                // borders, grids, in-band lanes).
+                // empty ∧ the lane is in the recorded probe's class ∧ (asize ≤ 1
+                // ∨ slot asize−1 present)) — `Table.lengthFast` itself, the
+                // premises under which `Table.length()` returns this value with
+                // no trim loop or hash search — else side-exit to tier-0, which
+                // owns the general border search (holes, hash borders, grids).
+                // The lane-class test is what native code branches on, so the
+                // two tiers leave at the same tables.
                 .alen => {
                     const tbl = table.Table.fromHeader(values[ins.a].asHeap());
-                    const ap = &tbl.array;
-                    const fast = tbl.hash.count() == 0 and ap.lane.scalarPresenceLane() and
-                        (ap.asize <= 1 or ap.isPresent(ap.asize - 1));
-                    if (fast) {
-                        values[i] = Value.int(if (ap.asize == 0) 0 else @intCast(ap.asize - 1));
+                    const in_class = trace_ir.AlenProbe.ofLane(tbl.array.lane) == trace_ir.AlenProbe.of(ins);
+                    const border: ?i64 = if (in_class) tbl.lengthFast() else null;
+                    if (border) |n| {
+                        values[i] = Value.int(n);
                         if (record) rec.value(i, values[i]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ins.a]);

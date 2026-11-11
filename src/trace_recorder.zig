@@ -6083,11 +6083,14 @@ pub const RecordingSession = struct {
 
     /// Record `#t` / `rawlen(t)` as the guarded `alen` producer (doc 23 D3):
     /// `guard_table(t)` then `alen(t)`, whose own runtime check side-exits
-    /// unless the exact fast case holds (hash empty ∧ bitmap lane ∧ (asize ≤ 1 ∨
-    /// present(asize−1))). The record-time observation must already satisfy the
-    /// fast case — an already-failing shape would be an instant turnstile — and
-    /// `.value`/`.boolean`/grid lanes abort (their presence is in-band, so the
-    /// fast case can't certify the border without reading elements).
+    /// unless the exact fast case holds (`Table.lengthFast`: hash empty ∧ not a
+    /// grid ∧ (asize ≤ 1 ∨ slot asize−1 is occupied)). The record-time
+    /// observation must already satisfy the fast case — an already-failing
+    /// shape would be an instant turnstile. How "occupied" is read depends on
+    /// the lane, so the op carries an `AlenProbe` in `b`: the presence bitmap
+    /// for the scalar lanes, the element's tag for `.value`, the element's
+    /// byte for `.boolean`. The op also exits when the table's lane has left
+    /// the recorded probe's class. A grid has no probe and aborts.
     ///
     /// Sunk-store interaction (arc-A codex #4, REFINED in doc 24 D7): pending
     /// RMW stores flush at commit, below every guard, so on-trace `alen` reads
@@ -6095,8 +6098,10 @@ pub const RecordingSession = struct {
     /// because sunk stores cannot change the guarded fast-case answer:
     ///   - only in-bounds stores sink (appends are never deferred — they change
     ///     `len` and abort/`astore_append` inline), so `asize` is invariant;
-    ///   - stores never clear presence (nil hole-punch aborts), so
-    ///     `present(asize-1)` can only go false→true; the trace's alen check
+    ///   - stores never empty a slot on any lane (a nil store aborts the
+    ///     recording, and a recorded store pins its value's type: int/float
+    ///     on `.value`, `guard_fits` elsewhere), so "slot asize−1 occupied"
+    ///     can only go false→true; the trace's alen check
     ///     reading the stale FALSE side-exits — and since `alen` is a
     ///     side-exiting op, the sunk stores are un-executed at that exit and
     ///     tier-0's replay applies them exactly once (the doc-08 argument);
@@ -6111,10 +6116,10 @@ pub const RecordingSession = struct {
         const vtab = regs.get(tab_slot);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
-        if (tbl.hash.count() != 0) return self.abort(.bad_type);
-        if (!tbl.array.lane.scalarPresenceLane()) return self.abort(.bad_type);
-        const asize = tbl.array.asize;
-        if (asize > 1 and !tbl.array.isPresent(asize - 1)) return self.abort(.bad_type);
+        // Record only what the op can answer: tier 0's own fast case, on a
+        // lane the op has a probe for (a grid has none).
+        const probe = trace_ir.AlenProbe.ofLane(tbl.array.lane) orelse return self.abort(.bad_type);
+        if (tbl.lengthFast() == null) return self.abort(.bad_type);
         const rtab = try self.refOf(tab_slot);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab, .aux = metaAux(tbl) }), .container_type, tab_od, .neutral);
         // Doc 77 §5.4: `#t` on a table with a metatable is the raw border
@@ -6123,7 +6128,7 @@ pub const RecordingSession = struct {
         if (tbl.metatable) |mt| if (!raw) {
             if (!try self.guardNoMetamethod(rtab, mt, "__len", tab_od, dst)) return;
         };
-        const r = try self.emit(.{ .op = .alen, .a = rtab, .ty = .int });
+        const r = try self.emit(.{ .op = .alen, .a = rtab, .b = @intFromEnum(probe), .ty = .int });
         self.stampProv(r, .border, tab_od, .neutral);
         self.setReg(dst, r);
     }

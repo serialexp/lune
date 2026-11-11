@@ -4398,6 +4398,138 @@ test "array element doc 85 end-to-end: strings and numbers mixed in one array st
     , "300\n");
 }
 
+/// `expectProgram` on every leg, then a native run that must have entered
+/// native code and hold a trace whose `alen` carries `probe`.
+fn expectNativeAlen(source: [:0]const u8, expected: []const u8, probe: trace_ir.AlenProbe) !void {
+    try expectProgram(source, expected);
+    if (comptime !@import("nativegen.zig").is_x64_linux) return;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try util.runNativeForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(expected, sink.buffered());
+    try testing.expect(vm.trace.native_entries > 0);
+    var found = false;
+    for (vm.trace.registry.cache.items) |t| {
+        for (t.code.instrs) |ins| {
+            if (ins.op == .alen and trace_ir.AlenProbe.of(ins) == probe) found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "#t of an array of tables in a loop condition records and runs native" {
+    try expectNativeAlen(
+        \\local items = {}
+        \\for i = 1, 200 do items[i] = { n = i } end
+        \\local s = 0
+        \\local i = 1
+        \\while i <= #items do
+        \\  s = s + items[i].n
+        \\  i = i + 1
+        \\end
+        \\print(s)
+    , "20100\n", .value);
+}
+
+test "#t of an array of strings and of an array of booleans record" {
+    try expectNativeAlen(
+        \\local names = { "alpha", "be", "gamma" }
+        \\local s = 0
+        \\for i = 1, 300 do s = s + #names end
+        \\print(s)
+    , "900\n", .value);
+    try expectNativeAlen(
+        \\local flags = { true, false, true, true }
+        \\local s = 0
+        \\for i = 1, 300 do s = s + #flags end
+        \\print(s)
+    , "1200\n", .boolean);
+}
+
+test "#t of a list of records in a function called from a loop records" {
+    try expectNativeAlen(
+        \\local function total(list)
+        \\  local n = 0
+        \\  for i = 1, #list do n = n + list[i].n end
+        \\  return n
+        \\end
+        \\local list = { { n = 1 }, { n = 2 }, { n = 3 }, { n = 4 }, { n = 5 } }
+        \\local s = 0
+        \\for round = 1, 200 do s = s + total(list) end
+        \\print(s)
+    , "3000\n", .value);
+}
+
+test "#t of a value-lane array stays exact when its last slot empties and its hash part fills" {
+    // The border moves under a compiled trace twice: the last element goes
+    // (a nil in the last slot, or a shorter extent), then a string key makes
+    // the hash part non-empty, which is the op's other exit.
+    try expectNativeAlen(
+        \\local items = {}
+        \\for i = 1, 8 do items[i] = { n = i } end
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  if i == 150 then items[#items] = nil end
+        \\  if i == 220 then
+        \\    items[#items + 1] = { n = 1 }
+        \\    items.extra = 1
+        \\  end
+        \\  s = s + #items
+        \\end
+        \\print(s)
+    , "2330\n", .value);
+}
+
+test "#t of a boolean-lane array stays exact when its last slot empties" {
+    try expectNativeAlen(
+        \\local flags = { true, false, true, true }
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  if i == 150 then flags[#flags] = nil end
+        \\  s = s + #flags
+        \\end
+        \\print(s)
+    , "1049\n", .boolean);
+}
+
+test "#t recorded on the boolean lane leaves when the array widens to the value lane" {
+    // Sixteen elements, so the byte the boolean probe would read (data + 16)
+    // is the tag of element 1 once the lane holds 16-byte values: non-zero,
+    // while the last slot is empty. Only the op's lane check keeps the
+    // answer at 15.
+    try expectNativeAlen(
+        \\local flags = {}
+        \\for i = 1, 16 do flags[i] = (i % 2 == 0) end
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  if i == 150 then
+        \\    flags[16] = nil
+        \\    flags[2] = "two"
+        \\  end
+        \\  s = s + #flags
+        \\end
+        \\print(s)
+    , "4649\n", .boolean);
+}
+
+test "#t follows an array that widens from a scalar lane to the value lane" {
+    // Recorded with the bitmap probe; the string store widens the lane, the
+    // op leaves at its lane check, and the length is still 3.
+    try expectProgram(
+        \\local xs = { 1, 2, 3 }
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  if i == 150 then xs[2] = "two" end
+        \\  s = s + #xs
+        \\end
+        \\print(s)
+    , "900\n");
+}
+
 test "type() of a string records: a loop over strings behind type(v) == \"string\" runs native" {
     try expectNativeProgram(
         \\local names = { "alpha", "be", "gamma" }

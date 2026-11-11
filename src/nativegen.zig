@@ -2187,38 +2187,77 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, trace_id: u32, kinds: []const 
                 try jccNativeExit(a, exit_labels, i, .ne); // hash non-empty → migrate possible
             },
             // alen (doc 23 D3): the `#t` fast-case border, `max(asize−1, 0)`.
-            // Re-verifies the same premises tier-1a checks — hash empty,
-            // presence-bitmap lane, (asize ≤ 1 ∨ present(asize−1)) — with
-            // memory-operand compares mirroring guard_append, side-exiting to
-            // tier-0 (which owns the general border search) on any miss. The
-            // bitmap-lane test is a single unsigned range compare: the bitmap
-            // lanes are exactly the contiguous ordinals `i8..u8` (pinned by a
-            // comptime assert against `Lane.usesPresenceBitmap` below).
+            // Re-verifies the same premises tier-1a checks — hash empty, the
+            // lane in the recorded probe's class (`AlenProbe`), (asize ≤ 1 ∨
+            // slot asize−1 present) — with memory-operand compares mirroring
+            // guard_append, side-exiting to tier-0 (which owns the general
+            // border search) on any miss. The bitmap-lane test is a single
+            // unsigned range compare: the bitmap lanes are exactly the
+            // contiguous ordinals `i8..u8` (pinned by a comptime assert
+            // against `Lane.scalarPresenceLane` below); an in-band lane is
+            // one ordinal, one compare.
             .alen => {
                 comptime {
                     for (@typeInfo(arr.Lane).@"enum".field_values) |fv| {
                         const l: arr.Lane = @enumFromInt(fv);
                         const in_range = fv >= @intFromEnum(arr.Lane.i8) and fv <= @intFromEnum(arr.Lane.u8);
                         std.debug.assert(l.scalarPresenceLane() == in_range);
+                        std.debug.assert((trace_ir.AlenProbe.ofLane(l) == .bitmap) == in_range);
                     }
                 }
+                const probe = trace_ir.AlenProbe.of(ins);
                 const tbreg = try refBaseReg(a, alloc, ins.a, .rax); // table ptr
                 try a.cmpDwordMemImm(tbreg, ArrLayout.hash_size, 0);
                 try jccNativeExit(a, exit_labels, i, .ne); // hash non-empty → general border
-                try a.cmpByteMemImm(tbreg, ArrLayout.array_base + ArrLayout.lane, @intFromEnum(arr.Lane.i8));
-                try jccNativeExit(a, exit_labels, i, .b); // below i8 → .value/.boolean (in-band)
-                try a.cmpByteMemImm(tbreg, ArrLayout.array_base + ArrLayout.lane, @intFromEnum(arr.Lane.u8));
-                try jccNativeExit(a, exit_labels, i, .a); // above u8 → grid
+                // The lane must still be in the recorded probe's class, so the
+                // probe below reads slot asize−1 through the right layout.
+                switch (probe) {
+                    .bitmap => {
+                        try a.cmpByteMemImm(tbreg, ArrLayout.array_base + ArrLayout.lane, @intFromEnum(arr.Lane.i8));
+                        try jccNativeExit(a, exit_labels, i, .b); // below i8 → .value/.boolean (in-band)
+                        try a.cmpByteMemImm(tbreg, ArrLayout.array_base + ArrLayout.lane, @intFromEnum(arr.Lane.u8));
+                        try jccNativeExit(a, exit_labels, i, .a); // above u8 → grid
+                    },
+                    .value, .boolean => {
+                        const lane: arr.Lane = if (probe == .value) .value else .boolean;
+                        try a.cmpByteMemImm(tbreg, ArrLayout.array_base + ArrLayout.lane, @intFromEnum(lane));
+                        try jccNativeExit(a, exit_labels, i, .ne);
+                    },
+                }
                 try a.movRegMem(.rcx, tbreg, ArrLayout.array_base + ArrLayout.asize); // rcx = asize
                 const skip_presence = try a.label();
                 try a.cmpRegImm32(.rcx, 1);
                 try a.jcc(.be, skip_presence); // asize ≤ 1 → border 0, nothing to probe
-                try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
-                try a.cmpRegImm32(.rax, 0);
-                try jccNativeExit(a, exit_labels, i, .e); // no bitmap allocated → side-exit
-                try a.subRegImm32(.rcx, 1); // rcx = asize − 1 (the border candidate)
-                try a.btMemReg(.rax, 0, .rcx); // CF = present(asize−1)
-                try jccNativeExit(a, exit_labels, i, .ae); // bit clear → trailing hole → tier-0
+                // rax is free from here: the table pointer has had its last use.
+                switch (probe) {
+                    .bitmap => {
+                        try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
+                        try a.cmpRegImm32(.rax, 0);
+                        try jccNativeExit(a, exit_labels, i, .e); // no bitmap allocated → side-exit
+                        try a.subRegImm32(.rcx, 1); // rcx = asize − 1 (the border candidate)
+                        try a.btMemReg(.rax, 0, .rcx); // CF = present(asize−1)
+                        try jccNativeExit(a, exit_labels, i, .ae); // bit clear → trailing hole → tier-0
+                    },
+                    // In-band lanes: asize > 1 means `data` is allocated. `lea`
+                    // leaves rcx (the result) and the flags alone.
+                    .value => {
+                        try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                        try a.subRegImm32(.rcx, 1);
+                        // &data[asize−1] with 16-byte elements: SIB scales by 8
+                        // at most, so add rcx*8 twice.
+                        try a.leaRegMemSib(.rax, .rax, .rcx, 8, 0);
+                        try a.leaRegMemSib(.rax, .rax, .rcx, 8, 0);
+                        try a.cmpByteMemImm(.rax, VALUE_TAG_OFF, TAG_NIL);
+                        try jccNativeExit(a, exit_labels, i, .e); // nil → trailing hole → tier-0
+                    },
+                    .boolean => {
+                        try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                        try a.subRegImm32(.rcx, 1);
+                        try a.leaRegMemSib(.rax, .rax, .rcx, 1, 0);
+                        try a.cmpByteMemImm(.rax, 0, 0); // 0 = absent
+                        try jccNativeExit(a, exit_labels, i, .e);
+                    },
+                }
                 const done = try a.label();
                 try a.jmp(done);
                 a.bind(skip_presence);

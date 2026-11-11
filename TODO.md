@@ -113,12 +113,40 @@ more than tier 0. Four causes, by pass:
       loop through the call (the last item below), which removes the
       per-call activation altogether. Related: "A nested `while` goes
       silent late on a short run" below.
-- [ ] **`#t` on a `.value`-lane array aborts the recording**
+- [x] **`#t` on a `.value`-lane array aborts the recording**
       (`bad_type len`; `recAlenShape` takes scalar presence lanes
       only). `for i = 1, #items` over records, strings or closures is
       every function's first line here, so no function head and no
       caller's loop records through it. 88 aborts on the board before
-      this row (globals_script, tbl_stack, meta_fields).
+      this row (globals_script, tbl_stack, meta_fields). Fixed
+      2026-11-11 (doc 85 §7.3): `alen` carries an `AlenProbe` and
+      answers `Table.lengthFast` on the value and boolean lanes too.
+      meta_fields −39.9% JIT, globals_script −0.27%, this row unchanged
+      (9,301 M): `configured` and `refine` fall from 220 M and 61 M to
+      9 M and 4 M when run alone, because main's loop then swallows
+      them, and in the full program that recording dies in `carried`'s
+      64-trip loop (next item). The 46 `bad_type len` aborts left on
+      the board are the popping idiom ("A popping loop never traces").
+- [ ] **Nothing joins a loop to the next one across a return and a
+      call** (doc 85 §7.3, found 2026-11-11). LuaJIT runs this row as
+      four loop roots (`carried`, `owed`, `tags`, `count`) joined in a
+      ring by side traces: each loop's exit returns into main, runs to
+      the next call, enters the callee and links to its loop
+      (`25 (3/3) :112 -> 4` and so on; `configured`, `refine` and main's
+      back-edge ride unrolled inside the side trace from `count` to
+      `carried`). It has no trace for main's loop. Here every step of
+      the ring ends a recording: `cross_frame` at a `ret` below the
+      start frame (LuaJIT: `lj_record_ret`, `retdepth`), `cont_backedge`
+      when a `.cont` meets the next callee's loop (doc 44 D12b), no
+      link from inside an inlined call (`recForPrepLink`: the target is
+      resolved in the anchor's proto; LuaJIT: `rec_loop_jit`,
+      `LJ_TRLINK_ROOT` at any depth), and main's own loop dies
+      unrolling `carried` (`loop_unroll`, 389 IR). Doc 44's frame links
+      (`ret_cont`, `call_head`) are the nearest machinery and arm
+      nothing in this run. Needs a design doc; not started, not picked.
+      The heapsort entry ("A short loop in a function called from a
+      loop") and "A short loop in a function is entered from tier 0 on
+      every call" below are cases of this.
 - [ ] **A table found by a string key that is not a constant aborts**
       (`rules[item.kind]`: `bad_type get_index`; `owed` and `tags`,
       four fifths of the row's tier-0 time). `hashGetShape` wants the
@@ -131,7 +159,9 @@ more than tier 0. Four causes, by pass:
       types in eight elements at ~1,300 cycles per traced iteration).
       The heapsort entry below ("A short loop in a function called from
       a loop") is the same shape; LuaJIT records the caller's loop
-      through the call and the inner loop.
+      through the call and the inner loop. (Not on this row: see
+      "Nothing joins a loop to the next one" above. Alone in the round,
+      both passes are swallowed by main's loop since `#t` records.)
 - [ ] **`owed`'s four closures are head traces entered from tier 0**,
       320k times at ~375 cycles (892 M against 501 M). Doc 84's subject
       ("Entering a head trace from tier-0 costs more than a small body
@@ -920,7 +950,10 @@ earlier in `/tmp/t0micro/`).
       `t[#t] = nil` stays on tier 0 (tbl_stack: 4 abort sites, 0 trace
       entries). LuaJIT records `lj_tab_len_hint`, a guarded check that the
       previous border is still one (`t[h] ~= nil and t[h+1] == nil`),
-      falling back to the full search.
+      falling back to the full search. Since doc 85 §7.3 (2026-11-11)
+      this is every `bad_type len` abort left on the board, 46 of them:
+      tbl_stack, and globals_script's swap-remove
+      (`entities[i] = entities[#entities]; entities[#entities] = nil`).
 
 ## JIT instruction counts move with bytecode pc layout (noted 2026-10-22)
 

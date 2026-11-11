@@ -6,7 +6,10 @@ Phase 2 (string, native, closure and bool array elements) and the typed-load
 exit fix that Phase 2 turned up (§5.2, §5.3) landed, `type()` of a
 string records (§5.3 follow-up), and Phase 4's board row is in
 (`bench/records_script.lua`, §7): the JIT runs it 1.67x slower than tier
-0, and Phases 1 and 2 and the exit fix each made it slower (§7.2). Phase 3 is not
+0, and Phases 1 and 2 and the exit fix each made it slower (§7.2). `#t`
+on an array of records, strings or booleans records now (§7.3):
+meta_fields −39.9%, and `records_script` unchanged, because nothing joins
+its loops across the calls between them. Phase 3 is not
 started; Q1, Q2 and Q3 (§8) are open. Bart has not picked this arc: it was
 started on 2026-11-11 under "continue using your best judgement" after four
 asks went unanswered. Phase 3 needs his answer to Q1.
@@ -68,12 +71,27 @@ land; move whole phases to Done once everything inside them is checked.
   `bench/records_script.lua` with its hashgate digests (§7.1). Agrees
   across the three tiers and with LuaJIT. Baseline and what it shows:
   §7.2.
+- [x] **`#t` on a `.value`- or `.boolean`-lane array records** (§7.3;
+  the first of §7.2's causes taken, on an unanswered ask). `alen` carries
+  an `AlenProbe` and answers tier 0's own fast case
+  (`Table.lengthFast`) on every lane but a grid. With the JIT on:
+  meta_fields 2,236 M to 1,344 M instructions (−39.9%), globals_script
+  −0.27%, `records_script` 9,300 M to 9,301 M. `bad_type len` aborts on
+  the board: 169 to 46.
 
 ### Outstanding
 
 - [ ] **`records_script` is slower with the JIT than on tier 0** (§7.2):
-  9,300 M instructions against 5,561 M, LuaJIT 853 M. Four causes, each
-  with its own entry in `TODO.md`; none is in this doc's phases.
+  9,301 M instructions against 5,561 M, LuaJIT 853 M. Four causes, each
+  with its own entry in `TODO.md`; none is in this doc's phases. `#t`
+  is done (§7.3); what it uncovered is the next item.
+- [ ] **Nothing joins a loop to the next one across a return and a
+  call** (§7.3). LuaJIT runs `records_script` as a ring of four loop
+  traces joined by side traces that return to the caller and enter the
+  next function's loop. Here each step of that ring stops a recording:
+  `cross_frame` at the `ret`, `cont_backedge` at the next loop,
+  `nyi_opcode for_prep` at a function head, and no link from inside an
+  inlined call. Needs a design; Bart has not picked it.
 
 - [ ] **Phase 3 — `math.abs`, `math.min`, `math.max` get recorder arms**
   (§6). Needs Q1.
@@ -649,15 +667,132 @@ Four causes, none of them a missing recorder arm for a library call:
    (`recAlenShape` takes scalar lanes only, so an array of tables,
    strings, closures or mixed values is `bad_type len`, §2.2). The last
    one stops the program's outer loop and all six functions' heads at
-   their `for i = 1, #list`.
+   their `for i = 1, #list`. (`#t` records since §7.3.)
 4. **A short loop in a function is entered from tier 0 on every call.**
    LuaJIT records the caller's loop through the call and the inner loop;
    here the outer loop does not record (cause 3), so each inner loop
    pays an entry and an exit per call (`TODO.md`, "a short loop in a
-   function called from a loop").
+   function called from a loop"). (Corrected in §7.3: LuaJIT's trace
+   log shows no trace for the caller's loop. Its inner loops are roots
+   and their exits link them through the caller.)
 
 The probes this doc used (§2.1, §5.3) were single loops of three million
 iterations. They measured the trace body and missed all four.
+
+### 7.3 `#t` on an in-band lane (2026-11-11)
+
+Taken first of §7.2's causes because it stood in front of the others:
+every function in the row starts `for i = 1, #list`, so no recording
+that came from outside a loop got past the first line. The ask about
+which cause to take went unanswered.
+
+**What was built.** `alen` answers exactly tier 0's fast case,
+`Table.lengthFast`: not a grid, hash part empty, and `asize ≤ 1` (0) or
+slot `asize − 1` occupied (`asize − 1`). Until now it took only the
+lanes that keep a presence bitmap. How "occupied" is read is the one
+thing that differs by lane, so the op carries an `AlenProbe` in `b`:
+`bitmap` (the scalar lanes; ordinal 0, what the op carried before),
+`value` (the element's tag is not nil) and `boolean` (the element's byte
+is not 0). `recAlenShape` records when the lane has a probe and
+`lengthFast()` answers at record time. Tier 1a calls `lengthFast` behind
+a check that the table's lane is still in the recorded probe's class;
+native compares the lane byte and reads the tag at `data + 16·(asize−1)`
+or the byte at `data + (asize−1)`. A failed check is the op's side exit,
+as before.
+
+The sunk-store argument (doc 24 D7) carries over: a pending store
+cannot empty a slot on any lane (a nil store aborts the recording; a
+recorded store pins its value's type, int or float on `.value`,
+`guard_fits` elsewhere), so the op read before the flush either gives
+tier 0's answer or leaves.
+
+Tests, in `src/interp_trace_test.zig`: `#t` of an array of tables in a
+`while` condition, of strings, of booleans, of a list of records in a
+function called from a loop; the border moving under a compiled trace
+(last slot emptied, then the hash part filled) on the value lane and on
+the boolean lane; a boolean-lane recording whose array widens to the
+value lane with the last slot empty (16 elements, so the byte the
+boolean probe would read is element 1's tag); a scalar lane widening to
+the value lane. In `src/trace_record_test.zig`: the probe recorded per
+lane, and the abort matrix with a value-lane trailing nil. Three mutants
+of the native arm (value probe without its exit, boolean probe without
+its exit, no lane check on the in-band probes) each fail one test.
+
+**Measured** (instructions, `--trace --jit-native`, 2e0b2fd against
+2e0b2fd with this):
+
+| row | before | after | |
+|---|---|---|---|
+| meta_fields | 2,236 M | 1,344 M | −39.9% |
+| globals_script | | | −0.27% |
+| records_script | 9,299.6 M | 9,300.7 M | +0.01% |
+
+Every other row is within ±0.05% (proc_pipe counts a child process and
+differs between two runs of one binary). meta_fields' inner
+`for i = 1, #ps` over an array of tables records now: 65.8% of the run
+in traces before, 90.5% after. `bad_type len` aborts over the board:
+169 to 46. The 46 are globals_script and tbl_stack, both after
+`t[#t] = nil`, which leaves a nil in the last slot so the fast case does
+not hold (`TODO.md`, "A popping loop never traces").
+
+Each pass alone, as in §7.2 (5,000 rounds, JIT):
+
+| pass | before | after | LuaJIT |
+|---|---|---|---|
+| `carried` | 279 M | 280 M | 9.8 M |
+| `owed` | 892 M | 892 M | 81 M |
+| `tags` | 620 M | 621 M | 113 M |
+| `count` | 145 M | 145 M | 15 M |
+| `configured` | 220 M | 9 M | 6.8 M |
+| `refine` | 61 M | 4 M | 2.0 M |
+
+**Why two passes fall by 24 and 15 times alone and the row does not
+move.** In the scratch copy the round runs one pass. The `for round`
+loop then records through the call, and the callee's loop is unrolled
+inside it (8 and 3 trips, under `loopunroll`'s 15): one trace holds the
+whole round. In the full program the same recording reaches `carried`
+first, and its loop runs 64 trips: `loop_unroll` at 389 IR, six times,
+and the anchor is barred. With the outer loop gone, the abort table
+after this change is:
+
+| recording | stops at | reason |
+|---|---|---|
+| main's `for round` (root) | `carried`'s loop, inlined | `loop_unroll` |
+| the continuation after each of main's first five calls (`.cont`) | the next callee's loop | `cont_backedge` |
+| the continuation after `refine` returns (`.cont`) | main's own back-edge | `cont_backedge` |
+| each function's head (`.head`), six | its own `for_prep` | `nyi_opcode` (LINNER) |
+| a recording that runs off the end of `configured`'s or `refine`'s loop | the function's `ret` | `cross_frame` |
+| `owed`, `tags`, `count` loops | as §7.2 | `bad_type get_index`, `jeq` |
+
+**What LuaJIT does with it** (`luajit -jv`, 29 traces). Its roots are
+the four loops in `carried`, `owed`, `tags` and `count`. There is no
+trace for main's loop, nor for `configured`'s or `refine`'s. Each
+loop's exit grows a side trace that returns into main, runs main's code
+up to the next call, enters the callee and links to that callee's loop:
+`25 (3/3) :112 -> 4` (`carried` to `owed`), `28 (13/3) :123 -> 5`
+(`owed` to `tags`), `27 (5/3) :134 -> 6` (`tags` to `count`), and
+`10 (6/1) :143 -> 3`, which leaves `count`, carries `configured` and
+`refine` unrolled (8 and 3 trips), main's back-edge and the call of
+`carried`, and links to `carried`'s loop. The program is a ring of four
+loop traces and never leaves native code. Two mechanisms make the ring:
+a side trace that returns below the frame it started in
+(`lj_record_ret`: `J->retdepth`, a guard on the return address), and a
+side trace that links to a root from any frame depth (`rec_loop_jit`,
+`LJ_TRLINK_ROOT`). A root that reaches an inner loop aborts there too
+(`LJ_TRERR_LINNER`), so the function-head aborts above are not the
+difference.
+
+Here the first mechanism is the `cross_frame` abort, and the second is
+`recForPrepLink`'s depth rule: a link's target is resolved in the
+anchor's proto, so a recording inside an inlined call can only unroll
+the loop it meets. Doc 44's frame links (`ret_cont`, `call_head`) are
+the nearest machinery; this run has `ret-cont arms=0`, `call-head
+arms=0`.
+
+So cause 4 of §7.2 said the wrong thing about LuaJIT, and the cause is
+wider than "a short loop": no loop in a called function is joined to
+anything outside that function, whatever its trip count. That is a
+design of its own, not a phase of this doc.
 
 ## 8. Open questions for review
 

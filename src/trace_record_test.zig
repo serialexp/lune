@@ -1840,20 +1840,56 @@ test "len opcode: #t on a bitmap-lane table records guard_table + alen" {
     try testing.expectEqual(@as(usize, 3), ops.len);
     try testing.expectEqual(IrOp.guard_table, ops[1].op);
     try testing.expectEqual(IrOp.alen, ops[2].op);
+    try testing.expectEqual(trace_ir.AlenProbe.bitmap, trace_ir.AlenProbe.of(ops[2]));
     try testing.expectEqual(ObsType.int, ops[2].ty);
     try testing.expectEqual(@as(Ref, 2), try state.rec.refOf(0));
 }
 
-test "len opcode: alen abort matrix — in-band lane, hash border, metatable" {
+test "len opcode: #t on an in-band lane records alen with that lane's probe" {
+    // The `.boolean` lane and the `.value` lane keep absence in the element
+    // itself; `alen` carries which one it reads (`AlenProbe`, its `b`).
     const gpa = testing.allocator;
-
-    // Boolean lane: presence is in-band, the fast case can't certify the border.
-    {
+    const inner = try table_mod.Table.create(gpa);
+    defer inner.destroy(gpa);
+    const Case = struct { elem: Value, lane: arr.Lane, probe: trace_ir.AlenProbe };
+    const cases = [_]Case{
+        .{ .elem = Value.boolean(true), .lane = .boolean, .probe = .boolean },
+        .{ .elem = Value.heap(&inner.header), .lane = .value, .probe = .value },
+    };
+    for (cases) |c| {
         const t = try table_mod.Table.create(gpa);
         defer t.destroy(gpa);
         var i: i64 = 1;
-        while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
-        try testing.expectEqual(arr.Lane.boolean, t.array.lane);
+        while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), c.elem);
+        try testing.expectEqual(c.lane, t.array.lane);
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+        try state.startRecordingForTest(gpa, .{ .proto = &proto, .pc = 0, .proto_id = proto.id }, proto.num_registers);
+        var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil() };
+        state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
+        try testing.expect(state.isRecording());
+        const ops = state.rec.instrs.items;
+        try testing.expectEqual(IrOp.alen, ops[ops.len - 1].op);
+        try testing.expectEqual(c.probe, trace_ir.AlenProbe.of(ops[ops.len - 1]));
+    }
+}
+
+test "len opcode: alen abort matrix — trailing hole, hash border, metatable" {
+    const gpa = testing.allocator;
+
+    // A `.value` lane whose last slot is nil: tier 0 searches for the border,
+    // so there is no fast case to record.
+    {
+        const inner = try table_mod.Table.create(gpa);
+        defer inner.destroy(gpa);
+        const t = try table_mod.Table.create(gpa);
+        defer t.destroy(gpa);
+        var i: i64 = 1;
+        while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.heap(&inner.header));
+        try t.set(gpa, Value.int(8), Value.nil());
+        try testing.expectEqual(arr.Lane.value, t.array.lane);
+        try testing.expect(t.lengthFast() == null);
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };

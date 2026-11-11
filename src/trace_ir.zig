@@ -457,21 +457,25 @@ pub const IrOp = enum(u8) {
     link,
 
     // ---- builtin recording breadth (doc 23, arc A) ----------------------------
-    /// `a`=table value ref → the table's `#t` border via the exact fast case
-    /// (doc 23 D3): produces `max(asize − 1, 0)` (`.int`), side-exiting unless
-    /// *hash.count == 0 ∧ the array lane keeps a presence bitmap ∧ (asize ≤ 1 ∨
-    /// present(asize−1))* — under exactly those premises `Table.length()` returns
-    /// `asize − 1` with no trim/hash search (key 0 never participates, doc 18),
-    /// so the fast case is exact, not approximate. A **guarded producer** like
-    /// `int_of_float`: it stamps its exit PC in `aux` (see `emit`) and appears in
+    /// `a`=table value ref, `b`=an `AlenProbe` (an immediate, not a ref) →
+    /// the table's `#t` border via the exact fast case (doc 23 D3,
+    /// `Table.lengthFast`): produces `max(asize − 1, 0)` (`.int`), side-exiting
+    /// unless *hash.count == 0 ∧ the array lane is in the probe's class ∧
+    /// (asize ≤ 1 ∨ slot asize−1 is present)* — under exactly those premises
+    /// `Table.length()` returns `asize − 1` with no trim/hash search (key 0
+    /// never participates, doc 18), so the fast case is exact, not
+    /// approximate. "Present" is the probe: the presence bit of a scalar
+    /// lane, a non-nil tag in the `.value` lane, a non-zero byte in the
+    /// `.boolean` lane. A **guarded producer** like `int_of_float`: it stamps
+    /// its exit PC in `aux` (see `emit`) and appears in
     /// `guardExitPc`/`isSideExitGuardOp`. The general border search (trailing
-    /// holes, hash borders, grids, in-band `.value`/`.boolean` lanes) stays
-    /// tier-0 behind the side-exit. Alias discipline is `aload`-like — never
-    /// CSE'd/hoisted across stores. Pending SUNK stores are fine to record past
-    /// (doc 24 D7): sunk stores are in-bounds-only (`asize` invariant), presence
-    /// only goes false→true, and `alen` side-exits with the stores un-executed —
-    /// so a pre-flush read either matches the post-flush border or exits cleanly.
-    /// Appended last (wire ordinal 57).
+    /// holes, hash borders, grids) stays tier-0 behind the side-exit. Alias
+    /// discipline is `aload`-like — never CSE'd/hoisted across stores. Pending
+    /// SUNK stores are fine to record past (doc 24 D7): sunk stores are
+    /// in-bounds-only (`asize` invariant) and never write nil, so presence
+    /// only goes false→true in every lane, and `alen` side-exits with the
+    /// stores un-executed — so a pre-flush read either matches the post-flush
+    /// border or exits cleanly. Appended last (wire ordinal 57).
     alen,
     /// `a`=float operand ref → `sin(a)` (`.float`). A leaf pure producer like
     /// `fsqrt` — hoistable iff invariant, CSE'd, DCE'd if dead, deliberately
@@ -1063,6 +1067,42 @@ pub fn isSideExitGuardOp(op: IrOp) bool {
         else => false,
     };
 }
+
+/// What `alen` reads to certify its border candidate, slot `asize − 1`: the
+/// op's `b` field. The recorder takes it from the lane it observed, and both
+/// executors exit when the table's lane has left the class, so a trace never
+/// reads a slot through the wrong layout.
+pub const AlenProbe = enum(u8) {
+    /// The fixed-width scalar lanes (`i8…f64`, `u8`): the per-slot presence
+    /// bitmap. Ordinal 0, which is what an `alen` carried before `b` meant
+    /// anything.
+    bitmap = 0,
+    /// The `.value` lane: the element's own tag (`nil` is in-band).
+    value = 1,
+    /// The `.boolean` lane: the element's byte (0 is absent).
+    boolean = 2,
+
+    /// The probe for a lane, or null for a grid: its `#t` is a row count,
+    /// a different formula, and stays tier 0's.
+    pub fn ofLane(lane: array.Lane) ?AlenProbe {
+        return switch (lane) {
+            .i8, .i16, .i32, .i64, .f64, .u8 => .bitmap,
+            .value => .value,
+            .boolean => .boolean,
+            .grid => null,
+        };
+    }
+
+    /// The probe an `alen` carries. Total: an unknown ordinal reads as
+    /// `.bitmap`, whose lane check then decides.
+    pub fn of(ins: IrInstr) AlenProbe {
+        return switch (ins.b) {
+            1 => .value,
+            2 => .boolean,
+            else => .bitmap,
+        };
+    }
+};
 
 /// A load whose recorded `ty` is checked AT THE LOAD in both executors (the
 /// fused tag exit): `hload` and `uload` always, `aload` out of a `.value`
