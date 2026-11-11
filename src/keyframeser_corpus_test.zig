@@ -2,8 +2,8 @@
 //!
 //! Every program under `tests/` (a `.lua` or `.mah` file; `build.zig` embeds
 //! them as the `program_corpus` module, so a new program joins without a list
-//! to keep) is recorded once, uninterrupted, against a fake clock and a fixed
-//! seed. Then, for several cut steps k spread over the run, a VM replays the
+//! to keep) is recorded once, uninterrupted, against a fake clock, a fixed
+//! seed and a fake environment. Then, for several cut steps k spread over the run, a VM replays the
 //! recording to k and stops, the keyframe captured there is restored into a
 //! fresh VM, and that VM replays on to the end. It must match the recording:
 //!   (a) the run stopped at the cut (did not run straight through);
@@ -32,9 +32,22 @@ const EffectLog = interp.EffectLog;
 /// How many cuts each program is resumed from, spread evenly over its run.
 const cuts_per_program = 9;
 
+const system = @import("system.zig");
+
 /// The groups every corpus program gets: the deterministic-under-replay
-/// effects a test can fake.
-const groups: @import("system.zig").Groups = .{ .clock = true, .random = true };
+/// effects a test can fake. `env` gives a program string effects
+/// (`os.getenv`), whose entries a replay interns only when it consumes them.
+const groups: system.Groups = .{ .clock = true, .random = true, .env = true };
+
+/// The recording's host environment: two variables, every other name unset.
+const FakeEnv = struct {
+    fn getenv(_: *anyopaque, name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "HOME")) return "/home/mahina";
+        if (std.mem.eql(u8, name, "LANG")) return "C.UTF-8";
+        return null;
+    }
+    const vtable: system.HostSystem.VTable = .{ .getenv = &FakeEnv.getenv };
+};
 
 /// A clock that advances a fixed step per reading.
 const FakeClock = struct {
@@ -99,6 +112,8 @@ fn record(gpa: std.mem.Allocator, program: keyframeser.Program.Source, source: [
     vm.setClockSource(.{ .ctx = &clock, .nowNs = &FakeClock.nowNs });
     var seed_ctx: u8 = 0;
     vm.random_seed_source = .{ .ctx = &seed_ctx, .seed = &FixedSeed.seed };
+    var env_ctx: u8 = 0;
+    vm.system = .{ .ctx = &env_ctx, .vtable = &FakeEnv.vtable };
 
     var chunk = try compileInto(gpa, &vm, program, source);
     defer chunk.deinit();

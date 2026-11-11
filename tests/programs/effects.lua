@@ -1,5 +1,7 @@
--- Effects (doc 86 P1 corpus): math.random's seed and os.clock go through the
--- effect log, so a resumed run must replay them where the recording read them.
+-- Effects (doc 86 P1 corpus): math.random's seed, os.clock and os.getenv go
+-- through the effect log, so a resumed run must replay them where the
+-- recording read them. A getenv result is a string, which the replay interns
+-- only when it reaches that entry.
 local rolls = {}
 for _ = 1, 6 do
     rolls[#rolls + 1] = math.random(1, 6)
@@ -20,3 +22,9 @@ for _ = 1, 4 do
 end
 print("samples", table.concat(samples, " "))
 print("float", math.random() < 1)
+
+local env = {}
+for _, name in ipairs({ "HOME", "MISSING", "LANG", "HOME" }) do
+    env[#env + 1] = name .. "=" .. tostring(os.getenv(name))
+end
+print("env", table.concat(env, " "))
