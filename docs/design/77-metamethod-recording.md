@@ -6,7 +6,8 @@ upvalue reads and the anchor-window alias, §6.6; `__index`/`__newindex`
 functions, §6.1; arithmetic, bitwise, unary and `__len` handlers, §6.4;
 `__lt`/`__le`/`__eq` and the compare-and-branch forms, §6.4; `__call`,
 §6.7; a function `__index` under a fused read, §6.3; the fused store
-into a plain table); the rest of
+into a plain table); Phase 5's `__close` recording landed (2026-11-12),
+its "closes done, return only" completion outstanding; the rest of
 Phases 4–7 outstanding (doc 68 P2, which Phase 4 waits on, has landed)
 Owner: Bart
 Last updated: 2026-11-12
@@ -339,6 +340,30 @@ land; move whole phases to Done once everything inside them is checked.
   - [x] the test catches a violation: a boundary opened at the instruction
     inside `finishIndex2Mid` made a second-lookup guard attachable, and the
     test failed (checked by hand, then removed).
+- [x] **Phase 5, first part — `__close` as inlined handlers** (§8,
+  2026-11-12). `tbc` (and `tfor_prep`'s closing value) on a closable
+  value aborted `nyi_opcode`; now a table whose metatable holds `__close`
+  as a heap value records, the field loaded with a heap-typed load
+  (`recTbc`). `close`, and a `ret_close` in an inlined frame, run as tier
+  0's `closeStep` stages (`recCloseStage`): highest register first, nil
+  and false pinned, each closable value's `__close` re-read and inlined as
+  `h(v, nil)` with finish `.close`, whose return makes the next stage or,
+  for a `ret_close`, the return (`finishClose`, which reads the caller's
+  window through `RegWindow.below`). At depth 0 a one-shot recording's
+  `ret_close` closes nothing on trace: its return terminal resumes tier 0
+  at the instruction, which runs the closes (§8 amendment). Still with
+  tier 0: a `__close` that is not a Lua function, a `ret_close` with a
+  dynamic result count in an inlined frame that would close something,
+  and a value that is not a table. Gated in
+  `src/interp_meta_trace_test.zig` ("doc 77 §8: …", six tests, and "doc
+  77 §7: a close's handlers exit by route"); closing in ascending order,
+  recording a depth-0 `ret_close`'s closes, skipping the return after an
+  inlined one, and a boundary at the close's successor after a handler
+  each fail a test (checked by hand, then removed). §10.14 has the
+  numbers.
+  - [x] §7 route 4, its interim form: the head-trace test checks that no
+    head trace inlines a `__close` (no `guard_func`), and every close runs
+    once.
 - [x] **Phase 4, ninth part — the fused store into a plain table** (§6.3,
   doc 14's second follow-up, 2026-11-12). `set_index2` on a table that is
   not a grid aborted `nyi_opcode`. `recIndex2Set` records it as the read
@@ -374,9 +399,11 @@ land; move whole phases to Done once everything inside them is checked.
   - [ ] computed-callee upvalue writes (§6.6): a `set_upval`, and a read
     of a cell with an alias class, through a computed callee still abort
     `.cross_frame`
-- [ ] **Phase 5 — `__close`** (§8): doc 76's Phase 3b, with the
-  "closes done, return only" completion, and §7's route 4 added to the
-  exit-contract test.
+- [ ] **Phase 5 — the "closes done, return only" completion** (§8): a
+  depth-0 `ret_close` of a one-shot recording still ends the trace before
+  its closes (the interim §8 allows; see the first part under Done). The
+  completion both executors share would let the trace run them and
+  return.
 - [ ] **Phase 6 — doc amendments** (§9.3): doc 61 §2 and F3, the
   `nativegen.zig` prologue argument, doc 10's non-goal, doc 68 §4.6, doc 23,
   TODO.md's `guard_no_metatable` entry.
@@ -908,6 +935,20 @@ they would close is nil or false. With this doc:
   including the top-level case (98ff883). A `__close` that yields aborts the
   recording as any yield does.
 
+Amendment (2026-11-12, Phase 5 first part): the interim needs no
+recording at all. A one-shot recording's return terminal already resumes
+tier 0 *at* the `ret_close`, which runs every close and returns, so the
+recorder closes the terminal there and records none of the closes; it no
+longer pins the values nil either. `tbc` proves less than "`__close`
+present" in the sense of a Lua function: a heap-typed load of the field
+exits when it is not a heap value, which is all tier 0 checks before
+`NonClosable`. Whether it is a function is the close's question, since
+`closeStep` re-reads it then. The second stage's guards (the next
+receiver, its `__close` load and `guard_func`) follow a handler's return
+with no boundary of their own, so they exit coarse as §7's route 2 says;
+the close's successor gets no boundary either, which would make them
+attach and skip a close.
+
 ## 9. Invariants, gates and doc amendments
 
 ### 9.1 Invariants
@@ -1190,6 +1231,21 @@ counter field. Two runs each:
 | after | 0.44, 0.48 | 0.01, 0.01 |
 
 `--jit-stats` after: the loop runs 100% traced, ~16 cycles per iteration.
+
+### 10.14 After `__close` as inlined handlers (2026-11-12)
+
+ReleaseFast builds of 32cc089 and with Phase 5's first part, load ~14
+(both alternated, two runs each), `bench/meta_close_reused.lua 10000000`:
+
+| | t0 s | jit s |
+|---|---|---|
+| before (aborts `nyi_opcode` at `tbc`) | 0.70, 0.66 | 0.65, 0.64 |
+| after | 0.66, 0.64 | 0.02, 0.02 |
+
+`--jit-stats` after: the loop runs traced, ~10 cycles per iteration.
+`bench/stdlib/meta_close.lua` is unchanged: its loop aborts before the
+`tbc`, at the fields of the table it allocates each iteration
+(`needs_precise` at `new_table`, then `bad_type` at `set_field`).
 
 ## 11. Open questions for review
 

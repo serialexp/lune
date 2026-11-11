@@ -341,6 +341,12 @@ more than tier 0. Four causes, by pass:
       (`has_metatable`, `recIndex2Set`, noted 2026-11-12). The fused read
       finishes such a handler with `MetaFinish.index2_mid`; the store
       needs the same stage ending in the row's store (doc 77 §6.3).
+- [ ] **`bench/stdlib/meta_close.lua`'s loop never records** (noted
+      2026-11-12, doc 77 §10.14). `setmetatable({ w = i % 7 }, C)`
+      allocates a table per iteration: `needs_precise` at `new_table`,
+      then the precise retry aborts `bad_type` at the `set_field` of `w`
+      into the fresh table. Its `<close>` would now record
+      (`bench/meta_close_reused.lua` does).
 - [ ] **A short loop in a function is entered from tier 0 on every
       call** (`refine`: three trips, 0.2% of its iterations in its loop
       trace, 61 M against 19 M; `configured`: 221 M against 46 M, five

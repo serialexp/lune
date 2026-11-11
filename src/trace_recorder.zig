@@ -569,13 +569,18 @@ pub const InlineFrame = struct {
 /// when it fails. `.index2_mid` is the first lookup of a fused `get_index2`
 /// (tier 0's phase 0): the result is the table the second lookup reads,
 /// with the key `RecordingSession.meta_keys` saved for this frame.
-pub const MetaFinish = enum(u8) { result, truthy, truthy_not, branch_true, branch_false, index2_mid };
+/// `.close` is one `__close` of a `close` or `ret_close` (doc 77 §8,
+/// `closeStep`): the result is dropped, and the variables below
+/// `ret_dest` are closed next, then a `ret_close` returns.
+pub const MetaFinish = enum(u8) { result, truthy, truthy_not, branch_true, branch_false, index2_mid, close };
 
-/// Doc 77 §6.3: what a pending fused `get_index2` keeps while its first
-/// lookup's handler runs: the second key's register and observed value,
-/// and the proto of the frame running the instruction. The handler's frame
-/// cannot read the caller's registers, and the key's value is fixed for
-/// the instruction (a handler writes no register of its caller).
+/// Doc 77 §6.3: what a pending instruction keeps while a handler it called
+/// runs, besides the frame's own fields: the proto of the frame running the
+/// instruction, and a register. For a fused `get_index2`, the second key's
+/// register and observed value: the handler's frame cannot read the
+/// caller's registers, and the key's value is fixed for the instruction (a
+/// handler writes no register of its caller). For a `close` (§8), the
+/// lowest register it closes (`value` unused).
 pub const MetaKey = struct { value: Value, reg: u16, proto: *const Proto };
 
 /// Build a guard's ordered inline-path prefix (doc 17, A-i.2) from the recorder's
@@ -989,8 +994,9 @@ pub const RecordingSession = struct {
     /// Saved caller contexts for the currently-open inlined calls, indexed by
     /// `inline_depth - 1`. Pushed at an inlined `.call`, popped at the `.ret`.
     frames: [MAX_INLINE_DEPTH]InlineFrame = undefined,
-    /// Doc 77 §6.3: for each open frame whose finish is `.index2_mid`, the
-    /// fused read's second key, at the frame's index in `frames`.
+    /// Doc 77 §6.3: for each open frame whose finish is `.index2_mid` or
+    /// `.close`, what its pending instruction keeps, at the frame's index in
+    /// `frames`.
     meta_keys: [MAX_INLINE_DEPTH]MetaKey = undefined,
     /// Number of inlined calls currently open (frame-stack depth). 0 at the anchor
     /// frame; a `.call` beyond `MAX_INLINE_DEPTH` aborts `.too_deep`.
@@ -1830,15 +1836,16 @@ pub const RecordingSession = struct {
             // Doc 30 c4: the generic-for back-edge — mirrors the CONTINUE
             // direction (first loop var non-nil → publish it as ctrl).
             .tfor_loop => try self.recTForLoop(instr, regs, pc),
-            // Doc 76 §6: a trace runs a to-be-closed scope only while its
-            // values are nil or false, which need no `__close` (a generic
-            // `for`'s closing value, nearly always): pinned so, `tbc` and
-            // `close` record nothing else. A closable value aborts.
-            .tbc => _ = try self.pinUnclosable(instr.a, regs),
-            .close => try self.recCloseScope(proto, pc - 1, instr.a, regs),
+            // Doc 76 §6, doc 77 §8: a to-be-closed value that is nil or
+            // false needs no `__close` (a generic `for`'s closing value,
+            // nearly always) and is pinned so. A closable one is proved
+            // closable at `tbc`, and each `close` calls its `__close` as an
+            // inlined handler (`recCloseStage`).
+            .tbc => _ = try self.recTbc(instr.a, regs),
+            .close => _ = try self.recCloseStage(proto, pc - 1, instr.a, std.math.maxInt(u16), regs),
             // `tbc` of the closing value as it moves down, then the jump,
             // which records nothing (as `jmp`).
-            .tfor_prep => if (try self.pinUnclosable(instr.a + 4, regs))
+            .tfor_prep => if (try self.recTbc(instr.a + 4, regs))
                 self.setReg(instr.a, try self.refOf(instr.a + 4)),
             // Nested-loop trace linking (doc 15, Phase 2). A continuation recording
             // re-reaching an inner numeric-`for`'s `for_prep` whose loop header
@@ -2742,7 +2749,7 @@ pub const RecordingSession = struct {
         self.cur_proto_id = fr.caller_proto_id;
         const t = (try self.truthRef(r, v)) orelse return self.abort(.bad_type);
         switch (fr.finish) {
-            .result, .index2_mid => unreachable,
+            .result, .index2_mid, .close => unreachable,
             .truthy => self.setReg(fr.ret_dest, t),
             .truthy_not => self.setReg(fr.ret_dest, if (self.konstValueOf(t)) |kv|
                 try self.konst(Value.boolean(!kv.isTruthy()))
@@ -4654,15 +4661,36 @@ pub const RecordingSession = struct {
         return try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
     }
 
-    /// `ret`, and doc 76's `ret_close` once its closes are known to close
-    /// nothing (`recCloseScope`).
+    /// `ret`, and doc 76's `ret_close`. In an inlined frame a `ret_close`
+    /// first calls its `__close` handlers (`recCloseStage`; the last one's
+    /// return makes the return, `finishClose`), except with a dynamic
+    /// result count, which keeps doc 76's rule: it records only when it
+    /// closes nothing (`recCloseScope`). At depth 0 a one-shot recording's
+    /// return terminal resumes tier 0 at the `ret_close`, which runs the
+    /// closes itself, so the trace records none of them (doc 77 §8: until
+    /// the executors share a "closes done, return only" completion).
     fn recRet(self: *RecordingSession, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, multret: ?u32) !void {
-        if (instr.op == .ret_close) {
-            try self.recCloseScope(proto, pc - 1, 0, regs);
+        if (instr.op == .ret_close and self.inline_depth > 0) {
+            if (instr.b == bytecode.all_results) {
+                try self.recCloseScope(proto, pc - 1, 0, regs);
+            } else if (try self.recCloseStage(proto, pc - 1, 0, std.math.maxInt(u16), regs)) return;
             if (!self.active) return;
         }
+        return self.recRetTail(instr, regs, multret);
+    }
+
+    /// `recRet` once a `ret_close`'s closes are recorded: the return.
+    fn recRetTail(self: *RecordingSession, instr: Instr, regs: RegWindow, multret: ?u32) RecordError!void {
         if (self.inline_depth > 0) {
             const fr = self.frames[self.inline_depth - 1];
+            if (fr.finish == .close) {
+                // A `__close` handler's results are dropped; the caller's
+                // window sits `base_off` below the handler's.
+                const below = self.base_off - fr.base_off;
+                try self.recReturn(instr, multret);
+                if (!self.active) return;
+                return self.finishClose(fr, regs.below(below, self.meta_keys[self.inline_depth].proto.num_registers));
+            }
             if (fr.tostr_answer) {
                 try self.recTostrAnswer(instr, regs);
                 if (!self.active) return;
@@ -4692,6 +4720,91 @@ pub const RecordingSession = struct {
             self.closeDynamicTerminal(.return_interp, instr.a, multret)
         else
             self.closeHeadTerminal(.return_interp, 0);
+    }
+
+    /// Doc 77 §8: `tbc` of the value in `reg` (also `tfor_prep`'s closing
+    /// value). Tier 0 raises `NonClosable` unless the value is nil, false,
+    /// or has a `__close` (`opTbc`). nil and false are pinned
+    /// (`pinUnclosable`). Any other value is recorded when it is a table
+    /// whose metatable holds `__close` as a heap value: the field is loaded,
+    /// and the heap-typed load exits when it no longer is one. Whether that
+    /// value is a function `close` can inline is `close`'s question, which
+    /// re-reads it, as tier 0 does. Anything else stays with tier 0.
+    /// Returns false when the recording stopped.
+    fn recTbc(self: *RecordingSession, reg: u16, regs: RegWindow) !bool {
+        const v = regs.get(reg);
+        if (!v.isTruthy()) return self.pinUnclosable(reg, regs);
+        const mt = if (isTableValue(v)) table_mod.Table.fromHeader(v.asHeap()).metatable else null;
+        const key_ref = try self.foldInternedStr("__close");
+        if (mt == null or key_ref == null or !mt.?.get(self.konstValueOf(key_ref.?).?).isHeap()) {
+            self.abort(.has_metatable);
+            return false;
+        }
+        const r = try self.refOf(reg);
+        _ = try self.guardMetaTable(r, v, .a);
+        return try self.loadMetaField(r, mt.?, key_ref.?, .a) != null;
+    }
+
+    /// Doc 77 §8: the next stage of a `close from` (or a `ret_close`, from
+    /// 0) at instruction `cur` of `proto`, as `closeStep` runs it: the
+    /// to-be-closed variables in scope there, from `from` up and below
+    /// register `cursor`, highest first. nil and false keep their pin
+    /// (`pinUnclosable`). The first other one has its `__close` re-read and
+    /// called as `h(v, nil)`, an inlined handler with finish `.close`
+    /// (`finishClose` makes the next stage at its return). Returns true when
+    /// it pushed a handler's frame, false when every variable is done or the
+    /// recording stopped. A value whose `__close` is not a Lua function
+    /// stays with tier 0, which calls it or raises.
+    fn recCloseStage(self: *RecordingSession, proto: *const Proto, cur: u32, from: u16, cursor: u16, regs: RegWindow) RecordError!bool {
+        var i = proto.tbc_vars.len;
+        while (i > 0) {
+            i -= 1;
+            const tv = proto.tbc_vars[i];
+            if (tv.reg < from or tv.reg >= cursor or !tv.openAt(cur)) continue;
+            const v = regs.get(tv.reg);
+            if (!v.isTruthy()) {
+                if (!try self.pinUnclosable(tv.reg, regs)) return false;
+                continue;
+            }
+            if (!isTableValue(v)) {
+                self.abort(.bad_type);
+                return false;
+            }
+            const r = try self.refOf(tv.reg);
+            const mt = (try self.metaReceiver(r, v, "__close", .a, tv.reg)) orelse {
+                self.abort(.has_metatable);
+                return false;
+            };
+            const depth = self.inline_depth;
+            try self.recMetaCall(proto, r, mt, "__close", &.{ r, try self.konst(Value.nil()) }, tv.reg, 0, .a, .close);
+            if (!self.active) return false;
+            self.meta_keys[depth] = .{ .value = Value.nil(), .reg = from, .proto = proto };
+            return true;
+        }
+        return false;
+    }
+
+    /// Doc 77 §8: a `__close` handler of the frame `fr` returned (its frame
+    /// is popped): the next stage of its `close`/`ret_close`, in the frame
+    /// that runs the instruction (window `regs`), below the variable just
+    /// closed (`fr.ret_dest`). When none is left, a `close` is done and a
+    /// `ret_close` returns. The guards recorded here sit after a handler's
+    /// return with no boundary of their own, so they exit coarse (§7 route
+    /// 2).
+    fn finishClose(self: *RecordingSession, fr: InlineFrame, regs: RegWindow) RecordError!void {
+        const saved_pc = self.cur_pc;
+        const saved_proto = self.cur_proto_id;
+        defer {
+            self.cur_pc = saved_pc;
+            self.cur_proto_id = saved_proto;
+        }
+        self.cur_pc = fr.call_pc + 1;
+        self.cur_proto_id = fr.caller_proto_id;
+        const mk = self.meta_keys[self.inline_depth];
+        if (try self.recCloseStage(mk.proto, fr.call_pc, mk.reg, fr.ret_dest, regs) or !self.active) return;
+        const ins = mk.proto.code[fr.call_pc];
+        if (ins.op == .close) return;
+        return self.recRetTail(ins, regs, null);
     }
 
     /// Doc 76 §6: the to-be-closed value in `reg` is nil or false when the

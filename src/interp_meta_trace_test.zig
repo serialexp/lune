@@ -10,6 +10,7 @@ const interp = @import("interp.zig");
 const trace_ir = @import("trace_ir.zig");
 const basic = @import("stdlib/basic.zig");
 const bytecode = @import("bytecode.zig");
+const trace = @import("trace.zig");
 
 const Vm = interp.Vm;
 const TraceMode = util.TraceMode;
@@ -1476,4 +1477,212 @@ test "doc 77 §6.7: a native or vararg __call stays with tier 0" {
         \\end
         \\print(t, w, u)
     , "300\t136350\t1500\n");
+}
+
+// --- doc 77 §8: `__close` --------------------------------------------------
+
+/// Doc 77 §8: no recording stopped at a to-be-closed instruction, a
+/// handler was inlined, and the trace ran.
+fn expectCloseRan(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    for (vm.trace.abort_log.items) |r| switch (r.op) {
+        .tbc, .close, .ret_close, .tfor_prep => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try expectMetaCallRan(vm, mode);
+}
+
+test "doc 77 §8: a reused <close> value's __close is called on the trace at every block end" {
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  local G = { __close = function(g, e)
+        \\    c.n = c.n + 1
+        \\    if e ~= nil then c.err = e end
+        \\  end }
+        \\  return c, setmetatable({}, G)
+        \\end
+        \\local c, g = mk()
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  local h <close> = g
+        \\  s = s + i
+        \\end
+        \\print(s, c.n, c.err)
+    , "45150\t300\tnil\n", .{ .record_aborts = true, .inspect = expectCloseRan });
+}
+
+test "doc 77 §8: a block's closable values close top first, past nil and false ones" {
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { t = 0, a = 0, b = 0 }
+        \\  local A = { __close = function() c.t = c.t + 1; c.a = c.t end }
+        \\  local B = { __close = function() c.t = c.t + 1; c.b = c.t end }
+        \\  return c, setmetatable({}, A), setmetatable({}, B)
+        \\end
+        \\local c, a, b = mk()
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  local x <close> = a
+        \\  local n <close> = nil
+        \\  local y <close> = b
+        \\  local f <close> = false
+        \\  s = s + i
+        \\end
+        \\print(s, c.t, c.a, c.b)
+    , "45150\t600\t600\t599\n", .{ .record_aborts = true, .inspect = expectCloseRan });
+}
+
+test "doc 77 §8: each close re-reads __close, so a handler that replaces the next one's is seen" {
+    // `y` closes first; at its 150th call its handler replaces `x`'s
+    // `__close`, which that same iteration's close of `x` calls.
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { a = 0, a2 = 0, b = 0 }
+        \\  local A = {}
+        \\  A.__close = function() c.a = c.a + 1 end
+        \\  local A2 = function() c.a2 = c.a2 + 1 end
+        \\  local B = { __close = function()
+        \\    c.b = c.b + 1
+        \\    if c.b == 150 then A.__close = A2 end
+        \\  end }
+        \\  return c, setmetatable({}, A), setmetatable({}, B)
+        \\end
+        \\local c, a, b = mk()
+        \\for i = 1, 300 do
+        \\  local x <close> = a
+        \\  local y <close> = b
+        \\end
+        \\print(c.a, c.a2, c.b)
+    , "149\t151\t300\n", .{ .record_aborts = true, .inspect = expectCloseRan });
+}
+
+test "doc 77 §8: an inlined function's ret_close closes, then returns its results" {
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, setmetatable({}, { __close = function() c.n = c.n + 1 end })
+        \\end
+        \\local c, g = mk()
+        \\local function f(x)
+        \\  local h <close> = g
+        \\  return x + 1, x * 2
+        \\end
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  local a, b = f(i)
+        \\  s = s + a + b
+        \\end
+        \\print(s, c.n)
+    , "135750\t300\n", .{ .record_aborts = true, .inspect = expectCloseRan });
+}
+
+test "doc 77 §8: a __close that raises, and a value that is not closable, leave the trace" {
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, setmetatable({}, { __close = function()
+        \\    c.n = c.n + 1
+        \\    if c.n == 200 then error("boom", 0) end
+        \\  end })
+        \\end
+        \\local c, g = mk()
+        \\local r = { s = 0 }
+        \\local ok, err = pcall(function()
+        \\  for i = 1, 300 do
+        \\    local h <close> = g
+        \\    r.s = r.s + i
+        \\  end
+        \\end)
+        \\local vals = {}
+        \\for i = 1, 300 do vals[i] = g end
+        \\vals[250] = {}
+        \\local ok2, err2 = pcall(function()
+        \\  for i = 1, 300 do
+        \\    local h <close> = vals[i]
+        \\    r.s = r.s + 1
+        \\  end
+        \\end)
+        \\print(ok, err, c.n, r.s, ok2, (string.find(err2, "non-closable", 1, true)) ~= nil)
+    , "false\tboom\t449\t20349\tfalse\ttrue\n", .{ .record_aborts = true, .inspect = expectCloseRan });
+}
+
+fn expectHeadRetClose(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (!recorded(mode)) return;
+    for (vm.trace.abort_log.items) |r| switch (r.op) {
+        .tbc, .ret_close => return error.TestUnexpectedResult,
+        else => {},
+    };
+    // Route 4's interim (§7): a head trace calls no `__close` (it would
+    // pin the handler with `guard_func`), so its return terminal resumes
+    // tier 0 at a `ret_close` none of whose closes ran.
+    var heads: usize = 0;
+    for (vm.trace.registry.cache.items) |t| {
+        if (trace.anchorKind(t.code.anchor.pc) != .head) continue;
+        heads += 1;
+        for (t.code.instrs) |ins| try testing.expect(ins.op != .guard_func);
+    }
+    try testing.expect(heads > 0);
+}
+
+test "doc 77 §8: a head trace ends at its ret_close, and tier 0 runs the closes once" {
+    // The loop never records (`setmetatable` is no recorded builtin, §4.2),
+    // so `f` is called from tier 0 and gets a head trace. Its return
+    // terminal resumes tier 0 at the `ret_close` (route 4's interim).
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { n = 0 }
+        \\  return c, { __close = function() c.n = c.n + 1 end }
+        \\end
+        \\local c, G = mk()
+        \\local function f(g, x)
+        \\  local h <close> = g
+        \\  return x + 1
+        \\end
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  s = s + f(setmetatable({}, G), i)
+        \\end
+        \\print(s, c.n)
+    , "45450\t300\n", .{ .record_aborts = true, .inspect = expectHeadRetClose });
+}
+
+test "doc 77 §7: a close's handlers exit by route" {
+    // Each handler's branch turns mid-run (route 1). `x`'s handler is
+    // looked up after `y`'s returned, so its guards are the close's
+    // after a handler (route 2); `x` alternates between two values, so
+    // they stay in the loop, and `y`'s handler replaces `x`'s `__close`
+    // at its 250th call, so one of them fails after `y`'s ran. `i == 280`
+    // is a later instruction's branch, which attaches (route 3). Each
+    // count is the iteration count, so no exit ran a handler twice.
+    try expectProgramTuned(
+        \\local function mk()
+        \\  local c = { a = 0, b = 0 }
+        \\  local A = { __close = function(o)
+        \\    c.a = c.a + 1
+        \\    if c.a > 200 then o.v = 2 end
+        \\  end }
+        \\  local A2 = function(o)
+        \\    c.a = c.a + 1
+        \\    if c.a > 200 then o.v = 2 end
+        \\  end
+        \\  local B = { __close = function(o)
+        \\    c.b = c.b + 1
+        \\    if c.b > 100 then o.v = 1 end
+        \\    if c.b == 250 then A.__close = A2 end
+        \\  end }
+        \\  return c, { setmetatable({ v = 0 }, A), setmetatable({ v = 0 }, A) }, setmetatable({ v = 0 }, B)
+        \\end
+        \\local c, as, b = mk()
+        \\local s = 0
+        \\for i = 1, 300 do
+        \\  do
+        \\    local x <close> = as[i % 2 + 1]
+        \\    local y <close> = b
+        \\    s = s + i
+        \\  end
+        \\  if i == 280 then s = s + 0.25 end
+        \\end
+        \\print(s, c.a, c.b, as[1].v, as[2].v, b.v)
+    , "45150.25\t300\t300\t2\t2\t1\n", .{ .inspect = expectExitContract });
 }

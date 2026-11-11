@@ -64,6 +64,15 @@ pub const RegWindow = struct {
         return self.n;
     }
 
+    /// The window `k` slots below this one, spanning `n` registers: the frame
+    /// that pushed this one, seen from it (the trace recorder reads a pending
+    /// instruction's registers so while its handler returns, doc 77 §8). The
+    /// register file is one fixed array that never moves (`Vm.tags`/
+    /// `Vm.payloads`), so the window stays valid.
+    pub inline fn below(self: RegWindow, k: usize, n: usize) RegWindow {
+        return .{ .tags = self.tags - k, .payloads = self.payloads - k, .n = n };
+    }
+
     // ---- direct lane accessors (the hot arms; no `Value` materialization) ----
 
     /// The tag of `R[slot]` without building a `Value`.
