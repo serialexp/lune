@@ -1451,10 +1451,17 @@ pub inline fn captureNativeCallProvenance(
     if (origin != .dispatcher_root) noteExitSideBurstSkip(self, entries);
     captured.len = if (result.silent_active != 0)
         self.captureSilentSuffixProvenance(result, &captured.verdicts)
-    else if (self.provenance_edges.items.len == 0 or self.registry.native_physical.armedLinks().len == 0)
+    else if (self.nativeCallCapturesNothing())
         0
     else
         self.captureProvenanceVerdicts(entries, 0, &captured.verdicts);
+}
+
+/// Whether an ordinary (never silent) native call captures no provenance
+/// verdict whatever its ledger says: `captureProvenanceVerdicts` returns 0
+/// without an edge, and without an armed link.
+pub inline fn nativeCallCapturesNothing(self: *const TraceState) bool {
+    return self.provenance_edges.items.len == 0 or self.registry.native_physical.armedLinks().len == 0;
 }
 
 /// Doc 56 §4.8.2 item 10: count a burst-origin call (`exit_side_ok = 0`)

@@ -161,10 +161,13 @@ more than tier 0. Four causes, by pass:
       unrolling `carried` (`loop_unroll`, 389 IR). Doc 44's frame links
       (`ret_cont`, `call_head`) are the nearest machinery and arm
       nothing in this run. Design drafted 2026-11-11: doc 87 (Bart
-      picked "Design: join loops across calls"); its Q1–Q5 are open and
-      nothing is built. A two-function probe (doc 87 §2.1) costs 5,094
-      instructions a round over the loop bodies, against 1,681 on tier 0
-      and 231 on LuaJIT.
+      picked "Design: join loops across calls"). Bart's answers the same
+      day: Q1 the LuaJIT shape (one glue trace), Q2 no smaller first
+      step unless it is reused, Q3 trim the seam first, Q4 needs
+      counts, Q5 the probe as a bench (`bench/loop_ring.lua`). The seam
+      trim is in (entry below); the join is not built. The probe costs
+      3,224 instructions a round over the loop bodies after the trim
+      (5,094 before), against 1,681 on tier 0 and 231 on LuaJIT.
       The heapsort entry ("A short loop in a function called from a
       loop") and "A short loop in a function is entered from tier 0 on
       every call" below are cases of this.
@@ -188,15 +191,77 @@ more than tier 0. Four causes, by pass:
       per call: a non-member receipt then charges the open region's
       payoff, so the rows are not inert. Doc 87 §5.5 is the design
       question.
-- [ ] **A loop trace entered from tier 0 costs ~1,240 instructions a
-      visit in the dispatcher** (doc 87 §2.2, callgrind on the probe:
-      `enterSelectedTrace` 573 itself, receipt/provenance/arming helpers
-      670). Two of the helpers repeat a refusal that cannot change:
-      `maybeArmContinuation` re-derives "no enclosing back-edge" at
-      every loop-done exit (192 with its callees), and
-      `anchorSourceInstr` takes 130 instructions per call. Doc 44 D9
-      left "the loop-anchor quiet episode" as a follow-up; doc 87 Q3
-      asks when. Not started.
+- [x] **A loop trace entered from tier 0 cost ~1,240 instructions a
+      visit in the dispatcher** (doc 87 §2.2). Trimmed 2026-11-11 (Bart
+      on doc 87 Q3: "Trim it before the join"; doc 87 §5.6 "the trim"):
+      exit facts cached on the page, inline settlement, a lazy chain
+      exclusion, and a loop lane for a settled visit through a patched
+      entry. The dispatcher's share is ~330 a visit. `loop_ring`
+      150.7 M to 113.1 M instructions (−25.0%), `loop_ring_16` 457.1 M
+      to 306.5 M (−32.9%); the lane alone against the unit before it:
+      −12.4% and −17.3%, `euler14-bit` −6.5%, `spectral-norm` −1.7%,
+      nothing on the board up by more than 0.17%. Per round over the
+      loop bodies: 5,094 to 3,224 (tier 0 1,681, LuaJIT 231). The next
+      seven entries were found on the way.
+- [ ] **The loop lane's lean arm covers a numeric `for` only** (doc 87
+      §5.6). A `while`, `repeat` or generic-`for` visit goes through the
+      lane's native call and then the shared consumer
+      (`finishLoopLane`), which costs what the long form's exit side
+      does. A lean arm for them needs the exit's facts on the page the
+      way `loopLaneLeanDone` reads a loop-done exit's.
+- [ ] **A loop whose visits are shorter than 8 trips never gets an
+      entry patch, so it never reaches the lane** (needs Bart).
+      `accountTraceRun` marks a root eligible for a patch only when one
+      receipt completes `config.min_useful` (8) iterations. The bar was
+      set when a visit cost ~1,700 instructions more than tier 0 and
+      broke even near 10 trips. With the lane it costs ~770 more and
+      breaks even near 4.5 (178 saved per iteration on `loop_ring`).
+      Loops visited for 5 to 7 trips now pay the discovery walk on
+      every visit though a patched entry would earn its cost. Options:
+      lower `min_useful`; make the bar a property of the trace (its
+      measured saving per iteration against the lane's fixed cost);
+      leave it. The bar also feeds the thrash accounting, so moving it
+      changes which short loops are struck.
+- [ ] **`--jit-stats` measures the long form.** Coverage refuses both
+      lanes (the one-shot lane and the loop lane), because the lanes do
+      not stamp the tsc pairs the attribution needs. So a `--jit-stats`
+      run takes `enterSelectedTrace` on every entry and its cycle split
+      overstates the seam of a normal run. Either the lanes stamp when
+      coverage is on, or the output says which form it measured.
+- [ ] **A loop that fills a fresh table takes three dispatcher
+      receipts per visit and never patches** (`for i = 1, n do t[i] =
+      i * 2 end` with 12 elements, visited from tier 0; exits 13,
+      4294967295 and 20 each visit). Seen while choosing shapes for the
+      lane's differential test. Not diagnosed: the Z-8 ladder has not
+      been walked on it.
+- [ ] **The quiet head predicate tests fewer pending states than the
+      inline settlement** (`headEpisodeQuiet` against
+      `settlementHeadIdle`: `pending_region_rebuild`,
+      `pending_exit_side_disarm` and `resident_demotion_notice` are
+      not tested, and a quiet entry drains none of them). A Safe-build
+      witness asserting all three clear at the predicate's `return nt`
+      passes `zig build test` and the 66 board programs (2026-11-11),
+      so no run we have reaches it; nothing proves it cannot be
+      reached. A quiet entry would delay the drain to the next full
+      entry, not lose it. Options: keep the three asserts as a
+      permanent Safe-build witness; add the three tests to the
+      predicate (three loads per head entry); prove it from who raises
+      them.
+- [ ] **A stitched loop root on the quiet head path never takes a
+      published exit adapter.** `enterHeadNativeQuiet` starts the
+      native call with `exit_side_ok = false`; the full path and the
+      loop lane pass `exitSideNative()`. The exit then takes its
+      ordinary path, which is sound and slower. Not measured.
+      (`exit_side_burst_skips` counts the same thing for burst
+      origins.)
+- [ ] **Tier 0 around a loop visit is now most of the seam.** Callgrind
+      on `loop_ring` after the trim, per round (two visits): JIT code
+      2,426, `enterLoopLane` 530, `opCall` 501, `opForPrep` 330,
+      `opRet` 314. `opForPrep` is ~165 a visit against `opForLoop` 41
+      for a whole loop; `opCall` ~250 and `opRet` ~157 a call. The loop
+      bodies are 19.0 instructions an iteration against LuaJIT's 7.8.
+      Doc 87's join removes the calls and returns from this path; the
+      body gap is separate.
 - [ ] **An exit-side child that ends a burst is struck on its own
       anchor, every burst, for good** (found 2026-11-11). The short
       loops of `configured` (8 trips) and `refine` (3) are each a root
@@ -222,6 +287,13 @@ more than tier 0. Four causes, by pass:
       key to be a recorded constant ("v1 scope" in its comment).
 - [ ] **`==` on two strings aborts** (`bad_type jeq`; `count`). Already
       listed under doc 85 above as heap `==`/`~=`.
+- [ ] **A fused store `a[i][j] = v` into a plain nested table aborts**
+      (noted 2026-11-11; `recGridSet` takes grids only). The fused read
+      records as two reads since doc 14's 2026-11-11 follow-up. The store
+      cannot simply be two steps: tier 0's `fusedStoreGrid` first tries
+      `inflateToGrid` on any table not yet marked `no_grid`, so the trace
+      must prove that mark at run time (a new guard) or tier 0 and the
+      trace would leave the heap in different shapes.
 - [ ] **A short loop in a function is entered from tier 0 on every
       call** (`refine`: three trips, 0.2% of its iterations in its loop
       trace, 61 M against 19 M; `configured`: 221 M against 46 M, five
@@ -376,6 +448,13 @@ more than tier 0. Four causes, by pass:
       `POSIX_SPAWN_TCSETPGROUP` or a `tcsetpgrp` in the forked child), and
       the test, which kills only mahina on failure and leaves the child's
       group running.
+      Seen again 2026-11-11 (coral-marten): three `zig build test
+      -Djit-debug=true` runs at once failed it in all three, and each
+      passed alone. `host_system` "proc forwards Ctrl-C to the children's
+      group and goes on waiting" failed in the same three runs: the stage
+      came back `exited`, and the test reads `status.signaled` without
+      testing the tag first, so it dies on the union access (SIGABRT,
+      "1 crashed") instead of failing.
 
 ## Multret-feeding steps are not stops (noted 2026-11-09)
 

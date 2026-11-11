@@ -7441,8 +7441,9 @@ pub const Vm = struct {
     /// or a snapshot says otherwise. The caller holds the entry lease and
     /// the `executing` borrow.
     ///
-    /// Its own function so an entry path that ran the page itself can hand
-    /// over the result; `enterSelectedTrace` inlines it.
+    /// Its own function so the loop lane, which runs the page itself, can
+    /// hand over a result its lean arm does not take (`finishLoopLane`,
+    /// doc 87 §5.6); `enterSelectedTrace` inlines it.
     fn consumeEntryResult(
         self: *Vm,
         comptime mode: ExecMode,
@@ -8768,6 +8769,319 @@ pub const Vm = struct {
         return self.finishPatchedWalk(mode, patch, slot, closure, proto, regs, base, pc, anchor_pc, true, &visited, &wctx, first, false);
     }
 
+    /// Doc 87 §5.6: the settled test of a loop patch site, asked by
+    /// `enterLoopPatch` before anything else.
+    ///
+    /// `fast_block == 0` is the dispatch half of the §R1-5 bypass set in one
+    /// word (recording, the pending exit and replay anchors, `suspend_ctl`,
+    /// safepoint lines) and the two frame-link requests
+    /// `tryArmFrameLinks` would place. With no exec log and no coverage as
+    /// well, the bypass set is known false and `safe_to_arm` known true.
+    /// The word's other bits (the pending call and return anchors, a
+    /// published final cut) are no bypass condition; refusing on them is
+    /// only conservative, and the long form then decides as it always did.
+    inline fn loopSettled(self: *Vm) bool {
+        const ts = &self.trace;
+        if (ts.fast_block != 0 or ts.config.record_exec_log or ts.config.coverage) return false;
+        if (std.debug.runtime_safety) {
+            std.debug.assert(ts.fast_block == self.fastBlockReference());
+            std.debug.assert(!(ts.isRecording() or self.suspend_ctl != null or
+                self.record_safepoint_lines or ts.pending_exit_anchor != null or
+                ts.pending_replay_anchor != null));
+            std.debug.assert(ts.pending_ret_cont_arm == null and ts.pending_call_head_arm == null);
+        }
+        return true;
+    }
+
+    /// Doc 87 §5.6: whether a settled loop-patch entry takes the loop lane,
+    /// and on which page. The lane runs `enterSelectedTrace`'s native entry
+    /// with the steps that `loopSettled` and the lines below prove idle left
+    /// out; each line names the step it stands for. What the run then
+    /// returned is tested after it (`loopLaneLeanDone`), not here, so the
+    /// gate asks nothing about regions, links or promoted sets.
+    inline fn loopLaneGate(self: *Vm, ct: *trace.Trace) ?*const nativegen.CompiledTrace {
+        const ts = &self.trace;
+        const refusal: LoopLaneRefusal = refused: {
+            // `nativeFor`: the lane enters a page that exists. One that
+            // does not yet is compiled by the walk's entry.
+            if (!ts.config.native_codegen or ct.native != .compiled) break :refused .no_page;
+            const nt = &ct.native.compiled;
+            // The seed-hash decline reruns the entry on tier-1a, with the
+            // VM-side seeding and the value frame `enterSelectedTrace` owns.
+            if (nt.has_hash_seed) break :refused .hash_seed;
+            // `tryArmSiblingHandoff` has a request to place at a selection.
+            if (ts.pending_sibling_arm != null) break :refused .sibling_arm;
+            // A loop root that ends at a host call is a one-shot episode
+            // with its own lean entry (`enterHeadNativeQuiet`, doc 44).
+            if (ct.code.endsInTerminal()) break :refused .terminal;
+            // The knob comes last, so a run with the lane off logs the
+            // refusals a run with it on does.
+            if (!ts.config.loop_lane) return null;
+            return nt;
+        };
+        ts.dbg("loop-lane refuse: pc={d} t={d} {s}", .{ ct.code.anchor.pc, ct.id, @tagName(refusal) });
+        return null;
+    }
+
+    /// Why `loopLaneGate` sent a settled loop-patch entry to the long form
+    /// (the `-Djit-debug` "loop-lane refuse:" line).
+    const LoopLaneRefusal = enum { no_page, hash_seed, sibling_arm, terminal };
+
+    /// The entry of a live loop patch on a taken back-edge, for `.jfor_loop`
+    /// (and a `for_prep` over one) and `.jloop`. Null when the §R1-5 bypass
+    /// set sends the back-edge through the ordinary epilogue instead.
+    inline fn enterLoopPatch(
+        self: *Vm,
+        comptime mode: ExecMode,
+        patch: *trace.EntryPatch,
+        slot: u16,
+        closure: *const function.Closure,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        npc: usize,
+    ) ?EntryDirective {
+        if (self.loopSettled()) {
+            if (self.loopLaneGate(patch.trace)) |nt|
+                return self.enterLoopLane(mode, patch, slot, nt, closure, proto, regs, base, npc);
+        } else {
+            self.trace.dbg("loop-lane refuse: pc={d} t={d} unsettled fast_block={x} exec_log={} coverage={}", .{
+                patch.trace.code.anchor.pc,        patch.trace.id,             self.trace.fast_block,
+                self.trace.config.record_exec_log, self.trace.config.coverage,
+            });
+            if (self.trace.isRecording() or self.suspend_ctl != null or
+                self.record_safepoint_lines or self.trace.config.record_exec_log or
+                self.trace.pending_exit_anchor != null or
+                self.trace.pending_replay_anchor != null or
+                self.trace.config.coverage)
+            {
+                // §R1-5 bypass set — live authoritative fields, no
+                // maintained flag: the `runFastPath` `.full` set plus
+                // exec-log and coverage. The caller takes the back-edge
+                // through the ordinary epilogue with the canonical
+                // instruction presented, so recording, coverage
+                // attribution, `onBackEdge`, and trace closure all see
+                // virgin behaviour.
+                return null;
+            }
+        }
+        // Patched entry: skip exactly the discovery/selection prefix
+        // (hot-count probe, counters hashmap, trip computation,
+        // isGated, walk, fingerprint — the native prologue's
+        // fail-closed type check subsumes the fingerprint at entry,
+        // per the B-4 discipline) and run the identical entry/receipt
+        // routine the walk uses.
+        return self.enterPatchedTrace(mode, patch, slot, closure, proto, regs, base, npc, false);
+    }
+
+    /// Doc 87 §5.6: the loop lane, the loop analog of the one-shot lane
+    /// (doc 84) and the "loop-anchor quiet episode" doc 44 D9 left open. An
+    /// admitted loop-patch entry runs its page directly: the same native
+    /// call `enterSelectedTrace` makes, in ordinary or linked mode, with
+    /// silent staging and exit-side permission as there.
+    ///
+    /// One result is consumed here, the one a loop visited from tier 0
+    /// produces every time: the entered trace ran its numeric `for` to the
+    /// end and left through the loop-done exit with nothing captured and
+    /// nothing deferred (`loopLaneLeanDone`). For that result the shared
+    /// consumers reduce to the receipt, the continuation arm and the mode
+    /// choice below, and the walk tail to its strike reset and drain.
+    /// Every other result is decoded and handed to the shared consumers
+    /// unchanged (`finishLoopLane`), so the lane decides nothing they do
+    /// not: with `config.loop_lane` off, the same program makes the same
+    /// receipts in the same order.
+    fn enterLoopLane(
+        self: *Vm,
+        comptime mode: ExecMode,
+        patch: *trace.EntryPatch,
+        slot: u16,
+        nt: *const nativegen.CompiledTrace,
+        closure: *const function.Closure,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        pc: usize,
+    ) EntryDirective {
+        const ts = &self.trace;
+        const ct = patch.trace; // live pre-drain ⇒ valid (§R7-2)
+        if (std.debug.runtime_safety) ts.loop_lane_entries +%= 1;
+        // The entry lease (doc 63 §5.10) and the `executing` borrow (§5.8),
+        // as `enterSelectedTrace` takes them. The lean arm gives them back
+        // itself; any other result hands them to `finishLoopLane`.
+        ts.raiseLease();
+        const outer = ts.executing;
+        ts.executing = ct;
+        // Doc 26 D1 tripwire, as in the full path.
+        if (ct.code.requires_unicode_pin) std.debug.assert(self.unicode_version_pinned);
+        ts.entries +%= 1;
+        // Doc 22 §B.1: the native page seeds itself from this ctx.
+        self.prepareNativeEpisode(closure, proto, base);
+        ts.native_entries +%= 1;
+        // The full path's native call, step for step. These gate themselves
+        // inline, so the lane runs them instead of proving them idle.
+        const link_mode = nt.linked_loop_done_ok and ts.hasNativeLoopDoneLink(ct, proto);
+        ts.prepareNativeEntry();
+        const exit_side_ok = ts.exitSideNative();
+        var nr: nativegen.NativeResult = undefined;
+        nt.enterRaw(regs, &nr, link_mode, ts.silentStaging(), exit_side_ok);
+        const local_done = self.loopLaneLeanDone(ct, nt, &nr, link_mode) orelse
+            return self.finishLoopLane(mode, patch, slot, ct, nt, &nr, link_mode, exit_side_ok, outer, closure, proto, regs, base, pc);
+        const ei = nr.exit_instr;
+        if (std.debug.runtime_safety) {
+            self.assertLoopLaneLean(ct, nt, &nr, exit_side_ok, local_done);
+            ts.loop_lane_lean +%= 1;
+        }
+        // `consumeNativeEntryHead` for a result that moved no frame, never
+        // was silent and has one row: the settlement of a call that
+        // captured nothing (the lean test).
+        var captured: trace.TraceState.NativeCallProvenance = undefined;
+        captured.len = 0;
+        ts.settleNativeCallProvenance(&captured, true);
+        // `consumeEntryResult` for a loop-done exit of the entered trace
+        // itself: its B-2b drain, the exit record, the receipt (a
+        // numeric `for`'s loop-done exit is not counted as a taken exit,
+        // and is one traversal of region work), the continuation arm.
+        ts.drainProvenanceArms(true);
+        ts.last_exit_instr = ei;
+        ts.dbg("receipt: pc={d} t={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.code.anchor.pc, ct.id, false, local_done, ei, nr.ledger_len, nr.completed });
+        ts.onSideExitReceipt(ct, local_done, ei, 1, .deferred, .entered);
+        ts.maybeArmContinuation(ct, ei, proto);
+        // Tier 0 resumes at the header and replays the final trip. A
+        // continuation recording that just armed starts from a `.full`
+        // prologue; otherwise `.full` drops to `.fast` once nothing holds
+        // it there (T3).
+        var directive: EntryDirective = .{ .resume_tier0 = pc };
+        if (ts.pending_exit_anchor != null) {
+            if (mode == .fast) directive = .{ .switch_mode_at = pc };
+        } else {
+            // No prime-side want stood before the receipt (the lean test),
+            // and only `noteTakenExit` raises one.
+            if (std.debug.runtime_safety) std.debug.assert(ts.wants_prime_side == null);
+            if (mode == .full and self.runFastPath()) directive = .{ .switch_mode_at = pc };
+        }
+        ts.executing = outer;
+        ts.lowerLease();
+        // `finishPatchedWalk` for a loop patch whose entry did not decline:
+        // the strike reset in its §R6-1 place (the slot is stable, nothing
+        // drained yet), then the drain.
+        if (patch.live) patch.strikes = 0;
+        if (ts.registry.entry_registry.entry_patch_dirty != 0) ts.drainEntryPatchWork();
+        return directive;
+    }
+
+    /// Doc 87 §5.6: the lean test, asked of the raw result before anything
+    /// is consumed. Returns the entered trace's own committed count when
+    /// the shared consumers would take exactly the steps the lane's lean
+    /// arm takes. Each line is the branch of theirs it decides.
+    inline fn loopLaneLeanDone(
+        self: *Vm,
+        ct: *const trace.Trace,
+        nt: *const nativegen.CompiledTrace,
+        nr: *const nativegen.NativeResult,
+        link_mode: bool,
+    ) ?usize {
+        const ts = &self.trace;
+        // `consumeNativeEntryHead`: no pushed descent, no silent burst; a
+        // scalar result, so no ledger replay either.
+        if (nr.pushed_frames != 0 or nr.silent_active != 0 or nr.ledger_len > 1) return null;
+        // An ordinary exit: no seed decline, no precise reason, no exit
+        // adapter, no prologue failure.
+        if (nr.exit_reason != @intFromEnum(trace_exec.ExitReason.normal)) return null;
+        // A linked run's loop-done chains into its continuation.
+        if (link_mode) return null;
+        // The final trace is the entered one, still published.
+        if (nr.final_trace_id != ct.id or ct.doomed) return null;
+        // Its numeric `for` ran to the end: a commit-time fact of the exit
+        // (never a terminal, never a source branch, never counted).
+        const ei = nr.exit_instr;
+        if (ei >= ct.code.instrs.len or !ct.code.isNumericForLoopDoneGuard(ei)) return null;
+        // A precise page's `.normal` exits are prologue failures.
+        if (ct.code.deopt_mode == .precise) return null;
+        // Productive: a zero exit takes the penalty and the sibling chain.
+        const local_done = nt.localCompleted(nr);
+        if (local_done == 0) return null;
+        // The settlement: nothing to capture, nothing deferred.
+        if (!ts.nativeCallCapturesNothing() or !ts.settlementHeadIdle()) return null;
+        // A standing prime-side want is consumed on the productive path.
+        if (ts.wants_prime_side != null) return null;
+        return local_done;
+    }
+
+    /// Safe builds: the lean test against the decoded result the shared
+    /// consumers read, and against the tests of theirs it stands for.
+    fn assertLoopLaneLean(
+        self: *Vm,
+        ct: *trace.Trace,
+        nt: *const nativegen.CompiledTrace,
+        nr: *const nativegen.NativeResult,
+        exit_side_ok: bool,
+        local_done: usize,
+    ) void {
+        const ts = &self.trace;
+        var row: [1]trace_exec.LedgerEntry = undefined;
+        const r = nt.decodeRaw(nr, &row, exit_side_ok);
+        std.debug.assert(r.pushed_frames == 0 and r.silent_active == 0 and r.ledger_len == 1);
+        std.debug.assert(r.exit_reason == .normal and r.final_trace_id == ct.id);
+        std.debug.assert(r.local_completed == local_done and local_done > 0);
+        std.debug.assert(ts.traceById(ct.id) == ct);
+        const ei = r.exit_instr;
+        std.debug.assert(ei < ct.code.instrs.len and ct.code.instrs[ei].op != .terminal);
+        std.debug.assert(trace.anchorKind(ct.code.anchor.pc) == .loop);
+        std.debug.assert(ct.code.deopt_mode != .precise);
+        std.debug.assert(trace.isLoopDoneGuardIndex(ct, ei));
+        std.debug.assert(!ts.isSourceBranchGuardExit(ct, ei));
+    }
+
+    /// The loop lane's other results: decoded as the full path's native
+    /// call decodes them, then through the shared consumers and the shared
+    /// walk tail from the state `enterPatchedTrace` would have after the
+    /// same entry (the incumbent visited, nothing dead). Takes over the
+    /// lane's lease and its `executing` borrow (`outer` is the borrow to
+    /// restore), which end where `enterSelectedTrace`'s do: before the walk
+    /// tail.
+    noinline fn finishLoopLane(
+        self: *Vm,
+        comptime mode: ExecMode,
+        patch: *trace.EntryPatch,
+        slot: u16,
+        ct: *trace.Trace,
+        nt: *const nativegen.CompiledTrace,
+        nr: *const nativegen.NativeResult,
+        link_mode: bool,
+        exit_side_ok: bool,
+        outer: ?*trace.Trace,
+        closure: *const function.Closure,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        pc: usize,
+    ) EntryDirective {
+        const ts = &self.trace;
+        // Read before the lease is lowered: a trace retired during the
+        // entry is destroyed by then.
+        const anchor_pc = ct.code.anchor.pc;
+        var dead: WalkDead = .{};
+        var visited: [trial_visited_cap]*trace.Trace = undefined;
+        visited[0] = ct;
+        var wctx: TrialWalkCtx = .{
+            .visited = visited[0..1],
+            .dead = &dead,
+        };
+        const first: EntryDirective = blk: {
+            defer ts.lowerLease();
+            defer ts.executing = outer;
+            const result = nt.decodeRaw(nr, &ts.ledger_scratch, exit_side_ok);
+            if (self.consumeNativeEntryHead(mode, ct, proto, regs, base, pc, &wctx, result, true)) |d| break :blk d;
+            // `loopLaneGate` refused a page with a hash seed, the only one
+            // whose prologue raises this decline.
+            std.debug.assert(!(result.ledger_len <= 1 and result.exit_reason == .seed_hash_decline));
+            // A native entry runs on the narrow window and has no value
+            // frame.
+            break :blk self.consumeEntryResult(mode, ct, proto, regs, regs, base, pc, &wctx, result, true, link_mode, &.{}, true);
+        };
+        return self.finishPatchedWalk(mode, patch, slot, closure, proto, regs, base, pc, anchor_pc, true, &visited, &wctx, first, false);
+    }
+
     /// Doc 42: one `execImpl` invocation = build the chain state on THIS
     /// frame, enter the handler chain with an ordinary call, and translate its
     /// register-sized result back into `Error!ExecStep` (re-raising a parked
@@ -9847,27 +10161,9 @@ pub const Vm = struct {
         const self = vm;
         const regs: RegWindow = .{ .tags = tags, .payloads = payloads, .n = st.regs.n };
         if (!enter) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
-        // §R1-5 bypass set — live authoritative fields, no maintained
-        // flag: the `runFastPath` `.full` set plus exec-log and
-        // coverage. Take the back-edge through the ordinary epilogue
-        // with the canonical instruction presented, so recording, coverage
-        // attribution, `onBackEdge`, and trace closure all see virgin
-        // behaviour.
-        if (self.trace.isRecording() or self.suspend_ctl != null or
-            self.record_safepoint_lines or self.trace.config.record_exec_log or
-            self.trace.pending_exit_anchor != null or
-            self.trace.pending_replay_anchor != null or
-            self.trace.config.coverage)
-        {
+        // The loop lane, the walk's entry, or the §R1-5 bypass.
+        const directive = self.enterLoopPatch(mode, patch, slot, st.closure, st.proto, regs, st.base, npc) orelse
             return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
-        }
-        // Patched entry: skip exactly the discovery/selection prefix
-        // (hot-count probe, counters hashmap, trip computation,
-        // isGated, walk, fingerprint — the native prologue's
-        // fail-closed type check subsumes the fingerprint at entry,
-        // per the B-4 discipline) and run the identical entry/receipt
-        // routine the walk uses.
-        const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc, false);
         if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
             st.code = self.cachedCodeFor(st.frame, st.proto);
             st.code_gen = self.trace.registry.entry_registry.image_gen;
@@ -9954,15 +10250,8 @@ pub const Vm = struct {
                     return dispatchTail(mode, st, npc, vm);
                 }
                 if (!live or suspended) return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads }); // restored virgin cascade
-                if (self.trace.isRecording() or self.suspend_ctl != null or
-                    self.record_safepoint_lines or self.trace.config.record_exec_log or
-                    self.trace.pending_exit_anchor != null or
-                    self.trace.pending_replay_anchor != null or
-                    self.trace.config.coverage)
-                {
+                const directive = self.enterLoopPatch(mode, patch, slot, st.closure, st.proto, regs, st.base, npc) orelse
                     return @call(.always_tail, backEdgeHandler(mode), .{ st, npc, instr, vm, tags, payloads });
-                }
-                const directive = self.enterPatchedTrace(mode, patch, slot, st.closure, st.proto, regs, st.base, npc, false);
                 if (self.trace.registry.entry_registry.image_gen != st.code_gen) {
                     st.code = self.cachedCodeFor(st.frame, st.proto);
                     st.code_gen = self.trace.registry.entry_registry.image_gen;

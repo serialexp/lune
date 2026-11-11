@@ -137,6 +137,14 @@ land; move whole phases to Done once everything inside them is checked.
   were checked against the code and folded into §4.1–§4.4 as follow-up
   paragraphs ("Review, 2026-11-10").
 
+- [x] **The loop-anchor lane** (was "Defer — the loop-anchor lane").
+  Built 2026-11-11 as doc 87 §5.6's loop lane, after Bart's answer to
+  doc 87 Q3 ("Trim it before the join"). It is a lane of its own, not an
+  extension of this doc's one-shot lane: a settled visit through a
+  patched loop entry makes the native call `enterSelectedTrace` makes
+  and reads a numeric-`for` loop-done exit without the shared consumer.
+  Design, checks and numbers are in doc 87 §5.6 ("the trim").
+
 ### Outstanding
 
 - [ ] **Phase 0b — baselines on the pinned pool.** Record §2's rows there
@@ -174,9 +182,6 @@ land; move whole phases to Done once everything inside them is checked.
   (§4.6). A `.global` seed is a hash lookup per entry in `nativeSeedFn`.
   Doc 81's load-time cells make it a load. This doc does no seed work of
   its own until E2 lands.
-- [ ] **Defer — the loop-anchor lane.** Doc 44 D9 already deferred the
-  loop-anchor quiet episode. It stays deferred until the one-shot lane has
-  proved itself (§5).
 
 ## 1. Why this exists
 
@@ -1231,7 +1236,9 @@ continuations. The lane's functions are named for the one-shot class.
 - No change to what receipts, gates, wants or strikes decide. Only when
   the code that does nothing is physically executed.
 - No loop-anchor lane in v1 (doc 44 D9's deferral stands). A loop entry
-  amortises the seam over its iterations.
+  amortises the seam over its iterations. (Follow-up, 2026-11-11: built
+  separately as doc 87 §5.6's loop lane. A loop visited from tier 0 for
+  a few trips at a time does not amortise it: `bench/loop_ring.lua`.)
 - Not the frame-motion paths (`consumePushedDescent`,
   `consumeDescentTerminalRow`, call-head and ret-cont links). The lane
   covers the scalar result. Those consumers keep their own costs, and

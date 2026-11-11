@@ -926,7 +926,9 @@ slice has no behavioral latitude at all.
 
 **Non-goals.** No change to what receipts/gates/wants DO — only to when
 the no-op paths are physically executed. The loop-anchor quiet episode is
-a follow-up once the head shape proves out. P4 still owns removing the
+a follow-up once the head shape proves out. (Follow-up, 2026-11-11: built
+as doc 87 §5.6's loop lane, for a loop entered through its patched entry.)
+P4 still owns removing the
 episode-per-call structure for recursion; this makes the episodes that
 remain (and every episode P4 keeps: outermost entries, side exits) cheap.
 

@@ -672,6 +672,13 @@ pub const TraceConfig = struct {
     /// Off (`--jit-no-exit-side-native`), the machine code is byte-identical
     /// to a pre-Phase-4 page — an ablation knob, not a supported tier.
     exit_side_native: bool = true,
+    /// Doc 87 §5.6: a loop patch's entry takes the loop lane
+    /// (`Vm.enterLoopLane`) when the lane admits it. Off
+    /// (`--jit-no-loop-lane`), every entry goes through
+    /// `enterPatchedTrace`. The two make the same tiering decisions in the
+    /// same order; the switch exists so a test can run both and compare
+    /// them, and to bisect with. Not a tuning knob.
+    loop_lane: bool = true,
     /// Maximum distinct traces cached per anchor before `countGuardFailure` /
     /// `countFingerprintMiss` stop counting (i.e. before side-trace recording at
     /// that anchor is refused). Four remains the economic bound until native exit
@@ -1223,6 +1230,14 @@ pub const TraceState = struct {
     /// the lean tail (`Vm.laneDeclineSettled`) instead of the walk tail.
     /// Safe builds only, like `one_shot_lane_entries`.
     one_shot_lane_lean_declines: u64 = 0,
+    /// Doc 87 §5.6: loop-patch entries that took the loop lane
+    /// (`Vm.enterLoopLane`). Safe builds only, like
+    /// `one_shot_lane_entries`.
+    loop_lane_entries: u64 = 0,
+    /// Doc 87 §5.6: loop-lane entries consumed by the lane's lean arm (a
+    /// numeric `for` that ran to its end); the rest went to the shared
+    /// consumer. Safe builds only.
+    loop_lane_lean: u64 = 0,
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a
     /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
     /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).
@@ -3078,6 +3093,7 @@ pub const TraceState = struct {
     pub const captureNativeCallProvenance = trace_chain_mod.captureNativeCallProvenance;
     pub const settleNativeCallProvenance = trace_chain_mod.settleNativeCallProvenance;
     pub const settlementHeadIdle = trace_chain_mod.settlementHeadIdle;
+    pub const nativeCallCapturesNothing = trace_chain_mod.nativeCallCapturesNothing;
     pub const replayLedger = trace_chain_mod.replayLedger;
     pub const replayLedgerSuffix = trace_chain_mod.replayLedgerSuffix;
     pub const replayLedgerFrom = trace_chain_mod.replayLedgerFrom;

@@ -202,6 +202,9 @@ const TraceOpts = struct {
     /// `--jit-no-exit-side-native` clears it: doc 56 Phase 4 — native pages
     /// take exit adapters (`Config.exit_side_native`). On by default (doc 58 B2).
     exit_side_native: bool = true,
+    /// `--jit-no-loop-lane` clears it: doc 87 §5.6, loop patches enter
+    /// through the loop lane (`Config.loop_lane`). A bisecting switch.
+    loop_lane: bool = true,
     /// `--dump-aborts`: imply `--trace`, record every abandoned recording into the
     /// abort log (`config.record_aborts`), and print the aggregated table to stderr
     /// after the run — which loop dies on which opcode/reason, and how far it got.
@@ -332,6 +335,8 @@ pub fn main(init: std.process.Init) u8 {
             topts.jit_coverage = true;
         } else if (std.mem.eql(u8, arg, "--jit-no-exit-side-native")) {
             topts.exit_side_native = false;
+        } else if (std.mem.eql(u8, arg, "--jit-no-loop-lane")) {
+            topts.loop_lane = false;
         } else if (std.mem.eql(u8, arg, "--jit-stats")) {
             topts.enabled = true;
             topts.execute = true;
@@ -663,6 +668,7 @@ fn configureVm(vm: *mahina.interp.Vm, topts: TraceOpts, real_sys: *mahina.host_s
     if (topts.hotguard) |v| vm.trace.config.hotguard = v;
     if (topts.silent_budget) |v| vm.trace.config.silent_budget = v;
     vm.trace.config.exit_side_native = topts.exit_side_native;
+    vm.trace.config.loop_lane = topts.loop_lane;
     // Inject the native clock. The interpreter holds no platform clock of its own
     // (so the VM core stays portable, incl. wasm); the host that builds the VM —
     // here, the CLI — supplies one. This is the single place the OS clock syscall

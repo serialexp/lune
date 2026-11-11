@@ -77,7 +77,10 @@ const freeRegionBridges = trace_mod.freeRegionBridges;
 /// entry so the original run can commit the final iteration in linked mode;
 /// after a normal native deopt the pre-run snapshot needed for that commit is
 /// already gone.
-pub fn hasNativeLoopDoneLink(self: *const TraceState, failed: *Trace, proto: *const Proto) bool {
+///
+/// Inline: the kind test and the memo hit are the whole cost of a native
+/// dispatch whose trace cache has not changed since the last one.
+pub inline fn hasNativeLoopDoneLink(self: *const TraceState, failed: *Trace, proto: *const Proto) bool {
     // Doc 44 D9 (review round 3) / D12b: a one-shot trace (head or cont) has
     // no loop-done exits by construction — its guards deopt to its entry pc,
     // never to a post-loop pc. The body scan below matches `guard_true` exit
@@ -90,6 +93,10 @@ pub fn hasNativeLoopDoneLink(self: *const TraceState, failed: *Trace, proto: *co
     // changes when the trace cache does (`nextTraceExcluding` reads it), and
     // this runs once per native dispatch.
     if (failed.ldl_memo_gen == self.registry.cache_gen) return failed.ldl_memo;
+    return refreshNativeLoopDoneLink(self, failed, proto);
+}
+
+noinline fn refreshNativeLoopDoneLink(self: *const TraceState, failed: *Trace, proto: *const Proto) bool {
     const answer = self.computeNativeLoopDoneLink(failed, proto);
     failed.ldl_memo = answer;
     failed.ldl_memo_gen = self.registry.cache_gen;

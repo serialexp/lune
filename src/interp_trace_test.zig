@@ -6620,6 +6620,305 @@ test "one-shot lane (doc 84 §3.6): an anchor at sibling capacity keeps the walk
     }.tune));
 }
 
+/// Doc 87 §5.6: what one native run of a program left behind, as far as
+/// tiering can be told from outside: the output, the dispatcher's entry
+/// counters, and each cached trace's identity and receipts.
+const LoopLaneRun = struct {
+    out: [256]u8 = undefined,
+    out_len: usize = 0,
+    entries: u64 = 0,
+    native_entries: u64 = 0,
+    for_prep_patched: u64 = 0,
+    lane_entries: u64 = 0,
+    lane_lean: u64 = 0,
+    traces: usize = 0,
+    /// Per trace: id, anchor pc, instruction count, native state, hit
+    /// count, and the sum of its per-exit counts.
+    rows: [6 * 32]u64 = @splat(0),
+
+    fn output(self: *const LoopLaneRun) []const u8 {
+        return self.out[0..self.out_len];
+    }
+};
+
+/// Run `source` natively with `tune` applied and report `LoopLaneRun`.
+/// `refuse_op` refuses `jeq`, which every source below uses once, in its
+/// driver loop (`a ~= b`), and nowhere in a helper: the driver stays on
+/// tier 0, so each call is a visit of the helper's loop from tier 0.
+fn loopLaneRun(source: [:0]const u8, comptime tune: fn (*Vm) void) !LoopLaneRun {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotcall = 4;
+    vm.trace.config.refuse_op = .jeq;
+    tune(&vm);
+    var run: LoopLaneRun = .{};
+    var sink = io.Writer.fixed(&run.out);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    run.out_len = sink.buffered().len;
+    run.entries = vm.trace.entries;
+    run.native_entries = vm.trace.native_entries;
+    run.for_prep_patched = vm.trace.for_prep_patched;
+    run.lane_entries = vm.trace.loop_lane_entries;
+    run.lane_lean = vm.trace.loop_lane_lean;
+    const cache = vm.trace.registry.cache.items;
+    run.traces = cache.len;
+    try testing.expect(cache.len <= run.rows.len / 6);
+    for (cache, 0..) |t, i| {
+        var exits: u64 = 0;
+        for (t.exit_counts) |c| exits += c;
+        run.rows[i * 6 ..][0..6].* = .{
+            t.id,                   t.code.anchor.pc, t.code.instrs.len,
+            @intFromEnum(t.native), t.hit_count,      exits,
+        };
+    }
+    return run;
+}
+
+/// A helper with a numeric `for` loop, called from a loop that cannot
+/// trace (its `a ~= b` is the program's only `jeq`, which `loopLaneRun`
+/// has the recorder refuse): every call is one visit of the helper's loop
+/// from tier 0.
+const loop_lane_for_source =
+    \\local function sum(t)
+    \\  local s = 0
+    \\  for i = 1, #t do s = s + t[i] end
+    \\  return s
+    \\end
+    \\local t = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }
+    \\local a, b = {}, {}
+    \\local acc = 0
+    \\for round = 1, 400 do
+    \\  if a ~= b then acc = acc + sum(t) end
+    \\end
+    \\print(acc)
+;
+
+/// The same call shape around a `while` loop, whose exit is a failing
+/// loop test and not a numeric `for`'s loop-done guard.
+const loop_lane_while_source =
+    \\local function count(n)
+    \\  local i, s = 0, 0
+    \\  while i < n do
+    \\    s = s + i
+    \\    i = i + 1
+    \\  end
+    \\  return s
+    \\end
+    \\local a, b = {}, {}
+    \\local acc = 0
+    \\for round = 1, 400 do
+    \\  if a ~= b then acc = acc + count(16) end
+    \\end
+    \\print(acc)
+;
+
+test "loop lane (doc 87 §5.6): a settled loop visit from tier 0 enters through the lane and its lean arm" {
+    // The lane and the long form leave the same state by construction, so
+    // the witness is the lane's own counters: once the helper's loop trace
+    // is committed, every visit enters through the lane, and a numeric
+    // `for` that runs to its end is consumed by the lean arm.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const run = try loopLaneRun(loop_lane_for_source, struct {
+        fn tune(_: *Vm) void {}
+    }.tune);
+    try testing.expectEqualStrings("54400\n", run.output());
+    try testing.expect(run.lane_entries >= 350);
+    try testing.expect(run.lane_lean >= 350);
+}
+
+test "loop lane (doc 87 §5.6): a while loop enters through the lane and leaves through the shared consumer" {
+    // The lean arm consumes one outcome only (a numeric `for`'s loop-done
+    // exit); a `while` loop's exit takes the lane's entry and then the
+    // consumer every other entry uses.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const run = try loopLaneRun(loop_lane_while_source, struct {
+        fn tune(_: *Vm) void {}
+    }.tune);
+    try testing.expectEqualStrings("48000\n", run.output());
+    try testing.expect(run.lane_entries >= 350);
+    try testing.expectEqual(@as(u64, 0), run.lane_lean);
+}
+
+test "loop lane (doc 87 §5.6): an exec log, coverage, a held .full dispatch and the knob each refuse it" {
+    // The first three belong to different layers of the long form (the
+    // handlers' bypass set, the quiet predicate, `fast_block`); the knob is
+    // the lane's own switch, which the differential below relies on.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const legs = [_]LoopLaneRun{
+        try loopLaneRun(loop_lane_for_source, struct {
+            fn tune(vm: *Vm) void {
+                vm.trace.config.record_exec_log = true;
+            }
+        }.tune),
+        try loopLaneRun(loop_lane_for_source, struct {
+            fn tune(vm: *Vm) void {
+                vm.trace.config.coverage = true;
+            }
+        }.tune),
+        try loopLaneRun(loop_lane_for_source, struct {
+            fn tune(vm: *Vm) void {
+                vm.setRecordSafepointLines(true);
+            }
+        }.tune),
+        try loopLaneRun(loop_lane_for_source, struct {
+            fn tune(vm: *Vm) void {
+                vm.trace.config.loop_lane = false;
+            }
+        }.tune),
+    };
+    for (legs) |run| {
+        try testing.expectEqualStrings("54400\n", run.output());
+        try testing.expectEqual(@as(u64, 0), run.lane_entries);
+        try testing.expectEqual(@as(u64, 0), run.lane_lean);
+    }
+}
+
+test "loop lane (doc 87 §5.6): the lane and the long form leave the same output, entries and traces" {
+    // Each program runs twice, with the lane and with `loop_lane` off, and
+    // must leave the same output, entry counters and trace cache (ids,
+    // anchors, sizes, native states, hit counts, per-exit counts). The
+    // programs cover what a loop visit can end in: a numeric `for` done, a
+    // `while` test, a zero-trip and a one-trip visit, a branch inside the
+    // body taken at a moving position, a nested loop, a generic `for` and
+    // a `repeat`. Each program has visits of 8 iterations or more, since
+    // a loop root gets its patched entry (and so the lane) from a receipt
+    // that completes `min_useful` of them.
+    if (!@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const sources = [_][:0]const u8{
+        loop_lane_for_source,
+        loop_lane_while_source,
+        // Trip counts from 0 to 22, so some visits never enter the body
+        // and some run one iteration.
+        \\local function tri(n)
+        \\  local s = 0
+        \\  for i = 1, n do s = s + i end
+        \\  return s
+        \\end
+        \\local a, b = {}, {}
+        \\local acc = 0
+        \\for round = 1, 300 do
+        \\  if a ~= b then acc = acc + tri((round * 7) % 23) end
+        \\end
+        \\print(acc)
+        ,
+        // A branch in the body that goes one way on one iteration of
+        // each visit, at a position that moves between visits: side
+        // exits in the middle of a visit, and the siblings and handoffs
+        // that follow. (Written without `==`: see `loopLaneRun`.)
+        \\local function mix(n, k)
+        \\  local s = 0
+        \\  for i = 1, n do
+        \\    if i < k then s = s - 1 elseif i > k then s = s - 2 else s = s + i end
+        \\  end
+        \\  return s
+        \\end
+        \\local a, b = {}, {}
+        \\local acc = 0
+        \\for round = 1, 300 do
+        \\  if a ~= b then acc = acc + mix(12, round % 12 + 1) end
+        \\end
+        \\print(acc)
+        ,
+        // A nested loop: the outer loop of the helper is entered from
+        // tier 0, the inner one from the outer's trace or its exits.
+        \\local function grid(n)
+        \\  local s = 0
+        \\  for i = 1, n do
+        \\    for j = 1, 12 do s = s + j * i end
+        \\  end
+        \\  return s
+        \\end
+        \\local a, b = {}, {}
+        \\local acc = 0
+        \\for round = 1, 200 do
+        \\  if a ~= b then acc = acc + grid(4) end
+        \\end
+        \\print(acc)
+        ,
+        // A generic `for` over a closure iterator (the kind that
+        // records), whose patched entry is `.jloop`'s.
+        \\local function upto(n)
+        \\  local i = 0
+        \\  return function()
+        \\    i = i + 1
+        \\    if i <= n then return i end
+        \\  end
+        \\end
+        \\local function total(n)
+        \\  local s = 0
+        \\  for v in upto(n) do s = s + v end
+        \\  return s
+        \\end
+        \\local a, b = {}, {}
+        \\local acc = 0
+        \\for round = 1, 200 do
+        \\  if a ~= b then acc = acc + total(12) end
+        \\end
+        \\print(acc)
+        ,
+        // A `repeat` loop.
+        \\local function halve(n)
+        \\  local steps = 0
+        \\  repeat
+        \\    n = n // 2
+        \\    steps = steps + 1
+        \\  until n < 1
+        \\  return steps
+        \\end
+        \\local a, b = {}, {}
+        \\local acc = 0
+        \\for round = 1, 200 do
+        \\  if a ~= b then acc = acc + halve(100000 + round) end
+        \\end
+        \\print(acc)
+        ,
+    };
+    for (sources, 0..) |source, i| {
+        const lane = try loopLaneRun(source, struct {
+            fn tune(_: *Vm) void {}
+        }.tune);
+        const long = try loopLaneRun(source, struct {
+            fn tune(vm: *Vm) void {
+                vm.trace.config.loop_lane = false;
+            }
+        }.tune);
+        expectSameLoopLaneRun(&long, &lane) catch |e| {
+            std.debug.print("loop lane differential: program {d} (lane entries {d}, lean {d})\n", .{ i, lane.lane_entries, lane.lane_lean });
+            return e;
+        };
+    }
+}
+
+/// `lane` (the lane on) and `long` (`loop_lane` off) are the same run.
+fn expectSameLoopLaneRun(long: *const LoopLaneRun, lane: *const LoopLaneRun) !void {
+    // The program must actually reach the lane, or the comparison proves
+    // nothing.
+    try testing.expect(lane.lane_entries > 0);
+    try testing.expectEqual(@as(u64, 0), long.lane_entries);
+    try testing.expectEqualStrings(long.output(), lane.output());
+    try testing.expectEqual(long.entries, lane.entries);
+    try testing.expectEqual(long.native_entries, lane.native_entries);
+    try testing.expectEqual(long.for_prep_patched, lane.for_prep_patched);
+    try testing.expectEqual(long.traces, lane.traces);
+    try testing.expectEqualSlices(u64, &long.rows, &lane.rows);
+}
+
 test "return hook (doc 84 §4.5): an abandoned continuation's resume pc ends up settled" {
     // The loop's `a ~= b` is the program's only `jeq`, which `refuse_op`
     // makes the recorder refuse, so neither it nor the continuation after

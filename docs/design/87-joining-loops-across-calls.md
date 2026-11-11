@@ -1,11 +1,13 @@
 # 87 — Joining loops across returns and calls — Design
 
-Status: draft, not implemented. One prerequisite fix landed with this draft
-(an admitted region no longer turns off native frame motion, §4.4). Bart
-answered on 2026-11-11 (§10.1): the shape is A (LuaJIT's), the seam is
-trimmed before the join, and the probe is a board row (`loop_ring`,
-`loop_ring_16`). Still open: Q2's choice between (R-a) and (R-b), and Q4,
-which needs counts first.
+Status: draft; the join itself is not implemented. Landed: one
+prerequisite fix (an admitted region no longer turns off native frame
+motion, §4.4) and the seam trim Bart ordered before the join (§5.6: the
+dispatcher's share of a loop visit from tier 0 went from about 1,240
+instructions to about 330). Bart answered on 2026-11-11 (§10.1): the shape
+is A (LuaJIT's), the seam is trimmed before the join, and the probe is a
+board row (`loop_ring`, `loop_ring_16`). Still open: Q2's choice between
+(R-a) and (R-b), and Q4, which needs counts first.
 Owner: Bart
 Last updated: 2026-11-11
 
@@ -36,6 +38,12 @@ inside them is checked.
   `bench/loop_ring.lua` with two rows, `loop_ring` (20,000 rounds of 64
   trips) and `loop_ring_16` (80,000 of 16), and their hashgate rows. All
   three modes and LuaJIT agree.
+- [x] **Seam — a loop visit from tier 0 costs less** (§5.6, follow-up of
+  2026-11-11). Exit facts computed once per trace, a native call with
+  nothing deferred settled inline, the chain exclusion built only where a
+  chain is driven, and the loop lane (`Vm.enterLoopLane`).
+  `loop_ring` 150.7 M → 113.1 M instructions (−25.0%), `loop_ring_16`
+  457.1 M → 306.5 M (−32.9%).
 
 ### Outstanding
 
@@ -49,8 +57,10 @@ inside them is checked.
 - [ ] **Review round.** §11 lists the claims this draft makes from
   reading, not from running; each needs a check against the source
   before the phase that leans on it.
-- [ ] **Seam — a loop visit from tier 0 costs less** (§5.6), before
-  Phase 1.
+- [ ] **Seam, left open** (§5.6 follow-up, "What the trim leaves"): a
+  lean arm for the exits of `while`, `repeat` and generic `for` loops,
+  and whether the patched entry's bar of 8 iterations should move now
+  that an entry is cheaper. Neither blocks Phase 1.
 - [ ] **Phase 0 — counters** (inert): glue wants, recordings, arms, hits
   and declines by reason, with their jit-debug probes.
 - [ ] **Phase 1 — a recording that starts at a loop's exit and leaves the
@@ -491,6 +501,98 @@ Two items in §2.2's split repeat a decision that cannot change:
 
 A lean loop episode is independent of the join and survives it. It could
 come first, alongside, or later (Q3).
+
+**Follow-up, 2026-11-11: the trim** (Bart: "Trim it before the join").
+Four changes. None of them knows the probe; each applies to every loop
+trace entered from tier 0.
+
+- **Exit facts.** What `maybeArmContinuation` and
+  `isSourceBranchGuardExit` re-derived at every exit is computed once per
+  trace (`TraceCode.exit_facts`: a numeric `for`'s loop-done guard, the
+  loop's own test, a source branch, the continuation seed). 4aa9f3d.
+- **Inline settlement.** A native call that captured no provenance and
+  deferred nothing settles with two inline tests in place of the
+  capture and settle calls. 57c0c7c.
+- **Lazy chain exclusion.** The list of traces a sibling chain must not
+  re-enter is built at the two sites that drive such a chain
+  (`ChainExclusion`), not on every entry.
+- **The loop lane** (`Vm.enterLoopLane`): the loop analog of doc 84's
+  one-shot lane, and the episode doc 44 D9 deferred.
+
+The lane, step by step. A loop-patch entry (`.jfor_loop`, a `for_prep`
+over one, `.jloop`) first asks `loopSettled`: `fast_block == 0`, no exec
+log, no coverage. That word holds the dispatch half of the §R1-5 bypass
+set and both frame-link requests, so the bypass set is known false and
+`safe_to_arm` known true. `loopLaneGate` then asks for what the rest of
+`enterSelectedTrace`'s prelude would otherwise handle: a compiled page,
+no hash seed, no sibling arm waiting to be placed, not a stitched root.
+The lane makes the native call the long form makes, in ordinary or
+linked mode, with the same silent staging and exit-side permission.
+
+One result is consumed in the lane: the entered trace ran its numeric
+`for` to the end, in ordinary mode, with one ledger row, nothing captured
+and nothing deferred (`loopLaneLeanDone`, a test on the raw
+`NativeResult`). For that result the shared consumers reduce to the
+receipt, the continuation arm and the mode choice. Every other result is
+decoded and handed to the consumers the long form uses
+(`consumeNativeEntryHead` and `consumeEntryResult`, extracted from
+`enterSelectedTrace` so that both callers share one body), and then to
+the walk tail.
+
+So the lane decides nothing the long form does not. Three checks hold it
+to that:
+
+- `config.loop_lane` (CLI `--jit-no-loop-lane`) turns the lane off. With
+  the jit-debug log on, each of the 66 board programs writes the same
+  log, byte for byte, with the lane and without it.
+- A test runs seven loop shapes both ways (numeric `for`, `while`,
+  `repeat`, a closure-iterator `for`, zero-trip and one-trip visits, a
+  branch that moves between visits, a nest) and compares output, entry
+  counters and the trace cache.
+- Safe builds assert the long form's own tests on every lean exit
+  (`assertLoopLaneLean`).
+
+A refused entry writes a "loop-lane refuse:" line with its reason under
+`-Djit-debug`, the same line with the lane on or off.
+
+Instructions, `--trace --jit-native`:
+
+| | `loop_ring` (64 trips) | `loop_ring_16` |
+|---|---|---|
+| before (29033d3) | 150.7 M | 457.1 M |
+| exit facts | 139.1 M | 410.5 M |
+| inline settlement | 132.5 M | 384.3 M |
+| lazy exclusion and the extraction | 129.1 M | 370.8 M |
+| loop lane | 113.1 M | 306.5 M |
+| LuaJIT | 24.7 M | 38.6 M |
+
+Split as in §2.1, the JIT's cost per round fell from 5,094 instructions
+to 3,224 and its cost per iteration stayed at 19.0 (tier 0: 1,681 and
+197; LuaJIT: 231 and 7.8).
+
+Callgrind as in §2.2, per round at 64 trips: 7,381 → 5,483. The
+dispatcher's part went from 2,487 (about 1,240 a visit) to 664 (about
+330 a visit: `enterLoopLane` 265, `onCallEntryTraced` 41,
+`maybeArmContinuation` 26). The loop bodies are unchanged at 2,426, and
+tier 0 runs 2,392 (`opCall` 501, `opForPrep` 330, `opRet` 314, and the
+iteration tier 0 replays after each loop-done exit).
+
+**What the trim leaves.**
+
+- A `while`, `repeat` or generic `for` enters through the lane, but its
+  exit goes to the shared consumer. Only a numeric `for`'s end has a
+  lean arm.
+- The lane needs the patched entry, and a loop root gets one from a
+  receipt that completes `min_useful` (8) iterations (doc 20). A shorter
+  visit enters through the discovery walk as before. A visit used to
+  cost the JIT about 1,700 instructions more than tier 0 and now costs
+  about 770; at 178 instructions saved per iteration the break-even
+  moved from about 10 trips to about 4.5. Whether the bar of 8 should
+  follow is not decided.
+- Coverage refuses both lanes, so `--jit-stats` measures the long form.
+- What remains of a round is mostly not seam: loop bodies at 19
+  instructions an iteration against LuaJIT's 7.8 (codegen, §2.1), and
+  tier 0's call, return and `for_prep`, which the join (§5.2) removes.
 
 ### 5.7 Determinism and replay
 

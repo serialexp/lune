@@ -771,15 +771,30 @@ pub const CompiledTrace = struct {
     /// frames or fused. Ordinary mode, no silent staging and no exit-side
     /// permission, as `runCapturingLedger(regs, out, .{})` passes.
     pub inline fn enterQuiet(self: CompiledTrace, regs: RegWindow, result: *NativeResult) void {
-        initResult(result, false, .{}, false);
-        self.enterPage(regs, result);
-        assertResult(result, false);
+        self.enterRaw(regs, result, false, .{}, false);
     }
 
     /// The decode half of `runCapturingLedger` for a result `enterQuiet`
     /// produced.
     pub inline fn decodeQuiet(self: CompiledTrace, result: *const NativeResult, ledger_out: []trace_exec.LedgerEntry) trace_exec.ExecResult {
-        return self.decodeResult(result, ledger_out, false);
+        return self.decodeRaw(result, ledger_out, false);
+    }
+
+    /// Doc 87 §5.6: the entry half of the dispatcher's direct entries
+    /// (`runCapturingLedgerEntry`, or `runLinkedLoopDoneCapturingEntry`
+    /// with `linked_loop_done`), for a caller that reads the usual outcome
+    /// from the raw `NativeResult` and decodes (`decodeRaw`) only the
+    /// results it hands to the shared consumers.
+    pub inline fn enterRaw(self: CompiledTrace, regs: RegWindow, result: *NativeResult, linked_loop_done: bool, silent: SilentStaging, exit_side_ok: bool) void {
+        initResult(result, linked_loop_done, silent, exit_side_ok);
+        self.enterPage(regs, result);
+        assertResult(result, exit_side_ok);
+    }
+
+    /// The decode half for a result `enterRaw` produced under the same
+    /// `exit_side_ok`.
+    pub inline fn decodeRaw(self: CompiledTrace, result: *const NativeResult, ledger_out: []trace_exec.LedgerEntry, exit_side_ok: bool) trace_exec.ExecResult {
+        return self.decodeResult(result, ledger_out, exit_side_ok);
     }
 
     /// The fresh state every native entry starts from.
