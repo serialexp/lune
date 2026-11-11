@@ -542,6 +542,13 @@ pub const InlineFrame = struct {
     /// A `__tostring` handler's frame (doc 82 `recTostrHandler`): its return
     /// is converted as `tostringAnswer` does, before it lands in `ret_dest`.
     tostr_answer: bool = false,
+    /// The ref of the closure running in this frame, which the callee's
+    /// upvalue reads go through (doc 77 §6.1: explicit, not derived from
+    /// `ret_dest`, which names the destination register). A `.call` sets it
+    /// to the callee its `guard_func` pins. Null when the trace holds no
+    /// such ref (a `__tostring` handler, pinned by `guard_tostring` through
+    /// the receiver): its upvalue reads abort `.cross_frame`.
+    callee: ?Ref = null,
 };
 
 /// Build a guard's ordered inline-path prefix (doc 17, A-i.2) from the recorder's
@@ -5081,6 +5088,7 @@ pub const RecordingSession = struct {
             .ret_count = instr.c,
             .caller_proto_id = proto.id,
             .call_pc = self.cur_pc - 1,
+            .callee = callee_ref,
         };
         self.inline_depth += 1;
         self.base_off = callee_base_off;
@@ -6620,15 +6628,8 @@ pub const RecordingSession = struct {
     /// callee's own seed was appended earlier (when the anchor-frame `get_upval`
     /// that loaded the callee ran), so seed ordering is correct by construction.
     pub fn recCalleeUpval(self: *RecordingSession, dest: u16, source: u16, resolved: Value) !void {
-        // Find the callee's closure ref. The callee was at register `ret_dest` in
-        // frame `inline_depth - 1` (ret_dest = instr.a of the .call that opened
-        // this inline frame — Lua convention: reg A holds the callee).
-        const d = self.inline_depth - 1;
-        const callee_anchor_reg: usize = @as(usize, self.frames[d].base_off) + self.frames[d].ret_dest;
-        if (callee_anchor_reg >= self.reg_map.len) return self.abort(.cross_frame);
-        const callee_entry = self.reg_map[callee_anchor_reg];
-        if (callee_entry.state == .undef) return self.abort(.cross_frame);
-        const callee_ref = callee_entry.ref;
+        // The closure running in this frame, as its push recorded it.
+        const callee_ref = self.frames[self.inline_depth - 1].callee orelse return self.abort(.cross_frame);
 
         // A `slot_load` callee's closure is in a known slab slot at entry
         // time, so the cell resolves once per entry. A computed callee (aload,
@@ -6801,12 +6802,8 @@ pub const RecordingSession = struct {
     /// `.cross_frame`.
     fn upvalAccessPathSlot(self: *const RecordingSession) ?u16 {
         if (self.inline_depth == 0) return UPVALUE_CELL_ANCHOR;
-        const d = self.inline_depth - 1;
-        const callee_anchor_reg: usize = @as(usize, self.frames[d].base_off) + self.frames[d].ret_dest;
-        if (callee_anchor_reg >= self.reg_map.len) return null;
-        const callee_entry = self.reg_map[callee_anchor_reg];
-        if (callee_entry.state == .undef) return null;
-        const callee_ir = self.instrs.items[callee_entry.ref];
+        const callee_ref = self.frames[self.inline_depth - 1].callee orelse return null;
+        const callee_ir = self.instrs.items[callee_ref];
         if (callee_ir.op != .slot_load) return null;
         return @intCast(callee_ir.aux);
     }

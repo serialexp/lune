@@ -458,6 +458,41 @@ test "[REQ-115.1] a table hole with a __tostring is recorded with its handler in
     }
 }
 
+/// `__tostring` handlers that read their upvalues, on a receiver held in a
+/// slot and on one loaded from a field. The trace holds no ref to the
+/// handler closure (`guard_tostring` pins it through the receiver), so its
+/// upvalue reads stop the recording rather than resolve against the
+/// receiver.
+const handler_upvalue_loop =
+    \\local function mk(word)
+    \\  return setmetatable({}, { __tostring = function() return word end })
+    \\end
+    \\local a = mk("aa")
+    \\local holder = { o = mk("bbb") }
+    \\local function run(x, h)
+    \\  local total = 0
+    \\  for i = 1, 400 do
+    \\    total = total + #`{x}` + #`{h.o}`
+    \\  end
+    \\  return total
+    \\end
+    \\print(run(a, holder), run(holder.o, { o = a }))
+;
+
+test "[REQ-115.1] a __tostring handler that reads its upvalues answers as tier 0 does" {
+    const gpa = testing.allocator;
+    const ref = try ktu.referenceRun(gpa, handler_upvalue_loop);
+    defer ref.deinit(gpa);
+    try testing.expectEqualStrings("2000\t2000\n", ref.full_out);
+    const modes = [_]JitMode{ .record_only, .tier1a_raw, .tier1a_opt, .native };
+    for (modes) |mode| {
+        if (mode == .native and !nativegen.is_x64_linux) continue;
+        const run = try jitRun(gpa, handler_upvalue_loop, mode, ref.full_out);
+        defer gpa.free(run.snap);
+        try testing.expectEqualSlices(u8, ref.final_snap, run.snap);
+    }
+}
+
 test "[REQ-115.3] a guard failure inside a template runs no hole or __tostring twice" {
     const gpa = testing.allocator;
     const ref = try ktu.referenceRun(gpa, handler_change_loop);
