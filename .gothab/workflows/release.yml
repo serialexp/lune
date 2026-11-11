@@ -1,0 +1,278 @@
+name: release
+
+# The release pipeline on gothab.io: the vendor bundle and the CLI archives,
+# each built once on Linux (zig cross-compiles every target, so CI and a local
+# `just bundle` / `just cli` produce the same bytes), proved, and published as
+# one gothab release with `gt release create`. The twin of the GitHub mirror's
+# .github/workflows/bundle.yml, which stays for the platforms gothab's runners
+# are not (macOS, Windows, arm64: see TODO.md, "Release pipeline").
+#
+# Triggered by pushing a tag `vX.Y.Z`, or by dispatching this workflow on one.
+# The tag must equal the version of build.zig.zon and both Rust crates
+# (embed/rust/*/Cargo.toml), so a release, the crates inside it and a
+# downstream lock file all name one version. Downstream projects pin the
+# tarball by URL + sha256.
+#
+# Each artifact is proved twice over:
+#   - reproducible: a second build from another path, with a cold cache, must
+#     give byte-identical archives;
+#   - usable, on the runner's own platform (x86-64 Linux, gnu and musl): a
+#     minimal Rust crate built against the bundle with NO zig on PATH links
+#     and runs one VM lifecycle (tools/bundle-smoke.sh); the CLI runs scripts,
+#     serves its UI and POST /run (tools/cli-smoke.sh), install.sh installs it
+#     (tools/install-smoke.sh), and the UI works in headless Chrome
+#     (viz/e2e/browser-smoke.ts).
+# gt publishes with the job token the runner sets (GOTHAB_TOKEN / GITHUB_TOKEN).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # Pinned by .zig-version (the same pin as ci.yml); the digest is
+  # ziglang.org/download/index.json's shasum for the x86_64-linux tarball.
+  # .github/actions/install-zig fetches it from the community mirrors.
+  ZIG_VERSION: 0.17.0
+  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+
+jobs:
+  bundle:
+    name: build the bundle
+    runs-on: 2xheavy
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/install-zig
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          sha256: ${{ env.ZIG_SHA256 }}
+
+      - name: Build the bundle
+        run: bash tools/mahina-bundle.sh "$RUNNER_TEMP/mahina-bundle"
+
+      - name: Rebuild from another path with a cold cache, and compare
+        run: |
+          set -eu
+          rsync -a --exclude /.zig-cache --exclude /zig-out ./ "$RUNNER_TEMP/repro/"
+          (cd "$RUNNER_TEMP/repro" && bash tools/mahina-bundle.sh "$RUNNER_TEMP/mahina-bundle-repro")
+          diff "$RUNNER_TEMP/mahina-bundle/SHA256SUMS" "$RUNNER_TEMP/mahina-bundle-repro/SHA256SUMS"
+          cat "$RUNNER_TEMP/mahina-bundle/SHA256SUMS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mahina-bundle
+          path: ${{ runner.temp }}/mahina-bundle
+          relative-to: ${{ runner.temp }}/mahina-bundle
+          if-no-files-found: error
+
+  bundle-smoke:
+    name: smoke the bundle (x86-64 Linux)
+    needs: bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mahina-bundle
+          path: mahina-bundle
+
+      - name: Install the Rust targets
+        run: |
+          set -eu
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
+          rustc -vV
+
+      - name: Smoke-test the bundle (no zig installed)
+        run: |
+          set -eu
+          if command -v zig >/dev/null; then
+            echo "::warning::this runner has a zig on PATH; the smoke script hides it"
+          fi
+          bash tools/bundle-smoke.sh --strict mahina-bundle x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
+
+  cli:
+    name: build the CLI
+    runs-on: 2xheavy
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/install-zig
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          sha256: ${{ env.ZIG_SHA256 }}
+
+      # The web UI's toolchain (Node >= 22.13 and the pnpm viz/package.json
+      # pins) comes with the runner image, as in ci.yml's viz leg.
+      - name: Build the CLI
+        run: bash tools/mahina-cli.sh "$RUNNER_TEMP/mahina-cli"
+
+      - name: Rebuild from another path with cold caches, and compare
+        run: |
+          set -eu
+          rsync -a --exclude /.zig-cache --exclude /zig-out --exclude /viz/node_modules ./ "$RUNNER_TEMP/repro/"
+          (cd "$RUNNER_TEMP/repro" && bash tools/mahina-cli.sh "$RUNNER_TEMP/mahina-cli-repro")
+          diff "$RUNNER_TEMP/mahina-cli/SHA256SUMS" "$RUNNER_TEMP/mahina-cli-repro/SHA256SUMS"
+          cat "$RUNNER_TEMP/mahina-cli/SHA256SUMS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mahina-cli
+          path: ${{ runner.temp }}/mahina-cli
+          relative-to: ${{ runner.temp }}/mahina-cli
+          if-no-files-found: error
+
+  cli-smoke:
+    name: smoke the CLI (x86-64 Linux)
+    needs: cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mahina-cli
+          path: mahina-cli
+
+      - name: Smoke-test the CLI
+        run: bash tools/cli-smoke.sh --strict mahina-cli x86_64-linux
+
+      # install.sh against these archives, served like a release (no
+      # publishing needed).
+      - name: Smoke-test install.sh
+        run: bash tools/install-smoke.sh mahina-cli
+
+  # The visualiser driven in headless Chrome (viz/e2e/browser-smoke.ts): load
+  # a trace, Run (wasm), Run both + diff, Replay. cli-smoke proves the page's
+  # files are served; this proves the page works.
+  viz-browser-smoke:
+    name: visualiser in a browser
+    needs: cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mahina-cli
+          path: mahina-cli
+
+      - name: Drive mahina viz in Chrome
+        run: |
+          set -eu
+          tar -xzf mahina-cli/mahina-x86_64-linux.tar.gz -C "$RUNNER_TEMP"
+          cd viz
+          pnpm install --frozen-lockfile
+          pnpm run smoke:browser "$RUNNER_TEMP/mahina-x86_64-linux/mahina"
+
+  release:
+    name: publish the release
+    # Only for version tags, and only once every proof passed.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [bundle, bundle-smoke, cli, cli-smoke, viz-browser-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mahina-bundle
+          path: mahina-bundle
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mahina-cli
+          path: mahina-cli
+
+      - name: Check the tag, the crates, the bundle and the CLI agree
+        run: |
+          set -eu
+          tag=${GITHUB_REF_NAME}
+          v=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          if [ "v$v" != "$tag" ]; then
+            echo "::error::tag $tag but build.zig.zon is version $v (what mahina --version says); bump it first"
+            exit 1
+          fi
+          for crate in mahina mahina-sys; do
+            v=$(sed -n 's/^version = "\(.*\)"$/\1/p' "embed/rust/$crate/Cargo.toml" | head -1)
+            if [ "v$v" != "$tag" ]; then
+              echo "::error::tag $tag but embed/rust/$crate is version $v; bump the crates first"
+              exit 1
+            fi
+          done
+          commit=$(cat mahina-bundle/LUNE_COMMIT)
+          if [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "::error::bundle LUNE_COMMIT is '$commit', want the tagged commit $GITHUB_SHA"
+            exit 1
+          fi
+          (cd mahina-bundle && sha256sum -c SHA256SUMS)
+          commit=$(cat mahina-cli/LUNE_COMMIT)
+          if [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "::error::CLI LUNE_COMMIT is '$commit', want the tagged commit $GITHUB_SHA"
+            exit 1
+          fi
+          (cd mahina-cli && sha256sum -c SHA256SUMS)
+
+      - name: Pack the release tarball
+        # Reproducible: sorted names, zeroed mtimes/owners, normalised modes,
+        # and gzip without a timestamp, so the same bundle gives the same
+        # tarball (and sha256) every time.
+        run: |
+          set -eu
+          name=mahina-bundle-${GITHUB_REF_NAME}
+          mv mahina-bundle "$name"
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+            --mode='u+rwX,go+rX,go-w' --format=gnu -cf - "$name" | gzip -9 -n > "$name.tar.gz"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          # The CLI archives keep their bytes and gain the version in the name.
+          mkdir cli-assets
+          for f in mahina-cli/mahina-*; do
+            base=${f#mahina-cli/mahina-}
+            cp "$f" "cli-assets/mahina-${GITHUB_REF_NAME}-$base"
+          done
+          (cd cli-assets && sha256sum mahina-* > "mahina-${GITHUB_REF_NAME}-SHA256SUMS")
+          {
+            echo "mahina ${GITHUB_REF_NAME}"
+            echo
+            echo "- lune commit: \`$(cat "$name/LUNE_COMMIT")\`"
+            echo "- zig: \`$(cat "$name/ZIG_VERSION")\`"
+            echo
+            echo "## CLI"
+            echo
+            echo "\`mahina-${GITHUB_REF_NAME}-<platform>\`: one \`mahina\` binary per platform with the trace visualiser built in."
+            echo "Run scripts with \`mahina script.mahina\`; \`mahina viz [trace.mahinatrace]\` serves the visualiser on localhost."
+            echo "The native JIT (\`--jit-native\`) is x86-64 Linux only; elsewhere it falls back to the interpreter tiers."
+            echo
+            echo '```'
+            cat "cli-assets/mahina-${GITHUB_REF_NAME}-SHA256SUMS"
+            echo '```'
+            echo
+            echo "## Vendor bundle"
+            echo
+            echo "\`$name.tar.gz\`: prebuilt libmahina for every supported Rust target (sha256 \`$(cut -d' ' -f1 "$name.tar.gz.sha256")\`)."
+            echo "Unpack, then build with \`MAHINA_PREBUILT_ROOT=<dir>/lib\` against \`<dir>/rust/mahina\`; no zig needed."
+            echo
+            echo "Archives:"
+            echo '```'
+            cat "$name/SHA256SUMS"
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Create the gothab release
+        # The runner sets GOTHAB_TOKEN, GOTHAB_HOST and GOTHAB_PROTOCOL.
+        run: |
+          set -eu
+          name=mahina-bundle-${GITHUB_REF_NAME}
+          gt release create "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" cli-assets/* \
+            --title "mahina ${GITHUB_REF_NAME}" --notes-file notes.md

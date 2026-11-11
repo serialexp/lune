@@ -4192,3 +4192,15 @@ test in `src/interp_phaseq_test.zig` and were dodged there, not fixed.
       prints `1800000`. Lua 5.4 raises
       "'__tostring' must return a string". Decide which behaviour mahina
       wants, then fix the tag or the program.
+
+## Release pipeline on gothab (noted 2026-11-11)
+
+- [ ] **`.gothab/workflows/release.yml` proves only x86-64 Linux.** The GitHub
+      mirror's `bundle.yml` also smoke-tests the bundle and CLI on macOS
+      (x86-64, arm64), Windows (x86-64, arm64) and Linux arm64. Gothab's
+      runners are Linux x86-64, so those legs are missing until they are
+      dispatched to the mirror (`gothab/github-dispatch`, as the gothab repo's
+      docker.yml does) or gothab gets those runners.
+- [ ] **`install.sh` and its release-notes line still name GitHub** (`repo_releases`
+      is github.com/serialexp/lune/releases), so the gothab release notes omit
+      the `curl | sh` line and the post-publish `install` job is not ported.
