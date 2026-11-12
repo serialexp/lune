@@ -434,3 +434,12 @@ fn os_exit_is_an_error_with_the_status_and_the_vm_stays_usable() {
     let plain = Vm::new().unwrap();
     assert_eq!(plain.eval("return os.exit == nil", "t").unwrap()[0], Value::Bool(true));
 }
+
+#[test]
+fn proc_group_installs_proc_run_only_when_enabled() {
+    let plain = Vm::new().unwrap();
+    assert_eq!(plain.eval("return proc == nil or proc.run == nil", "t").unwrap()[0], Value::Bool(true));
+    let vm = Vm::with_config(Config { system: System::PROC, ..Config::default() }).unwrap();
+    assert_eq!(vm.eval("return type(proc.run)", "t").unwrap()[0].as_str().unwrap().as_bytes(), b"function");
+    assert!(System::ALL.contains(System::PROC));
+}

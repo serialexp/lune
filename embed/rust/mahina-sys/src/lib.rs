@@ -94,7 +94,8 @@ pub const MH_SYSTEM_ENV: c_uint = 1 << 2;
 pub const MH_SYSTEM_TIME: c_uint = 1 << 3;
 pub const MH_SYSTEM_CLOCK: c_uint = 1 << 4;
 pub const MH_SYSTEM_RANDOM: c_uint = 1 << 5;
-pub const MH_SYSTEM_ALL: c_uint = 0x3F;
+pub const MH_SYSTEM_PROC: c_uint = 1 << 6;
+pub const MH_SYSTEM_ALL: c_uint = 0x7F;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]

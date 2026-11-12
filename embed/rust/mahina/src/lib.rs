@@ -210,6 +210,8 @@ impl System {
     pub const CLOCK: System = System(sys::MH_SYSTEM_CLOCK);
     /// An OS seed for `math.random` (off: a fixed seed).
     pub const RANDOM: System = System(sys::MH_SYSTEM_RANDOM);
+    /// `proc.run`: running other programs.
+    pub const PROC: System = System(sys::MH_SYSTEM_PROC);
     pub const ALL: System = System(sys::MH_SYSTEM_ALL);
 
     pub fn contains(self, other: System) -> bool {
