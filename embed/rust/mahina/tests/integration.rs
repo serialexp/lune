@@ -604,3 +604,29 @@ fn an_error_table_raised_from_a_prelude_survives_pcall() {
     // Uncaught, the host sees the table's text only (a string message API).
     assert!(matches!(vm.eval("fail('E', 'x')", "t"), Err(Error::Runtime(_))));
 }
+
+#[test]
+fn env_group_installs_os_environ_getenv_and_setenv_only_when_enabled() {
+    let plain = Vm::new().unwrap();
+    let out = plain.eval("return os.environ == nil, os.getenv == nil, os.setenv == nil", "t").unwrap();
+    assert_eq!(out, vec![Value::Bool(true), Value::Bool(true), Value::Bool(true)]);
+
+    let vm = Vm::with_config(Config { system: System::ENV, ..Config::default() }).unwrap();
+    // os.setenv gives the VM its own environment copy; getenv and environ read it.
+    let out = vm
+        .eval(
+            "os.setenv('MAHINA_EMBED_ENV_TEST', 'hello')
+             local e = os.environ()
+             local seen = 0 for _ in pairs(e) do seen = seen + 1 end
+             return type(e), e.MAHINA_EMBED_ENV_TEST, os.getenv('MAHINA_EMBED_ENV_TEST'), seen > 1",
+            "t",
+        )
+        .unwrap();
+    assert_eq!(out[0].as_str().unwrap().as_bytes(), b"table");
+    assert_eq!(out[1].as_str().unwrap().as_bytes(), b"hello");
+    assert_eq!(out[2].as_str().unwrap().as_bytes(), b"hello");
+    assert_eq!(out[3], Value::Bool(true));
+    // Removing it with nil removes it from both views.
+    let out = vm.eval("os.setenv('MAHINA_EMBED_ENV_TEST', nil) return os.getenv('MAHINA_EMBED_ENV_TEST'), os.environ().MAHINA_EMBED_ENV_TEST", "t").unwrap();
+    assert_eq!(out, vec![Value::Nil, Value::Nil]);
+}
