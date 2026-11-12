@@ -21,8 +21,10 @@ const std = @import("std");
 const interp = @import("../interp.zig");
 const bytecode = @import("../bytecode.zig");
 const coroutine = @import("../coroutine.zig");
+const compiler = @import("../compiler.zig");
 const breakpoints = @import("breakpoints.zig");
 const eval = @import("eval.zig");
+const inspect = @import("inspect.zig");
 
 const Vm = interp.Vm;
 const Proto = bytecode.Proto;
@@ -245,6 +247,8 @@ pub const Session = struct {
     protects: std.ArrayList(Protect) = .empty,
     /// An error stop's text, reset at each one.
     stop_arena: std.heap.ArenaAllocator,
+    /// The references handed out while stopped, and the sources held.
+    inspector: inspect.Inspector,
 
     /// A protected call made in Zig: on coroutine `co` (a header id, 0 for
     /// the main stack), entered at frame depth `depth`.
@@ -280,6 +284,7 @@ pub const Session = struct {
             .breakpoints = .init(gpa),
             .eval_arena = .init(gpa),
             .stop_arena = .init(gpa),
+            .inspector = .init(gpa),
         };
         if (opts.stop_on_entry) self.hooks.flags.store(Flags.pause, .release);
         vm.trace.raiseSuspend();
@@ -300,6 +305,7 @@ pub const Session = struct {
         std.debug.assert(self.protects.items.len == 0);
         self.protects.deinit(self.gpa);
         self.stop_arena.deinit();
+        self.inspector.deinit();
     }
 
     /// Set which errors stop (`setExceptionBreakpoints`). While stopped, or
@@ -313,7 +319,49 @@ pub const Session = struct {
     /// The outcome's text lives until the next evaluation.
     pub fn evaluate(self: *Session, expression: []const u8) Error!eval.Outcome {
         _ = self.eval_arena.reset(.retain_capacity);
-        const scope: eval.Scope = if (self.stopped_at) |at| .ofFrame(self.vm, at.frame) else .top(self.vm);
+        var scope: eval.Scope = if (self.stopped_at) |at| .ofFrame(self.vm, at.frame) else .top(self.vm);
+        scope.source = self.inspector.sourceOf(self.vm, scope.proto.id);
+        return eval.evaluate(self.eval_arena.allocator(), self.vm, scope, expression);
+    }
+
+    // ---- inspecting the stopped program (§5.5, §7) ----------------------
+    //
+    // Results are allocated in `arena`, which the caller owns. References
+    // (`StackFrame.id`, `ScopeInfo.ref`, `Variable.ref`) stand until the
+    // program resumes.
+
+    /// Hold the source text of `chunk`, borrowed until detach: it gives
+    /// stack frames their columns, and evaluate its folded `<const>`s.
+    /// Chunks the VM compiled itself already carry theirs.
+    pub fn addSource(self: *Session, chunk: *const compiler.Chunk, text: []const u8) Error!void {
+        try self.inspector.addSource(chunk, text);
+    }
+
+    /// The main stack, and every coroutine that has not died.
+    pub fn threads(self: *Session, arena: std.mem.Allocator) Error![]inspect.ThreadInfo {
+        return self.inspector.threads(self.vm, arena);
+    }
+
+    /// One page of a thread's stack, deepest frame first (§5.5).
+    pub fn stackTrace(self: *Session, arena: std.mem.Allocator, thread_id: u32, start: u32, levels: u32) inspect.Error!inspect.StackPage {
+        return self.inspector.stackTrace(self.vm, arena, thread_id, start, levels);
+    }
+
+    /// A frame's scopes: locals, upvalues and globals (§7.1).
+    pub fn scopes(self: *Session, arena: std.mem.Allocator, frame: u32) inspect.Error![]inspect.ScopeInfo {
+        return self.inspector.scopes(self.vm, arena, frame);
+    }
+
+    /// The children of a scope or variable reference, paged (§7.2).
+    pub fn variables(self: *Session, arena: std.mem.Allocator, ref: u32, filter: inspect.Filter, start: u32, count: u32) inspect.Error![]inspect.Variable {
+        return self.inspector.variables(self.vm, arena, ref, filter, start, count);
+    }
+
+    /// `evaluate` in the frame `frame` names (DAP's `frameId`), on any
+    /// stack, not only the running one.
+    pub fn evaluateIn(self: *Session, frame: u32, expression: []const u8) inspect.Error!eval.Outcome {
+        const scope = try self.inspector.scopeOf(self.vm, frame);
+        _ = self.eval_arena.reset(.retain_capacity);
         return eval.evaluate(self.eval_arena.allocator(), self.vm, scope, expression);
     }
 
@@ -398,6 +446,7 @@ pub const Session = struct {
         self.hooks.flags.store(0, .release);
         self.hooks.raise_seen = false;
         self.stepping = null;
+        defer self.inspector.clear();
         return self.driver.stopped(self.driver.ctx, self, .{ .reason = .ended, .err = err });
     }
 
@@ -613,6 +662,7 @@ pub const Session = struct {
         self.stopped_at = at;
         const r = self.driver.stopped(self.driver.ctx, self, s);
         self.stopped_at = null;
+        self.inspector.clear();
         switch (r) {
             .@"continue" => {},
             .step => |st| {

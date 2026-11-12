@@ -1,6 +1,6 @@
 # Time-travel debugger over DAP — Design
 
-Status: partial — P0 and P1 landed; P2–P7 outstanding
+Status: partial — P0, P1 and P2 landed; P3–P7 outstanding
 Owner: Bart
 Last updated: 2026-11-12
 
@@ -50,10 +50,7 @@ everything inside them is checked.
     the output, the final snapshot bytes and the effect cursor. It asserts
     that some program collects. `tests/programs/` holds the eight corpus
     programs.
-
-### Outstanding
-
-- [ ] **P2 — the debugger core, forward only** (§3, §5, §7). `src/debug/`
+- [x] **P2 — the debugger core, forward only** (§3, §5, §7). `src/debug/`
   covers the items below, and does no I/O.
   - [x] The session and its live VM (`src/debug/session.zig`). It
     attaches through `Vm.debug` (`interp.DebugHooks`), whose check runs in
@@ -77,20 +74,28 @@ everything inside them is checked.
     decoder lifted out so the two cannot disagree. Tests are in
     `src/debug/eval_test.zig`; one shows that evaluating at every stop
     leaves the step count and the final snapshot bytes unchanged.
-  - [ ] Evaluate reads a folded `<const>` (§4 `literal` rows). It needs
-    the chunk's source text, which the session does not hold yet, so for
-    now it refuses.
+  - [x] Evaluate reads a folded `<const>` (§4 `literal` rows) from the
+    chunk's source text (`Session.addSource`, or the VM's own loaded
+    chunks). Without the source it refuses, naming that as the reason.
   - [x] Step in, over and out (`Resume.step`, `Session.stepDone`), with
     `granularity: "instruction"` as well as lines. How it differs from the
     plan is in §5.3's follow-up. Tests are in `src/debug/step_test.zig`.
-  - [ ] Evaluate in any frame (`frameId`), with the stack (below).
+  - [x] Evaluate in any frame (`Session.evaluateIn`), on any coroutine's
+    stack, with the stack (below).
   - [x] Error stops at every site where an error is raised (§5.4),
     with the `uncaught` and `caught` filters
     (`Session.setExceptionFilters`), the error's text and value
     (`Stop.exception`), and `evaluate` in the raising frame. How it
     differs from the plan is in §5.4's follow-up. Tests are in
     `src/debug/error_test.zig`.
-  - [ ] Threads, the stack, scopes, and variables with slot-order paging.
+  - [x] Threads, the stack, scopes, and variables with slot-order paging
+    (`src/debug/inspect.zig`; how it differs from the plan is in §5.5's
+    and §7.2's follow-ups). Tests are in `src/debug/inspect_test.zig`.
+    One shows that inspecting everything at every stop leaves the step
+    count and the final snapshot bytes unchanged.
+
+### Outstanding
+
 - [ ] **P3 — `mahina dap`** (§8). The DAP server on stdio, with the full
   lifecycle (initialize, configuration, disconnect and terminate) and a
   post-exit stop. Program output goes to `output` events, and stdin comes
@@ -635,6 +640,31 @@ Scratch-VM replays are P4.
   there. `terminated` is sent only on `disconnect` or `terminate`, or when
   no history exists.
 
+**As built (P2, 2026-11-12).** `src/debug/inspect.zig`, through
+`Session.threads`, `stackTrace`, `scopes`, `variables` and `evaluateIn`.
+
+- **Thread ids.** The main stack is 1 and a coroutine is its header id
+  plus 1, because header ids start at 0 (the globals table's) and a
+  coroutine's could otherwise be 1. A dead coroutine that is not yet
+  collected is not listed. `threads` walks the heap, so it costs the
+  heap's object count, once per stop.
+- **The stack.** It comes from `Vm.contextFrames`, one row per frame,
+  deepest first, with `stackTrace` paging by `start` and `levels`. The
+  running coroutine's stack continues into its resumers' (`.chain`); any
+  other thread lists its own frames, read from its saved context, and
+  evaluate works in those frames too. A frame's `column` counts bytes
+  from the chunk's source and is 0 when the session does not hold it;
+  `start` and `end` are the span's byte offsets.
+- **References are per stop.** A frame, scope or variable reference is a
+  handle that a resume clears. Numbers are never reissued, so a stale one
+  is refused (`InvalidReference`) and cannot name a later stop's handle.
+- **Frame pcs.** A frame below the top is placed at its call instruction
+  (`pc - 1`), as a traceback places it, so liveness and names are those of
+  the call. The earlier `Scope.ofFrame` used the return address there.
+- **Not covered yet.** Step requests aimed at a coroutine that is not
+  running (the message in the bullet above) are the transport's (P3).
+  Typed arrays and grid rows list no children.
+
 ### 5.6 Why tier 0 (D3)
 
 Traces have no per-instruction prologue. Stopping in one requires the
@@ -911,14 +941,40 @@ For each frame, `scopes` returns:
   carried across one.
 - **Arrays.** A table's array part is reported as `indexedVariables`, and
   `start`/`count` page it directly.
-- **Hash parts.** These are listed in slot order, which is the order
-  `next` uses and is deterministic (keyed by ids). Nothing is sorted. A
+- **Hash parts.** These are listed in slot order, which is deterministic
+  (keyed by ids). Nothing is sorted. `next` does not use this order: it
+  walks the keys sorted (tag, id, payload), which costs a sort per change
+  to the key set, so slot order is what makes a page O(page). A
   hash part over 100 entries is shown as synthetic group children, for
   example `[slots 0–99]`, each a slot range. Expanding a group reads only
   its slots, so a page costs O(page) with no index to build.
 - **Metatables** show as a `[metatable]` child.
 - **Rendering** uses `io.zig`'s renderer with a length cap, and never calls
   `__tostring` or `__name` (D6).
+
+**As built (P2, 2026-11-12).**
+
+- **Scopes** are Locals, Upvalues and Globals (`expensive`). The locals
+  are the rows visible at the frame's pc, the later row winning a shared
+  name. A register that is dead there shows as `<unavailable>`, and so
+  does a folded `<const>` whose chunk source is not held (with the
+  reason). `...` is a variable with the varargs as its children,
+  `[1]`, `[2]`, and so on.
+- **Arrays.** `indexedVariables` counts positions 1 and up of the array
+  part (a grid's rows); a hole shows as `nil`. Key 0, when the array part
+  holds it, is the first named child after `[metatable]`.
+- **Groups.** A hash part with more than 100 slots lists as groups,
+  `[slots 0–99]` and so on, counted in slots, so a group may hold fewer
+  than 100 entries. Expanding one reads only its slots.
+- **Functions** list their upvalues. A coroutine, userdata, file and typed
+  array list nothing, and a grid row shows as a `table` with no children.
+- **Rendering.** A string is quoted and cut at 200 bytes at a character
+  boundary, with an ellipsis. Everything else is `io.writeValue`. Neither
+  `__tostring` nor `__name` runs.
+- **Folded `<const>`s** are read by the evaluator from the literal at the
+  span, so a string decodes as the compiler decodes it. The session holds
+  no source text itself: `Session.addSource(chunk, text)` lends it, and a
+  chunk the VM compiled carries its own.
 
 ### 7.3 Evaluate and conditions (D6)
 

@@ -3450,7 +3450,7 @@ pub const Vm = struct {
         return o.name;
     }
 
-    fn contextFrames(self: *const Vm, out: []FaultFrame, frames: []const CallFrame, live: bool, thread: ?*const coroutine.Thread) usize {
+    pub fn contextFrames(self: *const Vm, out: []FaultFrame, frames: []const CallFrame, live: bool, thread: ?*const coroutine.Thread) usize {
         const tid: u32 = if (thread) |t| t.header.id else 0;
         for (frames, 0..) |*f, i| {
             const fp = f.closure.proto;

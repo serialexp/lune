@@ -81,6 +81,9 @@ pub const Scope = struct {
     tags: []const u8,
     payloads: []const u64,
     base: usize,
+    /// The source text of the frame's chunk, when the session holds it: a
+    /// folded `<const>` is the literal at a span of it (§4).
+    source: ?[]const u8 = null,
 
     /// The running frame of the running coroutine, at its published pc.
     pub fn top(vm: *const Vm) Scope {
@@ -93,18 +96,27 @@ pub const Scope = struct {
     /// in for one below.
     pub fn ofFrame(vm: *const Vm, i: u32) Scope {
         std.debug.assert(i < vm.depth);
-        const f = &vm.frames[i];
+        return ofStack(vm.frames[0..vm.depth], vm.tags, vm.payloads, i, true);
+    }
+
+    /// Frame `i` of one coroutine's `frames` and registers. `live` says the
+    /// stack is the running one, whose top frame is at the instruction about
+    /// to run (or that raised). Every other frame is inside a call, at the
+    /// call instruction (`Vm.contextFrames` places a frame the same way).
+    pub fn ofStack(frames: []const interp.CallFrame, tags: []const u8, payloads: []const u64, i: usize, live: bool) Scope {
+        const f = &frames[i];
+        const at: usize = if ((live and i == frames.len - 1) or f.in_flight) f.pc else f.pc -| 1;
         return .{
             .proto = f.closure.proto,
             .closure = f.closure,
-            .pc = @intCast(f.pc),
-            .tags = vm.tags,
-            .payloads = vm.payloads,
+            .pc = @intCast(at),
+            .tags = tags,
+            .payloads = payloads,
             .base = f.base,
         };
     }
 
-    fn reg(self: Scope, r: u16) Value {
+    pub fn reg(self: Scope, r: u16) Value {
         const slot = self.base + r;
         return .{ .tag = @enumFromInt(self.tags[slot]), .payload = .{ .bits = self.payloads[slot] } };
     }
@@ -114,6 +126,34 @@ pub const Scope = struct {
 /// in `arena`, which the caller resets; the outcome's text lives there.
 pub fn evaluate(arena: Allocator, vm: *Vm, scope: Scope, source: []const u8) Allocator.Error!Outcome {
     var e: Evaluator = .{ .arena = arena, .vm = vm, .scope = scope };
+    const expr = switch (try parseExpression(arena, source)) {
+        .expr => |x| x,
+        .refused => |why| return .{ .refused = why },
+    };
+    const v = e.eval(expr) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Refused => return .{ .refused = e.message },
+        error.Failed => return .{ .failed = e.message },
+    };
+    return .{ .ok = v };
+}
+
+/// The value of the folded `<const>` `name` (§4), the literal at `span` of
+/// the scope's source: refused when the source is not held.
+pub fn foldedValue(arena: Allocator, vm: *Vm, scope: Scope, name: []const u8, span: bytecode.Span) Allocator.Error!Outcome {
+    var e: Evaluator = .{ .arena = arena, .vm = vm, .scope = scope };
+    const v = e.folded(name, span) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Refused => return .{ .refused = e.message },
+        error.Failed => return .{ .failed = e.message },
+    };
+    return .{ .ok = v };
+}
+
+/// `source` as one expression, or why it is not one.
+const Parsed = union(enum) { expr: *const ast.Expr, refused: []const u8 };
+
+fn parseExpression(arena: Allocator, source: []const u8) Allocator.Error!Parsed {
     const prefix = "return ";
     const text = try arena.allocSentinel(u8, prefix.len + source.len, 0);
     @memcpy(text[0..prefix.len], prefix);
@@ -129,12 +169,7 @@ pub fn evaluate(arena: Allocator, vm: *Vm, scope: Scope, source: []const u8) All
     if (tree.root.len != 1 or tree.root[0].data != .return_ or tree.root[0].data.return_.len != 1) {
         return .{ .refused = "evaluate takes one expression" };
     }
-    const v = e.eval(tree.root[0].data.return_[0]) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Refused => return .{ .refused = e.message },
-        error.Failed => return .{ .failed = e.message },
-    };
-    return .{ .ok = v };
+    return .{ .expr = tree.root[0].data.return_[0] };
 }
 
 const Fail = error{ OutOfMemory, Refused, Failed };
@@ -163,7 +198,7 @@ const Evaluator = struct {
             .float => |f| val(Value.float(f)),
             .string_raw => |raw| .{ .text = try self.decoded(try strlit.decodeString(self.arena, raw)) },
             .string_interp => |t| self.template(t.chunks, t.holes),
-            .name => |n| val(try self.name(n)),
+            .name => |n| self.name(n),
             .paren => |inner| self.eval(inner),
             .unary => |u| self.unary(u.op, u.operand),
             .binary => |b| self.binary(b.op, b.lhs, b.rhs),
@@ -194,7 +229,7 @@ const Evaluator = struct {
 
     // ---- names -------------------------------------------------------
 
-    fn name(self: *Evaluator, n: []const u8) Fail!Value {
+    fn name(self: *Evaluator, n: []const u8) Fail!Val {
         const sc = self.scope;
         // The innermost visible local of that name (`locals` is sorted by
         // start pc, so the last visible row is the innermost).
@@ -208,19 +243,32 @@ const Evaluator = struct {
                     const live = sc.proto.reg_live;
                     if (live.available() and sc.pc < sc.proto.code.len and !live.liveIn(sc.pc, r))
                         return self.refuse("'{s}' is not available here (its register is dead)", .{n});
-                    return sc.reg(r);
+                    return val(sc.reg(r));
                 },
-                .literal => return self.refuse("'{s}' is a folded <const>, which evaluate cannot read yet", .{n}),
+                .literal => |span| return self.folded(n, span),
             }
         }
         if (sc.closure) |cl| {
             for (sc.proto.upval_names, 0..) |un, idx| {
                 if (!std.mem.eql(u8, un, n) or idx >= cl.upvalues.len) continue;
                 const cell = cl.upvalues[idx];
-                return .{ .tag = @enumFromInt(cell.tag.*), .payload = .{ .bits = cell.payload.* } };
+                return val(.{ .tag = @enumFromInt(cell.tag.*), .payload = .{ .bits = cell.payload.* } });
             }
         }
-        return self.rawGet(Value.heap(&self.vm.globals.header), .{ .text = n }, "global");
+        return val(try self.rawGet(Value.heap(&self.vm.globals.header), .{ .text = n }, "global"));
+    }
+
+    /// A folded `<const>` (§4): the literal at `span` of the chunk's source,
+    /// read by this evaluator, so a string decodes as the compiler decodes it.
+    fn folded(self: *Evaluator, n: []const u8, span: bytecode.Span) Fail!Val {
+        const src = self.scope.source orelse
+            return self.refuse("'{s}' is a folded <const>, and the source of its chunk is not available", .{n});
+        if (span.start >= span.end or span.end > src.len)
+            return self.refuse("'{s}' is a folded <const>, and its source span is outside the chunk's source", .{n});
+        return switch (try parseExpression(self.arena, src[span.start..span.end])) {
+            .expr => |x| self.eval(x),
+            .refused => |why| self.refuse("'{s}' is a folded <const>: {s}", .{ n, why }),
+        };
     }
 
     // ---- indexing ----------------------------------------------------

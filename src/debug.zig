@@ -5,15 +5,18 @@
 pub const session = @import("debug/session.zig");
 pub const breakpoints = @import("debug/breakpoints.zig");
 pub const eval = @import("debug/eval.zig");
+pub const inspect = @import("debug/inspect.zig");
 pub const Session = session.Session;
 
 test {
     _ = session;
     _ = breakpoints;
     _ = eval;
+    _ = inspect;
     _ = @import("debug/eval_test.zig");
     _ = @import("debug/step_test.zig");
     _ = @import("debug/error_test.zig");
+    _ = @import("debug/inspect_test.zig");
     _ = @import("debug/session_test.zig");
     _ = @import("debug/breakpoints_test.zig");
 }
