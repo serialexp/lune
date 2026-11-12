@@ -189,6 +189,19 @@ jobs:
         with:
           node-version: 24
 
+      # The runner image has no Chrome; the smoke drives the system one
+      # (Playwright's `chrome` channel, /opt/google/chrome). The .deb brings
+      # its own dependencies through apt.
+      - name: Install Chrome
+        run: |
+          set -eu
+          SUDO=
+          [ "$(id -u)" = 0 ] || SUDO=sudo
+          $SUDO apt-get update -qq
+          curl -fsSL -o "$RUNNER_TEMP/chrome.deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          $SUDO apt-get install -y -qq "$RUNNER_TEMP/chrome.deb"
+          /opt/google/chrome/chrome --version
+
       - name: Drive mahina viz in Chrome
         run: |
           set -eu
