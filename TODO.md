@@ -325,8 +325,10 @@ more than tier 0. Four causes, by pass:
       bodies are 19.0 instructions an iteration against LuaJIT's 7.8.
       Doc 87's join removes the calls and returns from this path; the
       body gap is separate.
-- [ ] **An exit-side child that ends a burst is struck on its own
-      anchor, every burst, for good** (found 2026-11-11). The short
+- [x] **An exit-side child that ends a burst is struck on its own
+      anchor, every burst, for good** (found 2026-11-11; fixed
+      2026-11-12 for `.link`-closed continuations, see the end of this
+      entry). The short
       loops of `configured` (8 trips) and `refine` (3) are each a root
       with exit-side children anchored at the exit's resume pc (pc 7
       and pc 6) that link back to the root. Each call runs root, child,
@@ -344,6 +346,23 @@ more than tier 0. Four causes, by pass:
       strike should go to the burst's entry anchor, or a gate should
       disarm the links into its anchor. Rule Z-8 territory (read doc 47
       first); not started.
+      2026-11-12 (Bart took the advisors' order: this first): Z-8
+      ladder walked on `records_script`: the exits are armed
+      (`sibling-arm`, `exit-side hop`), the cycle regions mint
+      `armable=true`, so this is not an arming or election problem. The
+      strikes are `accountLedgerRow` at the `entered_via_*` branch of
+      `replayLedger`, for a continuation entered through an armed exit.
+      A `.link`-closed continuation is never entered through the anchor
+      walk, so its dispatch gate stops nothing; those rows now take
+      `accountTraceRun` only. `legacy_thrash` 716 → 6 in 400 rounds,
+      `records_script` −0.36% instructions, board geomean −0.008%, no
+      other row moved by 0.3%. Test "an exit-side continuation reached
+      through its arm is not struck on its own anchor". NOT taken:
+      exempting a loop-root child as well (`ends_loop`; its anchor is
+      dispatchable): the first try exempted every `entered_via_*` row and
+      `str_gmatch` went +10.5%. Still open from this entry: silent
+      promotion never fires on this cycle (`silent: candidates=392
+      promotions=0`, the per-activation streak, the next item).
 - [ ] **A table found by a string key that is not a constant aborts**
       (`rules[item.kind]`: `bad_type get_index`; `owed` and `tags`,
       four fifths of the row's tier-0 time). `hashGetShape` wants the

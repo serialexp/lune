@@ -2212,3 +2212,82 @@ test "doc 85: a closed upvalue alternating int and float exits attachably at the
         \\print(mk()(300, { 1, 2.5 }))
     , "525\n", .{ .exit_side_native = true, .inspect = Inspect.run });
 }
+
+/// `records_script`'s shape, cut down: a root (`carried`'s loop) and two
+/// short loops entered once a round (`configured`'s eight trips, `refine`'s
+/// three) whose exit-side continuations link back to their roots, so a
+/// round runs root, child, root, child and leaves through a child's exit.
+const exit_side_strike_src =
+    \\local settings = { 3, "verbose", true, 0.75, { 1, 2, 3 }, "fast", false, 12 }
+    \\local steps = {
+    \\  function(v) return v + 3 end,
+    \\  function(v) return v * 2 end,
+    \\  function(v) return v % 1009 end,
+    \\}
+    \\local function weigh(v)
+    \\  local t = type(v)
+    \\  if t == "number" then return math.floor(v * 4)
+    \\  elseif t == "string" then return #v
+    \\  elseif t == "boolean" then return v and 1 or 0
+    \\  elseif t == "table" then return #v
+    \\  end
+    \\  return 0
+    \\end
+    \\local function configured(list)
+    \\  local n = 0
+    \\  for i = 1, #list do n = n + weigh(list[i]) end
+    \\  return n
+    \\end
+    \\local function refine(v)
+    \\  for s = 1, #steps do v = steps[s](v) end
+    \\  return v
+    \\end
+    \\local inventory = {}
+    \\for i = 1, 64 do inventory[i] = { weight = 1 + i % 5, qty = 1 + i % 9 } end
+    \\local function carried(inv)
+    \\  local w = 0
+    \\  for i = 1, #inv do
+    \\    local item = inv[i]
+    \\    w = w + item.weight * item.qty
+    \\  end
+    \\  return math.floor(w * 8)
+    \\end
+    \\local check = 0
+    \\for round = 1, 400 do
+    \\  local sum = carried(inventory) + configured(settings)
+    \\  check = (check * 31 + sum + refine(sum)) % 1000000007
+    \\  local item = inventory[round % #inventory + 1]
+    \\  item.qty = item.qty % 9 + 1
+    \\end
+    \\print(check)
+;
+
+test "an exit-side continuation reached through its arm is not struck on its own anchor" {
+    // The continuation is `.link`-closed, so the anchor walk never enters it
+    // and a dispatch gate on its anchor stops nothing. Every burst used to
+    // end through its exit with a zero completion and strike it anyway: 321
+    // legacy-thrash strikes in these 400 rounds, 716 in `records_script`'s.
+    // The parent exit's `noteExitSideChain` owns a continuation that does
+    // not fit; a strike on the child's anchor is no part of that.
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            const ts = &vm.trace;
+            // The shape under test is present: an exit-side arm exists or
+            // did (an armed link, or a bound exit on some trace).
+            var bound: usize = 0;
+            for (ts.registry.cache.items) |t| {
+                for (t.exit_side) |s| {
+                    if (s == .attached) bound += 1;
+                }
+            }
+            try testing.expect(bound > 0);
+            try testing.expect(ts.dispatch_gates.get(.legacy_thrash) < 20);
+        }
+    };
+    try expectProgramTuned(exit_side_strike_src, "85008137\n", .{
+        .exit_side_native = true,
+        .hotloop = (@import("trace.zig").TraceConfig{}).hotloop,
+        .inspect = Inspect.run,
+    });
+}

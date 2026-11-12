@@ -2505,7 +2505,21 @@ pub fn replayLedgerFrom(
                         @panic("replayLedger: bridged successor deopt on a non-body owner shape");
                     if (resume_pc.* != owner.code.anchor.pc)
                         @panic("replayLedger: bridged successor deopt resume mismatches its anchor");
-                    self.accountLedgerRow(owner, local, e.exit, region_consumed, .entered);
+                    // A `.link`-closed continuation reached through an armed
+                    // exit (its parent's exit-side arm, or a same-anchor
+                    // handoff from another continuation) is never entered
+                    // through the anchor walk (entry-patch suppression says
+                    // the same), so a dispatch gate on its anchor stops
+                    // nothing: the strike only costs. The parent's
+                    // `noteExitSideChain` owns an exit-side continuation that
+                    // does not fit. A loop-root child is dispatchable and
+                    // keeps its strike (exempting it too took `str_gmatch`
+                    // +10.5% instructions).
+                    if ((entered_via_exit_side or entered_via_handoff) and !entered_via_bridge and ends_link) {
+                        self.accountTraceRun(owner, local);
+                    } else {
+                        self.accountLedgerRow(owner, local, e.exit, region_consumed, .entered);
+                    }
                     return .{ .return_result = .{
                         .completed = linked_completed.* + local,
                         .resume_pc = resume_pc.*,
