@@ -183,6 +183,15 @@ land; move whole phases to Done once everything inside them is checked.
   `docs/differences-from-lua.md` track the library; doc 00's Non-goal,
   its decision row and guiding principles, and doc 02's Non-goal and
   "Host-mediated suspension" got follow-up paragraphs (2026-10-27).
+- [x] **The Rust crate's task API** (2026-11-12): `Vm::pending` and
+  `Pending::resolve`/`reject`, `Vm::set_wait_fn`/`clear_wait_fn`,
+  `Vm::eval_step`/`Script::run_step`/`Function::call_step` returning a
+  `Step` (`Done`, or `Waiting(Task)`), `Vm::run_tasks`, `Task::result`.
+  A rejected operation fails the awaiting task with its value; a failing
+  wait function raises its message where the guest awaits. A closure the
+  VM stores (a registered function, the wait function) must not own a
+  `Pending`: an `Rc` cycle, so park it in a guest table and recover it with
+  `Pending::from_value`.
 
 ### Outstanding
 
@@ -211,9 +220,6 @@ land; move whole phases to Done once everything inside them is checked.
   d150 2.22 → 0.42 s, both now ahead of t0). What remains
   coroutine-specific: a loop containing `resume` never traces (d1: 100%
   tier-0, no trace).
-- [ ] **The Rust crate's task API**: `mahina` maps `MH_WAITING` to an
-  `Error::Api` saying it can't continue the task; a safe surface over
-  §7.5's functions is its own design (TODO.md).
 - [ ] **Traces over `intrinsic`**: the recorder doesn't know the op
   (`nyi_opcode`), so a loop that calls an async function or awaits never
   traces in its own frame. Performance work, deferred with P2 (TODO.md).

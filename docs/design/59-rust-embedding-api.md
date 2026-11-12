@@ -222,7 +222,7 @@ land; move whole phases to Done once everything inside them is checked.
 - [x] **Tasks and host operations** (§3.10, doc 73 §7.5, 2026-10-27):
   `MH_WAITING`, `mh_set_wait_fn`, `mh_pending_new`/`mh_pending_settle`,
   `mh_tasks_run`, `mh_task_result`; `mahina-sys` mirrors them, the safe
-  crate has no task API yet (doc 73's Outstanding).
+  crate wraps them since 2026-11-12 (doc 73, `eval_step`/`Pending`/`set_wait_fn`).
 ### Outstanding
 
 - [ ] **E6 — host-call record/replay.** Defer. v1 refuses `.record` AND

@@ -644,11 +644,6 @@ keyframe to carry the pending `reg_top` window: a separate piece of work.
       `await` never traces in its own frame. The op loads a VM-lifetime
       closure, so it could record as a constant. Deferred with the rest of
       coroutine performance (Bart, 2026-10-27).
-- [ ] Doc 73 §7.5: the `mahina` Rust crate has no task API. `MH_WAITING`
-      maps to an `Error::Api` saying the task can't be continued; a safe
-      surface over `mh_set_wait_fn`/`mh_pending_*`/`mh_tasks_run`/
-      `mh_task_result` (a closure wait callback, a pending handle, an
-      entry result that can be a task) needs a design pass with Bart.
 - [ ] A live coroutine commits at least one page in each of its four
       regions (scratch, payloads, tags, frames): ~16 KiB each, so
       `co_many` (10k live) holds 164 MB where LuaJIT holds 7.6 MB.
@@ -4398,3 +4393,29 @@ test in `src/interp_phaseq_test.zig` and were dodged there, not fixed.
 - [ ] **`install.sh` and its release-notes line still name GitHub** (`repo_releases`
       is github.com/serialexp/lune/releases), so the gothab release notes omit
       the `curl | sh` line and the post-publish `install` job is not ported.
+
+## Debugger review findings awaiting a decision (doc 86 P2, 2026-11-12)
+
+Reproduced by a failing probe each; the fix shape is Bart's call.
+
+- [ ] **A Lua `__lt`/`__le`/`__eq` metamethod comparison can miss a line visit.**
+      `LineVisits.observe` judges a frame re-entered after a call by the
+      *static* predecessor `pc - 1`. A comparison metamethod returns into
+      `cmpBranchTail`, which may jump, so the dynamic predecessor is the
+      compare, not `pc - 1`. `if y < x then\n  r = 1 end r = r + 1` with
+      tables and a Lua `__lt` (false) never stops a line-3 breakpoint at
+      `r = r + 1`; the same code with numbers does. Options: a stack of
+      suspended activations' last pcs in `LineVisits`; the VM reporting the
+      compare's pc on a metamethod return; or treating a return into a
+      compare as fresh.
+- [ ] **A native-bodied raise makes no exception stop.** `xpcall(f, error)`
+      (native message handler), `coroutine.resume(coroutine.create(error), "x")`
+      and `coroutine.wrap(error)("x")` raise with no Lua frame, so neither
+      raise hook runs. Only the first `error` of such a program stops.
+      Options: a raise hook at the boundary where the VM turns a native
+      error into a Lua-visible one (widens doc 86's "two hook sites"), or
+      document that natives raising straight out of a native body do not
+      stop.
+- [ ] **`capi.zig` treats `Error.DebugTerminated` as fatal** (poisons the
+      embedded VM) and `runProtected` natives have no boundary raise hook.
+      Both belong to P6 (embedding).

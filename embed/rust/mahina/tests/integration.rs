@@ -1,7 +1,7 @@
 //! Integration tests for the safe `mahina` crate (doc 59 E4). These also
 //! exercise `mahina-sys`'s build.rs (`zig build lib`) end to end.
 
-use mahina::{shared, Config, Error, System, Value, Vm};
+use mahina::{shared, Config, Error, Pending, Step, System, Task, Value, Vm};
 
 #[test]
 fn eval_scalars() {
@@ -442,4 +442,165 @@ fn proc_group_installs_proc_run_only_when_enabled() {
     let vm = Vm::with_config(Config { system: System::PROC, ..Config::default() }).unwrap();
     assert_eq!(vm.eval("return type(proc.run)", "t").unwrap()[0].as_str().unwrap().as_bytes(), b"function");
     assert!(System::ALL.contains(System::PROC));
+}
+
+// ---- doc 73 §7.5: tasks and host operations --------------------------------
+
+/// `start_op()`: a new operation, parked in the guest table `ops` (so no
+/// closure owns a handle) and returned to the guest.
+fn register_start_op(vm: &Vm) {
+    vm.eval("ops = {}", "ops").unwrap();
+    vm.register_fn("start_op", |vm, _args| {
+        let p = vm.pending().map_err(|e| e.to_string())?;
+        let ops = vm.global("ops").map_err(|e| e.to_string())?;
+        let ops = ops.as_table().map_err(|e| e.to_string())?;
+        let n = ops.len().map_err(|e| e.to_string())?;
+        ops.set(n + 1, p.to_value()).map_err(|e| e.to_string())?;
+        Ok(vec![p.to_value()])
+    })
+    .unwrap();
+}
+
+fn op(vm: &Vm, i: i64) -> Pending {
+    let ops = vm.global("ops").unwrap();
+    Pending::from_value(&ops.as_table().unwrap().get(i).unwrap()).unwrap()
+}
+
+#[test]
+fn an_await_on_a_host_operation_comes_back_as_a_waiting_task_and_finishes_once_settled() {
+    let vm = Vm::new().unwrap();
+    register_start_op(&vm);
+    let Step::Waiting(task) = vm.eval_step("local v = await start_op() return v + 1, 'done'", "t").unwrap() else {
+        panic!("expected a waiting task");
+    };
+    assert_eq!(task.result().unwrap().map(|r| r.len()), None);
+    assert!(!vm.run_tasks().unwrap());
+
+    op(&vm, 1).resolve(41).unwrap();
+    assert!(vm.run_tasks().unwrap());
+    let out = task.result().unwrap().expect("done");
+    assert_eq!(out[0], Value::Int(42));
+    assert_eq!(out[1].as_str().unwrap().as_bytes(), b"done");
+}
+
+#[test]
+fn a_rejected_operation_fails_the_awaiting_task_with_its_error() {
+    let vm = Vm::new().unwrap();
+    register_start_op(&vm);
+    let Step::Waiting(task) = vm.eval_step("return await start_op()", "t").unwrap() else { panic!() };
+    op(&vm, 1).reject("boom").unwrap();
+    assert!(vm.run_tasks().unwrap());
+    match task.result() {
+        Err(Error::Runtime(m)) => assert!(m.contains("boom"), "{m}"),
+        other => panic!("expected a runtime error, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn one_script_awaits_several_operations_settled_out_of_order() {
+    let vm = Vm::new().unwrap();
+    register_start_op(&vm);
+    let src = "local a, b = start_op(), start_op() local y = await b local x = await a return x * 10 + y";
+    let Step::Waiting(task) = vm.eval_step(src, "t").unwrap() else { panic!() };
+    op(&vm, 2).resolve(3).unwrap();
+    assert!(!vm.run_tasks().unwrap());
+    op(&vm, 1).resolve(4).unwrap();
+    assert!(vm.run_tasks().unwrap());
+    assert_eq!(task.result().unwrap().unwrap()[0], Value::Int(43));
+}
+
+#[test]
+fn a_wait_function_settles_operations_and_entries_finish_synchronously() {
+    let vm = Vm::new().unwrap();
+    register_start_op(&vm);
+    let waits = shared(0i64);
+    let w = waits.clone();
+    vm.set_wait_fn(move |vm| {
+        *w.borrow_mut() += 1;
+        let ops = vm.global("ops").map_err(|e| e.to_string())?;
+        let ops = ops.as_table().map_err(|e| e.to_string())?;
+        let p = Pending::from_value(&ops.get(1).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        p.resolve(41).map_err(|e| e.to_string())
+    })
+    .unwrap();
+    let out = vm.eval("local v = await start_op() return v + 1", "t").unwrap();
+    assert_eq!(out[0], Value::Int(42));
+    assert_eq!(*waits.borrow(), 1);
+    vm.clear_wait_fn().unwrap();
+}
+
+#[test]
+fn a_failing_wait_function_raises_where_the_guest_awaits() {
+    let vm = Vm::new().unwrap();
+    register_start_op(&vm);
+    let fail = shared(true);
+    let f = fail.clone();
+    vm.set_wait_fn(move |vm| {
+        if std::mem::replace(&mut *f.borrow_mut(), false) {
+            return Err("no more events".into());
+        }
+        // The operation is still in flight; the next chunk's drain waits for it.
+        let ops = vm.global("ops").map_err(|e| e.to_string())?;
+        let p = Pending::from_value(&ops.as_table().unwrap().get(1).unwrap()).map_err(|e| e.to_string())?;
+        p.resolve(()).map_err(|e| e.to_string())
+    })
+    .unwrap();
+    match vm.eval("return await start_op()", "t") {
+        Err(Error::Runtime(m)) => assert!(m.contains("no more events"), "{m}"),
+        other => panic!("expected a runtime error, got {:?}", other.map(|_| ())),
+    }
+    // The VM stays usable; the operation left in flight is waited for after it.
+    assert_eq!(vm.eval("return 1", "t").unwrap()[0], Value::Int(1));
+    vm.clear_wait_fn().unwrap();
+}
+
+#[test]
+fn a_plain_eval_that_waits_reports_it_instead_of_hanging() {
+    let vm = Vm::new().unwrap();
+    register_start_op(&vm);
+    match vm.eval("return await start_op()", "t") {
+        Err(Error::Api(m)) => assert!(m.contains("eval_step"), "{m}"),
+        other => panic!("expected an API error, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn call_step_hands_back_a_waiting_task() {
+    let vm = Vm::new().unwrap();
+    register_start_op(&vm);
+    vm.eval("function go() return await start_op() + 1 end", "t").unwrap();
+    let f = vm.global("go").unwrap().as_function().unwrap().clone();
+    let Step::Waiting(task) = f.call_step(()).unwrap() else { panic!() };
+    op(&vm, 1).resolve(9).unwrap();
+    assert!(vm.run_tasks().unwrap());
+    assert_eq!(task.result().unwrap().unwrap()[0], Value::Int(10));
+    let _ = Task::from_value(&task.to_value()).unwrap();
+}
+
+// ---- spike: what a Lua prelude can do on top of the embedding ---------------
+
+#[test]
+fn a_prelude_can_reassign_print_and_stream() {
+    let vm = Vm::new().unwrap();
+    vm.register_fn("emit", |_vm, args| {
+        let _ = args;
+        Ok(vec![])
+    })
+    .unwrap();
+    // `print` itself can't be registered, but a prelude may replace the global.
+    vm.eval("local real = print print = function(...) real('>', ...) end", "prelude").unwrap();
+    vm.eval("print('hi')", "t").unwrap();
+    assert_eq!(vm.take_output(), ">\thi\n");
+}
+
+#[test]
+fn an_error_table_raised_from_a_prelude_survives_pcall() {
+    let vm = Vm::new().unwrap();
+    vm.eval("fail = function(code, msg) error({ code = code, message = msg }) end", "prelude").unwrap();
+    let out = vm.eval("local ok, e = pcall(fail, 'ENOENT', 'no such file') return ok, e.code, e.message", "t").unwrap();
+    assert_eq!(out[0], Value::Bool(false));
+    assert_eq!(out[1].as_str().unwrap().as_bytes(), b"ENOENT");
+    assert_eq!(out[2].as_str().unwrap().as_bytes(), b"no such file");
+    // Uncaught, the host sees the table's text only (a string message API).
+    assert!(matches!(vm.eval("fail('E', 'x')", "t"), Err(Error::Runtime(_))));
 }

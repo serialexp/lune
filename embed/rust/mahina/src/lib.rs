@@ -133,6 +133,9 @@ pub fn format(src: &str) -> Result<String> {
 #[doc(hidden)]
 pub struct VmInner {
     raw: *mut sys::mh_vm,
+    /// The wait callback's state (doc 73 §7.5); the VM holds only a raw
+    /// pointer to it, so it lives here and drops after `mh_vm_free`.
+    wait: RefCell<Option<Box<WaitData>>>,
 }
 
 impl VmInner {
@@ -159,8 +162,8 @@ impl VmInner {
             sys::MH_ERR_RUNTIME => Error::Runtime(self.last_error()),
             sys::MH_ERR_OOM => Error::Oom,
             sys::MH_EXIT => Error::Exit(unsafe { sys::mh_exit_status(self.raw) }),
-            // Doc 73 §7.5: this crate has no task API yet (TODO.md).
-            sys::MH_WAITING => Error::Api("the call's task waits on host operations (MH_WAITING), which this crate can't continue yet".into()),
+            // Doc 73 §7.5: only the `*_step` entries can hand a waiting task back.
+            sys::MH_WAITING => Error::Api("the call's task waits on host operations (MH_WAITING); use eval_step/run_step/call_step, or set_wait_fn".into()),
             _ => Error::Api(self.last_error()),
         }
     }
@@ -979,7 +982,7 @@ impl Vm {
                 _ => Error::Api("mh_vm_new failed".into()),
             });
         }
-        Ok(Vm { inner: Rc::new(VmInner { raw }) })
+        Ok(Vm { inner: Rc::new(VmInner { raw, wait: RefCell::new(None) }) })
     }
 
     /// Compile + run `src` (chunk-named `name` in error messages), returning
@@ -1348,6 +1351,254 @@ unsafe extern "C" fn host_destroy(userdata: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         drop(Box::from_raw(userdata as *mut CallbackData));
     }));
+}
+
+// ---------------------------------------------------------------------------
+// tasks and host operations (doc 73 §7.5)
+// ---------------------------------------------------------------------------
+
+/// A guest task, rooted: what an entry hands back while it waits on a host
+/// operation ([`Step::Waiting`]).
+#[derive(Clone)]
+pub struct Task(Handle);
+
+/// A host operation in flight, rooted: made by [`Vm::pending`], returned to
+/// the guest (as [`Pending::to_value`]) to `await`, and finished once with
+/// [`Pending::resolve`] or [`Pending::reject`].
+///
+/// A `Pending` keeps the VM alive like any value. A closure stored in the VM
+/// (a registered function, the wait callback) must not own one: that is an
+/// `Rc` cycle (VM → closure → `Pending` → VM). Park it in a guest table and
+/// recover it with [`Pending::from_value`].
+#[derive(Clone)]
+pub struct Pending(Handle);
+
+/// How an entry ended: with its results, or waiting on host operations.
+pub enum Step {
+    Done(Vec<Value>),
+    /// The entry's task is waiting. Settle the operations it awaits, call
+    /// [`Vm::run_tasks`], then read [`Task::result`].
+    Waiting(Task),
+}
+
+fn heap_handle(v: &Value) -> Result<&Handle> {
+    v.handle().ok_or(Error::Type { expected: "task or operation", got: v.type_name() })
+}
+
+impl Task {
+    /// The task behind a value an entry or a guest function gave back.
+    /// Whether it really is one is checked by [`Task::result`].
+    pub fn from_value(v: &Value) -> Result<Task> {
+        Ok(Task(heap_handle(v)?.clone()))
+    }
+
+    pub fn to_value(&self) -> Value {
+        Value::Other(Opaque(self.0.clone()))
+    }
+
+    /// `Some(results)` once the task is done, `None` while it waits. A task
+    /// that failed is `Err(Error::Runtime)` with its error.
+    pub fn result(&self) -> Result<Option<Vec<Value>>> {
+        let inner = &self.0.inner;
+        let mut out = result_buf();
+        let mut n: usize = 0;
+        let st = unsafe { sys::mh_task_result(inner.raw, self.0.raw, out.as_mut_ptr().cast(), MAX_RESULTS, &mut n) };
+        match st {
+            sys::MH_WAITING => Ok(None),
+            _ => {
+                inner.status(st)?;
+                Vm { inner: inner.clone() }.wrap_results(unsafe { written(&out, n) }).map(Some)
+            }
+        }
+    }
+}
+
+impl Pending {
+    /// The operation behind a value [`Pending::to_value`] gave out.
+    pub fn from_value(v: &Value) -> Result<Pending> {
+        Ok(Pending(heap_handle(v)?.clone()))
+    }
+
+    /// The value to hand to the guest (return it from a registered function).
+    pub fn to_value(&self) -> Value {
+        Value::Other(Opaque(self.0.clone()))
+    }
+
+    /// Finish the operation: the awaits give `values`.
+    pub fn resolve<A: IntoArgs>(&self, values: A) -> Result<()> {
+        self.settle(true, values)
+    }
+
+    /// Finish the operation with a failure: the awaits raise `error`
+    /// (any value, so a table keeps its shape through `pcall`).
+    pub fn reject(&self, error: impl IntoValue) -> Result<()> {
+        self.settle(false, error)
+    }
+
+    fn settle<A: IntoArgs>(&self, ok: bool, values: A) -> Result<()> {
+        let inner = &self.0.inner;
+        let mut keep = Keep(Vec::new());
+        let mut buf = ArgBuf::new();
+        values.push_args(inner, &mut keep, &mut buf)?;
+        let a = buf.as_slice();
+        let st = unsafe {
+            sys::mh_pending_settle(
+                inner.raw,
+                self.0.raw,
+                ok as c_int,
+                if a.is_empty() { std::ptr::null() } else { a.as_ptr() },
+                a.len(),
+            )
+        };
+        inner.status(st)
+    }
+}
+
+/// The wait callback and the VM it belongs to. The VM is held weakly so the
+/// callback never keeps it alive.
+type WaitClosure = Rc<dyn Fn(&Vm) -> std::result::Result<(), String>>;
+
+struct WaitData {
+    f: WaitClosure,
+    inner: std::rc::Weak<VmInner>,
+}
+
+unsafe extern "C" fn wait_trampoline(_vm: *mut sys::mh_vm, userdata: *mut c_void) -> sys::mh_status {
+    // Copy what the call needs out of `userdata` first: the callback may
+    // replace or clear the wait function, which frees it.
+    let (f, inner) = {
+        let data = &*(userdata as *const WaitData);
+        (data.f.clone(), data.inner.upgrade())
+    };
+    let Some(inner) = inner else { return sys::MH_ERR_API };
+    let vm = Vm { inner };
+    let fail = |msg: &str| {
+        sys::mh_error_set(vm.inner.raw, sys::mh_str::from_slice(msg.as_bytes()));
+        sys::MH_ERR_RUNTIME
+    };
+    match catch_unwind(AssertUnwindSafe(|| f(&vm))) {
+        Ok(Ok(())) => sys::MH_OK,
+        Ok(Err(msg)) => fail(&msg),
+        Err(_) => fail("panic in wait function"),
+    }
+}
+
+impl Vm {
+    /// A new host operation for the guest to `await` (loads the task
+    /// library). See [`Pending`].
+    pub fn pending(&self) -> Result<Pending> {
+        let mut out = sys::mh_value::zeroed();
+        let st = unsafe { sys::mh_pending_new(self.inner.raw, &mut out) };
+        self.inner.status(st)?;
+        Ok(Pending(Handle::new(&self.inner, out)?))
+    }
+
+    /// Run the ready tasks. `true` once nothing is left to run, `false`
+    /// while tasks wait on unsettled operations and there is no wait
+    /// function.
+    pub fn run_tasks(&self) -> Result<bool> {
+        let st = unsafe { sys::mh_tasks_run(self.inner.raw) };
+        match st {
+            sys::MH_WAITING => Ok(false),
+            _ => self.inner.status(st).map(|()| true),
+        }
+    }
+
+    /// Install the host's wait (doc 73 §7.5). An `await` with nothing ready
+    /// calls it; it blocks until it has settled what it can and returns
+    /// `Ok(())`, or `Err(message)` to raise where the guest awaits. With one,
+    /// entries run as plain code and finish synchronously.
+    ///
+    /// The VM stores the closure, so it must not own the `Vm` or a
+    /// [`Pending`] (an `Rc` cycle); it gets `&Vm` per call. Replace or
+    /// [`Vm::clear_wait_fn`] to release it.
+    pub fn set_wait_fn<F>(&self, f: F) -> Result<()>
+    where
+        F: Fn(&Vm) -> std::result::Result<(), String> + 'static,
+    {
+        let data = Box::new(WaitData { f: Rc::new(f), inner: Rc::downgrade(&self.inner) });
+        let ptr = &*data as *const WaitData as *mut c_void;
+        let st = unsafe { sys::mh_set_wait_fn(self.inner.raw, Some(wait_trampoline), ptr) };
+        self.inner.status(st)?;
+        *self.inner.wait.borrow_mut() = Some(data);
+        Ok(())
+    }
+
+    /// Remove the wait function: entries run as tasks again.
+    pub fn clear_wait_fn(&self) -> Result<()> {
+        let st = unsafe { sys::mh_set_wait_fn(self.inner.raw, None, std::ptr::null_mut()) };
+        self.inner.status(st)?;
+        *self.inner.wait.borrow_mut() = None;
+        Ok(())
+    }
+
+    /// [`Vm::eval`] for a VM without a wait function: a chunk that awaits an
+    /// unsettled operation comes back as [`Step::Waiting`].
+    pub fn eval_step(&self, src: &str, name: &str) -> Result<Step> {
+        let mut out = result_buf();
+        let mut n: usize = 0;
+        let st = unsafe {
+            sys::mh_eval(
+                self.inner.raw,
+                sys::mh_str::from_slice(src.as_bytes()),
+                sys::mh_str::from_slice(name.as_bytes()),
+                out.as_mut_ptr().cast(),
+                MAX_RESULTS,
+                &mut n,
+            )
+        };
+        self.step(st, &out, n)
+    }
+
+    fn step(&self, st: sys::mh_status, out: &[MaybeUninit<sys::mh_value>; MAX_RESULTS], n: usize) -> Result<Step> {
+        if st == sys::MH_WAITING {
+            // The task comes back in results[0].
+            let raw = unsafe { written(out, n) };
+            let first = raw.first().ok_or_else(|| Error::Api("MH_WAITING without a task".into()))?;
+            return Ok(Step::Waiting(Task(Handle::new(&self.inner, load_words(first))?)));
+        }
+        self.inner.status(st)?;
+        self.wrap_results(unsafe { written(out, n) }).map(Step::Done)
+    }
+}
+
+impl Script {
+    /// [`Script::run`] for a VM without a wait function; see [`Vm::eval_step`].
+    pub fn run_step(&self) -> Result<Step> {
+        let mut out = result_buf();
+        let mut n: usize = 0;
+        let st = unsafe { sys::mh_run(self.inner.raw, self.raw, out.as_mut_ptr().cast(), MAX_RESULTS, &mut n) };
+        Vm { inner: self.inner.clone() }.step(st, &out, n)
+    }
+}
+
+impl Function {
+    /// [`Function::call`] for a VM that has loaded the task library (an
+    /// async function ran, or [`Vm::pending`] was called) and has no wait
+    /// function: a call that awaits an unsettled operation comes back as
+    /// [`Step::Waiting`]. Results are untyped; the call does not drain ready
+    /// tasks (use [`Vm::run_tasks`]).
+    pub fn call_step<A: IntoArgs>(&self, args: A) -> Result<Step> {
+        let inner = &self.0.inner;
+        let mut keep = Keep(Vec::new());
+        let mut buf = ArgBuf::new();
+        args.push_args(inner, &mut keep, &mut buf)?;
+        let a = buf.as_slice();
+        let mut out = result_buf();
+        let mut n: usize = 0;
+        let st = unsafe {
+            sys::mh_call(
+                inner.raw,
+                self.0.raw,
+                if a.is_empty() { std::ptr::null() } else { a.as_ptr() },
+                a.len(),
+                out.as_mut_ptr().cast(),
+                MAX_RESULTS,
+                &mut n,
+            )
+        };
+        Vm { inner: inner.clone() }.step(st, &out, n)
+    }
 }
 
 // ---------------------------------------------------------------------------
