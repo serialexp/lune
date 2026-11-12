@@ -84,7 +84,12 @@ everything inside them is checked.
     `granularity: "instruction"` as well as lines. How it differs from the
     plan is in §5.3's follow-up. Tests are in `src/debug/step_test.zig`.
   - [ ] Evaluate in any frame (`frameId`), with the stack (below).
-  - [ ] Error stops at every site where an error is raised (§5.4).
+  - [x] Error stops at every site where an error is raised (§5.4),
+    with the `uncaught` and `caught` filters
+    (`Session.setExceptionFilters`), the error's text and value
+    (`Stop.exception`), and `evaluate` in the raising frame. How it
+    differs from the plan is in §5.4's follow-up. Tests are in
+    `src/debug/error_test.zig`.
   - [ ] Threads, the stack, scopes, and variables with slot-order paging.
 - [ ] **P3 — `mahina dap`** (§8). The DAP server on stdio, with the full
   lifecycle (initialize, configuration, disconnect and terminate) and a
@@ -544,6 +549,70 @@ During a replay in a scratch VM, a raise stops only if that replay is a
 user step or continue in history. A replay that is only seeking a target
 step, or scanning for a reverse continue, records the raise as a
 candidate (§6.5) instead.
+
+**As built (P2, 2026-11-12).** One hook, `DebugHooks.raise`
+(`Vm.debug.onRaise`), is called where an error first exists with its
+faulting frames still live. The table's five sites collapse to two:
+
+- **`catchExec`.** Every error that leaves a dispatch passes through it
+  before anything catches or unwinds it. That covers an instruction or a
+  native called from one, a coroutine's error (resumed by an instruction
+  or from Zig), a `__close` handler's error (it runs in a dispatch of its
+  own), an `xpcall` handler's error, and an uncaught error in the main
+  chunk.
+- **`protectedCallSync`.** A native that `pcall` calls directly
+  (`pcall(error, "x")`) raises outside any dispatch. The hook gets the
+  error value the call already holds, and the stop is at the `pcall`'s
+  line.
+
+**One stop per raise.** An error passes `catchExec` once per dispatch it
+propagates out of. `DebugHooks.raise_seen` is set when the hook sees a
+raise and cleared at the next prologue, because an error raised after
+guest code runs again is a new one. That keeps a handler's or a
+`__close`'s own error a stop of its own. The two places that raise a
+dead coroutine's error again through its `wrap` function
+(`catchInCoroutine`, `wrapSync`) mark it seen first. Otherwise a `__close`
+that runs as the coroutine dies would clear the bit, and the same error
+would stop twice.
+
+**Caught or uncaught** is a walk of the running chain, reading frames
+only (`Session.raiseCaught`). From the raise down, each stack checks two
+things: a protected frame (`ctl.protect`, a `pcall` or `xpcall` from an
+instruction), and a protected call made in Zig. `protectedCallSync`
+brackets the latter with `protect_enter` and `protect_leave`, because no
+frame records it.
+
+The doc's sentence "a raise whose coroutine has no handler, inside a
+chain that has one, counts as caught" is read as follows:
+
+- A coroutine's resume catches its death (it returns `false, err`, and the
+  program goes on), so such a raise is caught even when nothing above
+  has a handler.
+- A `wrap` function raises the error again in the resumer, where the walk
+  goes on.
+- For a `wrap` called from Zig, `runSync` now sets `Thread.wrapped` as
+  the instruction path does.
+
+**What a stop holds.** `Stop.exception` holds the error's `text` (the
+error value its catcher will see), `caught`, the `err` code and the raised
+`value` when one exists. None of this touches the heap:
+
+- `Vm.faultText` is `synthErrorValue` split into text and intern, and the
+  stop takes the text without the intern.
+- A raised table renders by type, because no `__tostring` may run.
+
+**Stop location.** The stop is at the raising frame, or the topmost
+frame of the program's own code when the error came from the VM's own
+(`Location.frame`), and `evaluate` reads that frame.
+
+**Terminate.** The hook cannot fail, so every catcher runs as it would
+undebugged. A terminate chosen at an error stop sets the terminate flag:
+the next prologue ends the run, or `Session.run` does when the error ends
+it first, with no end stop either way.
+
+**Not covered yet.** An error that leaves a host's own call through the
+C API (`capi.guestFault`) is reported as uncaught, and is P6's to refine.
+Scratch-VM replays are P4.
 
 ### 5.5 Threads, stack, pause, end of program
 

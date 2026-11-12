@@ -846,6 +846,43 @@ pub const DebugHooks = struct {
     /// the run with `Error.DebugTerminated`. It never touches the VM heap,
     /// so neither the collection schedule nor the step count sees it.
     check: *const fn (ctx: *anyopaque, vm: *Vm, proto: *const Proto, pc: usize) Error!void,
+    /// Runs where a catchable error first leaves an instruction or a
+    /// native (`catchExec`, `protectedCallSync`), before anything catches
+    /// or unwinds it, so the faulting frames are live. `value` is the error
+    /// value when the site already holds it, else null (`pending_error`, or
+    /// a runtime fault `Vm.faultText` describes). It may stop the program
+    /// in place, as `check` does; it never touches the VM heap. It cannot
+    /// fail, so every catcher runs as it would undebugged: a client that
+    /// ends the program here sets the terminate flag, which the next
+    /// prologue acts on.
+    raise: *const fn (ctx: *anyopaque, vm: *Vm, err: Error, value: ?Value) void,
+    /// Bracket a protected call made in Zig (`protectedCallSync`), which no
+    /// frame records: an error raised inside it is caught.
+    protect_enter: *const fn (ctx: *anyopaque, vm: *Vm) Error!void,
+    protect_leave: *const fn (ctx: *anyopaque, vm: *Vm) void,
+    /// The error in flight has been seen by `raise`. An error passes
+    /// `catchExec` once per dispatch it propagates out of, and a coroutine
+    /// that dies raises its error again through its `wrap` function; each
+    /// raise calls `raise` once. Cleared at the next prologue's `check`,
+    /// since any error raised after guest code ran again is a new one.
+    raise_seen: bool = false,
+
+    /// The `flags` bit that keeps `check` running until it clears
+    /// `raise_seen`.
+    pub const flag_raise_seen: u32 = 1 << 5;
+
+    /// A catchable error `err` is leaving an instruction or a native.
+    pub fn onRaise(self: *DebugHooks, vm: *Vm, err: Error, raised: ?Value) void {
+        if (self.raise_seen or !catchable(err)) return;
+        self.markRaiseSeen();
+        self.raise(self.ctx, vm, err, raised);
+    }
+
+    /// The error about to be raised again was already seen (`raise_seen`).
+    pub fn markRaiseSeen(self: *DebugHooks) void {
+        self.raise_seen = true;
+        _ = self.flags.fetchOr(flag_raise_seen, .acq_rel);
+    }
 };
 
 /// The tier-0 virtual machine. Owns the resources a running program needs that
@@ -4231,6 +4268,10 @@ pub const Vm = struct {
         // any re-entry; an error leaves it set, and each discard restores it.
         const entry_in_flight = entry_depth > 0 and self.frames[entry_depth - 1].in_flight;
         const results = out[1..];
+        // Doc 86 §5.4: a debug session counts an error raised in here as
+        // caught.
+        if (self.debug) |d| try d.protect_enter(d.ctx, self);
+        defer if (self.debug) |d| d.protect_leave(d.ctx, self);
         const produced = self.callValue(f, call_args, results) catch |err| {
             if (!catchable(err)) return err;
             // Still at the faulting depth (`callValue` does not unwind): the
@@ -4243,6 +4284,9 @@ pub const Vm = struct {
             else
                 try self.synthErrorValue(err);
             self.pending_error = null;
+            // Doc 86 §5.4: a native `f` raised it, or `f` could not be
+            // called; an error from a Lua `f` was seen in its dispatch.
+            if (self.debug) |d| d.onRaise(self, err, errval);
             out[0] = Value.boolean(false);
             var n: usize = 1;
             if (handler) |h| {
@@ -4300,7 +4344,20 @@ pub const Vm = struct {
         var scratch: MsgScratch = undefined;
         scratch.init(self.gpa);
         defer scratch.deinit();
-        const a = scratch.allocator();
+        return self.heap.internValue(try self.synthErrorText(e, scratch.allocator()));
+    }
+
+    /// The text of the error value a catcher of `e` will see, made in
+    /// `arena` without touching the heap: `pending_error` rendered as a
+    /// value (`renderErrorValue`, so no `__tostring` runs), or what
+    /// `synthErrorValue` would intern. Same calling rule as `describeFault`.
+    /// For the debugger's error stops (doc 86 §5.4).
+    pub fn faultText(self: *Vm, e: Error, arena: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        if (self.pending_error) |pe| return renderErrorValue(pe, arena);
+        return self.synthErrorText(e, arena);
+    }
+
+    fn synthErrorText(self: *Vm, e: Error, a: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
         const fault = try self.describeFault(e, a);
         // A raised value (`error`/`assert`/`badArg`) already carries its own
         // `chunk:line:`; intern it verbatim. A bare runtime fault (`nil + 1`,
@@ -4309,9 +4366,8 @@ pub const Vm = struct {
         // fault's chunk and line. Deterministic: the chunk name is static and
         // the line derives from a source offset.
         if (fault.self_located or fault.line == 0 or self.depth == 0)
-            return self.heap.internValue(fault.message);
-        const full = try std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ fault.chunk, fault.line, fault.message });
-        return self.heap.internValue(full);
+            return fault.message;
+        return std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ fault.chunk, fault.line, fault.message });
     }
 
     /// Run one stop-the-world collection. Invoked only at the dispatch-loop
@@ -4940,6 +4996,8 @@ pub const Vm = struct {
     /// An error nothing may catch kills every coroutine between the running
     /// one and the entry context, and propagates from the entry context.
     fn catchExec(self: *Vm, e: Error, entry_ctx: ?*coroutine.Thread, stop_depth: u32) Error!bool {
+        // Doc 86 §5.4: an error stop, before anything unwinds.
+        if (self.debug) |d| d.onRaise(self, e, null);
         if (self.current == entry_ctx) return self.catchProtected(e, stop_depth);
         return self.catchInCoroutine(e, entry_ctx, stop_depth);
     }
@@ -5227,6 +5285,8 @@ pub const Vm = struct {
                 self.leaveUntil(entry_ctx);
                 return raised;
             }
+            // The coroutine's error, not a new one (doc 86 §5.4).
+            if (self.debug) |d| d.markRaiseSeen();
             return self.catchExec(raised, entry_ctx, stop_depth);
         }
         const one = [1]Value{errval};
@@ -5313,6 +5373,8 @@ pub const Vm = struct {
     pub fn wrapSync(self: *Vm, args: []const Value, out: []Value) Error!usize {
         const co = coroutine.Thread.fromHeader(self.calledNative().bound[0].asHeap());
         if (try self.runSync(co, args, out, false)) |n| return n;
+        // The coroutine's error, not a new one (doc 86 §5.4).
+        if (self.debug) |d| d.markRaiseSeen();
         return self.raiseWrapped(co.death.?);
     }
 
@@ -5329,6 +5391,7 @@ pub const Vm = struct {
         defer self.unparked_native = saved_native;
         try self.resumeInto(co, SliceSpan{ .s = args, .n = args.len });
         co.sync = true;
+        co.wrapped = !head;
         const stop = self.execLoop(1, co) catch |e| {
             // No protected frame of the coroutine caught it (`execLoop`).
             if (!catchable(e)) {

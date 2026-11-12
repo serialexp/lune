@@ -44,6 +44,9 @@ pub const Flags = struct {
     pub const breakpoints: u32 = 1 << 3;
     /// A step is under way (`Session.stepping`).
     pub const step: u32 = 1 << 4;
+    /// The error in flight was seen (`DebugHooks.raise_seen`); the next
+    /// prologue clears both.
+    pub const raise_seen: u32 = interp.DebugHooks.flag_raise_seen;
 };
 
 /// Why the program stopped: DAP's `stopped` reasons the session produces.
@@ -56,6 +59,9 @@ pub const Reason = enum {
     breakpoint,
     /// A step finished (§5.3).
     step,
+    /// An error was raised that the exception filters admit (§5.4);
+    /// `Stop.exception` describes it.
+    exception,
     /// The program has returned, exited or died of an uncaught error
     /// (§5.5). The VM is idle; nothing runs after this stop.
     ended,
@@ -68,6 +74,30 @@ pub const Stop = struct {
     /// For `.breakpoint`, the ids of the breakpoints bound at this pc.
     /// Valid during the stop only.
     hits: []const u32 = &.{},
+    /// For `.exception`, the error. Valid during the stop only.
+    exception: ?Exception = null,
+};
+
+/// An error stop's error (DAP's `exceptionInfo`).
+pub const Exception = struct {
+    /// The error as its catcher will see it: the message of a raised
+    /// string, or the text of a runtime fault with its location. A raised
+    /// table is rendered by type, since no `__tostring` may run.
+    text: []const u8,
+    /// Something will catch it (§5.4 `caught`), or nothing will.
+    caught: bool,
+    err: Error,
+    /// The raised value, when one exists already (`error(v)`); a runtime
+    /// fault's value is made by its catcher.
+    value: ?Value,
+};
+
+/// `setExceptionBreakpoints`' two filters (§5.4).
+pub const ExceptionFilters = struct {
+    /// Uncaught errors, on by default.
+    uncaught: bool = true,
+    /// Errors something catches: `pcall`, `xpcall`, a coroutine's resume.
+    caught: bool = false,
 };
 
 /// What the driver says to do when a stop returns.
@@ -123,11 +153,15 @@ pub const Options = struct {
     stop_on_entry: bool = false,
 };
 
-/// A stopped program's position: the instruction about to run, in the
-/// running coroutine's top frame.
+/// A stopped program's position: the instruction about to run, or the
+/// one that raised, in a frame of the running coroutine.
 pub const Location = struct {
     proto: *const Proto,
     pc: usize,
+    /// The frame's index in the running coroutine's frames: the top one,
+    /// except at an error raised inside the VM's own code, where it is the
+    /// topmost frame of the program's.
+    frame: u32,
 
     /// The source line, or 0 for an instruction with no span.
     pub fn line(self: Location) u32 {
@@ -205,6 +239,16 @@ pub const Session = struct {
     passing: std.ArrayList(u32) = .empty,
     /// The step under way, while `Flags.step` is set.
     stepping: ?Stepping = null,
+    exception_filters: ExceptionFilters = .{},
+    /// The protected calls made in Zig that are running
+    /// (`DebugHooks.protect_enter`), innermost last.
+    protects: std.ArrayList(Protect) = .empty,
+    /// An error stop's text, reset at each one.
+    stop_arena: std.heap.ArenaAllocator,
+
+    /// A protected call made in Zig: on coroutine `co` (a header id, 0 for
+    /// the main stack), entered at frame depth `depth`.
+    const Protect = struct { co: u32, depth: u32 };
 
     /// Where a step started (§5.3): the coroutine `C` and the depth `D` of
     /// its frame. `C` is named by its header id, 0 for the main stack, so
@@ -225,10 +269,17 @@ pub const Session = struct {
             .gpa = gpa,
             .vm = vm,
             .driver = driver,
-            .hooks = .{ .ctx = self, .check = &check },
+            .hooks = .{
+                .ctx = self,
+                .check = &check,
+                .raise = &raise,
+                .protect_enter = &protectEnter,
+                .protect_leave = &protectLeave,
+            },
             .entry_pending = opts.stop_on_entry,
             .breakpoints = .init(gpa),
             .eval_arena = .init(gpa),
+            .stop_arena = .init(gpa),
         };
         if (opts.stop_on_entry) self.hooks.flags.store(Flags.pause, .release);
         vm.trace.raiseSuspend();
@@ -246,13 +297,24 @@ pub const Session = struct {
         self.changed.deinit(self.gpa);
         self.eval_arena.deinit();
         self.passing.deinit(self.gpa);
+        std.debug.assert(self.protects.items.len == 0);
+        self.protects.deinit(self.gpa);
+        self.stop_arena.deinit();
     }
 
-    /// Evaluate `expression` in the stopped program's top frame (§7.3).
-    /// The outcome's text lives until the next evaluation. While stopped.
+    /// Set which errors stop (`setExceptionBreakpoints`). While stopped, or
+    /// from `Driver.requests`.
+    pub fn setExceptionFilters(self: *Session, filters: ExceptionFilters) void {
+        self.exception_filters = filters;
+    }
+
+    /// Evaluate `expression` in the stopped program's frame (§7.3): the
+    /// stop's, or the top one while a breakpoint's condition is tested.
+    /// The outcome's text lives until the next evaluation.
     pub fn evaluate(self: *Session, expression: []const u8) Error!eval.Outcome {
         _ = self.eval_arena.reset(.retain_capacity);
-        return eval.evaluate(self.eval_arena.allocator(), self.vm, .top(self.vm), expression);
+        const scope: eval.Scope = if (self.stopped_at) |at| .ofFrame(self.vm, at.frame) else .top(self.vm);
+        return eval.evaluate(self.eval_arena.allocator(), self.vm, scope, expression);
     }
 
     /// Run `proto` as the program, to its end, then make the end stop
@@ -262,14 +324,19 @@ pub const Session = struct {
     pub fn run(self: *Session, proto: *const Proto) Error!Value {
         try self.addChunk(proto);
         const result = self.vm.run(proto);
+        // A terminate the client chose at an error stop (`raise`) that no
+        // prologue came to act on: the error ended the run first.
+        const terminated = if (result) |_| false else |err| err == Error.DebugTerminated;
+        if (terminated or self.hooks.flags.load(.acquire) & Flags.terminate != 0) {
+            // The terminate is spent; the VM is idle and may run again.
+            self.hooks.flags.store(0, .release);
+            self.hooks.raise_seen = false;
+            self.stepping = null;
+            return Error.DebugTerminated;
+        }
         if (result) |_| {
             _ = self.stopAtEnd(null);
         } else |err| {
-            if (err == Error.DebugTerminated) {
-                // The terminate is spent; the VM is idle and may run again.
-                self.hooks.flags.store(0, .release);
-                return err;
-            }
             _ = self.stopAtEnd(err);
         }
         return result;
@@ -329,6 +396,7 @@ pub const Session = struct {
         // The run is over, so a pause, terminate or step asked for late
         // has nothing left to act on.
         self.hooks.flags.store(0, .release);
+        self.hooks.raise_seen = false;
         self.stepping = null;
         return self.driver.stopped(self.driver.ctx, self, .{ .reason = .ended, .err = err });
     }
@@ -344,6 +412,12 @@ pub const Session = struct {
         const self: *Session = @ptrCast(@alignCast(ctx));
         std.debug.assert(vm == self.vm);
         var f = self.hooks.flags.load(.acquire);
+        if (f & Flags.raise_seen != 0) {
+            // Guest code runs again: an error raised from here on is new.
+            self.hooks.raise_seen = false;
+            _ = self.hooks.flags.fetchAnd(~Flags.raise_seen, .acq_rel);
+            f &= ~Flags.raise_seen;
+        }
         if (f & Flags.requests != 0) {
             // Cleared before the drain, so a request that arrives during it
             // sets the bit again and is taken at the next prologue.
@@ -378,7 +452,7 @@ pub const Session = struct {
             else
                 .step;
             self.entry_pending = false;
-            try self.stop(.{ .reason = reason, .hits = hits orelse &.{} }, .{ .proto = proto, .pc = pc });
+            try self.stop(.{ .reason = reason, .hits = hits orelse &.{} }, .{ .proto = proto, .pc = pc, .frame = vm.depth - 1 });
         }
     }
 
@@ -450,6 +524,86 @@ pub const Session = struct {
             try self.passing.append(self.gpa, id);
         }
         return if (self.passing.items.len == 0) null else self.passing.items;
+    }
+
+    fn protectEnter(ctx: *anyopaque, vm: *Vm) Error!void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        try self.protects.append(self.gpa, .{ .co = runningId(vm), .depth = vm.depth });
+    }
+
+    fn protectLeave(ctx: *anyopaque, _: *Vm) void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        _ = self.protects.pop().?;
+    }
+
+    /// §5.4: a catchable error is leaving an instruction or a native, its
+    /// frames still live. Stop if the filters admit it.
+    fn raise(ctx: *anyopaque, vm: *Vm, err: Error, value: ?Value) void {
+        const self: *Session = @ptrCast(@alignCast(ctx));
+        std.debug.assert(vm == self.vm);
+        const filters = self.exception_filters;
+        if (!filters.caught and !filters.uncaught) return;
+        const caught = self.raiseCaught();
+        if (!(if (caught) filters.caught else filters.uncaught)) return;
+        // The topmost frame of the program's own code: an error a native
+        // raises from inside the VM's code (a coroutine's native body)
+        // stops at its caller. With none on this stack, there is nowhere
+        // to stop.
+        const fi: u32 = blk: {
+            var i = vm.depth;
+            while (i > 0) {
+                i -= 1;
+                if (stoppable(vm.frames[i].closure.proto)) break :blk i;
+            }
+            return;
+        };
+        const fr = &vm.frames[fi];
+        _ = self.stop_arena.reset(.retain_capacity);
+        const a = self.stop_arena.allocator();
+        const text = (if (value) |v| Vm.renderErrorValue(v, a) else vm.faultText(err, a)) catch "(out of memory describing the error)";
+        const ex: Exception = .{ .text = text, .caught = caught, .err = err, .value = value orelse vm.pending_error };
+        self.stop(.{ .reason = .exception, .exception = ex }, .{ .proto = fr.closure.proto, .pc = fr.pc, .frame = fi }) catch |e| {
+            // The client ended the program. The catchers run as they would
+            // undebugged; the next prologue, or `run`, ends it.
+            std.debug.assert(e == Error.DebugTerminated);
+            self.requestTerminate();
+        };
+    }
+
+    /// Whether something will catch the error in flight (§5.4). It walks
+    /// the running chain from the running coroutine to the main stack:
+    /// a protected frame (`pcall`/`xpcall` from an instruction) or a
+    /// protected call made in Zig on a stack catches it. A coroutine with
+    /// neither dies of it, and its resume returns it, which is a catch;
+    /// a `wrap` function raises it again in the resumer, where the walk
+    /// goes on. Reads frames only.
+    fn raiseCaught(self: *Session) bool {
+        const vm = self.vm;
+        var ctx: ?*coroutine.Thread = vm.current;
+        while (true) {
+            const id: u32 = if (ctx) |t| t.header.id else 0;
+            const frames: []const interp.CallFrame = if (ctx == vm.current)
+                vm.frames[0..vm.depth]
+            else blk: {
+                const sv = coroutine.savedOf(vm, ctx);
+                break :blk sv.frames[0..sv.depth];
+            };
+            // From the raise down, so the nearest catcher ends the walk.
+            var i = frames.len;
+            while (i > 0) {
+                i -= 1;
+                if (frames[i].ctl.protect != .none) return true;
+            }
+            var k = self.protects.items.len;
+            while (k > 0) {
+                k -= 1;
+                const pr = self.protects.items[k];
+                if (pr.co == id and pr.depth <= frames.len) return true;
+            }
+            const t = ctx orelse return false;
+            if (!t.wrapped) return true;
+            ctx = t.resumer;
+        }
     }
 
     fn stop(self: *Session, s: Stop, at: Location) Error!void {

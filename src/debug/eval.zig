@@ -85,7 +85,15 @@ pub const Scope = struct {
     /// The running frame of the running coroutine, at its published pc.
     pub fn top(vm: *const Vm) Scope {
         std.debug.assert(vm.depth > 0);
-        const f = &vm.frames[vm.depth - 1];
+        return ofFrame(vm, vm.depth - 1);
+    }
+
+    /// Frame `i` of the running coroutine, at its pc: the instruction
+    /// about to run or that raised, for the top frame, and the call it is
+    /// in for one below.
+    pub fn ofFrame(vm: *const Vm, i: u32) Scope {
+        std.debug.assert(i < vm.depth);
+        const f = &vm.frames[i];
         return .{
             .proto = f.closure.proto,
             .closure = f.closure,

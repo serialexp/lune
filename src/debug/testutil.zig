@@ -48,6 +48,10 @@ pub const Seen = struct {
     hits: usize = 0,
     /// The running coroutine's header id, 0 for the main stack.
     co: u32 = 0,
+    /// For an error stop: the error's text (owned by the script) and
+    /// whether something catches it.
+    text: []const u8 = "",
+    caught: bool = false,
 };
 
 /// A scripted driver: it logs every stop, and for each one asks `decide`
@@ -101,6 +105,8 @@ pub const Script = struct {
             .hit = if (stop.hits.len > 0) stop.hits[0] else 0,
             .hits = stop.hits.len,
             .co = if (s.vm.current) |t| t.header.id else 0,
+            .text = if (stop.exception) |e| self.gpa.dupe(u8, e.text) catch @panic("OOM in a test driver") else "",
+            .caught = if (stop.exception) |e| e.caught else false,
         }) catch @panic("OOM in a test driver");
         return self.decide(self, s, stop);
     }
@@ -112,6 +118,7 @@ pub const Script = struct {
     }
 
     pub fn deinit(self: *Script) void {
+        for (self.seen.items) |x| self.gpa.free(x.text);
         self.seen.deinit(self.gpa);
         self.changed.deinit(self.gpa);
     }

@@ -167,7 +167,7 @@ test "doc 86 P2: requests taken while the program runs, and a terminate from the
     try testing.expectEqual(@as(usize, 0), script.seen.items.len);
 }
 
-test "doc 86 P2: an uncaught error ends with the end stop, which carries it" {
+test "doc 86 P2: an uncaught error stops where it is raised, then ends with the end stop, which carries it" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -180,8 +180,11 @@ test "doc 86 P2: an uncaught error ends with the end stop, which carries it" {
     s.attach(gpa, &vm, script.driver(), .{});
     defer s.detach();
     try testing.expectError(error.LuaError, s.run(prog.chunk.proto));
-    try testing.expectEqual(@as(usize, 1), script.seen.items.len);
-    try testing.expectEqual(session_mod.Reason.ended, script.seen.items[0].reason);
+    try testing.expectEqual(@as(usize, 2), script.seen.items.len);
+    // `uncaught` is on by default (§5.4).
+    try testing.expectEqual(session_mod.Reason.exception, script.seen.items[0].reason);
+    try testing.expectEqual(@as(u32, 1), script.seen.items[0].line);
+    try testing.expectEqual(session_mod.Reason.ended, script.seen.items[1].reason);
 }
 
 fn hotLoopSource() [:0]const u8 {

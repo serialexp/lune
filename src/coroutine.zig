@@ -125,7 +125,10 @@ pub const Thread = struct {
     ret_c: u16 = 0,
     /// While it runs or is `normal`: resumed by its `coroutine.wrap`
     /// function, so its results land without resume's leading `true`, and
-    /// an error that kills it is raised again in the resumer.
+    /// an error that kills it is raised again in the resumer. Set for a
+    /// resume from Zig too (`wrapSync`), where `runSync` places the results
+    /// itself; there it tells a debug session the error goes on (doc 86
+    /// §5.4).
     wrapped: bool = false,
     /// While suspended at a yield: where the next resume's values land (the
     /// yield call's base slot) and how many the call wants.
