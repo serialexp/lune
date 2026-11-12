@@ -226,6 +226,10 @@ the `zig build` invocations and, for benchmarks, guarantee the right binary.
   `.zig-cache`/`zig-out` so that can't happen; after restoring the baseline
   sources in the copy (`git show HEAD:<file> > <file>`) and building, verify
   with `nm <bin> | grep <new-symbol>` (must be empty) before trusting any A/B.
+  **Put shadow trees under `/home/bart/Projects/` (e.g. `~/Projects/lune-shadow-<name>`),
+  never `/tmp`:** `/tmp` is memory-backed, so a build that fills it takes the
+  machine down, whereas `~/Projects` is its own disk and only fails with
+  ENOSPC. Delete a shadow when its A/B is done; they run to GBs each.
 - `just cli [out]` / `just cli-smoke [out] [platforms]` — the release CLIs
   (`tools/mahina-cli.sh`: six platforms, stripped ReleaseFast, the `viz/` UI
   embedded via `-Dviz-dist` for `mahina viz`) and their smoke test, which

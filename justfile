@@ -96,6 +96,8 @@ glue-census *args:
 # verify the binary is really the baseline: `nm DEST/zig-out/bin/mahina | grep
 # <new-symbol>` must come up empty. The caches are never copied at all (the
 # local .zig-cache runs to tens of GB; copy-then-delete once filled /tmp).
+# DEST belongs under ~/Projects (e.g. ~/Projects/lune-shadow-<name>), never
+# /tmp: /tmp is memory-backed and a full one crashes the machine.
 shadow dest:
     @case "{{dest}}" in ""|/|.|./|..|../|"$HOME"|"$HOME"/) echo "shadow: refusing destination '{{dest}}'" >&2; exit 1;; esac
     rm -rf "{{dest}}"
