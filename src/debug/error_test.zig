@@ -263,3 +263,52 @@ test "doc 86 P2: an error stop changes nothing: the same steps and the same fina
     defer gpa.free(got);
     try testing.expectEqualSlices(u8, want, got);
 }
+
+test "doc 86 P2: terminate at an uncaught error stop leaves the VM idle, and the same session runs again" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var prog = try Program.init(gpa, &vm, "error(\"boom\")\n");
+    defer prog.deinit();
+    var script: Script = .{ .gpa = gpa, .decide = &terminateAtError };
+    defer script.deinit();
+    var s: Session = undefined;
+    s.attach(gpa, &vm, script.driver(), .{});
+    defer s.detach();
+    s.setExceptionFilters(both);
+    try testing.expectError(error.DebugTerminated, s.run(prog.chunk.proto));
+    try testing.expectEqual(@as(u32, 0), vm.depth);
+    try testing.expect(vm.pending_error == null);
+    var again = try Program.init(gpa, &vm, "return 7");
+    defer again.deinit();
+    try testing.expectEqual(@as(i64, 7), (try s.run(again.chunk.proto)).asInt());
+}
+
+fn terminateWhenPending(_: *Script, s: *Session, _: Stop) Resume {
+    if (s.vm.reg_top_pending) return .terminate;
+    s.requestPause();
+    return .@"continue";
+}
+
+test "doc 86 P2: terminate where a multiple-result call is pending leaves the VM reusable" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local function f() return 1, 2 end
+        \\local function g() return f() end
+        \\return g()
+    ;
+    var prog = try Program.init(gpa, &vm, source);
+    defer prog.deinit();
+    var script: Script = .{ .gpa = gpa, .decide = &terminateWhenPending };
+    defer script.deinit();
+    var s: Session = undefined;
+    s.attach(gpa, &vm, script.driver(), .{ .stop_on_entry = true });
+    defer s.detach();
+    try testing.expectError(error.DebugTerminated, s.run(prog.chunk.proto));
+    try testing.expect(!vm.reg_top_pending);
+    var again = try Program.init(gpa, &vm, "local function f() return 1, 2 end\nreturn (f())");
+    defer again.deinit();
+    try testing.expectEqual(@as(i64, 1), (try s.run(again.chunk.proto)).asInt());
+}

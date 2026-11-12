@@ -232,8 +232,6 @@ pub const Session = struct {
     /// included, is appended there (`Vm.appendLoadedChunk`), so a longer
     /// list is the signal that a chunk loaded.
     chunks_seen: usize = 0,
-    /// Scratch for the bindings a chunk load changed.
-    changed: std.ArrayList(Breakpoint) = .empty,
     visits: LineVisits = .{},
     /// The evaluator's scratch, reset at every evaluation.
     eval_arena: std.heap.ArenaAllocator,
@@ -299,7 +297,6 @@ pub const Session = struct {
         self.vm.debug = null;
         self.vm.trace.lowerSuspend();
         self.breakpoints.deinit();
-        self.changed.deinit(self.gpa);
         self.eval_arena.deinit();
         self.passing.deinit(self.gpa);
         std.debug.assert(self.protects.items.len == 0);
@@ -318,10 +315,24 @@ pub const Session = struct {
     /// stop's, or the top one while a breakpoint's condition is tested.
     /// The outcome's text lives until the next evaluation.
     pub fn evaluate(self: *Session, expression: []const u8) Error!eval.Outcome {
+        return self.evaluateWith(.{ .text = expression });
+    }
+
+    const Expression = union(enum) { text: []const u8, parsed: *const eval.Condition };
+
+    fn evaluateWith(self: *Session, expression: Expression) Error!eval.Outcome {
+        // At the end stop no frame is left to read (after an error, the
+        // VM's frames are the host's for its traceback, not the program's).
+        if (self.inspector.ended or (self.stopped_at == null and self.vm.depth == 0))
+            return .{ .refused = "the program has ended" };
         _ = self.eval_arena.reset(.retain_capacity);
         var scope: eval.Scope = if (self.stopped_at) |at| .ofFrame(self.vm, at.frame) else .top(self.vm);
         scope.source = self.inspector.sourceOf(self.vm, scope.proto.id);
-        return eval.evaluate(self.eval_arena.allocator(), self.vm, scope, expression);
+        const arena = self.eval_arena.allocator();
+        return switch (expression) {
+            .text => |t| eval.evaluate(arena, self.vm, scope, t),
+            .parsed => |p| eval.evaluateCondition(arena, self.vm, scope, p),
+        };
     }
 
     // ---- inspecting the stopped program (§5.5, §7) ----------------------
@@ -371,15 +382,18 @@ pub const Session = struct {
     /// ended the program, which makes no end stop.
     pub fn run(self: *Session, proto: *const Proto) Error!Value {
         try self.addChunk(proto);
+        // Nothing of an earlier run's line visits carries over.
+        self.visits.reset();
         const result = self.vm.run(proto);
         // A terminate the client chose at an error stop (`raise`) that no
         // prologue came to act on: the error ended the run first.
         const terminated = if (result) |_| false else |err| err == Error.DebugTerminated;
         if (terminated or self.hooks.flags.load(.acquire) & Flags.terminate != 0) {
-            // The terminate is spent; the VM is idle and may run again.
-            self.hooks.flags.store(0, .release);
-            self.hooks.raise_seen = false;
-            self.stepping = null;
+            // The terminate is spent. The run's own frames may be all that
+            // is left of an error, so leave the VM idle, as a host does
+            // after an error it has handled: it may run again.
+            self.vm.abandonRun();
+            self.endOfRun();
             return Error.DebugTerminated;
         }
         if (result) |_| {
@@ -424,10 +438,13 @@ pub const Session = struct {
     /// breakpoints it binds.
     fn addChunk(self: *Session, root: *const Proto) Error!void {
         if (self.breakpoints.hasChunk(root)) return;
-        self.changed.clearRetainingCapacity();
-        try self.breakpoints.addChunk(root, &self.changed);
+        // A local list: a callback may call `setBreakpoints`, which reaches
+        // here again and must not disturb the one being walked.
+        var changed: std.ArrayList(Breakpoint) = .empty;
+        defer changed.deinit(self.gpa);
+        try self.breakpoints.addChunk(root, &changed);
         if (self.driver.breakpoint_changed) |f| {
-            for (self.changed.items) |bp| f(self.driver.ctx, self, bp);
+            for (changed.items) |bp| f(self.driver.ctx, self, bp);
         }
     }
 
@@ -435,18 +452,31 @@ pub const Session = struct {
     fn syncChunks(self: *Session) Error!void {
         if (self.vm.root_chunk) |rc| try self.addChunk(rc.chunk.proto);
         const loaded = self.vm.loaded_chunks.items;
-        while (self.chunks_seen < loaded.len) : (self.chunks_seen += 1) {
-            try self.addChunk(loaded[self.chunks_seen].chunk.proto);
+        while (self.chunks_seen < loaded.len) {
+            const root = loaded[self.chunks_seen].chunk.proto;
+            // Counted first: a callback may sync again from inside.
+            self.chunks_seen += 1;
+            try self.addChunk(root);
         }
     }
 
-    fn stopAtEnd(self: *Session, err: ?Error) Resume {
-        // The run is over, so a pause, terminate or step asked for late
-        // has nothing left to act on.
-        self.hooks.flags.store(0, .release);
+    /// The run is over, so a pause, terminate or step asked for late has
+    /// nothing left to act on. What belongs to the session, not the run (the
+    /// breakpoints, requests the transport holds), stays.
+    fn endOfRun(self: *Session) void {
+        _ = self.hooks.flags.fetchAnd(Flags.breakpoints | Flags.requests, .acq_rel);
         self.hooks.raise_seen = false;
         self.stepping = null;
-        defer self.inspector.clear();
+        self.entry_pending = false;
+    }
+
+    fn stopAtEnd(self: *Session, err: ?Error) Resume {
+        self.endOfRun();
+        self.inspector.ended = true;
+        defer {
+            self.inspector.ended = false;
+            self.inspector.clear();
+        }
         return self.driver.stopped(self.driver.ctx, self, .{ .reason = .ended, .err = err });
     }
 
@@ -552,7 +582,11 @@ pub const Session = struct {
         for (ids) |id| {
             const e = self.breakpoints.entry(id) orelse continue;
             if (e.condition) |c| {
-                const holds = switch (try self.evaluate(c)) {
+                if (e.compiled == null) {
+                    e.compiled = try eval.Condition.init(self.gpa, c);
+                    e.parses += 1;
+                }
+                const holds = switch (try self.evaluateWith(.{ .parsed = e.compiled.? })) {
                     .ok => |v| v.truthy(),
                     .refused, .failed => |msg| blk: {
                         // Counts as false, and is reported once (§5.2).

@@ -138,6 +138,8 @@ fn stackOf(vm: *Vm, t: ?*Thread) StackView {
     return .{ .frames = s.frames[0..s.depth], .tags = s.tags, .payloads = s.payloads, .live = false };
 }
 
+const no_frames: StackView = .{ .frames = &.{}, .tags = &.{}, .payloads = &.{}, .live = false };
+
 pub fn threadId(t: ?*const Thread) u32 {
     return if (t) |x| x.header.id + 1 else 1;
 }
@@ -148,6 +150,9 @@ pub const Inspector = struct {
     /// The reference of `handles[0]`. A resume moves it past every
     /// reference given out, so a stale one never names a new handle.
     first_ref: u32 = 1,
+    /// The program has ended: the main stack lists no frames, though the VM
+    /// may still hold the frames of the error that ended it.
+    ended: bool = false,
     sources: std.ArrayList(SourceEntry) = .empty,
 
     pub fn init(gpa: Allocator) Inspector {
@@ -182,6 +187,11 @@ pub const Inspector = struct {
         return null;
     }
 
+    fn stackView(self: *const Inspector, vm: *Vm, t: ?*Thread) StackView {
+        if (self.ended and t == null) return no_frames;
+        return stackOf(vm, t);
+    }
+
     fn add(self: *Inspector, h: Handle) Allocator.Error!u32 {
         try self.handles.append(self.gpa, h);
         return self.first_ref +% @as(u32, @intCast(self.handles.items.len - 1));
@@ -203,6 +213,9 @@ pub const Inspector = struct {
         while (it) |h| : (it = h.next) {
             if (h.type != .thread) continue;
             const t = Thread.fromHeader(h);
+            // `coroutine.running()` on the main stack makes a thread value
+            // that stands for it, with no stack of its own.
+            if (t == vm.main_thread) continue;
             const status: ThreadStatus = switch (t.status) {
                 .dead => continue,
                 .running => .running,
@@ -226,7 +239,7 @@ pub const Inspector = struct {
         while (it) |h| : (it = h.next) {
             if (h.type != .thread or h.id != id - 1) continue;
             const t = Thread.fromHeader(h);
-            return if (t.status == .dead) error.UnknownThread else t;
+            return if (t.status == .dead or t == vm.main_thread) error.UnknownThread else t;
         }
         return error.UnknownThread;
     }
@@ -248,12 +261,12 @@ pub const Inspector = struct {
         } else try stacks.append(arena, t);
 
         var total: u32 = 0;
-        for (stacks.items) |s| total += @intCast(stackOf(vm, s).frames.len);
+        for (stacks.items) |s| total += @intCast(self.stackView(vm, s).frames.len);
         const end: u32 = if (levels == 0) total else @min(total, start +| levels);
         var out: std.ArrayList(StackFrame) = .empty;
         var base: u32 = 0;
         for (stacks.items) |s| {
-            const view = stackOf(vm, s);
+            const view = self.stackView(vm, s);
             const n: u32 = @intCast(view.frames.len);
             defer base += n;
             if (base + n <= start or base >= end) continue;
@@ -305,7 +318,7 @@ pub const Inspector = struct {
     }
 
     fn scopeAt(self: *const Inspector, vm: *Vm, fr: FrameRef) eval.Scope {
-        const sv = stackOf(vm, fr.thread);
+        const sv = self.stackView(vm, fr.thread);
         var sc = eval.Scope.ofStack(sv.frames, sv.tags, sv.payloads, fr.index, sv.live);
         sc.source = self.sourceOf(vm, sc.proto.id);
         return sc;
@@ -342,7 +355,7 @@ pub const Inspector = struct {
                 return pageOf(Variable, all, start, count);
             },
             .varargs => |fr| {
-                const sv = stackOf(vm, fr.thread);
+                const sv = self.stackView(vm, fr.thread);
                 const f = &sv.frames[fr.index];
                 const lo = @min(start, f.varargs_count);
                 const hi = if (count == 0) f.varargs_count else @min(f.varargs_count, lo + count);
@@ -420,7 +433,7 @@ pub const Inspector = struct {
                 },
             }
         }
-        const sv = stackOf(vm, fr.thread);
+        const sv = self.stackView(vm, fr.thread);
         const f = &sv.frames[fr.index];
         if (sc.proto.is_vararg and f.varargs_count > 0) {
             try out.append(arena, .{

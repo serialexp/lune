@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const bytecode = @import("../bytecode.zig");
+const eval = @import("eval.zig");
 
 const Proto = bytecode.Proto;
 const Allocator = std.mem.Allocator;
@@ -92,6 +93,10 @@ pub const Entry = struct {
     /// The condition's evaluation failure was reported (it is reported
     /// once per breakpoint).
     condition_reported: bool = false,
+    /// The condition, parsed at its first hit and kept.
+    compiled: ?*eval.Condition = null,
+    /// How many times `compiled` was parsed: once, however many hits.
+    parses: u32 = 0,
 
     fn view(self: Entry) Breakpoint {
         return .{
@@ -104,6 +109,7 @@ pub const Entry = struct {
 
     fn deinit(self: *Entry, gpa: Allocator) void {
         if (self.condition) |c| gpa.free(c);
+        if (self.compiled) |c| c.deinit(gpa);
     }
 };
 
@@ -138,7 +144,15 @@ const ProtoPcs = struct {
     hits: std.ArrayList(Hit) = .empty,
     /// The ids at one pc, the slice `at` returns.
     fn idsAt(self: *const ProtoPcs, pc: u32, out: *std.ArrayList(u32), gpa: Allocator) !void {
-        for (self.hits.items) |h| if (h.pc == pc) try out.append(gpa, h.id);
+        const first = std.sort.lowerBound(Hit, self.hits.items, pc, cmpHitPc);
+        for (self.hits.items[first..]) |h| {
+            if (h.pc != pc) break;
+            try out.append(gpa, h.id);
+        }
+    }
+
+    fn cmpHitPc(pc: u32, h: Hit) std.math.Order {
+        return std.math.order(pc, h.pc);
     }
 };
 
@@ -192,8 +206,13 @@ pub const Table = struct {
     pub fn addChunk(self: *Table, root: *const Proto, changed: ?*std.ArrayList(Breakpoint)) !void {
         if (root.system or self.hasChunk(root)) return;
         const sites = try indexChunk(self.gpa, root);
-        errdefer self.gpa.free(sites);
-        try self.chunks.append(self.gpa, .{ .root = root, .sites = sites });
+        self.chunks.append(self.gpa, .{ .root = root, .sites = sites }) catch |err| {
+            self.gpa.free(sites);
+            return err;
+        };
+        // From here the table owns `sites`. A failure while binding leaves
+        // the chunk indexed and the table consistent, with some breakpoints
+        // unbound until the next `set` binds them all again.
         const s = self.findSourceMut(root.chunk) orelse return;
         const chunk = self.chunks.items[self.chunks.items.len - 1];
         for (s.entries.items) |*e| {
@@ -219,22 +238,32 @@ pub const Table = struct {
         var reused: std.DynamicBitSetUnmanaged = try .initEmpty(self.gpa, s.entries.items.len);
         defer reused.deinit(self.gpa);
         for (requests) |r| {
-            var id: u32 = 0;
-            var hits: u64 = 0;
-            for (s.entries.items, 0..) |old, i| {
-                if (old.req_line == r.line and !reused.isSet(i)) {
-                    reused.set(i);
-                    id = old.id;
-                    hits = old.hits;
-                    break;
+            // An empty condition is none: clients send "" for a breakpoint
+            // that has none.
+            const cond_text: ?[]const u8 = if (r.condition) |c| (if (std.mem.trim(u8, c, " \t").len == 0) null else c) else null;
+            // The breakpoint it was: the one asked for at this line, else
+            // the one that was bound to this line (a client sends back the
+            // line a breakpoint moved to).
+            const old_ix = findOld(s.entries.items, &reused, r.line);
+            const condition = if (cond_text) |c| try self.gpa.dupe(u8, c) else null;
+            errdefer if (condition) |c| self.gpa.free(c);
+            var e: Entry = .{ .id = 0, .req_line = r.line, .line = 0, .verified = false, .condition = condition };
+            if (old_ix) |i| {
+                const old = &s.entries.items[i];
+                reused.set(i);
+                e.id = old.id;
+                e.hits = old.hits;
+                // The same condition keeps its parse, and its report.
+                if (old.condition != null and condition != null and std.mem.eql(u8, old.condition.?, condition.?)) {
+                    e.compiled = old.compiled;
+                    old.compiled = null;
+                    e.parses = old.parses;
+                    e.condition_reported = old.condition_reported;
                 }
             } else {
-                id = self.next_id;
+                e.id = self.next_id;
                 self.next_id += 1;
             }
-            const condition = if (r.condition) |c| try self.gpa.dupe(u8, c) else null;
-            errdefer if (condition) |c| self.gpa.free(c);
-            var e: Entry = .{ .id = id, .req_line = r.line, .line = 0, .verified = false, .condition = condition, .hits = hits };
             if (r.hit_condition) |text| {
                 if (std.mem.trim(u8, text, " \t").len != 0) {
                     e.hit_condition = HitCondition.parse(text);
@@ -246,8 +275,20 @@ pub const Table = struct {
         for (s.entries.items) |*e| e.deinit(self.gpa);
         s.entries.deinit(self.gpa);
         s.entries = entries;
+        // The source owns them now. A failing `rebind` leaves them unbound,
+        // not freed.
+        entries = .empty;
         try self.rebind();
         for (s.entries.items, out) |e, *o| o.* = e.view();
+    }
+
+    /// The breakpoint of `old` that a request for `line` continues: the one
+    /// that asked for this line, else the one bound to it. Taken ones are
+    /// skipped.
+    fn findOld(old: []const Entry, taken: *const std.DynamicBitSetUnmanaged, line: u32) ?usize {
+        for (old, 0..) |e, i| if (!taken.isSet(i) and e.req_line == line) return i;
+        for (old, 0..) |e, i| if (!taken.isSet(i) and e.verified and e.line == line) return i;
+        return null;
     }
 
     /// The breakpoint `id`, while it is set. The pointer lives until the

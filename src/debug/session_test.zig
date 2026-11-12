@@ -264,3 +264,56 @@ test "doc 86 P2: after detach the JIT runs again" {
     _ = try vm.run(prog.chunk.proto);
     if (@import("../nativegen.zig").is_x64_linux) try testing.expect(vm.trace.entries > 0);
 }
+
+fn evaluateAtEnd(self: *Script, s: *Session, stop: Stop) Resume {
+    if (stop.reason != .ended) return .@"continue";
+    const o = s.evaluate("1 + 1") catch @panic("evaluate failed");
+    self.n = if (o == .refused) 1 else 2;
+    return .@"continue";
+}
+
+test "doc 86 P2: evaluate at the end stop is refused, after a return and after an uncaught error" {
+    const gpa = testing.allocator;
+    inline for (.{ "return 1", "local t = nil\nreturn t.x" }) |source| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var prog = try Program.init(gpa, &vm, source);
+        defer prog.deinit();
+        var script: Script = .{ .gpa = gpa, .decide = &evaluateAtEnd };
+        defer script.deinit();
+        var s: Session = undefined;
+        s.attach(gpa, &vm, script.driver(), .{});
+        defer s.detach();
+        _ = s.run(prog.chunk.proto) catch {};
+        try testing.expectEqual(@as(usize, 1), script.n);
+    }
+}
+
+test "doc 86 P2: breakpoints and the entry stop work on every run through a session, after a normal end and after a terminate" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var prog = try Program.init(gpa, &vm, "local a = 1\nlocal b = a + 1\nreturn b");
+    defer prog.deinit();
+    var script: Script = .{ .gpa = gpa, .decide = &alwaysContinue };
+    defer script.deinit();
+    var s: Session = undefined;
+    s.attach(gpa, &vm, script.driver(), .{});
+    defer s.detach();
+    var out: [1]session_mod.Breakpoint = undefined;
+    try s.setBreakpoints("main", &.{.{ .line = 2 }}, &out);
+    _ = try s.run(prog.chunk.proto);
+    _ = try s.run(prog.chunk.proto);
+    var buf: [8]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{ 2, 2 }, script.breakpointLines(&buf));
+
+    // A terminate ends a run the same way, and the breakpoint survives it.
+    var terminating: Script = .{ .gpa = gpa, .decide = &terminateOnLineTwo };
+    defer terminating.deinit();
+    script.driver_override = null;
+    s.driver = terminating.driver();
+    try testing.expectError(error.DebugTerminated, s.run(prog.chunk.proto));
+    s.driver = script.driver();
+    _ = try s.run(prog.chunk.proto);
+    try testing.expectEqualSlices(u32, &.{ 2, 2, 2 }, script.breakpointLines(&buf));
+}

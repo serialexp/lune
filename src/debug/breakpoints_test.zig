@@ -270,3 +270,146 @@ test "doc 86 P2: a coroutine resumed in the middle of a line goes on with that v
     const got = try hitLines(source, &.{2}, &buf);
     try testing.expectEqualSlices(u32, &.{ 2, 2 }, got);
 }
+
+const table_mod = @import("breakpoints.zig");
+
+test "doc 86 P2: an empty or blank condition is no condition" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local s = 0
+        \\for i = 1, 3 do
+        \\    s = s + i
+        \\end
+        \\return s
+    ;
+    var prog = try Program.init(gpa, &vm, source);
+    defer prog.deinit();
+    var script: Script = .{ .gpa = gpa, .decide = &testutil.alwaysContinue };
+    defer script.deinit();
+    var s: Session = undefined;
+    s.attach(gpa, &vm, script.driver(), .{});
+    defer s.detach();
+    var out: [2]Breakpoint = undefined;
+    try s.setBreakpoints("main", &.{ .{ .line = 3, .condition = "" }, .{ .line = 5, .condition = "  " } }, &out);
+    _ = try s.run(prog.chunk.proto);
+    var buf: [16]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{ 3, 3, 3, 5 }, script.breakpointLines(&buf));
+}
+
+test "doc 86 P2: a re-sent line that a breakpoint moved to keeps that breakpoint, and its hits" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local s = 0
+        \\
+        \\for i = 1, 3 do
+        \\    s = s + i
+        \\end
+        \\return s
+    ;
+    var prog = try Program.init(gpa, &vm, source);
+    defer prog.deinit();
+    var script: Script = .{ .gpa = gpa, .decide = &testutil.alwaysContinue };
+    defer script.deinit();
+    var s: Session = undefined;
+    s.attach(gpa, &vm, script.driver(), .{});
+    defer s.detach();
+    var out: [1]Breakpoint = undefined;
+    // Asked for line 2 (no code): it binds to line 3.
+    try s.setBreakpoints("main", &.{.{ .line = 2 }}, &out);
+    _ = try s.run(prog.chunk.proto);
+    const id = out[0].id;
+    const bound = s.breakpoints.entry(id).?;
+    try testing.expectEqual(@as(u32, 3), bound.line);
+    const hits = bound.hits;
+    try testing.expect(hits > 0);
+    // The client sends back the line the breakpoint moved to.
+    var again: [1]Breakpoint = undefined;
+    try s.setBreakpoints("main", &.{.{ .line = 3 }}, &again);
+    try testing.expectEqual(id, again[0].id);
+    try testing.expectEqual(hits, s.breakpoints.entry(id).?.hits);
+}
+
+test "doc 86 P2: a condition is parsed once, however many hits" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const source =
+        \\local s = 0
+        \\for i = 1, 50 do
+        \\    s = s + i
+        \\end
+        \\return s
+    ;
+    var prog = try Program.init(gpa, &vm, source);
+    defer prog.deinit();
+    var script: Script = .{ .gpa = gpa, .decide = &testutil.alwaysContinue };
+    defer script.deinit();
+    var s: Session = undefined;
+    s.attach(gpa, &vm, script.driver(), .{});
+    defer s.detach();
+    var out: [1]Breakpoint = undefined;
+    try s.setBreakpoints("main", &.{.{ .line = 3, .condition = "i % 10 == 0" }}, &out);
+    _ = try s.run(prog.chunk.proto);
+    var buf: [64]u32 = undefined;
+    try testing.expectEqual(@as(usize, 5), script.breakpointLines(&buf).len);
+    try testing.expectEqual(@as(u32, 1), s.breakpoints.entry(out[0].id).?.parses);
+    // Re-sending the same condition keeps the parse.
+    try s.setBreakpoints("main", &.{.{ .line = 3, .condition = "i % 10 == 0" }}, &out);
+    try testing.expectEqual(@as(u32, 1), s.breakpoints.entry(out[0].id).?.parses);
+    // A different one does not.
+    try s.setBreakpoints("main", &.{.{ .line = 3, .condition = "i > 3" }}, &out);
+    try testing.expectEqual(@as(u32, 0), s.breakpoints.entry(out[0].id).?.parses);
+}
+
+fn tableUnderFailure(gpa: std.mem.Allocator, root: *const @import("../bytecode.zig").Proto) !void {
+    var t = table_mod.Table.init(gpa);
+    defer t.deinit();
+    var out: [2]Breakpoint = undefined;
+    const reqs = [_]table_mod.Request{ .{ .line = 3, .condition = "i > 1" }, .{ .line = 5, .hit_condition = ">= 2" } };
+    try t.set("main", &reqs, &out);
+    try t.addChunk(root, null);
+    // Replace the set once the chunk is known: the reuse path.
+    try t.set("main", &reqs, &out);
+    try t.set("main", reqs[0..1], out[0..1]);
+}
+
+test "doc 86 P2: the breakpoint table leaks and double-frees nothing when an allocation fails" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var prog = try Program.init(gpa, &vm, "local s = 0\nfor i = 1, 3 do\n    s = s + i\nend\nreturn s");
+    defer prog.deinit();
+    try testing.checkAllAllocationFailures(gpa, tableUnderFailure, .{prog.chunk.proto});
+}
+
+fn resetInCallback(ctx: *anyopaque, s: *Session, bp: Breakpoint) void {
+    const script: *Script = @ptrCast(@alignCast(ctx));
+    script.changed.append(script.gpa, bp) catch @panic("OOM in a test driver");
+    var out: [1]Breakpoint = undefined;
+    s.setBreakpoints("main", &.{.{ .line = bp.line }}, &out) catch @panic("setBreakpoints in a callback");
+}
+
+test "doc 86 P2: setBreakpoints from a breakpoint_changed callback is safe" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var prog = try Program.init(gpa, &vm, "local s = 0\nfor i = 1, 3 do\n    s = s + i\nend\nreturn s");
+    defer prog.deinit();
+    var script: Script = .{ .gpa = gpa, .decide = &testutil.alwaysContinue };
+    defer script.deinit();
+    var d = script.driver();
+    d.breakpoint_changed = &resetInCallback;
+    script.driver_override = d;
+    var s: Session = undefined;
+    s.attach(gpa, &vm, script.driver(), .{});
+    defer s.detach();
+    var out: [1]Breakpoint = undefined;
+    try s.setBreakpoints("main", &.{.{ .line = 3 }}, &out);
+    _ = try s.run(prog.chunk.proto);
+    var buf: [16]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{ 3, 3, 3 }, script.breakpointLines(&buf));
+}

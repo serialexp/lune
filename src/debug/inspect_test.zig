@@ -456,3 +456,28 @@ test "doc 86 P2: inspecting everything at every stop changes neither the step co
     defer gpa.free(got_snap);
     try testing.expectEqualSlices(u8, want_snap, got_snap);
 }
+
+fn lookRunning(rig: *Rig, s: *Session) !void {
+    var arena_inst = std.heap.ArenaAllocator.init(rig.gpa);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    const threads = try s.threads(a);
+    try rig.print("{d}\n", .{threads.len});
+    for (threads) |th| {
+        const page = try s.stackTrace(a, th.id, 0, 0);
+        try rig.print("{d}:{d}\n", .{ th.id, page.total });
+    }
+}
+
+test "doc 86 P2: coroutine.running() on the main stack does not make a second thread" {
+    const gpa = testing.allocator;
+    const source =
+        \\local main = coroutine.running()
+        \\local x = 1
+        \\return x, main
+    ;
+    var rig = Rig.init(gpa, &lookRunning);
+    defer rig.deinit();
+    try runRig(gpa, &rig, source, &.{2}, true);
+    try testing.expectEqualStrings("1\n1:1\n", rig.text.items);
+}

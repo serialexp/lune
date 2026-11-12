@@ -2658,7 +2658,7 @@ pub const Vm = struct {
             // frame, as a finished run leaves the stack, so the host can
             // still snapshot and reuse the VM. A debugger's terminate
             // (doc 86 §5.5) ends a run the same way.
-            if (err == Error.Exit or err == Error.DebugTerminated) self.unwindTo(0, 0);
+            if (err == Error.Exit or err == Error.DebugTerminated) self.abandonRun();
             return err;
         };
         switch (outcome) {
@@ -4559,6 +4559,15 @@ pub const Vm = struct {
     /// Drop every frame above `entry_depth`, and the stack above `entry_top`,
     /// after an unwinding error: close their open upvalues first, so an
     /// escaped closure keeps its value once the slots are reused.
+    /// Leave a run that did not finish idle: every frame gone, no error or
+    /// multiple-result pair pending, as a host leaves the VM after an error
+    /// it has handled. The VM can run again.
+    pub fn abandonRun(self: *Vm) void {
+        self.pending_error = null;
+        self.reg_top_pending = false;
+        self.unwindTo(0, 0);
+    }
+
     pub fn unwindTo(self: *Vm, entry_depth: u32, entry_top: usize) void {
         self.closeUpvaluesFrom(entry_top);
         self.dropRegionActivationsFromDepth(entry_depth);

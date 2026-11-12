@@ -125,11 +125,45 @@ pub const Scope = struct {
 /// Evaluate `source`, one expression, in `scope`. Every allocation is
 /// in `arena`, which the caller resets; the outcome's text lives there.
 pub fn evaluate(arena: Allocator, vm: *Vm, scope: Scope, source: []const u8) Allocator.Error!Outcome {
-    var e: Evaluator = .{ .arena = arena, .vm = vm, .scope = scope };
     const expr = switch (try parseExpression(arena, source)) {
         .expr => |x| x,
         .refused => |why| return .{ .refused = why },
     };
+    return evaluateExpr(arena, vm, scope, expr);
+}
+
+/// A breakpoint's condition, parsed once: it is evaluated at every hit, and
+/// parsing is the part of an evaluation that costs allocations.
+pub const Condition = struct {
+    arena: std.heap.ArenaAllocator,
+    parsed: Parsed,
+
+    pub fn init(gpa: Allocator, source: []const u8) Allocator.Error!*Condition {
+        const self = try gpa.create(Condition);
+        errdefer gpa.destroy(self);
+        self.arena = .init(gpa);
+        errdefer self.arena.deinit();
+        self.parsed = try parseExpression(self.arena.allocator(), source);
+        return self;
+    }
+
+    pub fn deinit(self: *Condition, gpa: Allocator) void {
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
+/// `evaluate` of a condition parsed already.
+pub fn evaluateCondition(arena: Allocator, vm: *Vm, scope: Scope, cond: *const Condition) Allocator.Error!Outcome {
+    const expr = switch (cond.parsed) {
+        .expr => |x| x,
+        .refused => |why| return .{ .refused = why },
+    };
+    return evaluateExpr(arena, vm, scope, expr);
+}
+
+fn evaluateExpr(arena: Allocator, vm: *Vm, scope: Scope, expr: *const ast.Expr) Allocator.Error!Outcome {
+    var e: Evaluator = .{ .arena = arena, .vm = vm, .scope = scope };
     const v = e.eval(expr) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Refused => return .{ .refused = e.message },
