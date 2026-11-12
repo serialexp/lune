@@ -305,9 +305,13 @@ jobs:
           cat notes.md
 
       - name: Create the gothab release
-        # The runner sets GOTHAB_TOKEN, GOTHAB_HOST and GOTHAB_PROTOCOL.
+        # The runner sets GOTHAB_TOKEN, GOTHAB_HOST and GOTHAB_PROTOCOL. -R is
+        # explicit because gt reads the host from the checkout's origin URL,
+        # which carries the job token as userinfo (x-access-token:…@host), and
+        # takes that whole string for the host name.
         run: |
           set -eu
           name=mahina-bundle-${GITHUB_REF_NAME}
           gt release create "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" cli-assets/* \
+            -R "${GITHUB_REPOSITORY:-serialexp/lune}" \
             --title "mahina ${GITHUB_REF_NAME}" --notes-file notes.md
