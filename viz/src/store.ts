@@ -2,7 +2,7 @@
 // A native SolidJS store (no prop drilling) — components read `state` and call
 // the actions here.
 
-import { createStore } from "solid-js/store";
+import { createStore, unwrap } from "solid-js/store";
 import { decodeTraceFile, decodeExecLogFile, decodeCoverageFile, type TraceExecLogOutput, type CoverageFileOutput, type CoverageAnchorOutput } from "./decode";
 import { viewsOf, type TraceView, type SourcePoint } from "./disasm";
 import { flattenExec, type ExecStep } from "./exec";
@@ -826,7 +826,9 @@ export function setReplayPos(pos: number): void {
   const req = ++replayRequest;
   void (async () => {
     try {
-      const rs = await mahinaWorker().replay(state.replaySource, state.replayEffects!, k, state.replayArgv);
+      // postMessage structured-clones its arguments, and a Proxy can't be
+      // cloned: the store hands arrays out wrapped, so unwrap the argv.
+      const rs = await mahinaWorker().replay(state.replaySource, state.replayEffects!, k, unwrap(state.replayArgv));
       if (req !== replayRequest) return;
       const view = decodeSnapshot(rs.keyframe, rs.locals);
       setState({ replayState: rs, replayView: view });
