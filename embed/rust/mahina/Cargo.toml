@@ -1,6 +1,6 @@
 [package]
 name = "mahina"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Safe Rust embedding API for the mahina VM (doc 59)"
 license = "MIT"
