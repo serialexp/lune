@@ -275,3 +275,67 @@ test "doc 86 P2: a condition that cannot be evaluated counts as false, reported 
     try testing.expectEqualSlices(i64, &.{}, try stopsAt(.{ .line = 0, .condition = "nil + 1" }, &script, &buf));
     try testing.expectEqual(@as(usize, 1), console_lines);
 }
+
+var grid_seen = false;
+
+fn evaluateGrid(script: *Script, s: *Session, stop: Stop) Resume {
+    if (stop.reason == .breakpoint and !evaluated) {
+        // A collection flattens a numeric matrix into a grid; do that now,
+        // and check it took, or this tests nothing.
+        const o = s.evaluate("g") catch @panic("evaluate failed");
+        grid_seen = switch (o) {
+            .ok => |v| switch (v) {
+                .value => |x| blk: {
+                    if (!x.isHeap() or x.heapType() != .table) break :blk false;
+                    const t = @import("../table.zig").Table.fromHeader(x.asHeap());
+                    _ = s.vm.heap.inflateToGrid(t);
+                    break :blk t.array.isGrid();
+                },
+                .text => false,
+            },
+            else => false,
+        };
+    }
+    return evaluateAtFirstHit(script, s, stop);
+}
+
+test "doc 86 P2: evaluate reads a grid's rows without deflating it, and a row is no table's key" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var prog = try Program.init(gpa, &vm, "local g = { { 1, 2, 3 }, { 4, 5, 6 } }\nlocal t = { 1, x = 1 }\nprint(#g, #t)\nprint(g[2][3], t[1])\n");
+    defer prog.deinit();
+    var script: Script = .{ .gpa = gpa, .decide = &evaluateGrid };
+    defer script.deinit();
+    var s: Session = undefined;
+    s.attach(gpa, &vm, script.driver(), .{});
+    defer s.detach();
+    var out: [1]Breakpoint = undefined;
+    try s.setBreakpoints("main", &.{.{ .line = 3 }}, &out);
+    grid_seen = false;
+    cases = &.{
+        .{ .expr = "g[1][2]", .want = "value 2" },
+        .{ .expr = "g[1] == g[1]", .want = "value true" },
+        .{ .expr = "g[2][3] + g[1][1]", .want = "value 7" },
+        .{ .expr = "#g[2]", .want = "value 3" },
+        .{ .expr = "g[1][9]", .want = "value nil" },
+        .{ .expr = "g[1].x", .want = "value nil" },
+        .{ .expr = "t[g[1]]", .want = "value nil" },
+        .{ .expr = "g[3]", .want = "value nil" },
+    };
+    evaluated = false;
+    _ = try s.run(prog.chunk.proto);
+    try testing.expect(evaluated);
+    try testing.expect(grid_seen);
+    for (cases, 0..) |c, i| {
+        testing.expectEqualStrings(c.want, got[i][0..got_len[i]]) catch |err| {
+            std.debug.print("expression: {s}\n", .{c.expr});
+            return err;
+        };
+    }
+    // Read only: the program prints what an undisturbed run prints.
+    try testing.expectEqualStrings("2\t1\n6\t1\n", sink.buffered());
+}

@@ -282,3 +282,86 @@ test "doc 86 P2: step in by instruction stops at every stoppable instruction" {
     // A pause at every stop stops at every stoppable instruction once.
     try testing.expectEqual(try stopCount(source, &pauseEveryStop), try stopCount(source, &stepByInstruction));
 }
+
+test "doc 86 P2: step over a generic for stops on its header each pass, and skips the body of a loop that runs none" {
+    // `ipairs(t)` is a call, so the loop is the closing form (`tfor_prep`).
+    try expectStops(
+        \\local t = {10, 20}
+        \\local s = 0
+        \\for i, v in ipairs(t) do
+        \\    s = s + v
+        \\end
+        \\local e = {}
+        \\for i, v in ipairs(e) do
+        \\    s = s + v
+        \\end
+        \\return s
+    , &.{1}, &.{ over, over, over, over, over, over, over, over, over }, &.{
+        .{ .reason = .breakpoint, .line = 1 },
+        .{ .reason = .step, .line = 2 },
+        .{ .reason = .step, .line = 3 },
+        .{ .reason = .step, .line = 4 },
+        .{ .reason = .step, .line = 3 },
+        .{ .reason = .step, .line = 4 },
+        .{ .reason = .step, .line = 3 },
+        .{ .reason = .step, .line = 6 },
+        .{ .reason = .step, .line = 7 },
+        .{ .reason = .step, .line = 10 },
+        ended(),
+    });
+}
+
+test "doc 86 P2: step over a generic for without a closing value stops the same way" {
+    try expectStops(
+        \\local t = {x = 1}
+        \\local n = 0
+        \\for k, v in next, t do
+        \\    n = n + v
+        \\end
+        \\return n
+    , &.{1}, &.{ over, over, over, over, over }, &.{
+        .{ .reason = .breakpoint, .line = 1 },
+        .{ .reason = .step, .line = 2 },
+        .{ .reason = .step, .line = 3 },
+        .{ .reason = .step, .line = 4 },
+        .{ .reason = .step, .line = 3 },
+        .{ .reason = .step, .line = 6 },
+        ended(),
+    });
+}
+
+test "doc 86 P2: step over a while loop stops on its test each pass" {
+    try expectStops(
+        \\local n = 0
+        \\while n < 2 do
+        \\    n = n + 1
+        \\end
+        \\return n
+    , &.{1}, &.{ over, over, over, over, over, over }, &.{
+        .{ .reason = .breakpoint, .line = 1 },
+        .{ .reason = .step, .line = 2 },
+        .{ .reason = .step, .line = 3 },
+        .{ .reason = .step, .line = 2 },
+        .{ .reason = .step, .line = 3 },
+        .{ .reason = .step, .line = 2 },
+        .{ .reason = .step, .line = 5 },
+        ended(),
+    });
+}
+
+test "doc 86 P2: step over a call that ends its statement stops on the next line" {
+    // No operator follows the call, so nothing after it is on the call's line.
+    try expectStops(
+        \\local function f(x)
+        \\    return x + 1
+        \\end
+        \\local a = f(1)
+        \\local b = f(2)
+        \\return a + b
+    , &.{4}, &.{ over, over, over }, &.{
+        .{ .reason = .breakpoint, .line = 4 },
+        .{ .reason = .step, .line = 5 },
+        .{ .reason = .step, .line = 6 },
+        ended(),
+    });
+}

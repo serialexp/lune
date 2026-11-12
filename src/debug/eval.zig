@@ -318,7 +318,17 @@ const Evaluator = struct {
     /// `obj[key]` without metamethods: a refusal where the VM would apply
     /// `__index`, the VM's fault where it would fault.
     fn rawGet(self: *Evaluator, obj: Value, key: Val, comptime what: []const u8) Fail!Value {
-        if (obj.isRowView() or !obj.isHeap()) return self.fail("attempt to index a {s} value", .{obj.typeName()});
+        // A grid's row: a view the table mints per read, with no hash part and
+        // no metatable until it deflates. Reading it is `rowViewGet`'s job,
+        // and the grid stays a grid (a program's own `g[i][j]` deflates it).
+        if (obj.isRowView()) {
+            const rk: Value = switch (key) {
+                .value => |v| v,
+                .text => return Value.nil(),
+            };
+            return table.Table.rowViewGet(obj, rk);
+        }
+        if (!obj.isHeap()) return self.fail("attempt to index a {s} value", .{obj.typeName()});
         switch (obj.heapType()) {
             .table => {},
             .string => return self.refuse("indexing a string goes through its metatable", .{}),
@@ -335,6 +345,9 @@ const Evaluator = struct {
             .text => |bytes| if (self.vm.heap.internedLookup(bytes)) |s| Value.heap(&s.header) else null,
         };
         if (k) |kv| if (kv.isFloat() and std.math.isNan(kv.asFloat())) return Value.nil();
+        // A row view is no table's key (the VM deflates its grid before it
+        // could be one).
+        if (k) |kv| if (kv.isRowView()) return Value.nil();
         const got = if (k) |kv| t.get(kv) else Value.nil();
         if (got.isNil() and self.hasMeta(obj, self.vm.mm.index)) {
             return self.refuse("the " ++ what ++ " is absent and the table has an __index metamethod", .{});

@@ -2117,6 +2117,11 @@ const Compiler = struct {
         const n: u16 = @intCast(gf.names.len);
         const last = gf.exprs[gf.exprs.len - 1];
         const closing = gf.exprs.len >= 4 or last.isCall() or last.data == .vararg;
+        // The loop's own instructions (the entry jump, the step and the
+        // back-edge) belong to the `for` header, not to whatever the body
+        // compiled last: a debugger steps by the line each instruction
+        // carries, and a loop that runs no body must not land inside it.
+        const header_span: ast.Span = .{ .start = self.cur_span.start, .end = last.span.end };
 
         // [f, s, ctrl] from the explist, multret-adjusted to exactly 3, or
         // [f, s, ctrl, closing], with the closing value then moved below.
@@ -2129,6 +2134,7 @@ const Compiler = struct {
         while (w < window) : (w += 1) _ = try self.alloc1();
 
         // Jump forward to the test block (mirrors for_prep's forward jump).
+        self.cur_span = header_span;
         const prep = if (closing) try self.emitJump(.tfor_prep, first) else try self.emitJump(.jmp, 0);
         if (closing) try self.openTbc(first, prep);
         const body_start = self.code.items.len;
@@ -2150,6 +2156,7 @@ const Compiler = struct {
         // f(base+0)/s(base+1) are never clobbered by it, so they persist across
         // iterations — then the test.
         self.patchToHere(prep);
+        self.cur_span = header_span;
         _ = try self.emit(Instr.opABC(.itern, base, 0, n));
         try self.emitJumpTo(.tfor_loop, base, body_start);
 

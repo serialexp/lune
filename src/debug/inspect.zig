@@ -40,6 +40,9 @@ pub const text_cap = 200;
 pub const Error = Allocator.Error || error{
     /// The reference is not one the current stop handed out.
     InvalidReference,
+    /// Every reference a `u32` can hold was given out: no more can be made
+    /// without one aliasing a stale one.
+    ReferencesExhausted,
     /// No thread has that id.
     UnknownThread,
 };
@@ -150,6 +153,9 @@ pub const Inspector = struct {
     /// The reference of `handles[0]`. A resume moves it past every
     /// reference given out, so a stale one never names a new handle.
     first_ref: u32 = 1,
+    /// `first_ref` could not move past the references given out. Nothing
+    /// new is handed out: a wrapped reference would name a stale handle.
+    exhausted: bool = false,
     /// The program has ended: the main stack lists no frames, though the VM
     /// may still hold the frames of the error that ended it.
     ended: bool = false,
@@ -166,7 +172,8 @@ pub const Inspector = struct {
 
     /// Forget every reference: the program resumes.
     pub fn clear(self: *Inspector) void {
-        self.first_ref +%= @intCast(self.handles.items.len);
+        const len: u32 = @intCast(self.handles.items.len);
+        if (std.math.add(u32, self.first_ref, len)) |next| self.first_ref = next else |_| self.exhausted = true;
         self.handles.clearRetainingCapacity();
     }
 
@@ -192,13 +199,17 @@ pub const Inspector = struct {
         return stackOf(vm, t);
     }
 
-    fn add(self: *Inspector, h: Handle) Allocator.Error!u32 {
+    fn add(self: *Inspector, h: Handle) Error!u32 {
+        if (self.exhausted) return error.ReferencesExhausted;
+        // The next reference, and the one after it, must exist in a `u32`.
+        const next = std.math.add(u32, self.first_ref, @intCast(self.handles.items.len)) catch return error.ReferencesExhausted;
         try self.handles.append(self.gpa, h);
-        return self.first_ref +% @as(u32, @intCast(self.handles.items.len - 1));
+        return next;
     }
 
     fn get(self: *const Inspector, ref: u32) Error!Handle {
-        const i = ref -% self.first_ref;
+        if (self.exhausted or ref < self.first_ref) return error.InvalidReference;
+        const i = ref - self.first_ref;
         if (i >= self.handles.items.len) return error.InvalidReference;
         return self.handles.items[i];
     }
@@ -627,4 +638,25 @@ fn textOf(arena: Allocator, bytes: []const u8, quoted: bool) Allocator.Error![]c
     const cut = n < bytes.len;
     const q: []const u8 = if (quoted) "\"" else "";
     return std.fmt.allocPrint(arena, "{s}{s}{s}{s}", .{ q, bytes[0..n], if (cut) "\u{2026}" else "", q });
+}
+
+test "doc 86 P2: references are never reused, and running out is an error, not a wrap" {
+    var ins = Inspector.init(std.testing.allocator);
+    defer ins.deinit();
+    ins.first_ref = std.math.maxInt(u32) - 2;
+    const a = try ins.add(.{ .object = Value.nil() });
+    const b = try ins.add(.{ .object = Value.nil() });
+    try std.testing.expect(a != b and b > a);
+    try std.testing.expectEqual(std.math.maxInt(u32) - 1, b);
+    // `maxInt(u32)` is still a reference; the one after would wrap.
+    const c = try ins.add(.{ .object = Value.nil() });
+    try std.testing.expectEqual(std.math.maxInt(u32), c);
+    try std.testing.expectError(error.ReferencesExhausted, ins.add(.{ .object = Value.nil() }));
+    _ = try ins.get(a);
+    // A resume moves past them: nothing new may be named, and the old are gone.
+    ins.clear();
+    try std.testing.expectError(error.ReferencesExhausted, ins.add(.{ .object = Value.nil() }));
+    try std.testing.expectError(error.InvalidReference, ins.get(a));
+    try std.testing.expectError(error.InvalidReference, ins.get(c));
+    try std.testing.expectError(error.InvalidReference, ins.get(0));
 }

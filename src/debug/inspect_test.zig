@@ -210,18 +210,31 @@ fn lookBig(rig: *Rig, s: *Session) !void {
     try testing.expect(groups.len > 1);
     try testing.expectEqualStrings("[slots 0\u{2013}99]", groups[0].name);
     var entries: usize = 0;
-    for (groups) |g| {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (groups, 0..) |g, gi| {
         try testing.expect(g.ref != 0);
-        // A page of a group reads only its own slots: no more than 100.
+        // The groups tile the slots: each is the next hundred.
+        if (gi + 1 < groups.len) {
+            const want = try std.fmt.allocPrint(a, "[slots {d}\u{2013}{d}]", .{ gi * inspect.group_size, gi * inspect.group_size + inspect.group_size - 1 });
+            try testing.expectEqualStrings(want, g.name);
+        }
+        // A page of a group reads only its own slots (`lo..hi`, at most
+        // 100 of them), so no group lists more than that.
         const children = try s.variables(a, g.ref, .all, 0, 0);
         try testing.expect(children.len <= inspect.group_size);
         entries += children.len;
+        // Every entry is in exactly one group.
+        for (children) |c| {
+            const slot = try seen.getOrPut(a, c.name);
+            try testing.expect(!slot.found_existing);
+        }
         if (children.len > 2) {
             const part = try s.variables(a, g.ref, .all, 1, 2);
             try testing.expectEqual(@as(usize, 2), part.len);
             try testing.expectEqualStrings(children[1].name, part[0].name);
         }
     }
+    try testing.expectEqual(@as(usize, 300), seen.count());
     try rig.print("{d}\n", .{entries});
 }
 
