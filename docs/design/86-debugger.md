@@ -1329,3 +1329,77 @@ The rest:
   once, and `console` events mark entering and leaving history. Showing it
   again would print it twice.
 - **Zed API.** Recorded (§8.3), with a check of the API version first.
+
+Round 2, 2026-11-12: a code review of P2 (`src/debug/`, six slices).
+Codex reviewed all of it (11 findings). Antigravity reviewed session,
+breakpoints and stepping (11 findings); its runs on the error-stop and
+inspection/evaluation code died on connection errors and an exhausted
+quota, so **nobody but Codex has reviewed those two**. Each finding was
+reproduced with a test or probe before it was fixed, except where noted.
+
+Fixed (`ce657fc`, `4f584c4`):
+
+- **Terminate at an uncaught-error stop left the VM dirty.** The frames and
+  `pending_error` stayed, so the next run failed with `DirtyTopLevelEntry`.
+  A terminate while a multiple-result call was pending also left
+  `reg_top_pending` set. `Vm.abandonRun()` is the one reset (the host's
+  `pending_error = null; unwindTo(0, 0)` plus that flag), used by `run` and
+  by `runLine`.
+- **The end stop and terminate wiped `Flags.breakpoints`**, so a second run
+  through one session lost its breakpoints. `endOfRun()` keeps what belongs
+  to the session.
+- **`evaluate` at the end stop asserted on an empty stack, and `stackTrace`
+  after an uncaught error listed the dead frames.** Now refused / empty.
+- **`threads()` listed the main-thread object** (the value of
+  `coroutine.running()` on the main stack, with no saved context) as a
+  second thread.
+- **Breakpoint table OOM ownership.** `addChunk` and `set` left a dangling
+  chunk or a double free on a failed allocation; checked with
+  `checkAllAllocationFailures`.
+- **`idsAt` scanned every bound pc** (now a binary search), and **a condition
+  was parsed again at every hit** (now parsed once, kept while the text is
+  unchanged; a parse counter, not a clock, pins it).
+- **An empty or blank `condition` is no condition** (clients send `""`).
+- **A re-sent line that a breakpoint moved to keeps that breakpoint**, its
+  hits and its once-only condition report.
+- **Chunk loading shared one scratch list across re-entrant callbacks.**
+  `addChunk` now uses a local list and `syncChunks` counts a chunk before
+  indexing it. The test covers a callback that calls `setBreakpoints`; it
+  does not load a second chunk from inside the callback.
+- **`evaluate` on a grid row** (`g[1][1]`) failed, and `t[g[1]]` hit the
+  hash-key assertion. Rows now read through `rowViewGet`, a row is no
+  table's key, and the grid is never deflated by an evaluation.
+- **The reference counter wrapped** after 2^32 references and could name a
+  stale handle (or 0). It now fails with `ReferencesExhausted`.
+- **A generic `for` stepped wrongly.** Its entry jump, step and back-edge
+  took the span of the body's last statement, so a loop that ran no body
+  stopped inside it. They carry the header's span now: the header stops
+  once per pass.
+- **Weak tests.** The hash-group test now checks the group tiling and that
+  every entry is in exactly one group (the O(page) bound is the loop's
+  `lo..hi` range, so no counter was added). The step tests now cover generic
+  `for`, `while` and a call that ends its statement. Not covered: which
+  coroutine stopped (`Want.co` is a flag), and `repeat`.
+
+Fixed without a failing run first: the empty-condition, re-sent-line and
+`idsAt` changes, the epoch and group-test changes. They were written
+together with their tests.
+
+Open (in TODO.md, Bart's call):
+
+- **A Lua comparison metamethod can miss a line visit.** `LineVisits`
+  judges a frame it re-enters by the static predecessor `pc - 1`, but a
+  comparison metamethod returns into a branch that may jump. Reproduced.
+- **A native-bodied raise makes no exception stop** (`xpcall(f, error)`,
+  `coroutine.resume(coroutine.create(error), x)`, `coroutine.wrap(error)(x)`).
+  Reproduced. It widens §5.4's two hook sites.
+- **P6:** `capi.zig` treats `DebugTerminated` as fatal, and `runProtected`
+  natives have no boundary raise hook.
+- **Seen, not changed:** `repeat` stops on its `repeat` line every pass,
+  because the loop marker instruction carries it.
+
+Nothing found by either reviewer in: `protect_enter`/`protect_leave`
+pairing, the resume-versus-wrap `raiseCaught` walk, frame stability across a
+stop, ordinary array and hash paging, attach/detach, prologue ordering,
+coroutine liveness while stepping, or tail calls. The snapshot-equivalence
+tests do not force a collection.
